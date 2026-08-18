@@ -15,8 +15,9 @@ rl-service/**/__pycache__/
 rl-service/.pytest_cache/
 rl-service/**/*.egg-info/
 
-# data & model artifacts
-data/
+# data & model artifacts (top-level cache dirs only — not the rl_service/data package)
+/data/
+/rl-service/data/
 rl-service/models/
 *.log
 
