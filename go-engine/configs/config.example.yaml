@@ -1,0 +1,15 @@
+okx:
+  rest_base_url: "https://www.okx.com"
+  public_ws_url: "wss://ws.okx.com:8443/ws/v5/public"
+  private_ws_url: "wss://ws.okx.com:8443/ws/v5/private"
+
+trading:
+  inst_ids:
+    - "BTC-USDT-SWAP"
+  poll_interval_sec: 5
+
+risk:
+  max_leverage: 5
+  max_position_notional_usd: 1000
+  max_daily_drawdown_pct: 5
+  min_liquidation_buffer_pct: 15
