@@ -1,0 +1,25 @@
+# secrets / local config
+.env
+go-engine/configs/config.yaml
+rl-service/configs/config.yaml
+
+# Go
+go-engine/bin/
+*.exe
+*.test
+
+# Python
+rl-service/.venv/
+rl-service/**/__pycache__/
+*.pyc
+rl-service/.pytest_cache/
+rl-service/**/*.egg-info/
+
+# data & model artifacts
+data/
+rl-service/models/
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
