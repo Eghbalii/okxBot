@@ -244,7 +244,7 @@ logic, `go-engine` is organized ports-and-adapters style (see §3 for the target
 This is a meaningful refactor of what's already built (§14 phases it in) — existing code moves
 into this shape rather than being rewritten from scratch.
 
-## 11. Dashboard / reporting API (planned)
+## 11. Dashboard / reporting API
 
 A new `cmd/api` service (built on the same use-cases as the trading engine, per §10) exposing:
 
@@ -256,9 +256,22 @@ A new `cmd/api` service (built on the same use-cases as the trading engine, per 
   (entry/SL/TP, timestamps, close reason) — the `paper_orders`/`live_orders` tables (§7) are
   designed around exactly this. Chart overlay of orders is a `panel/` (frontend) concern for
   later, not a backend blocker.
-- Metrics/infra monitoring (CPU/RAM/GPU, throughput) is a good fit for Prometheus + Grafana rather
-  than reinventing a metrics dashboard — keep that separate from the product-specific
-  strategy/orders API and its own frontend panel.
+
+**Metrics (implemented): Prometheus + Grafana**, per explicit decision — not reinvented as a
+custom dashboard, kept separate from the product-specific strategy/orders API. `go-engine`
+services expose `/metrics` via `internal/metrics` (`promhttp`), scraped per `prometheus.yml`:
+- `okxbot_strategy_signals_total{strategy,inst_id,side}` — every strategy evaluation, incl. holds.
+- `okxbot_paper_orders_opened_total{strategy,inst_id,side}` — virtual trades opened.
+- `okxbot_paper_orders_closed_total{inst_id,reason}` — closed trades by reason; `reason="sl"` /
+  `reason="tp"` gives the SL-hit / TP-hit counts directly (rate()/increase() in Grafana for
+  hour/day/week windows, matching the panel's reporting requirement in §11).
+- `okxbot_paper_orders_open{inst_id}` — current open-order gauge.
+- `okxbot_paper_orders_realized_pnl_usd_total{inst_id}` — cumulative realized PnL gauge.
+- `okxbot_ingestor_events_total{kind,inst_id}` — WS ticks/candles received, for pipeline health.
+- Standard Go process metrics (goroutines, GC, memory) come free from `promhttp`.
+Grafana dashboards themselves (panels/layout) aren't built yet — only the metrics + scrape config
+are wired; building the actual dashboard JSON is a small follow-up once there's real data to look
+at. `rl_service/metrics.py` (CPU/RAM/GPU/training progress) is still planned, not implemented.
 
 ## 12. Event-driven design
 
@@ -302,16 +315,25 @@ Phase 1 — data & paper trading (unblocks everything else, do this next):
       automatically on startup) — not yet run against a live Postgres in this environment (no
       Docker available here); verify with `docker compose up -d timescaledb` before relying on it
 - [x] Strategy interface + a first indicator-based strategy (`internal/strategy`: RSI+SMA)
-- [x] Paper Trading Engine (`cmd/paper-trader`) — polls OKX REST candles (no live WS candle feed
-      yet, see note below), evaluates strategies, opens/monitors/closes virtual orders, persists
-      finalized candles + trades to Postgres
+- [x] Paper Trading Engine (`cmd/paper-trader`) — WS/event-driven (see below), evaluates
+      strategies, opens/monitors/closes virtual orders, persists finalized candles + trades to
+      Postgres
+- [x] Ingestor subscribes to OKX's candle WS channel (business endpoint) in addition to tickers,
+      publishing both to Redis (`okx:tickers`, `okx:candles`)
+- [x] Prometheus metrics (`internal/metrics`) + Grafana wired into docker-compose (§11)
 - [ ] Repoint `rl_service/train.py` at the paper-trading trade log instead of historical replay
       (blocked on accumulating real paper-trading data first)
 
-Note on the current paper-trading implementation: it polls `GET /market/candles` on the trading
-poll interval rather than subscribing to the OKX candle WebSocket channel + a dedicated
-Redis-stream-to-Postgres consumer as originally sketched in §7 — this was a deliberate scope cut
-to ship a working vertical slice; revisit if polling latency/rate limits become a problem.
+Paper-trading data flow (revised from the initial REST-polling cut): the ingestor subscribes to
+OKX's public `tickers` channel and business `candle{bar}` channel over a single WS connection
+each, publishing every event to Redis Streams. The Paper Trading Engine consumes both via
+consumer groups (`internal/stream.Consumer`): every **tick** triggers an immediate SL/TP check
+against open virtual orders (no missed intra-bar wicks, no polling delay), and every **finalized
+candle** triggers strategy re-evaluation and is persisted to Postgres. A REST call
+(`GetCandles`) is used exactly once at startup, to seed the initial in-memory candle window —
+not on an ongoing poll loop. This replaces the earlier REST-polling version, which had a real
+correctness bug (checking SL/TP only against candle-close prices could silently miss a price wick
+that touched SL/TP and reverted within the same bar) in addition to rate-limit/delay concerns.
 
 Phase 2 — clean architecture refactor & live wiring:
 - [ ] Refactor `go-engine` into `domain`/`usecase`/`port`/adapters (§10)

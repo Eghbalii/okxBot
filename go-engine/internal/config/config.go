@@ -17,6 +17,7 @@ type Config struct {
 		Simulated     bool   `yaml:"-"`
 		RESTBaseURL   string `yaml:"rest_base_url"`
 		PublicWSURL   string `yaml:"public_ws_url"`
+		BusinessWSURL string `yaml:"business_ws_url"`
 		PrivateWSURL  string `yaml:"private_ws_url"`
 	} `yaml:"okx"`
 
@@ -78,12 +79,16 @@ func Load(path string) (*Config, error) {
 	if cfg.OKX.PublicWSURL == "" {
 		cfg.OKX.PublicWSURL = "wss://ws.okx.com:8443/ws/v5/public"
 	}
+	if cfg.OKX.BusinessWSURL == "" {
+		cfg.OKX.BusinessWSURL = "wss://ws.okx.com:8443/ws/v5/business"
+	}
 	if cfg.OKX.PrivateWSURL == "" {
 		cfg.OKX.PrivateWSURL = "wss://ws.okx.com:8443/ws/v5/private"
 	}
 	if cfg.OKX.Simulated {
 		// Demo trading uses a dedicated WS host; REST stays on the same host with a header flag.
 		cfg.OKX.PublicWSURL = "wss://wspap.okx.com:8443/ws/v5/public"
+		cfg.OKX.BusinessWSURL = "wss://wspap.okx.com:8443/ws/v5/business"
 		cfg.OKX.PrivateWSURL = "wss://wspap.okx.com:8443/ws/v5/private"
 	}
 

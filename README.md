@@ -9,10 +9,20 @@ changes.
 
 ## Layout
 
-- `go-engine/` — Go module: WebSocket ingestor, OKX REST client, trading engine, risk manager.
-- `rl-service/` — Python: Gymnasium environment, PPO training (Stable-Baselines3), FastAPI
-  inference server.
-- `docker-compose.yml` — Redis + TimescaleDB + both services for local development.
+- `go-engine/` — Go module: WebSocket ingestor, OKX REST client, paper-trading engine, strategy
+  engine, trading engine, risk manager, Postgres persistence, Prometheus metrics.
+- `rl-service/` — Python: Gymnasium environment (dev sanity-check only), PPO training
+  (Stable-Baselines3), FastAPI inference server.
+- `docker-compose.yml` — Redis + TimescaleDB + Prometheus + Grafana + all Go/Python services.
+
+## Monitoring
+
+Prometheus scrapes `/metrics` from the ingestor (`:9101`) and paper trader (`:9102`) — see
+`prometheus.yml`. Metrics include strategy signals, paper orders opened/closed (by SL/TP/manual
+reason), open-order count, and cumulative realized PnL (CLAUDE.md §11 has the full list). Grafana
+is at `http://localhost:3000` (default admin/admin, per `docker-compose.yml`) with Prometheus
+(`http://prometheus:9090`) as a data source — dashboards aren't pre-built yet, add them once
+there's real paper-trading data to look at.
 
 ## Quickstart (development, OKX demo trading only)
 
@@ -21,10 +31,13 @@ cp go-engine/configs/config.example.yaml go-engine/configs/config.yaml
 cp rl-service/configs/config.example.yaml rl-service/configs/config.yaml
 cp .env.example .env   # fill in OKX demo API key/secret/passphrase
 
-docker compose up -d redis timescaledb
+docker compose up -d redis timescaledb prometheus grafana
 
-# Go: start the market data ingestor
+# Go: start the market data ingestor (WS -> Redis: ticks + candles)
 cd go-engine && go run ./cmd/ingestor
+
+# Go: start the Paper Trading Engine (virtual orders, the RL training data source, see CLAUDE.md §8)
+cd go-engine && go run ./cmd/paper-trader
 
 # Python: serve inference (training is driven by the paper-trading trade log, see CLAUDE.md §8)
 cd rl-service && pip install -r requirements.txt

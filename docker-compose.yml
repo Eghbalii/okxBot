@@ -35,6 +35,9 @@ services:
     environment:
       CONFIG_PATH: /app/configs/config.yaml
       REDIS_ADDR: redis:6379
+      METRICS_ADDR: ":9101"
+    ports:
+      - "9101:9101"
     volumes:
       - ./go-engine/configs:/app/configs
     depends_on:
@@ -66,16 +69,43 @@ services:
       CONFIG_PATH: /app/configs/config.yaml
       REDIS_ADDR: redis:6379
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
+      METRICS_ADDR: ":9102"
       OKX_API_KEY: ${OKX_API_KEY}
       OKX_API_SECRET: ${OKX_API_SECRET}
       OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE}
       OKX_SIMULATED_TRADING: ${OKX_SIMULATED_TRADING:-1}
+    ports:
+      - "9102:9102"
     volumes:
       - ./go-engine/configs:/app/configs
     depends_on:
       - redis
       - timescaledb
 
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - ingestor
+      - paper-trader
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 volumes:
   redis-data:
   timescale-data:
+  prometheus-data:
+  grafana-data:

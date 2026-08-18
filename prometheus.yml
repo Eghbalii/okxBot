@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: okxbot-ingestor
+    static_configs:
+      - targets: ["ingestor:9101"]
+
+  - job_name: okxbot-paper-trader
+    static_configs:
+      - targets: ["paper-trader:9102"]

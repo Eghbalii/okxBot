@@ -2,89 +2,151 @@
 // strategies against live prices, opens virtual orders with full SL/TP features, and monitors
 // them against the real price feed until SL or TP is hit. Closed trades are persisted and become
 // the RL training data — no real orders are ever sent to OKX from this package.
+//
+// Driven entirely by the WS-fed Redis event bus (CLAUDE.md §12), not REST polling: every tick
+// triggers an immediate SL/TP check (no missed intra-bar wicks, no polling delay), and every
+// finalized candle triggers strategy re-evaluation + persistence. A REST call is used only once,
+// at startup, to seed the initial rolling candle window.
 package paperengine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"time"
 
+	"github.com/rez/okxBot/go-engine/internal/metrics"
 	"github.com/rez/okxBot/go-engine/internal/okx"
 	"github.com/rez/okxBot/go-engine/internal/okx/rest"
 	"github.com/rez/okxBot/go-engine/internal/port"
 	"github.com/rez/okxBot/go-engine/internal/strategy"
+	"github.com/rez/okxBot/go-engine/internal/stream"
 )
 
-// Engine runs the paper-trading loop for a single instrument.
+// Engine runs the paper-trading loop for a single instrument, driven by ticks/candles from Redis.
 type Engine struct {
-	InstID        string
-	Bar           string // candle timeframe used for strategy evaluation, e.g. "1m"
-	CandleLimit   int
-	Strategies    []strategy.Strategy
-	RESTClient    *rest.Client
-	Repo          port.Repository
-	NotionalUSD   float64
-	MaxOpenOrders int
-	PollInterval  time.Duration
-	Logger        *slog.Logger
+	InstID         string
+	Bar            string // candle timeframe used for strategy evaluation, e.g. "1m"
+	CandleWindow   int    // how many recent candles to keep in memory for strategy evaluation
+	Strategies     []strategy.Strategy
+	RESTClient     *rest.Client // used once at startup to seed the initial candle window
+	TickConsumer   *stream.Consumer
+	CandleConsumer *stream.Consumer
+	Repo           port.Repository
+	NotionalUSD    float64
+	MaxOpenOrders  int
+	Logger         *slog.Logger
+
+	candles []strategy.Candle // append-only working window, touched only by the candle consumer
 }
 
-// Run polls candles/price and drives the paper-trading loop until ctx is cancelled.
+type tickEvent struct {
+	InstID string `json:"instId"`
+	Last   string `json:"last"`
+}
+
+type candleEvent struct {
+	InstID string   `json:"instId"`
+	Bar    string   `json:"bar"`
+	Candle []string `json:"candle"`
+}
+
+// Run seeds the initial candle window via REST, then consumes ticks/candles from Redis until
+// ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) error {
 	logger := e.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	ticker := time.NewTicker(e.PollInterval)
-	defer ticker.Stop()
+	if err := e.seedCandles(); err != nil {
+		return fmt.Errorf("seed initial candle window: %w", err)
+	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := e.step(ctx, logger); err != nil {
-				logger.Error("paper-trading step failed", "instId", e.InstID, "error", err)
-			}
-		}
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- e.TickConsumer.Run(ctx, func(ctx context.Context, data []byte) error {
+			return e.handleTick(ctx, data, logger)
+		})
+	}()
+	go func() {
+		errCh <- e.CandleConsumer.Run(ctx, func(ctx context.Context, data []byte) error {
+			return e.handleCandle(ctx, data, logger)
+		})
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-errCh:
+		return err
 	}
 }
 
-func (e *Engine) step(ctx context.Context, logger *slog.Logger) error {
-	rawCandles, err := e.RESTClient.GetCandles(e.InstID, e.Bar, e.CandleLimit)
+func (e *Engine) seedCandles() error {
+	raw, err := e.RESTClient.GetCandles(e.InstID, e.Bar, e.CandleWindow)
 	if err != nil {
-		return fmt.Errorf("fetch candles: %w", err)
+		return err
 	}
-	candles, err := toStrategyCandles(rawCandles)
+	candles, err := toStrategyCandles(raw)
 	if err != nil {
-		return fmt.Errorf("parse candles: %w", err)
+		return err
 	}
-	if len(candles) == 0 {
+	e.candles = candles
+	return nil
+}
+
+func (e *Engine) handleTick(ctx context.Context, data []byte, logger *slog.Logger) error {
+	var tick tickEvent
+	if err := json.Unmarshal(data, &tick); err != nil {
+		return fmt.Errorf("decode tick: %w", err)
+	}
+	if tick.InstID != e.InstID {
+		return nil // shared stream across instruments; this engine only cares about its own
+	}
+	price, err := strconv.ParseFloat(tick.Last, 64)
+	if err != nil {
+		return fmt.Errorf("parse tick price %q: %w", tick.Last, err)
+	}
+	return e.monitorOpenOrders(ctx, price, logger)
+}
+
+func (e *Engine) handleCandle(ctx context.Context, data []byte, logger *slog.Logger) error {
+	var event candleEvent
+	if err := json.Unmarshal(data, &event); err != nil {
+		return fmt.Errorf("decode candle event: %w", err)
+	}
+	if event.InstID != e.InstID || len(event.Candle) < 6 {
 		return nil
 	}
 
-	// Persist finalized bars so the engine also serves as the candle -> Postgres writer.
-	for i, raw := range rawCandles {
-		if raw.Confirm != "1" {
-			continue
-		}
-		if err := e.Repo.SaveCandle(ctx, toPortCandle(e.InstID, e.Bar, raw)); err != nil {
-			logger.Warn("failed to persist candle", "instId", e.InstID, "index", i, "error", err)
-		}
+	raw := okx.Candle{Ts: event.Candle[0], Open: event.Candle[1], High: event.Candle[2], Low: event.Candle[3], Close: event.Candle[4], Vol: event.Candle[5]}
+	if len(event.Candle) >= 9 {
+		raw.Confirm = event.Candle[8]
 	}
 
-	currentPrice := candles[len(candles)-1].Close
-	if err := e.monitorOpenOrders(ctx, currentPrice, logger); err != nil {
-		logger.Error("monitor open paper orders failed", "instId", e.InstID, "error", err)
+	c, err := parseCandle(raw)
+	if err != nil {
+		return fmt.Errorf("parse candle: %w", err)
 	}
 
-	return e.evaluateStrategies(ctx, candles, currentPrice, logger)
+	e.candles = append(e.candles, c)
+	if len(e.candles) > e.CandleWindow {
+		e.candles = e.candles[len(e.candles)-e.CandleWindow:]
+	}
+
+	if raw.Confirm != "1" {
+		return nil // still forming; wait for the finalized bar before persisting/evaluating
+	}
+	if err := e.Repo.SaveCandle(ctx, toPortCandle(e.InstID, e.Bar, raw)); err != nil {
+		logger.Warn("failed to persist candle", "instId", e.InstID, "error", err)
+	}
+	return e.evaluateStrategies(ctx, c.Close, logger)
 }
 
-func (e *Engine) evaluateStrategies(ctx context.Context, candles []strategy.Candle, price float64, logger *slog.Logger) error {
+func (e *Engine) evaluateStrategies(ctx context.Context, price float64, logger *slog.Logger) error {
 	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
 	if err != nil {
 		return fmt.Errorf("list open paper orders: %w", err)
@@ -94,11 +156,12 @@ func (e *Engine) evaluateStrategies(ctx context.Context, candles []strategy.Cand
 	}
 
 	for _, s := range e.Strategies {
-		signal, err := s.Evaluate(candles)
+		signal, err := s.Evaluate(e.candles)
 		if err != nil {
 			logger.Warn("strategy evaluation failed", "strategy", s.Name(), "instId", e.InstID, "error", err)
 			continue
 		}
+		metrics.StrategySignalsTotal.WithLabelValues(s.Name(), e.InstID, string(signal.Side)).Inc()
 		if signal.Side == strategy.Hold {
 			continue
 		}
@@ -109,6 +172,7 @@ func (e *Engine) evaluateStrategies(ctx context.Context, candles []strategy.Cand
 			logger.Error("failed to open paper order", "strategy", s.Name(), "instId", e.InstID, "error", err)
 			continue
 		}
+		metrics.PaperOrdersOpenedTotal.WithLabelValues(s.Name(), e.InstID, string(signal.Side)).Inc()
 		logger.Info("opened paper order", "id", id, "strategy", s.Name(), "instId", e.InstID,
 			"side", signal.Side, "entry", price, "confidence", signal.Confidence)
 	}
@@ -120,6 +184,7 @@ func (e *Engine) monitorOpenOrders(ctx context.Context, price float64, logger *s
 	if err != nil {
 		return fmt.Errorf("list open paper orders: %w", err)
 	}
+	metrics.PaperOrdersOpenGauge.WithLabelValues(e.InstID).Set(float64(len(open)))
 
 	for _, o := range open {
 		reason, hit := closeReason(o, price)
@@ -131,6 +196,8 @@ func (e *Engine) monitorOpenOrders(ctx context.Context, price float64, logger *s
 			logger.Error("failed to close paper order", "id", o.ID, "error", err)
 			continue
 		}
+		metrics.PaperOrdersClosedTotal.WithLabelValues(e.InstID, reason).Inc()
+		metrics.PaperOrdersRealizedPnL.WithLabelValues(e.InstID).Add(pnl)
 		logger.Info("closed paper order", "id", o.ID, "instId", e.InstID, "reason", reason, "closePx", price, "pnl", pnl)
 	}
 	return nil
