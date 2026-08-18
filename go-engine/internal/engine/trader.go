@@ -1,4 +1,3 @@
-package engine
 // Package engine orchestrates the live trading loop: fetch state, ask the RL service for an
 // action, run it through the risk manager, and execute orders/leverage changes on OKX.
 package engine

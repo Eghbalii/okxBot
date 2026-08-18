@@ -1,0 +1,10 @@
+gymnasium>=0.29
+stable-baselines3>=2.3
+torch>=2.2
+pandas>=2.2
+numpy>=1.26
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+requests>=2.31
+PyYAML>=6.0

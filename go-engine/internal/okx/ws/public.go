@@ -1,4 +1,3 @@
-package ws
 // Package ws implements OKX v5 WebSocket clients with auto-reconnect and heartbeat handling.
 package ws
 

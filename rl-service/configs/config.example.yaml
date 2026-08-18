@@ -1,0 +1,21 @@
+data:
+  candles_csv: "data/BTC-USDT-SWAP_1H.csv"
+
+env:
+  window_size: 32
+  max_leverage: 5.0
+  max_position_notional_usd: 1000.0
+  taker_fee_rate: 0.0005
+  funding_rate_per_8h: 0.0001
+  initial_equity_usd: 10000.0
+  liquidation_maintenance_margin_pct: 0.5
+
+train:
+  algo: "PPO"
+  total_timesteps: 500000
+  model_out: "models/ppo_okx_futures.zip"
+
+serve:
+  model_path: "models/ppo_okx_futures.zip"
+  host: "0.0.0.0"
+  port: 8000

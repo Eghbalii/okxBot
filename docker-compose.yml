@@ -1,0 +1,63 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: okxbot
+      POSTGRES_PASSWORD: okxbot
+      POSTGRES_DB: okxbot
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+
+  rl-service:
+    build: ./rl-service
+    environment:
+      CONFIG_PATH: /app/configs/config.yaml
+    volumes:
+      - ./rl-service/configs:/app/configs
+      - ./rl-service/models:/app/models
+      - ./rl-service/data:/app/data
+    ports:
+      - "8000:8000"
+
+  ingestor:
+    build:
+      context: ./go-engine
+      dockerfile: Dockerfile.ingestor
+    environment:
+      CONFIG_PATH: /app/configs/config.yaml
+      REDIS_ADDR: redis:6379
+    volumes:
+      - ./go-engine/configs:/app/configs
+    depends_on:
+      - redis
+
+  trader:
+    build:
+      context: ./go-engine
+      dockerfile: Dockerfile.trader
+    environment:
+      CONFIG_PATH: /app/configs/config.yaml
+      REDIS_ADDR: redis:6379
+      RL_SERVICE_URL: http://rl-service:8000
+      OKX_API_KEY: ${OKX_API_KEY}
+      OKX_API_SECRET: ${OKX_API_SECRET}
+      OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE}
+      OKX_SIMULATED_TRADING: ${OKX_SIMULATED_TRADING:-1}
+    volumes:
+      - ./go-engine/configs:/app/configs
+    depends_on:
+      - redis
+      - rl-service
+
+volumes:
+  redis-data:
+  timescale-data:

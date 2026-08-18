@@ -133,13 +133,21 @@ never bypass hard safety limits.
 ## 7. Roadmap / status
 
 - [x] Architecture defined (this doc)
-- [ ] Go OKX REST client (auth + trade + account)
-- [ ] Go OKX WebSocket ingestor → Redis
-- [ ] Go trading engine + risk manager + RL client
-- [ ] Python Gymnasium env for OKX futures backtesting
-- [ ] Python PPO training pipeline
-- [ ] Python FastAPI inference server
-- [ ] docker-compose wiring + local end-to-end dry run (demo trading)
+- [x] Go OKX REST client (auth + trade + account)
+- [x] Go OKX WebSocket ingestor → Redis
+- [x] Go trading engine + risk manager + RL client (order execution wiring is still a stub —
+      see `internal/engine/trader.go`)
+- [x] Python Gymnasium env for OKX futures backtesting (`rl_service/env/okx_futures_env.py`,
+      covered by `tests/test_okx_futures_env.py`)
+- [x] Python PPO training pipeline (`rl_service/train.py`) — not yet run against real historical
+      data, only unit-tested against a synthetic price series
+- [x] Python FastAPI inference server (`rl_service/serve/api.py`)
+- [x] docker-compose wiring (not yet run end-to-end)
+- [ ] Pull real OKX historical candles with `rl_service/data/fetch_okx_history.py` and run a full
+      training pass
+- [ ] Wire `engine.Trader.step` to actually translate RL actions into OKX orders (`PlaceOrder`,
+      `SetLeverage`) through the risk manager
 - [ ] Backtest evaluation harness / metrics (Sharpe, max DD, win rate) before any live capital
+- [ ] End-to-end dry run against OKX demo trading
 
 Update the checklist above as work progresses.

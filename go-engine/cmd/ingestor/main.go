@@ -1,4 +1,3 @@
-package main
 // Command ingestor connects to OKX's public WebSocket and streams ticker data into Redis for
 // downstream consumption (feature building, research, monitoring).
 package main
