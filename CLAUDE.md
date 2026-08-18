@@ -47,39 +47,72 @@ action. This is a well-understood microservice pattern — not overengineered, n
   opening/closing a position" behavior without a separate risk model — the agent learns it
   through the reward signal. We can later add a second head / auxiliary loss for explicit risk
   classification if needed.
-- Training happens **offline against historical data** (backtest environment). Live inference is
-  a frozen policy served over HTTP; periodic re-training happens offline and the model artifact
-  is swapped (no online/live learning in v1 — too risky with real money).
+- **Training data source: live paper-trading (forward-test), not historical backtesting.**
+  Per explicit product decision, the model is *not* trained primarily against replayed historical
+  candles. Instead: a Strategy generates a signal from real-time market data → the **Paper
+  Trading Engine** (§8) opens a virtual order with full features (entry, SL, TP, size, leverage)
+  at the live price → the order is tracked against the live price feed until SL or TP is hit →
+  the closed trade (entry features, action taken, realized outcome) is persisted (§7) and used as
+  training data. This is what actually improves the deployed model/strategies.
+  - Trade-off to keep in mind: PPO-style RL typically wants hundreds of thousands of
+    steps/episodes; a live-paced feed only produces on the order of tens of trades per
+    strategy/token per day, so early training will accumulate experience slowly. This is an
+    accepted, explicit trade-off in exchange for never training on data that doesn't reflect real
+    order execution — do not "fix" this by silently reintroducing historical backtesting.
+  - `rl_service/env/okx_futures_env.py` (the historical Gymnasium env) is kept only as an
+    **optional, off-by-default sanity-check tool** for validating environment/reward-function
+    code changes quickly with synthetic/historical data. It is not the source of the deployed
+    model and should not be treated as one.
+  - Live inference is still a frozen policy served over HTTP; periodic re-training consumes the
+    paper-trading trade log and the model artifact is swapped (no true online/in-place weight
+    updates in v1 — too risky with real money, and we want a reviewable model artifact per
+    training run).
 
 ## 3. Repository layout
+
+The target layout below reflects the **clean-architecture** direction (§10). Items marked
+`(planned)` don't exist yet — see the roadmap (§14) for phasing. Everything else already exists.
 
 ```
 okxBot/
 ├── CLAUDE.md                  # this file
-├── README.md                  # human quickstart
+├── README.md                  # human quickstart + infra/resource requirements
 ├── docker-compose.yml         # redis + timescaledb + go services + python service
-├── go-engine/                 # Go module: data ingestion + order execution + risk
+├── go-engine/                 # Go module: data ingestion + order execution + risk + API
 │   ├── cmd/
 │   │   ├── ingestor/          # connects OKX public WS, publishes ticks/candles to Redis
-│   │   └── trader/            # main trading loop: reads state, calls RL service, executes orders
+│   │   ├── trader/            # main trading loop: reads state, calls RL service, executes orders
+│   │   ├── paper-trader/      # (planned) forward-test engine, §8
+│   │   └── api/               # (planned) dashboard/reporting HTTP API, §11
 │   ├── internal/
-│   │   ├── config/            # env/yaml config loading
-│   │   ├── okx/
-│   │   │   ├── rest/          # signed REST client: orders, leverage, positions, balance
-│   │   │   └── ws/            # public + private websocket clients (reconnect, heartbeat)
-│   │   ├── stream/            # Redis pub/sub + stream helpers
-│   │   ├── risk/              # hard risk limits (circuit breakers) independent of the RL model
-│   │   ├── engine/            # trading loop orchestration
-│   │   └── rlclient/          # HTTP client for the Python inference API
+│   │   ├── domain/            # (planned) core entities: Order, Position, Strategy, Candle — no
+│   │   │                        framework/IO deps, per clean architecture (§10)
+│   │   ├── usecase/           # (planned) application services (PlaceOrder, EvaluateStrategy,
+│   │   │                        RecordTrade, ...) depending only on domain + ports
+│   │   ├── port/               # (planned) interfaces the use-cases depend on: ExchangeClient,
+│   │   │                        Repository, MarketDataBus, ModelClient
+│   │   ├── config/             # env/yaml config loading
+│   │   ├── okx/                 # OKX adapter (implements port.ExchangeClient)
+│   │   │   ├── rest/            # signed REST client: orders, leverage, positions, balance
+│   │   │   └── ws/              # public + private websocket clients (reconnect, heartbeat)
+│   │   ├── postgres/            # (planned) TimescaleDB/Postgres adapter (implements port.Repository), §7
+│   │   ├── stream/               # Redis pub/sub + stream helpers — the event bus, §12
+│   │   ├── strategy/              # (planned) strategy registry + indicator library, §9
+│   │   ├── risk/                  # hard risk limits (circuit breakers) independent of the RL model
+│   │   ├── engine/                 # trading loop orchestration
+│   │   └── rlclient/               # HTTP client for the Python inference API
 │   └── configs/config.example.yaml
 ├── rl-service/                 # Python: env, training, inference
 │   ├── requirements.txt
 │   ├── rl_service/
-│   │   ├── env/                # Gymnasium OKX futures trading environment
-│   │   ├── data/                # historical data loading + feature engineering
-│   │   ├── train.py             # SB3 PPO training entrypoint
-│   │   └── serve/               # FastAPI inference app
+│   │   ├── env/                # historical Gymnasium env — optional dev sanity-check only, §2
+│   │   ├── data/                # historical data loading + feature engineering (shared feature
+│   │   │                          code also used to build live observations)
+│   │   ├── train.py             # SB3 PPO training entrypoint, consumes paper-trading trade log
+│   │   ├── metrics.py            # (planned) CPU/RAM/GPU + training-progress reporting, §11
+│   │   └── serve/                # FastAPI inference app
 │   └── configs/config.example.yaml
+├── panel/                      # (planned) frontend reporting/strategy-management dashboard, §11
 └── data/                       # gitignored local data cache (candles, parquet, model artifacts)
 ```
 
@@ -130,24 +163,160 @@ never bypass hard safety limits.
 - Secrets: `.env` files and `configs/config.yaml` (real, non-example) are gitignored. Only
   `*.example.yaml` / `.env.example` are committed.
 
-## 7. Roadmap / status
+## 7. Data persistence (planned)
 
+Nothing is durably persisted today — the ingestor only writes to a capped Redis Stream (ephemeral,
+~100k entries). TimescaleDB is already wired in `docker-compose.yml` but unused; this is the next
+real gap to close. Planned schema (Postgres + Timescale hypertables for time-series tables):
+
+- `candles` (hypertable: `inst_id`, `bar`, `ts`, OHLCV) — downsampled storage; raw tick-level data
+  gets a short retention window (Timescale retention policy) since it grows fast and isn't needed
+  long-term once aggregated into bars.
+- `paper_orders` / `live_orders` — id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size,
+  leverage, opened_at, closed_at, close_reason (`sl`|`tp`|`manual`), realized_pnl, features_json
+  (the observation/indicator snapshot at entry, for training + the panel's order-detail view).
+- `strategies` — id, name, token(s) it's assigned to, config/version, enabled flag, source (built-
+  in indicator combo vs. user script).
+- `training_runs` — id, started_at, finished_at, status, timesteps, model_artifact_path, metrics.
+
+Implemented behind `port.Repository` (§10) so Postgres can be swapped later without touching
+use-cases. A small consumer reads the Redis Stream and writes candles/ticks to Postgres — keeps
+the WS ingestor itself simple and decoupled from the DB.
+
+## 8. Paper Trading Engine ("forward-test", not historical backtest)
+
+This is the core training-data source, replacing historical backtesting per explicit product
+decision (see §2). Flow:
+
+1. A **Strategy** (§9) evaluates real-time market data for an instrument and emits a signal
+   (buy/sell + suggested entry/SL/TP) — or the RL model does, once it's driving decisions.
+2. The Paper Trading Engine opens a **virtual order** at the live price with the full feature set
+   (entry, SL, TP, size, leverage) — no real order is sent to OKX.
+3. The engine subscribes to the live price feed (via the Redis event bus, §12) and monitors the
+   virtual order until SL or TP is hit (or a manual/timeout close condition).
+4. On close, the engine persists the trade (entry features, action taken, realized outcome) to
+   `paper_orders` (§7). This log is: (a) what the reporting panel (§11) displays, and (b) the
+   training data consumed by `rl_service/train.py`.
+
+This should run as its own process (`cmd/paper-trader`), independent of the live `cmd/trader`, so
+enabling/disabling live trading never affects the continuous paper-trading/data-collection loop.
+
+## 9. Strategy engine & multi-agent signal architecture
+
+- **Strategy** = a pluggable signal generator: given market data + indicator values for an
+  instrument, produce a signal (buy/sell/hold) plus suggested SL/TP/confidence. Lives behind a
+  small `Strategy` interface (`Evaluate(candles, indicators) (Signal, error)`) so built-in and
+  user-authored strategies look identical to the engine.
+- **Built-in indicators/strategies (v1):** moving averages, RSI, MACD, and structured concepts
+  like ICT/Smart-Money (order blocks, liquidity zones, fair value gaps) implemented as regular Go
+  or Python functions over OHLCV data — no separate scripting layer needed for these.
+- **Per-token strategy assignment:** each instrument has one or more enabled strategies; switching
+  which strategy runs on which token is a config/DB change, not a code change.
+- **User-authored strategies (v2):** "clone an existing strategy and edit it" is straightforward
+  (copy config row). A full custom scripting layer (Pine-Script-like) is a substantial feature on
+  its own — plan to start with a constrained, composable JSON/DSL of indicator conditions
+  (`if rsi(14) < 30 and close > sma(50) then buy`) before considering embedding an actual
+  scripting/sandboxed interpreter for arbitrary user code. Flagging this now so it isn't
+  underestimated later.
+- **RL sits above the strategy layer:** strategies decide *when* there's a tradeable signal; the
+  RL agent decides *how much* (sizing/leverage) and can learn to weight/ignore particular
+  strategies or tokens based on their live track record.
+- **Future agents (sentiment/news):** designed as just another entry in the same signal registry
+  — a `Strategy`-shaped adapter around an LLM-based sentiment score. No architecture change needed
+  when this is added later, which is why the registry pattern is worth building now instead of a
+  single hardcoded strategy path.
+
+## 10. Clean architecture for go-engine
+
+To support swapping exchanges (Bybit/Binance later) or the database without touching business
+logic, `go-engine` is organized ports-and-adapters style (see §3 for the target layout):
+
+- `internal/domain` — plain entities (Order, Position, Strategy, Candle), no framework/IO imports.
+- `internal/usecase` — application logic (PlaceOrder, EvaluateStrategy, RecordTrade, ...),
+  depending only on `domain` and `port` interfaces — this is where the actual business rules live
+  and what gets unit-tested without a real exchange or database.
+- `internal/port` — interfaces the use-cases depend on: `ExchangeClient`, `Repository`,
+  `MarketDataBus`, `ModelClient` (the RL inference call).
+- Adapters implement those ports: `internal/okx` implements `ExchangeClient`, `internal/postgres`
+  implements `Repository`, `internal/stream` implements `MarketDataBus`, `internal/rlclient`
+  implements `ModelClient`.
+
+This is a meaningful refactor of what's already built (§14 phases it in) — existing code moves
+into this shape rather than being rewritten from scratch.
+
+## 11. Dashboard / reporting API (planned)
+
+A new `cmd/api` service (built on the same use-cases as the trading engine, per §10) exposing:
+
+- **Training status:** whether training is running, elapsed time, and CPU/RAM/GPU usage. The
+  Python side exposes these via `rl_service/metrics.py` (e.g. `psutil` for CPU/RAM, `pynvml` if a
+  GPU is ever present) on a small endpoint that `cmd/api` polls or that's scraped via Prometheus.
+- **Strategy CRUD:** list, view, edit, clone-to-create, enable/disable per token (§9).
+- **Reports:** total orders/profit/loss with hour/day/week filters, and per-order detail
+  (entry/SL/TP, timestamps, close reason) — the `paper_orders`/`live_orders` tables (§7) are
+  designed around exactly this. Chart overlay of orders is a `panel/` (frontend) concern for
+  later, not a backend blocker.
+- Metrics/infra monitoring (CPU/RAM/GPU, throughput) is a good fit for Prometheus + Grafana rather
+  than reinventing a metrics dashboard — keep that separate from the product-specific
+  strategy/orders API and its own frontend panel.
+
+## 12. Event-driven design
+
+Real-money live trading benefits from reacting to events (fills, price ticks, risk breaches)
+rather than polling. The ingestion layer is already event-driven (OKX WS push → Redis Stream).
+Decision: extend that pattern as the **internal event bus from day one** — ticks, strategy
+signals, and order-fill events all flow through Redis Streams/pub-sub (which already supports
+consumer groups), and internal components (risk manager, paper-trading engine, order executor)
+are written as handlers subscribing to that bus. This gets most of the benefit of an event-driven
+architecture without adopting heavier infra (Kafka/NATS) before it's needed. Code against a small
+internal `EventBus` interface (`port.MarketDataBus` in §10) so migrating the transport later, if
+scale ever demands it, is mechanical rather than a rewrite.
+
+## 13. AI orchestration (LangChain/CrewAI/"Hermes"-style)
+
+Not needed for the current scope — today's "agents" (technical indicator strategies + the RL
+model) are deterministic/quantitative, not LLM-based, so there's nothing to orchestrate between
+yet. This becomes genuinely useful once LLM-based sentiment/news agents are added (§9's "future
+agents"), because at that point something needs to call heterogeneous agents and combine/weight
+their outputs. Plan: start with a small custom "signal aggregator" in the strategy registry (§9)
+rather than adopting a full orchestration framework, and only reach for a named framework if the
+number/complexity of LLM-based agents grows enough to justify the dependency.
+
+## 14. Roadmap / status
+
+Phase 0 — done:
 - [x] Architecture defined (this doc)
 - [x] Go OKX REST client (auth + trade + account)
 - [x] Go OKX WebSocket ingestor → Redis
 - [x] Go trading engine + risk manager + RL client (order execution wiring is still a stub —
       see `internal/engine/trader.go`)
-- [x] Python Gymnasium env for OKX futures backtesting (`rl_service/env/okx_futures_env.py`,
-      covered by `tests/test_okx_futures_env.py`)
-- [x] Python PPO training pipeline (`rl_service/train.py`) — not yet run against real historical
-      data, only unit-tested against a synthetic price series
+- [x] Python Gymnasium env — kept only as an optional offline sanity-check tool (§2), not the
+      training source of truth
+- [x] Python PPO training pipeline (`rl_service/train.py`) — needs to be repointed at the
+      paper-trading trade log once §8 exists
 - [x] Python FastAPI inference server (`rl_service/serve/api.py`)
 - [x] docker-compose wiring (not yet run end-to-end)
-- [ ] Pull real OKX historical candles with `rl_service/data/fetch_okx_history.py` and run a full
-      training pass
+
+Phase 1 — data & paper trading (unblocks everything else, do this next):
+- [ ] Postgres/TimescaleDB schema + migrations (§7); Redis-stream-to-Postgres consumer
+- [ ] Strategy interface + a first indicator-based strategy or two (§9)
+- [ ] Paper Trading Engine (`cmd/paper-trader`, §8) running continuously against live OKX data
+- [ ] Repoint `rl_service/train.py` at the paper-trading trade log instead of historical replay
+
+Phase 2 — clean architecture refactor & live wiring:
+- [ ] Refactor `go-engine` into `domain`/`usecase`/`port`/adapters (§10)
 - [ ] Wire `engine.Trader.step` to actually translate RL actions into OKX orders (`PlaceOrder`,
-      `SetLeverage`) through the risk manager
-- [ ] Backtest evaluation harness / metrics (Sharpe, max DD, win rate) before any live capital
+      `SetLeverage`) through the risk manager, using the same use-cases as paper trading
 - [ ] End-to-end dry run against OKX demo trading
+
+Phase 3 — dashboard:
+- [ ] `cmd/api` reporting/strategy-management backend (§11)
+- [ ] Training status + CPU/RAM/GPU metrics endpoint (`rl_service/metrics.py`)
+- [ ] `panel/` frontend (framework TBD — see open question in chat)
+
+Phase 4 — later/optional:
+- [ ] User-authored strategy scripting layer (§9)
+- [ ] Sentiment/news agents + signal aggregator (§9, §13)
+- [ ] Evaluate migrating the event bus off Redis Streams if scale demands it (§12)
 
 Update the checklist above as work progresses.
