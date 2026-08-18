@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS paper_orders;
+DROP TABLE IF EXISTS strategies;
+DROP TABLE IF EXISTS candles;

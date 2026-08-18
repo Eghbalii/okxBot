@@ -298,10 +298,20 @@ Phase 0 — done:
 - [x] docker-compose wiring (not yet run end-to-end)
 
 Phase 1 — data & paper trading (unblocks everything else, do this next):
-- [ ] Postgres/TimescaleDB schema + migrations (§7); Redis-stream-to-Postgres consumer
-- [ ] Strategy interface + a first indicator-based strategy or two (§9)
-- [ ] Paper Trading Engine (`cmd/paper-trader`, §8) running continuously against live OKX data
+- [x] Postgres/TimescaleDB schema + embedded migration runner (`internal/postgres`, applied
+      automatically on startup) — not yet run against a live Postgres in this environment (no
+      Docker available here); verify with `docker compose up -d timescaledb` before relying on it
+- [x] Strategy interface + a first indicator-based strategy (`internal/strategy`: RSI+SMA)
+- [x] Paper Trading Engine (`cmd/paper-trader`) — polls OKX REST candles (no live WS candle feed
+      yet, see note below), evaluates strategies, opens/monitors/closes virtual orders, persists
+      finalized candles + trades to Postgres
 - [ ] Repoint `rl_service/train.py` at the paper-trading trade log instead of historical replay
+      (blocked on accumulating real paper-trading data first)
+
+Note on the current paper-trading implementation: it polls `GET /market/candles` on the trading
+poll interval rather than subscribing to the OKX candle WebSocket channel + a dedicated
+Redis-stream-to-Postgres consumer as originally sketched in §7 — this was a deliberate scope cut
+to ship a working vertical slice; revisit if polling latency/rate limits become a problem.
 
 Phase 2 — clean architecture refactor & live wiring:
 - [ ] Refactor `go-engine` into `domain`/`usecase`/`port`/adapters (§10)

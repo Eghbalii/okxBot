@@ -38,6 +38,36 @@ func (c *Client) GetBalance(ccy string) ([]okx.Balance, error) {
 	return wrapper[0].Details, nil
 }
 
+// GetCandles fetches recent OHLCV candles via GET /api/v5/market/candles, newest first.
+func (c *Client) GetCandles(instID, bar string, limit int) ([]okx.Candle, error) {
+	if instID == "" {
+		return nil, fmt.Errorf("instID is required")
+	}
+	path := "/api/v5/market/candles?" + url.Values{
+		"instId": {instID},
+		"bar":    {bar},
+		"limit":  {fmt.Sprintf("%d", limit)},
+	}.Encode()
+
+	var raw [][]string
+	if err := c.do("GET", path, nil, &raw); err != nil {
+		return nil, err
+	}
+
+	candles := make([]okx.Candle, 0, len(raw))
+	for _, row := range raw {
+		if len(row) < 6 {
+			continue
+		}
+		candle := okx.Candle{Ts: row[0], Open: row[1], High: row[2], Low: row[3], Close: row[4], Vol: row[5]}
+		if len(row) >= 9 {
+			candle.Confirm = row[8]
+		}
+		candles = append(candles, candle)
+	}
+	return candles, nil
+}
+
 // GetTicker fetches a single instrument ticker via GET /api/v5/market/ticker.
 func (c *Client) GetTicker(instID string) (*okx.Ticker, error) {
 	if instID == "" {

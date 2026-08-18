@@ -15,6 +15,9 @@ ingestor:
 trader:
 	cd go-engine && go run ./cmd/trader
 
+paper-trader:
+	cd go-engine && go run ./cmd/paper-trader
+
 py-venv:
 	cd rl-service && python3 -m venv .venv
 

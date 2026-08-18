@@ -24,6 +24,10 @@ type Config struct {
 		Addr string `yaml:"-"`
 	} `yaml:"redis"`
 
+	Postgres struct {
+		DSN string `yaml:"-"`
+	} `yaml:"postgres"`
+
 	RLService struct {
 		URL string `yaml:"-"`
 	} `yaml:"rl_service"`
@@ -32,6 +36,13 @@ type Config struct {
 		InstIDs         []string `yaml:"inst_ids"`
 		PollIntervalSec int      `yaml:"poll_interval_sec"`
 	} `yaml:"trading"`
+
+	PaperTrading struct {
+		NotionalUSD   float64 `yaml:"notional_usd"`
+		MaxOpenOrders int     `yaml:"max_open_orders"`
+		Bar           string  `yaml:"bar"`
+		CandleLimit   int     `yaml:"candle_limit"`
+	} `yaml:"paper_trading"`
 
 	Risk struct {
 		MaxLeverage             float64 `yaml:"max_leverage"`
@@ -77,6 +88,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.Redis.Addr = envOr("REDIS_ADDR", "localhost:6379")
+	cfg.Postgres.DSN = envOr("POSTGRES_DSN", "postgres://okxbot:okxbot@localhost:5432/okxbot")
 	cfg.RLService.URL = envOr("RL_SERVICE_URL", "http://localhost:8000")
 
 	if len(cfg.Trading.InstIDs) == 0 {
@@ -84,6 +96,18 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Trading.PollIntervalSec == 0 {
 		cfg.Trading.PollIntervalSec = 5
+	}
+	if cfg.PaperTrading.NotionalUSD == 0 {
+		cfg.PaperTrading.NotionalUSD = 100
+	}
+	if cfg.PaperTrading.MaxOpenOrders == 0 {
+		cfg.PaperTrading.MaxOpenOrders = 3
+	}
+	if cfg.PaperTrading.Bar == "" {
+		cfg.PaperTrading.Bar = "1m"
+	}
+	if cfg.PaperTrading.CandleLimit == 0 {
+		cfg.PaperTrading.CandleLimit = 100
 	}
 	if cfg.Risk.MaxLeverage == 0 {
 		cfg.Risk.MaxLeverage = 5

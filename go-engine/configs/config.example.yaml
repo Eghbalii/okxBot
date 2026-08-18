@@ -8,6 +8,12 @@ trading:
     - "BTC-USDT-SWAP"
   poll_interval_sec: 5
 
+paper_trading:
+  notional_usd: 100
+  max_open_orders: 3
+  bar: "1m"
+  candle_limit: 100
+
 risk:
   max_leverage: 5
   max_position_notional_usd: 1000

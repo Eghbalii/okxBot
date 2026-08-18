@@ -58,6 +58,24 @@ services:
       - redis
       - rl-service
 
+  paper-trader:
+    build:
+      context: ./go-engine
+      dockerfile: Dockerfile.paper-trader
+    environment:
+      CONFIG_PATH: /app/configs/config.yaml
+      REDIS_ADDR: redis:6379
+      POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
+      OKX_API_KEY: ${OKX_API_KEY}
+      OKX_API_SECRET: ${OKX_API_SECRET}
+      OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE}
+      OKX_SIMULATED_TRADING: ${OKX_SIMULATED_TRADING:-1}
+    volumes:
+      - ./go-engine/configs:/app/configs
+    depends_on:
+      - redis
+      - timescaledb
+
 volumes:
   redis-data:
   timescale-data:
