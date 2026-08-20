@@ -41,6 +41,11 @@ func (m *Manager) Halted() (bool, string) {
 	return m.halted, m.haltReason
 }
 
+// Limits returns the configured hard risk limits, e.g. for sizing calculations upstream.
+func (m *Manager) Limits() Limits {
+	return m.limits
+}
+
 // Reset clears the halted state (e.g. after manual review or at the start of a new trading day).
 func (m *Manager) Reset(dayStartEquity float64) {
 	m.halted = false

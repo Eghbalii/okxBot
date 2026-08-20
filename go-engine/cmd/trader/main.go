@@ -65,6 +65,9 @@ func main() {
 			RLClient:     rlClient,
 			RiskManager:  riskManager,
 			PollInterval: time.Duration(cfg.Trading.PollIntervalSec) * time.Second,
+			TdMode:       cfg.Trading.TdMode,
+			PosMode:      cfg.Trading.PosMode,
+			MinOrderUSD:  cfg.Trading.MinOrderUSD,
 			Logger:       logger,
 		}
 		go func() { errCh <- trader.Run(ctx) }()

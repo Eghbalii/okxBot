@@ -337,8 +337,12 @@ that touched SL/TP and reverted within the same bar) in addition to rate-limit/d
 
 Phase 2 — clean architecture refactor & live wiring:
 - [ ] Refactor `go-engine` into `domain`/`usecase`/`port`/adapters (§10)
-- [ ] Wire `engine.Trader.step` to actually translate RL actions into OKX orders (`PlaceOrder`,
-      `SetLeverage`) through the risk manager, using the same use-cases as paper trading
+- [x] Wire `engine.Trader.step` to actually translate RL actions into OKX orders (`PlaceOrder`,
+      `SetLeverage`) through the risk manager, using the same use-cases as paper trading —
+      implemented in `internal/engine/trader.go` (`execute`). Known simplifications to revisit:
+      liquidation-buffer estimate is a conservative `100/leverage` approximation (ignores
+      maintenance margin), and order sizing assumes a contract multiplier of 1 (no
+      `/api/v5/public/instruments` lookup yet).
 - [ ] End-to-end dry run against OKX demo trading
 
 Phase 3 — dashboard:

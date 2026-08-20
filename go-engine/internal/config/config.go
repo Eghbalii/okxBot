@@ -36,6 +36,9 @@ type Config struct {
 	Trading struct {
 		InstIDs         []string `yaml:"inst_ids"`
 		PollIntervalSec int      `yaml:"poll_interval_sec"`
+		TdMode          string   `yaml:"td_mode"`       // "cross" or "isolated"
+		PosMode         string   `yaml:"pos_mode"`      // "net" or "long_short" (hedge mode)
+		MinOrderUSD     float64  `yaml:"min_order_usd"` // skip rebalancing orders smaller than this
 	} `yaml:"trading"`
 
 	PaperTrading struct {
@@ -101,6 +104,15 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Trading.PollIntervalSec == 0 {
 		cfg.Trading.PollIntervalSec = 5
+	}
+	if cfg.Trading.TdMode == "" {
+		cfg.Trading.TdMode = "cross"
+	}
+	if cfg.Trading.PosMode == "" {
+		cfg.Trading.PosMode = "net"
+	}
+	if cfg.Trading.MinOrderUSD == 0 {
+		cfg.Trading.MinOrderUSD = 10
 	}
 	if cfg.PaperTrading.NotionalUSD == 0 {
 		cfg.PaperTrading.NotionalUSD = 100

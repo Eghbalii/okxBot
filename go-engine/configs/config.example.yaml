@@ -7,6 +7,9 @@ trading:
   inst_ids:
     - "BTC-USDT-SWAP"
   poll_interval_sec: 5
+  td_mode: "cross"        # "cross" or "isolated"
+  pos_mode: "net"         # "net" or "long_short" (hedge mode)
+  min_order_usd: 10       # skip rebalancing orders smaller than this
 
 paper_trading:
   notional_usd: 100
