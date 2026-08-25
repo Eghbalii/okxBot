@@ -297,34 +297,14 @@ number/complexity of LLM-based agents grows enough to justify the dependency.
 
 ## 14. Roadmap / status
 
-Phase 0 — done:
-- [x] Architecture defined (this doc)
-- [x] Go OKX REST client (auth + trade + account)
-- [x] Go OKX WebSocket ingestor → Redis
-- [x] Go trading engine + risk manager + RL client (order execution wiring is still a stub —
-      see `internal/engine/trader.go`)
-- [x] Python Gymnasium env — kept only as an optional offline sanity-check tool (§2), not the
-      training source of truth
-- [x] Python PPO training pipeline (`rl_service/train.py`) — needs to be repointed at the
-      paper-trading trade log once §8 exists
-- [x] Python FastAPI inference server (`rl_service/serve/api.py`)
-- [x] docker-compose wiring (not yet run end-to-end)
-
-Phase 1 — data & paper trading (unblocks everything else, do this next):
-- [x] Postgres/TimescaleDB schema + embedded migration runner (`internal/postgres`, applied
-      automatically on startup) — not yet run against a live Postgres in this environment (no
-      Docker available here); verify with `docker compose up -d timescaledb` before relying on it
-- [x] Strategy interface + a first indicator-based strategy (`internal/strategy`: RSI+SMA)
-- [x] Paper Trading Engine (`cmd/paper-trader`) — WS/event-driven (see below), evaluates
-      strategies, opens/monitors/closes virtual orders, persists finalized candles + trades to
-      Postgres
-- [x] Ingestor subscribes to OKX's candle WS channel (business endpoint) in addition to tickers,
-      publishing both to Redis (`okx:tickers`, `okx:candles`)
-- [x] Prometheus metrics (`internal/metrics`) + Grafana wired into docker-compose (§11)
+Phases 0-1 (architecture, OKX REST/WS clients, Postgres/TimescaleDB persistence, strategy
+interface, Paper Trading Engine, Prometheus/Grafana metrics) are complete — see git history for
+details. One Phase 1 item remains open, tracked here since it's blocked on external state rather
+than done:
 - [ ] Repoint `rl_service/train.py` at the paper-trading trade log instead of historical replay
       (blocked on accumulating real paper-trading data first)
 
-Paper-trading data flow (revised from the initial REST-polling cut): the ingestor subscribes to
+Paper-trading data flow (current design): the ingestor subscribes to
 OKX's public `tickers` channel and business `candle{bar}` channel over a single WS connection
 each, publishing every event to Redis Streams. The Paper Trading Engine consumes both via
 consumer groups (`internal/stream.Consumer`): every **tick** triggers an immediate SL/TP check
@@ -335,7 +315,7 @@ not on an ongoing poll loop. This replaces the earlier REST-polling version, whi
 correctness bug (checking SL/TP only against candle-close prices could silently miss a price wick
 that touched SL/TP and reverted within the same bar) in addition to rate-limit/delay concerns.
 
-Phase 2 — clean architecture refactor & live wiring:
+Phase 2 — clean architecture refactor & live wiring (current phase):
 - [ ] Refactor `go-engine` into `domain`/`usecase`/`port`/adapters (§10)
 - [x] Wire `engine.Trader.step` to actually translate RL actions into OKX orders (`PlaceOrder`,
       `SetLeverage`) through the risk manager, using the same use-cases as paper trading —
