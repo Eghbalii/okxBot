@@ -14,7 +14,12 @@ trading:
 paper_trading:
   notional_usd: 100
   max_open_orders: 3
-  bar: "1m"
+  bars:                    # candle timeframes to subscribe to; OKX channel names, note casing
+    - "1m"
+    - "15m"
+    - "1H"
+    - "4H"
+    - "1D"
   candle_limit: 100
 
 risk:
