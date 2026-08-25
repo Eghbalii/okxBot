@@ -165,25 +165,27 @@ never bypass hard safety limits.
 - Secrets: `.env` files and `configs/config.yaml` (real, non-example) are gitignored. Only
   `*.example.yaml` / `.env.example` are committed.
 
-## 7. Data persistence (planned)
+## 7. Data persistence
 
-Nothing is durably persisted today — the ingestor only writes to a capped Redis Stream (ephemeral,
-~100k entries). TimescaleDB is already wired in `docker-compose.yml` but unused; this is the next
-real gap to close. Planned schema (Postgres + Timescale hypertables for time-series tables):
+Two datastores, different jobs — this is not redundant, each is used for what it's good at:
+- **Redis** (Streams) — the ephemeral real-time event bus (§12): ticks/candles/signals in transit
+  between the ingestor and consumers (paper-trader, trader). Capped (~100k entries), not meant for
+  long-term storage.
+- **TimescaleDB** (Postgres + the Timescale extension, not a separate database) — durable storage.
+  Schema (`internal/postgres/migrations`), all monetary/price columns `NUMERIC` (§ below on
+  `decimal.Decimal`):
+  - `candles` (hypertable: `inst_id`, `bar`, `ts`, OHLCV) — downsampled storage; raw tick-level
+    data isn't persisted long-term, only finalized bars.
+  - `paper_orders` — id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage,
+    opened_at, closed_at, close_reason (`sl`|`tp`|`manual`), realized_pnl, features_json (the
+    observation/indicator snapshot at entry, for training + the panel's order-detail view).
+  - `strategies` — id, name, token(s) it's assigned to, config/version, enabled flag.
+  - `training_runs` — (planned) started_at, finished_at, status, timesteps, model_artifact_path.
 
-- `candles` (hypertable: `inst_id`, `bar`, `ts`, OHLCV) — downsampled storage; raw tick-level data
-  gets a short retention window (Timescale retention policy) since it grows fast and isn't needed
-  long-term once aggregated into bars.
-- `paper_orders` / `live_orders` — id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size,
-  leverage, opened_at, closed_at, close_reason (`sl`|`tp`|`manual`), realized_pnl, features_json
-  (the observation/indicator snapshot at entry, for training + the panel's order-detail view).
-- `strategies` — id, name, token(s) it's assigned to, config/version, enabled flag, source (built-
-  in indicator combo vs. user script).
-- `training_runs` — id, started_at, finished_at, status, timesteps, model_artifact_path, metrics.
-
-Implemented behind `port.Repository` (§10) so Postgres can be swapped later without touching
-use-cases. A small consumer reads the Redis Stream and writes candles/ticks to Postgres — keeps
-the WS ingestor itself simple and decoupled from the DB.
+Implemented behind `port.Repository` (§10, `internal/postgres`), so use-cases never depend on pgx
+directly. `internal/postgres.Migrate` applies embedded `.sql` migrations automatically on startup.
+A finalized candle is written to Postgres by `PaperTrader` itself (from the candle consumer
+handler), not by a separate DB-writer process.
 
 ## 8. Paper Trading Engine ("forward-test", not historical backtest)
 
@@ -257,9 +259,9 @@ A new `cmd/api` service (built on the same use-cases as the trading engine, per 
   GPU is ever present) on a small endpoint that `cmd/api` polls or that's scraped via Prometheus.
 - **Strategy CRUD:** list, view, edit, clone-to-create, enable/disable per token (§9).
 - **Reports:** total orders/profit/loss with hour/day/week filters, and per-order detail
-  (entry/SL/TP, timestamps, close reason) — the `paper_orders`/`live_orders` tables (§7) are
-  designed around exactly this. Chart overlay of orders is a `panel/` (frontend) concern for
-  later, not a backend blocker.
+  (entry/SL/TP, timestamps, close reason) — the `paper_orders` table (§7) is designed around
+  exactly this. Chart overlay of orders is a `panel/` (frontend) concern for later, not a backend
+  blocker.
 
 **Metrics (implemented): Prometheus + Grafana**, per explicit decision — not reinvented as a
 custom dashboard, kept separate from the product-specific strategy/orders API. `go-engine`
@@ -285,9 +287,9 @@ Decision: extend that pattern as the **internal event bus from day one** — tic
 signals, and order-fill events all flow through Redis Streams/pub-sub (which already supports
 consumer groups), and internal components (risk manager, paper-trading engine, order executor)
 are written as handlers subscribing to that bus. This gets most of the benefit of an event-driven
-architecture without adopting heavier infra (Kafka/NATS) before it's needed. Code against a small
-internal `EventBus` interface (`port.MarketDataBus` in §10) so migrating the transport later, if
-scale ever demands it, is mechanical rather than a rewrite.
+architecture without adopting heavier infra (Kafka/NATS) before it's needed. Code against the
+`port.MarketDataConsumer`/`MarketDataPublisher` interfaces (§10) so migrating the transport later,
+if scale ever demands it, is mechanical rather than a rewrite.
 
 ## 13. AI orchestration (LangChain/CrewAI/"Hermes"-style)
 
@@ -320,22 +322,27 @@ correctness bug (checking SL/TP only against candle-close prices could silently 
 that touched SL/TP and reverted within the same bar) in addition to rate-limit/delay concerns.
 
 Phase 2 — clean architecture refactor & live wiring (current phase):
-- [x] All price/size/leverage/PnL/risk-limit fields migrated from `float64` to
-      `github.com/shopspring/decimal` (domain types, OKX adapter parsing, Postgres `NUMERIC`
-      columns via `github.com/jackc/pgx-shopspring-decimal`) — `float64` cannot represent most
-      decimal fractions exactly, which drifted repeated price arithmetic.
-- [x] Refactored `go-engine` into `domain`/`usecase`/`port`/adapters (§10) — `internal/engine` and
-      `internal/paperengine` deleted; their logic moved into `internal/usecase` (`Trader`,
-      `PaperTrader`), which depends only on `internal/domain` and the four `port` interfaces
-      (`Repository`, `ExchangeClient`, `ModelClient`, `MarketDataConsumer`/`Publisher`), never on
-      concrete adapter types. Added the first unit tests in the repo (`internal/usecase/*_test.go`)
-      using hand-rolled fakes. Caught and fixed a real pre-existing bug in the process: RL-requested
-      short positions were being silently placed as longs, because `risk.Manager.Approve` clamped
-      position notional with a sign-unaware comparison and `Trader.execute` then re-negated an
-      already-correctly-signed value. Known simplifications still open: liquidation-buffer estimate
-      is a conservative `100/leverage` approximation (ignores maintenance margin), and order sizing
-      assumes a contract multiplier of 1 (no `/api/v5/public/instruments` lookup yet).
-- [ ] End-to-end dry run against OKX demo trading
+- [x] All price/size/leverage/PnL/risk-limit fields migrated `float64` → `decimal.Decimal`
+      (`github.com/shopspring/decimal`), including Postgres `NUMERIC` columns via
+      `github.com/jackc/pgx-shopspring-decimal` — `float64` can't represent most decimal fractions
+      exactly, which drifted repeated price arithmetic.
+- [x] Refactored `go-engine` into `domain`/`usecase`/`port`/adapters (§10); added the repo's first
+      unit tests (`internal/usecase/*_test.go`, hand-rolled fakes). Caught and fixed two real bugs
+      along the way: (1) `risk.Manager.Approve` clamped position notional with a sign-unaware
+      comparison, so RL-requested shorts were silently placed as longs; (2) OKX WS subscribe-ack
+      frames were misclassified as data pushes, breaking every message decode — only surfaced once
+      `cmd/ingestor` was run against live OKX WS for the first time. Known simplifications still
+      open: liquidation-buffer estimate is a conservative `100/leverage` approximation (ignores
+      maintenance margin), order sizing assumes a contract multiplier of 1 (no
+      `/api/v5/public/instruments` lookup yet).
+- [x] `cmd/ingestor` + `cmd/paper-trader` dry run validated end-to-end against live OKX public
+      market data (top-10 crypto perpetuals by volume) and a local Redis/TimescaleDB — confirmed
+      the full pipeline (WS → Redis Streams → strategy evaluation → Postgres persistence →
+      Prometheus metrics) works correctly, including the decimal/`NUMERIC` migration against a
+      real database for the first time.
+- [ ] End-to-end dry run against OKX **demo trading** (`cmd/trader`, real order placement against
+      OKX's sandboxed demo environment) — needs OKX demo API credentials; deferred until running on
+      a server (not yet started).
 
 Phase 3 — dashboard:
 - [ ] `cmd/api` reporting/strategy-management backend (§11)
