@@ -70,8 +70,9 @@ action. This is a well-understood microservice pattern — not overengineered, n
 
 ## 3. Repository layout
 
-The target layout below reflects the **clean-architecture** direction (§10). Items marked
-`(planned)` don't exist yet — see the roadmap (§14) for phasing. Everything else already exists.
+The layout below reflects the **clean-architecture** direction (§10), now implemented for the
+core trading/paper-trading loops. Items marked `(planned)` don't exist yet — see the roadmap
+(§14) for phasing.
 
 ```
 okxBot/
@@ -82,25 +83,26 @@ okxBot/
 │   ├── cmd/
 │   │   ├── ingestor/          # connects OKX public WS, publishes ticks/candles to Redis
 │   │   ├── trader/            # main trading loop: reads state, calls RL service, executes orders
-│   │   ├── paper-trader/      # (planned) forward-test engine, §8
+│   │   ├── paper-trader/      # forward-test engine, §8
 │   │   └── api/               # (planned) dashboard/reporting HTTP API, §11
 │   ├── internal/
-│   │   ├── domain/            # (planned) core entities: Order, Position, Strategy, Candle — no
-│   │   │                        framework/IO deps, per clean architecture (§10)
-│   │   ├── usecase/           # (planned) application services (PlaceOrder, EvaluateStrategy,
-│   │   │                        RecordTrade, ...) depending only on domain + ports
-│   │   ├── port/               # (planned) interfaces the use-cases depend on: ExchangeClient,
-│   │   │                        Repository, MarketDataBus, ModelClient
+│   │   ├── domain/            # core entities: Candle, Ticker, Position, Balance, Order,
+│   │   │                        LeverageChange, Observation, Action — no framework/IO deps, §10
+│   │   ├── usecase/           # application logic: Trader (live trading loop), PaperTrader
+│   │   │                        (forward-test loop) — depend only on domain + port interfaces
+│   │   ├── port/               # interfaces use-cases depend on: Repository, ExchangeClient,
+│   │   │                        ModelClient, MarketDataConsumer/Publisher
 │   │   ├── config/             # env/yaml config loading
-│   │   ├── okx/                 # OKX adapter (implements port.ExchangeClient)
+│   │   ├── okx/                 # OKX adapter (implements port.ExchangeClient); converts wire
+│   │   │   │                      types to/from domain at the boundary
 │   │   │   ├── rest/            # signed REST client: orders, leverage, positions, balance
 │   │   │   └── ws/              # public + private websocket clients (reconnect, heartbeat)
-│   │   ├── postgres/            # (planned) TimescaleDB/Postgres adapter (implements port.Repository), §7
-│   │   ├── stream/               # Redis pub/sub + stream helpers — the event bus, §12
-│   │   ├── strategy/              # (planned) strategy registry + indicator library, §9
+│   │   ├── postgres/            # TimescaleDB/Postgres adapter (implements port.Repository), §7
+│   │   ├── stream/               # Redis pub/sub + stream helpers — the event bus, §12;
+│   │   │                           implements port.MarketDataConsumer/Publisher
+│   │   ├── strategy/              # strategy registry + indicator library, §9
 │   │   ├── risk/                  # hard risk limits (circuit breakers) independent of the RL model
-│   │   ├── engine/                 # trading loop orchestration
-│   │   └── rlclient/               # HTTP client for the Python inference API
+│   │   └── rlclient/               # HTTP client for the Python inference API (implements port.ModelClient)
 │   └── configs/config.example.yaml
 ├── rl-service/                 # Python: env, training, inference
 │   ├── requirements.txt
@@ -229,20 +231,22 @@ enabling/disabling live trading never affects the continuous paper-trading/data-
 ## 10. Clean architecture for go-engine
 
 To support swapping exchanges (Bybit/Binance later) or the database without touching business
-logic, `go-engine` is organized ports-and-adapters style (see §3 for the target layout):
+logic, `go-engine` is organized ports-and-adapters style (see §3 for the layout). Implemented:
 
-- `internal/domain` — plain entities (Order, Position, Strategy, Candle), no framework/IO imports.
-- `internal/usecase` — application logic (PlaceOrder, EvaluateStrategy, RecordTrade, ...),
-  depending only on `domain` and `port` interfaces — this is where the actual business rules live
-  and what gets unit-tested without a real exchange or database.
+- `internal/domain` — plain entities (Candle, Ticker, Position, Balance, OrderRequest,
+  OrderResult, LeverageChange, Observation, Action), no framework/IO imports.
+- `internal/usecase` — application logic: `Trader` (the live decide-and-execute loop) and
+  `PaperTrader` (the forward-test loop), depending only on `domain` and `port` interfaces — this
+  is where the actual business rules live and what's unit-tested (`internal/usecase/*_test.go`,
+  hand-rolled fakes) without a real exchange or database.
 - `internal/port` — interfaces the use-cases depend on: `ExchangeClient`, `Repository`,
-  `MarketDataBus`, `ModelClient` (the RL inference call).
-- Adapters implement those ports: `internal/okx` implements `ExchangeClient`, `internal/postgres`
-  implements `Repository`, `internal/stream` implements `MarketDataBus`, `internal/rlclient`
-  implements `ModelClient`.
-
-This is a meaningful refactor of what's already built (§14 phases it in) — existing code moves
-into this shape rather than being rewritten from scratch.
+  `MarketDataConsumer`/`MarketDataPublisher`, `ModelClient` (the RL inference call).
+- Adapters implement those ports: `internal/okx` (via `internal/okx/rest.Client`) implements
+  `ExchangeClient`, `internal/postgres` implements `Repository`, `internal/stream` implements
+  `MarketDataConsumer`/`Publisher`, `internal/rlclient` implements `ModelClient`. Adapters convert
+  their wire/storage formats to and from `domain` types at the boundary — e.g. `internal/okx`
+  keeps OKX-specific JSON field names and string-typed candle arrays internally, exposing
+  `ToDomain()`/`FromDomain()` converters rather than leaking OKX shapes into `usecase`.
 
 ## 11. Dashboard / reporting API
 
@@ -316,13 +320,21 @@ correctness bug (checking SL/TP only against candle-close prices could silently 
 that touched SL/TP and reverted within the same bar) in addition to rate-limit/delay concerns.
 
 Phase 2 — clean architecture refactor & live wiring (current phase):
-- [ ] Refactor `go-engine` into `domain`/`usecase`/`port`/adapters (§10)
-- [x] Wire `engine.Trader.step` to actually translate RL actions into OKX orders (`PlaceOrder`,
-      `SetLeverage`) through the risk manager, using the same use-cases as paper trading —
-      implemented in `internal/engine/trader.go` (`execute`). Known simplifications to revisit:
-      liquidation-buffer estimate is a conservative `100/leverage` approximation (ignores
-      maintenance margin), and order sizing assumes a contract multiplier of 1 (no
-      `/api/v5/public/instruments` lookup yet).
+- [x] All price/size/leverage/PnL/risk-limit fields migrated from `float64` to
+      `github.com/shopspring/decimal` (domain types, OKX adapter parsing, Postgres `NUMERIC`
+      columns via `github.com/jackc/pgx-shopspring-decimal`) — `float64` cannot represent most
+      decimal fractions exactly, which drifted repeated price arithmetic.
+- [x] Refactored `go-engine` into `domain`/`usecase`/`port`/adapters (§10) — `internal/engine` and
+      `internal/paperengine` deleted; their logic moved into `internal/usecase` (`Trader`,
+      `PaperTrader`), which depends only on `internal/domain` and the four `port` interfaces
+      (`Repository`, `ExchangeClient`, `ModelClient`, `MarketDataConsumer`/`Publisher`), never on
+      concrete adapter types. Added the first unit tests in the repo (`internal/usecase/*_test.go`)
+      using hand-rolled fakes. Caught and fixed a real pre-existing bug in the process: RL-requested
+      short positions were being silently placed as longs, because `risk.Manager.Approve` clamped
+      position notional with a sign-unaware comparison and `Trader.execute` then re-negated an
+      already-correctly-signed value. Known simplifications still open: liquidation-buffer estimate
+      is a conservative `100/leverage` approximation (ignores maintenance margin), and order sizing
+      assumes a contract multiplier of 1 (no `/api/v5/public/instruments` lookup yet).
 - [ ] End-to-end dry run against OKX demo trading
 
 Phase 3 — dashboard:
