@@ -1,6 +1,10 @@
 package okx
 
-import "github.com/shopspring/decimal"
+import (
+	"github.com/shopspring/decimal"
+
+	"github.com/rez/okxBot/go-engine/internal/domain"
+)
 
 // Ticker is a normalized OKX v5 "tickers" channel / REST market ticker payload.
 type Ticker struct {
@@ -13,6 +17,14 @@ type Ticker struct {
 	Low24h    decimal.Decimal `json:"low24h"`
 	Vol24h    decimal.Decimal `json:"vol24h"`
 	Timestamp string          `json:"ts"`
+}
+
+// ToDomain converts a Ticker to its domain representation.
+func (t Ticker) ToDomain() domain.Ticker {
+	return domain.Ticker{
+		InstID: t.InstID, Last: t.Last, AskPx: t.AskPx, BidPx: t.BidPx,
+		Open24h: t.Open24h, High24h: t.High24h, Low24h: t.Low24h, Vol24h: t.Vol24h,
+	}
 }
 
 // Position mirrors OKX's /api/v5/account/positions entry (fields we care about).
@@ -30,11 +42,25 @@ type Position struct {
 	MgnMode     string          `json:"mgnMode"`
 }
 
+// ToDomain converts a Position to its domain representation.
+func (p Position) ToDomain() domain.Position {
+	return domain.Position{
+		InstID: p.InstID, PosSide: p.PosSide, Pos: p.Pos, AvgPx: p.AvgPx, Lever: p.Lever,
+		Upl: p.Upl, UplRatio: p.UplRatio, LiqPx: p.LiqPx, MarkPx: p.MarkPx,
+		NotionalUsd: p.NotionalUsd, MgnMode: p.MgnMode,
+	}
+}
+
 // Balance mirrors a single currency entry from /api/v5/account/balance.
 type Balance struct {
 	Ccy     string          `json:"ccy"`
 	Eq      decimal.Decimal `json:"eq"`
 	AvailEq decimal.Decimal `json:"availEq"`
+}
+
+// ToDomain converts a Balance to its domain representation.
+func (b Balance) ToDomain() domain.Balance {
+	return domain.Balance{Ccy: b.Ccy, Eq: b.Eq, AvailEq: b.AvailEq}
 }
 
 // OrderRequest is the payload for POST /api/v5/trade/order.
@@ -48,6 +74,14 @@ type OrderRequest struct {
 	Px      decimal.Decimal `json:"px,omitempty"`      // required for limit orders
 }
 
+// OrderRequestFromDomain converts a domain.OrderRequest to the OKX wire payload.
+func OrderRequestFromDomain(req domain.OrderRequest) OrderRequest {
+	return OrderRequest{
+		InstID: req.InstID, TdMode: req.TdMode, Side: req.Side, PosSide: req.PosSide,
+		OrdType: req.OrdType, Sz: req.Sz, Px: req.Px,
+	}
+}
+
 // OrderResult mirrors a single entry of the /api/v5/trade/order response data array.
 type OrderResult struct {
 	OrdID   string `json:"ordId"`
@@ -56,10 +90,20 @@ type OrderResult struct {
 	SMsg    string `json:"sMsg"`
 }
 
+// ToDomain converts an OrderResult to its domain representation.
+func (r OrderResult) ToDomain() domain.OrderResult {
+	return domain.OrderResult{OrdID: r.OrdID, ClOrdID: r.ClOrdID, SCode: r.SCode, SMsg: r.SMsg}
+}
+
 // SetLeverageRequest is the payload for POST /api/v5/account/set-leverage.
 type SetLeverageRequest struct {
 	InstID  string          `json:"instId"`
 	Lever   decimal.Decimal `json:"lever"`
 	MgnMode string          `json:"mgnMode"`           // "cross" or "isolated"
 	PosSide string          `json:"posSide,omitempty"` // required in hedge mode
+}
+
+// SetLeverageRequestFromDomain converts a domain.LeverageChange to the OKX wire payload.
+func SetLeverageRequestFromDomain(req domain.LeverageChange) SetLeverageRequest {
+	return SetLeverageRequest{InstID: req.InstID, Lever: req.Lever, MgnMode: req.MgnMode, PosSide: req.PosSide}
 }

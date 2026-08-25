@@ -8,18 +8,17 @@ import (
 	"time"
 
 	"github.com/shopspring/decimal"
+
+	"github.com/rez/okxBot/go-engine/internal/domain"
 )
 
-// Candle is one OHLCV bar for an instrument.
+// Candle is one persisted OHLCV bar for an instrument (domain.Candle plus storage identity/key
+// fields).
 type Candle struct {
 	InstID string
 	Bar    string
 	Ts     time.Time
-	Open   decimal.Decimal
-	High   decimal.Decimal
-	Low    decimal.Decimal
-	Close  decimal.Decimal
-	Volume decimal.Decimal
+	domain.Candle
 }
 
 // StrategyConfig is a persisted, pluggable signal-generator configuration (see CLAUDE.md §9).

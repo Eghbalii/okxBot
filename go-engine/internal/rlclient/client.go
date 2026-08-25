@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/shopspring/decimal"
+	"github.com/rez/okxBot/go-engine/internal/domain"
 )
 
-// Client calls the FastAPI inference server's /predict endpoint.
+// Client calls the FastAPI inference server's /predict endpoint. Implements port.ModelClient.
 type Client struct {
 	BaseURL    string
 	httpClient *http.Client
@@ -26,31 +26,12 @@ func New(baseURL string) *Client {
 	}
 }
 
-// Observation is the feature vector sent to the RL service for one inference step.
-// Field names match rl_service/env observation construction — keep both sides in sync.
+// Predict requests an action from the RL inference service for the given observation.
 //
 // NOTE: decimal.Decimal marshals to a JSON string (not a bare number). rl_service's pydantic
 // models must parse these fields as strings (e.g. Decimal or a validator coercing str->float) —
 // verify against rl_service/serve/api.py before running this end-to-end against the RL service.
-type Observation struct {
-	InstID           string            `json:"inst_id"`
-	MidPrice         decimal.Decimal   `json:"mid_price"`
-	Position         decimal.Decimal   `json:"position"` // signed current position size
-	CurrentLeverage  decimal.Decimal   `json:"current_leverage"`
-	UnrealizedPnLPct decimal.Decimal   `json:"unrealized_pnl_pct"`
-	EquityUSD        decimal.Decimal   `json:"equity_usd"`
-	Features         []decimal.Decimal `json:"features"` // rolling window of engineered features
-}
-
-// Action is the RL agent's decision returned by the inference service.
-type Action struct {
-	TargetExposure decimal.Decimal `json:"target_exposure"` // in [-1, 1]
-	LeverageFrac   decimal.Decimal `json:"leverage_frac"`   // in [0, 1], mapped to [1x, max_leverage]
-	Confidence     decimal.Decimal `json:"confidence"`
-}
-
-// Predict requests an action from the RL inference service for the given observation.
-func (c *Client) Predict(ctx context.Context, obs Observation) (*Action, error) {
+func (c *Client) Predict(ctx context.Context, obs domain.Observation) (*domain.Action, error) {
 	body, err := json.Marshal(obs)
 	if err != nil {
 		return nil, fmt.Errorf("marshal observation: %w", err)
@@ -72,7 +53,7 @@ func (c *Client) Predict(ctx context.Context, obs Observation) (*Action, error) 
 		return nil, fmt.Errorf("rl-service /predict returned status %d", resp.StatusCode)
 	}
 
-	var action Action
+	var action domain.Action
 	if err := json.NewDecoder(resp.Body).Decode(&action); err != nil {
 		return nil, fmt.Errorf("decode /predict response: %w", err)
 	}

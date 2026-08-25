@@ -12,10 +12,10 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/rez/okxBot/go-engine/internal/config"
-	"github.com/rez/okxBot/go-engine/internal/engine"
 	"github.com/rez/okxBot/go-engine/internal/okx/rest"
 	"github.com/rez/okxBot/go-engine/internal/risk"
 	"github.com/rez/okxBot/go-engine/internal/rlclient"
+	"github.com/rez/okxBot/go-engine/internal/usecase"
 )
 
 func main() {
@@ -60,10 +60,10 @@ func main() {
 	// Run one Trader per configured instrument, each polling independently.
 	errCh := make(chan error, len(cfg.Trading.InstIDs))
 	for _, instID := range cfg.Trading.InstIDs {
-		trader := &engine.Trader{
+		trader := &usecase.Trader{
 			InstID:       instID,
-			RESTClient:   restClient,
-			RLClient:     rlClient,
+			Exchange:     restClient,
+			Model:        rlClient,
 			RiskManager:  riskManager,
 			PollInterval: time.Duration(cfg.Trading.PollIntervalSec) * time.Second,
 			TdMode:       cfg.Trading.TdMode,

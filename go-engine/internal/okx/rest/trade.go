@@ -1,17 +1,22 @@
 package rest
 
-import "github.com/rez/okxBot/go-engine/internal/okx"
+import (
+	"github.com/rez/okxBot/go-engine/internal/domain"
+	"github.com/rez/okxBot/go-engine/internal/okx"
+)
 
 // PlaceOrder submits an order via POST /api/v5/trade/order.
-func (c *Client) PlaceOrder(req okx.OrderRequest) (*okx.OrderResult, error) {
+func (c *Client) PlaceOrder(req domain.OrderRequest) (*domain.OrderResult, error) {
+	wireReq := okx.OrderRequestFromDomain(req)
 	var results []okx.OrderResult
-	if err := c.do("POST", "/api/v5/trade/order", req, &results); err != nil {
+	if err := c.do("POST", "/api/v5/trade/order", wireReq, &results); err != nil {
 		return nil, err
 	}
 	if len(results) == 0 {
 		return nil, nil
 	}
-	return &results[0], nil
+	result := results[0].ToDomain()
+	return &result, nil
 }
 
 // CancelOrder cancels an order via POST /api/v5/trade/cancel-order.
@@ -21,6 +26,6 @@ func (c *Client) CancelOrder(instID, ordID string) error {
 }
 
 // SetLeverage sets leverage for an instrument via POST /api/v5/account/set-leverage.
-func (c *Client) SetLeverage(req okx.SetLeverageRequest) error {
-	return c.do("POST", "/api/v5/account/set-leverage", req, nil)
+func (c *Client) SetLeverage(req domain.LeverageChange) error {
+	return c.do("POST", "/api/v5/account/set-leverage", okx.SetLeverageRequestFromDomain(req), nil)
 }

@@ -1,13 +1,4 @@
-// Package paperengine implements the Paper Trading Engine (CLAUDE.md §8): it evaluates
-// strategies against live prices, opens virtual orders with full SL/TP features, and monitors
-// them against the real price feed until SL or TP is hit. Closed trades are persisted and become
-// the RL training data — no real orders are ever sent to OKX from this package.
-//
-// Driven entirely by the WS-fed Redis event bus (CLAUDE.md §12), not REST polling: every tick
-// triggers an immediate SL/TP check (no missed intra-bar wicks, no polling delay), and every
-// finalized candle triggers strategy re-evaluation + persistence. A REST call is used only once,
-// at startup, to seed the initial rolling candle window.
-package paperengine
+package usecase
 
 import (
 	"context"
@@ -19,29 +10,35 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/rez/okxBot/go-engine/internal/domain"
 	"github.com/rez/okxBot/go-engine/internal/metrics"
-	"github.com/rez/okxBot/go-engine/internal/okx"
-	"github.com/rez/okxBot/go-engine/internal/okx/rest"
 	"github.com/rez/okxBot/go-engine/internal/port"
 	"github.com/rez/okxBot/go-engine/internal/strategy"
-	"github.com/rez/okxBot/go-engine/internal/stream"
 )
 
-// Engine runs the paper-trading loop for a single instrument, driven by ticks/candles from Redis.
-type Engine struct {
+// PaperTrader implements the Paper Trading Engine (CLAUDE.md §8): it evaluates strategies
+// against live prices, opens virtual orders with full SL/TP features, and monitors them against
+// the real price feed until SL or TP is hit. Closed trades are persisted and become the RL
+// training data — no real orders are ever sent to the exchange from this use-case.
+//
+// Driven entirely by the WS-fed event bus (CLAUDE.md §12), not REST polling: every tick triggers
+// an immediate SL/TP check (no missed intra-bar wicks, no polling delay), and every finalized
+// candle triggers strategy re-evaluation + persistence. The exchange port is used only once, at
+// startup, to seed the initial rolling candle window.
+type PaperTrader struct {
 	InstID         string
 	Bar            string // candle timeframe used for strategy evaluation, e.g. "1m"
 	CandleWindow   int    // how many recent candles to keep in memory for strategy evaluation
 	Strategies     []strategy.Strategy
-	RESTClient     *rest.Client // used once at startup to seed the initial candle window
-	TickConsumer   *stream.Consumer
-	CandleConsumer *stream.Consumer
+	Exchange       port.ExchangeClient // used once at startup to seed the initial candle window
+	TickConsumer   port.MarketDataConsumer
+	CandleConsumer port.MarketDataConsumer
 	Repo           port.Repository
 	NotionalUSD    decimal.Decimal
 	MaxOpenOrders  int
 	Logger         *slog.Logger
 
-	candles []strategy.Candle // append-only working window, touched only by the candle consumer
+	candles []domain.Candle // append-only working window, touched only by the candle consumer
 }
 
 type tickEvent struct {
@@ -55,9 +52,9 @@ type candleEvent struct {
 	Candle []string `json:"candle"`
 }
 
-// Run seeds the initial candle window via REST, then consumes ticks/candles from Redis until
-// ctx is cancelled.
-func (e *Engine) Run(ctx context.Context) error {
+// Run seeds the initial candle window via the exchange port, then consumes ticks/candles from
+// the event bus until ctx is cancelled.
+func (e *PaperTrader) Run(ctx context.Context) error {
 	logger := e.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -87,20 +84,21 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 }
 
-func (e *Engine) seedCandles() error {
-	raw, err := e.RESTClient.GetCandles(e.InstID, e.Bar, e.CandleWindow)
+func (e *PaperTrader) seedCandles() error {
+	candles, err := e.Exchange.GetCandles(e.InstID, e.Bar, e.CandleWindow)
 	if err != nil {
 		return err
 	}
-	candles, err := toStrategyCandles(raw)
-	if err != nil {
-		return err
+	// Exchange returns newest-first; strategies expect oldest-first.
+	out := make([]domain.Candle, len(candles))
+	for i, c := range candles {
+		out[len(candles)-1-i] = c
 	}
-	e.candles = candles
+	e.candles = out
 	return nil
 }
 
-func (e *Engine) handleTick(ctx context.Context, data []byte, logger *slog.Logger) error {
+func (e *PaperTrader) handleTick(ctx context.Context, data []byte, logger *slog.Logger) error {
 	var tick tickEvent
 	if err := json.Unmarshal(data, &tick); err != nil {
 		return fmt.Errorf("decode tick: %w", err)
@@ -115,7 +113,7 @@ func (e *Engine) handleTick(ctx context.Context, data []byte, logger *slog.Logge
 	return e.monitorOpenOrders(ctx, price, logger)
 }
 
-func (e *Engine) handleCandle(ctx context.Context, data []byte, logger *slog.Logger) error {
+func (e *PaperTrader) handleCandle(ctx context.Context, data []byte, logger *slog.Logger) error {
 	var event candleEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		return fmt.Errorf("decode candle event: %w", err)
@@ -124,12 +122,11 @@ func (e *Engine) handleCandle(ctx context.Context, data []byte, logger *slog.Log
 		return nil
 	}
 
-	raw := okx.Candle{Ts: event.Candle[0], Open: event.Candle[1], High: event.Candle[2], Low: event.Candle[3], Close: event.Candle[4], Vol: event.Candle[5]}
+	confirm := ""
 	if len(event.Candle) >= 9 {
-		raw.Confirm = event.Candle[8]
+		confirm = event.Candle[8]
 	}
-
-	c, err := parseCandle(raw)
+	c, err := parseCandleFields(event.Candle[1], event.Candle[2], event.Candle[3], event.Candle[4], event.Candle[5])
 	if err != nil {
 		return fmt.Errorf("parse candle: %w", err)
 	}
@@ -139,16 +136,17 @@ func (e *Engine) handleCandle(ctx context.Context, data []byte, logger *slog.Log
 		e.candles = e.candles[len(e.candles)-e.CandleWindow:]
 	}
 
-	if raw.Confirm != "1" {
+	if confirm != "1" {
 		return nil // still forming; wait for the finalized bar before persisting/evaluating
 	}
-	if err := e.Repo.SaveCandle(ctx, toPortCandle(e.InstID, e.Bar, raw)); err != nil {
+	ms, _ := strconv.ParseInt(event.Candle[0], 10, 64)
+	if err := e.Repo.SaveCandle(ctx, port.Candle{InstID: e.InstID, Bar: e.Bar, Ts: time.UnixMilli(ms).UTC(), Candle: c}); err != nil {
 		logger.Warn("failed to persist candle", "instId", e.InstID, "error", err)
 	}
 	return e.evaluateStrategies(ctx, c.Close, logger)
 }
 
-func (e *Engine) evaluateStrategies(ctx context.Context, price decimal.Decimal, logger *slog.Logger) error {
+func (e *PaperTrader) evaluateStrategies(ctx context.Context, price decimal.Decimal, logger *slog.Logger) error {
 	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
 	if err != nil {
 		return fmt.Errorf("list open paper orders: %w", err)
@@ -181,7 +179,7 @@ func (e *Engine) evaluateStrategies(ctx context.Context, price decimal.Decimal, 
 	return nil
 }
 
-func (e *Engine) monitorOpenOrders(ctx context.Context, price decimal.Decimal, logger *slog.Logger) error {
+func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decimal, logger *slog.Logger) error {
 	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
 	if err != nil {
 		return fmt.Errorf("list open paper orders: %w", err)
@@ -261,55 +259,26 @@ func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signa
 	}
 }
 
-func toStrategyCandles(raw []okx.Candle) ([]strategy.Candle, error) {
-	out := make([]strategy.Candle, 0, len(raw))
-	// OKX returns newest-first; strategies expect oldest-first.
-	for i := len(raw) - 1; i >= 0; i-- {
-		c, err := parseCandle(raw[i])
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, nil
-}
-
-func parseCandle(raw okx.Candle) (strategy.Candle, error) {
-	open, err := decimal.NewFromString(raw.Open)
+func parseCandleFields(open, high, low, close, vol string) (domain.Candle, error) {
+	o, err := decimal.NewFromString(open)
 	if err != nil {
-		return strategy.Candle{}, fmt.Errorf("parse open %q: %w", raw.Open, err)
+		return domain.Candle{}, fmt.Errorf("parse open %q: %w", open, err)
 	}
-	high, err := decimal.NewFromString(raw.High)
+	h, err := decimal.NewFromString(high)
 	if err != nil {
-		return strategy.Candle{}, fmt.Errorf("parse high %q: %w", raw.High, err)
+		return domain.Candle{}, fmt.Errorf("parse high %q: %w", high, err)
 	}
-	low, err := decimal.NewFromString(raw.Low)
+	l, err := decimal.NewFromString(low)
 	if err != nil {
-		return strategy.Candle{}, fmt.Errorf("parse low %q: %w", raw.Low, err)
+		return domain.Candle{}, fmt.Errorf("parse low %q: %w", low, err)
 	}
-	closePx, err := decimal.NewFromString(raw.Close)
+	c, err := decimal.NewFromString(close)
 	if err != nil {
-		return strategy.Candle{}, fmt.Errorf("parse close %q: %w", raw.Close, err)
+		return domain.Candle{}, fmt.Errorf("parse close %q: %w", close, err)
 	}
-	vol, err := decimal.NewFromString(raw.Vol)
+	v, err := decimal.NewFromString(vol)
 	if err != nil {
-		return strategy.Candle{}, fmt.Errorf("parse vol %q: %w", raw.Vol, err)
+		return domain.Candle{}, fmt.Errorf("parse vol %q: %w", vol, err)
 	}
-	return strategy.Candle{Open: open, High: high, Low: low, Close: closePx, Volume: vol}, nil
-}
-
-func toPortCandle(instID, bar string, raw okx.Candle) port.Candle {
-	msStr := raw.Ts
-	ms, _ := strconv.ParseInt(msStr, 10, 64)
-	c, _ := parseCandle(raw)
-	return port.Candle{
-		InstID: instID,
-		Bar:    bar,
-		Ts:     time.UnixMilli(ms).UTC(),
-		Open:   c.Open,
-		High:   c.High,
-		Low:    c.Low,
-		Close:  c.Close,
-		Volume: c.Volume,
-	}
+	return domain.Candle{Open: o, High: h, Low: l, Close: c, Volume: v}, nil
 }

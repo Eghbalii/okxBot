@@ -2,7 +2,11 @@
 // registry for built-in + configured strategies.
 package strategy
 
-import "github.com/shopspring/decimal"
+import (
+	"github.com/shopspring/decimal"
+
+	"github.com/rez/okxBot/go-engine/internal/domain"
+)
 
 // Side is the suggested trade direction, or "" for no signal.
 type Side string
@@ -22,10 +26,8 @@ type Signal struct {
 	TPPct decimal.Decimal
 }
 
-// Candle is the minimal OHLCV shape strategies evaluate over, oldest-first.
-type Candle struct {
-	Open, High, Low, Close, Volume decimal.Decimal
-}
+// Candle is the OHLCV shape strategies evaluate over, oldest-first.
+type Candle = domain.Candle
 
 // Strategy evaluates a candle series for one instrument and returns a trade signal.
 type Strategy interface {

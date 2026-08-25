@@ -1,6 +1,7 @@
-// Package engine orchestrates the live trading loop: fetch state, ask the RL service for an
-// action, run it through the risk manager, and execute orders/leverage changes on OKX.
-package engine
+// Package usecase holds application logic (CLAUDE.md §10) — depends only on internal/domain and
+// internal/port interfaces, never on concrete adapters, so it's unit-testable without a live
+// exchange, database, or RL service.
+package usecase
 
 import (
 	"context"
@@ -10,17 +11,18 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"github.com/rez/okxBot/go-engine/internal/okx"
-	"github.com/rez/okxBot/go-engine/internal/okx/rest"
+	"github.com/rez/okxBot/go-engine/internal/domain"
+	"github.com/rez/okxBot/go-engine/internal/port"
 	"github.com/rez/okxBot/go-engine/internal/risk"
-	"github.com/rez/okxBot/go-engine/internal/rlclient"
 )
 
-// Trader runs the periodic decide-and-execute loop for a single instrument.
+// Trader runs the periodic decide-and-execute loop for a single instrument: fetch state, ask the
+// RL service for an action, run it through the risk manager, and execute orders/leverage changes
+// on the exchange.
 type Trader struct {
 	InstID       string
-	RESTClient   *rest.Client
-	RLClient     *rlclient.Client
+	Exchange     port.ExchangeClient
+	Model        port.ModelClient
 	RiskManager  *risk.Manager
 	PollInterval time.Duration
 	TdMode       string // "cross" or "isolated"
@@ -52,17 +54,17 @@ func (t *Trader) Run(ctx context.Context) error {
 }
 
 func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
-	mkt, err := t.RESTClient.GetTicker(t.InstID)
+	mkt, err := t.Exchange.GetTicker(t.InstID)
 	if err != nil {
 		return fmt.Errorf("fetch ticker: %w", err)
 	}
 	mid := mkt.Last
 
-	positions, err := t.RESTClient.GetPositions("SWAP")
+	positions, err := t.Exchange.GetPositions("SWAP")
 	if err != nil {
 		return fmt.Errorf("fetch positions: %w", err)
 	}
-	balances, err := t.RESTClient.GetBalance("USDT")
+	balances, err := t.Exchange.GetBalance("USDT")
 	if err != nil {
 		return fmt.Errorf("fetch balance: %w", err)
 	}
@@ -77,7 +79,7 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 		return nil
 	}
 
-	var pos okx.Position
+	var pos domain.Position
 	for _, p := range positions {
 		if p.InstID == t.InstID {
 			pos = p
@@ -88,7 +90,7 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 	lever := pos.Lever
 	uplRatio := pos.UplRatio
 
-	obs := rlclient.Observation{
+	obs := domain.Observation{
 		InstID:           t.InstID,
 		MidPrice:         mid,
 		Position:         posSize,
@@ -97,7 +99,7 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 		EquityUSD:        equity,
 	}
 
-	action, err := t.RLClient.Predict(ctx, obs)
+	action, err := t.Model.Predict(ctx, obs)
 	if err != nil {
 		return fmt.Errorf("rl predict: %w", err)
 	}
@@ -114,9 +116,9 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 func (t *Trader) execute(
 	logger *slog.Logger,
 	mid decimal.Decimal,
-	pos okx.Position,
+	pos domain.Position,
 	posSize, currentLeverage, equity decimal.Decimal,
-	action *rlclient.Action,
+	action *domain.Action,
 ) error {
 	limits := t.RiskManager.Limits()
 
@@ -156,11 +158,11 @@ func (t *Trader) execute(
 	}
 
 	if !approved.Leverage.Equal(currentLeverage) && approved.Leverage.IsPositive() {
-		req := okx.SetLeverageRequest{InstID: t.InstID, Lever: approved.Leverage, MgnMode: t.TdMode}
+		req := domain.LeverageChange{InstID: t.InstID, Lever: approved.Leverage, MgnMode: t.TdMode}
 		if t.PosMode == "long_short" {
 			req.PosSide = posSideFor(approved.PositionNotionalUSD)
 		}
-		if err := t.RESTClient.SetLeverage(req); err != nil {
+		if err := t.Exchange.SetLeverage(req); err != nil {
 			return fmt.Errorf("set leverage: %w", err)
 		}
 		logger.Info("leverage updated", "instId", t.InstID, "leverage", approved.Leverage)
@@ -187,7 +189,7 @@ func (t *Trader) execute(
 	// is not yet wired in — revisit before trading instruments with a non-1x contract value.
 	sz := deltaNotional.Abs().Div(mid)
 
-	order := okx.OrderRequest{
+	order := domain.OrderRequest{
 		InstID:  t.InstID,
 		TdMode:  t.TdMode,
 		Side:    side,
@@ -198,7 +200,7 @@ func (t *Trader) execute(
 		order.PosSide = posSideFor(signedTarget)
 	}
 
-	result, err := t.RESTClient.PlaceOrder(order)
+	result, err := t.Exchange.PlaceOrder(order)
 	if err != nil {
 		return fmt.Errorf("place order: %w", err)
 	}

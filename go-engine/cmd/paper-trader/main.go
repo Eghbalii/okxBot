@@ -13,10 +13,10 @@ import (
 	"github.com/rez/okxBot/go-engine/internal/config"
 	"github.com/rez/okxBot/go-engine/internal/metrics"
 	"github.com/rez/okxBot/go-engine/internal/okx/rest"
-	"github.com/rez/okxBot/go-engine/internal/paperengine"
 	"github.com/rez/okxBot/go-engine/internal/postgres"
 	"github.com/rez/okxBot/go-engine/internal/strategy"
 	"github.com/rez/okxBot/go-engine/internal/stream"
+	"github.com/rez/okxBot/go-engine/internal/usecase"
 )
 
 func main() {
@@ -50,12 +50,12 @@ func main() {
 
 	errCh := make(chan error, len(cfg.Trading.InstIDs))
 	for _, instID := range cfg.Trading.InstIDs {
-		engine := &paperengine.Engine{
+		engine := &usecase.PaperTrader{
 			InstID:         instID,
 			Bar:            cfg.PaperTrading.Bar,
 			CandleWindow:   cfg.PaperTrading.CandleLimit,
 			Strategies:     []strategy.Strategy{strategy.NewRSISMA(14, 50)},
-			RESTClient:     restClient,
+			Exchange:       restClient,
 			TickConsumer:   stream.NewConsumer(cfg.Redis.Addr, "okx:tickers", "paper-trader", instID),
 			CandleConsumer: stream.NewConsumer(cfg.Redis.Addr, "okx:candles", "paper-trader", instID),
 			Repo:           repo,
