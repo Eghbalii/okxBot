@@ -45,4 +45,20 @@ var (
 		Name: "okxbot_ingestor_events_total",
 		Help: "Total number of market data events received from OKX WS, by kind and instrument.",
 	}, []string{"kind", "inst_id"})
+
+	// WSConnected reports whether a given OKX WS connection is currently up (1) or down (0),
+	// labeled by URL+channel — the liveness check: `okxbot_ws_connected == 0` means that
+	// connection is currently disconnected (auto-reconnect is retrying in the background).
+	WSConnected = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "okxbot_ws_connected",
+		Help: "Whether an OKX WebSocket connection is currently up (1) or down (0), by url/channel.",
+	}, []string{"url", "channel"})
+
+	// WSReconnectsTotal counts every reconnect attempt for a given OKX WS connection — a
+	// nonzero/increasing rate indicates connection instability worth investigating even if the
+	// gauge above shows "connected" right now.
+	WSReconnectsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_ws_reconnects_total",
+		Help: "Total number of reconnect attempts for an OKX WebSocket connection, by url/channel.",
+	}, []string{"url", "channel"})
 )

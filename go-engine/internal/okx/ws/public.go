@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/rez/okxBot/go-engine/internal/metrics"
 )
 
 // Message is a decoded OKX WS push message.
@@ -54,7 +57,13 @@ func (c *PublicClient) Run(ctx context.Context) error {
 		logger = slog.Default()
 	}
 
+	wsConnected := metrics.WSConnected.WithLabelValues(c.URL, c.Channel)
+	wsReconnects := metrics.WSReconnectsTotal.WithLabelValues(c.URL, c.Channel)
+	wsConnected.Set(0)
+	defer wsConnected.Set(0)
+
 	backoff := time.Second
+	first := true
 	for {
 		select {
 		case <-ctx.Done():
@@ -62,9 +71,15 @@ func (c *PublicClient) Run(ctx context.Context) error {
 		default:
 		}
 
-		if err := c.connectAndStream(ctx, logger); err != nil {
+		if !first {
+			wsReconnects.Inc()
+		}
+		first = false
+
+		if err := c.connectAndStream(ctx, logger, wsConnected); err != nil {
 			logger.Warn("okx ws connection dropped, reconnecting", "error", err, "backoff", backoff)
 		}
+		wsConnected.Set(0)
 
 		select {
 		case <-ctx.Done():
@@ -77,7 +92,7 @@ func (c *PublicClient) Run(ctx context.Context) error {
 	}
 }
 
-func (c *PublicClient) connectAndStream(ctx context.Context, logger *slog.Logger) error {
+func (c *PublicClient) connectAndStream(ctx context.Context, logger *slog.Logger, wsConnected prometheus.Gauge) error {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.URL, nil)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", c.URL, err)
@@ -91,6 +106,7 @@ func (c *PublicClient) connectAndStream(ctx context.Context, logger *slog.Logger
 	if err := conn.WriteJSON(subscribeReq{Op: "subscribe", Args: args}); err != nil {
 		return fmt.Errorf("subscribe: %w", err)
 	}
+	wsConnected.Set(1)
 	logger.Info("okx ws connected", "url", c.URL, "channel", c.Channel, "instIds", c.InstIDs)
 
 	pingTicker := time.NewTicker(20 * time.Second)
