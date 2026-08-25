@@ -13,8 +13,16 @@ import (
 
 // Message is a decoded OKX WS push message.
 type Message struct {
-	Arg  Arg             `json:"arg"`
-	Data json.RawMessage `json:"data"`
+	Event string          `json:"event"` // "subscribe"/"unsubscribe"/"error" for ack/event frames, "" for data pushes
+	Arg   Arg             `json:"arg"`
+	Data  json.RawMessage `json:"data"`
+}
+
+// isDataPush reports whether msg is an actual channel data push (has a "data" field to decode),
+// as opposed to a subscribe/unsubscribe/error acknowledgment frame. Ack frames still echo "arg"
+// (so a non-empty Arg.Channel alone isn't a reliable signal) but carry no "data" field at all.
+func (m Message) isDataPush() bool {
+	return m.Event == "" && m.Arg.Channel != ""
 }
 
 // Arg identifies the channel/instrument a push message belongs to.
@@ -106,8 +114,10 @@ func (c *PublicClient) connectAndStream(ctx context.Context, logger *slog.Logger
 				logger.Warn("okx ws: failed to decode message", "error", err, "raw", string(raw))
 				continue
 			}
-			if msg.Arg.Channel == "" {
-				// subscribe ack / event message, not a data push.
+			if !msg.isDataPush() {
+				if msg.Event == "error" {
+					logger.Warn("okx ws subscribe error", "raw", string(raw))
+				}
 				continue
 			}
 			if c.Handler != nil {
