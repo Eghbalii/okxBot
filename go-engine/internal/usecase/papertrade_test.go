@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -12,8 +13,12 @@ import (
 	"github.com/rez/okxBot/go-engine/internal/strategy"
 )
 
-// fakeRepository is an in-memory port.Repository for testing, no real Postgres needed.
+// fakeRepository is an in-memory port.Repository for testing, no real Postgres needed. Guarded
+// by a mutex since PaperTrader runs one goroutine per bar consumer plus one for ticks, all of
+// which can call into the repository concurrently (real Postgres handles this natively; this
+// fake must emulate that instead of assuming single-goroutine test access).
 type fakeRepository struct {
+	mu      sync.Mutex
 	nextID  int64
 	orders  map[int64]port.PaperOrder
 	candles []port.Candle
@@ -24,6 +29,8 @@ func newFakeRepository() *fakeRepository {
 }
 
 func (r *fakeRepository) SaveCandle(ctx context.Context, c port.Candle) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.candles = append(r.candles, c)
 	return nil
 }
@@ -34,12 +41,16 @@ func (r *fakeRepository) ListStrategies(ctx context.Context, instID string, enab
 	return nil, nil
 }
 func (r *fakeRepository) OpenPaperOrder(ctx context.Context, o port.PaperOrder) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.nextID++
 	o.ID = r.nextID
 	r.orders[o.ID] = o
 	return o.ID, nil
 }
 func (r *fakeRepository) ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	o := r.orders[id]
 	now := o.OpenedAt
 	o.ClosedAt = &now
@@ -52,6 +63,8 @@ func (r *fakeRepository) ClosePaperOrder(ctx context.Context, id int64, closePx 
 	return nil
 }
 func (r *fakeRepository) ListOpenPaperOrders(ctx context.Context, instID string) ([]port.PaperOrder, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	var out []port.PaperOrder
 	for _, o := range r.orders {
 		if o.InstID == instID && o.ClosedAt == nil {
@@ -89,19 +102,23 @@ func (noopConsumer) Run(ctx context.Context, handler func(ctx context.Context, d
 	return ctx.Err()
 }
 
-func newTestPaperTrader(repo port.Repository, strategies []strategy.Strategy) *PaperTrader {
+func newTestPaperTrader(repo port.Repository, strategies []StrategyAssignment) *PaperTrader {
 	return &PaperTrader{
-		InstID:         "BTC-USDT-SWAP",
-		Bar:            "1m",
-		CandleWindow:   100,
-		Strategies:     strategies,
-		Exchange:       &fakeExchangeForCandles{},
-		TickConsumer:   noopConsumer{},
-		CandleConsumer: noopConsumer{},
-		Repo:           repo,
-		NotionalUSD:    dec("100"),
-		MaxOpenOrders:  3,
-		Logger:         testLogger(),
+		InstID:       "BTC-USDT-SWAP",
+		Bars:         []string{"1m", "15m"},
+		CandleWindow: 100,
+		Strategies:   strategies,
+		Exchange:     &fakeExchangeForCandles{},
+		TickConsumer: noopConsumer{},
+		CandleConsumers: map[string]port.MarketDataConsumer{
+			"1m":  noopConsumer{},
+			"15m": noopConsumer{},
+		},
+		Repo:          repo,
+		NotionalUSD:   dec("100"),
+		MaxOpenOrders: 3,
+		Logger:        testLogger(),
+		candles:       map[string][]domain.Candle{"1m": nil, "15m": nil},
 	}
 }
 
@@ -175,16 +192,38 @@ func TestMaxOpenOrders_GatesNewSignals(t *testing.T) {
 	}
 
 	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
-	pt := newTestPaperTrader(repo, []strategy.Strategy{alwaysBuy})
-	pt.candles = []domain.Candle{{Open: dec("100"), High: dec("101"), Low: dec("99"), Close: dec("100"), Volume: dec("1")}}
+	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "1m", Strategy: alwaysBuy}})
+	pt.candles["1m"] = []domain.Candle{{Open: dec("100"), High: dec("101"), Low: dec("99"), Close: dec("100"), Volume: dec("1")}}
 
-	if err := pt.evaluateStrategies(context.Background(), dec("100"), testLogger()); err != nil {
+	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
 	}
 
 	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
 	if len(open) != 3 {
 		t.Errorf("expected MaxOpenOrders to gate new signals, still expected 3 open orders, got %d", len(open))
+	}
+}
+
+func TestEvaluateStrategies_OnlyRunsStrategyAssignedToThatBar(t *testing.T) {
+	repo := newFakeRepository()
+	alwaysBuy1m := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+	alwaysBuy15m := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+
+	pt := newTestPaperTrader(repo, []StrategyAssignment{
+		{Bar: "1m", Strategy: alwaysBuy1m},
+		{Bar: "15m", Strategy: alwaysBuy15m},
+	})
+	pt.candles["1m"] = []domain.Candle{{Close: dec("100")}}
+
+	// A 1m candle close should only trigger the 1m-assigned strategy, not the 15m one.
+	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if len(open) != 1 {
+		t.Fatalf("expected exactly 1 order opened (from the 1m strategy only), got %d", len(open))
 	}
 }
 
@@ -231,17 +270,92 @@ func TestHandleCandle_ParsesAndAppendsToWindow(t *testing.T) {
 		t.Fatalf("marshal event: %v", err)
 	}
 
-	if err := pt.handleCandle(context.Background(), data, testLogger()); err != nil {
+	if err := pt.handleCandle(context.Background(), "1m", data, testLogger()); err != nil {
 		t.Fatalf("handleCandle returned error: %v", err)
 	}
 
-	if len(pt.candles) != 1 {
-		t.Fatalf("expected 1 candle in window, got %d", len(pt.candles))
+	if len(pt.candles["1m"]) != 1 {
+		t.Fatalf("expected 1 candle in the 1m window, got %d", len(pt.candles["1m"]))
 	}
-	if !pt.candles[0].Close.Equal(dec("100.5")) {
-		t.Errorf("expected close=100.5, got %s", pt.candles[0].Close)
+	if !pt.candles["1m"][0].Close.Equal(dec("100.5")) {
+		t.Errorf("expected close=100.5, got %s", pt.candles["1m"][0].Close)
+	}
+	if len(pt.candles["15m"]) != 0 {
+		t.Errorf("expected the 15m window untouched by a 1m candle event, got %d entries", len(pt.candles["15m"]))
 	}
 	if len(repo.candles) != 1 {
 		t.Errorf("expected finalized candle to be persisted, got %d saved", len(repo.candles))
+	}
+	if repo.candles[0].Bar != "1m" {
+		t.Errorf("expected persisted candle to be tagged bar=1m, got %q", repo.candles[0].Bar)
+	}
+}
+
+func TestHandleCandle_DifferentBarsMaintainIndependentWindows(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+
+	oneMin := candleEvent{InstID: "BTC-USDT-SWAP", Bar: "1m", Candle: []string{"1700000000000", "100", "101", "99", "100.5", "10", "", "", "1"}}
+	fifteenMin := candleEvent{InstID: "BTC-USDT-SWAP", Bar: "15m", Candle: []string{"1700000000000", "200", "201", "199", "200.5", "20", "", "", "1"}}
+
+	oneMinData, _ := json.Marshal(oneMin)
+	fifteenMinData, _ := json.Marshal(fifteenMin)
+
+	if err := pt.handleCandle(context.Background(), "1m", oneMinData, testLogger()); err != nil {
+		t.Fatalf("handleCandle(1m) returned error: %v", err)
+	}
+	if err := pt.handleCandle(context.Background(), "15m", fifteenMinData, testLogger()); err != nil {
+		t.Fatalf("handleCandle(15m) returned error: %v", err)
+	}
+
+	if len(pt.candles["1m"]) != 1 || !pt.candles["1m"][0].Close.Equal(dec("100.5")) {
+		t.Errorf("expected 1m window to have exactly the 1m candle, got %v", pt.candles["1m"])
+	}
+	if len(pt.candles["15m"]) != 1 || !pt.candles["15m"][0].Close.Equal(dec("200.5")) {
+		t.Errorf("expected 15m window to have exactly the 15m candle, got %v", pt.candles["15m"])
+	}
+	if len(repo.candles) != 2 {
+		t.Fatalf("expected both candles persisted, got %d", len(repo.candles))
+	}
+}
+
+// TestHandleCandle_ConcurrentBarsDoNotRace is a regression test for a real crash found during
+// the multi-timeframe dry run: each bar gets its own consumer goroutine (see Run), so concurrent
+// handleCandle calls for different bars write to the shared e.candles map at the same time —
+// caught in production as "fatal error: concurrent map writes" (a Go runtime crash, not just a
+// -race warning). Run with `go test -race` to actually catch a regression here; without -race
+// this only proves the code doesn't deadlock/panic under load, not that it's race-free.
+func TestHandleCandle_ConcurrentBarsDoNotRace(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.Bars = []string{"1m", "15m", "1H"}
+	pt.candles = map[string][]domain.Candle{"1m": nil, "15m": nil, "1H": nil}
+
+	makeEvent := func(bar string, closePx string) []byte {
+		e := candleEvent{InstID: "BTC-USDT-SWAP", Bar: bar, Candle: []string{"1700000000000", "100", "101", "99", closePx, "10", "", "", "1"}}
+		data, _ := json.Marshal(e)
+		return data
+	}
+
+	var wg sync.WaitGroup
+	for _, bar := range []string{"1m", "15m", "1H"} {
+		bar := bar
+		for i := 0; i < 50; i++ {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				data := makeEvent(bar, "100.5")
+				if err := pt.handleCandle(context.Background(), bar, data, testLogger()); err != nil {
+					t.Errorf("handleCandle(%s) returned error: %v", bar, err)
+				}
+			}(i)
+		}
+	}
+	wg.Wait()
+
+	for _, bar := range []string{"1m", "15m", "1H"} {
+		if len(pt.candles[bar]) == 0 {
+			t.Errorf("expected candles recorded for bar %s after concurrent writes, got none", bar)
+		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -16,6 +17,14 @@ import (
 	"github.com/rez/okxBot/go-engine/internal/strategy"
 )
 
+// StrategyAssignment pairs a Strategy with the candle timeframe it evaluates against. A
+// PaperTrader can run several strategies across several timeframes concurrently — each strategy
+// only re-evaluates when its own assigned bar closes.
+type StrategyAssignment struct {
+	Bar      string
+	Strategy strategy.Strategy
+}
+
 // PaperTrader implements the Paper Trading Engine (CLAUDE.md §8): it evaluates strategies
 // against live prices, opens virtual orders with full SL/TP features, and monitors them against
 // the real price feed until SL or TP is hit. Closed trades are persisted and become the RL
@@ -23,22 +32,27 @@ import (
 //
 // Driven entirely by the WS-fed event bus (CLAUDE.md §12), not REST polling: every tick triggers
 // an immediate SL/TP check (no missed intra-bar wicks, no polling delay), and every finalized
-// candle triggers strategy re-evaluation + persistence. The exchange port is used only once, at
-// startup, to seed the initial rolling candle window.
+// candle triggers re-evaluation of strategies assigned to that candle's timeframe, and is
+// persisted. The exchange port is used only once per configured timeframe, at startup, to seed
+// each candle window.
 type PaperTrader struct {
-	InstID         string
-	Bar            string // candle timeframe used for strategy evaluation, e.g. "1m"
-	CandleWindow   int    // how many recent candles to keep in memory for strategy evaluation
-	Strategies     []strategy.Strategy
-	Exchange       port.ExchangeClient // used once at startup to seed the initial candle window
-	TickConsumer   port.MarketDataConsumer
-	CandleConsumer port.MarketDataConsumer
-	Repo           port.Repository
-	NotionalUSD    decimal.Decimal
-	MaxOpenOrders  int
-	Logger         *slog.Logger
+	InstID          string
+	Bars            []string // candle timeframes to maintain windows for, e.g. ["1m", "15m", "1h"]
+	CandleWindow    int      // how many recent candles to keep in memory per timeframe
+	Strategies      []StrategyAssignment
+	Exchange        port.ExchangeClient // used once per bar at startup to seed each candle window
+	TickConsumer    port.MarketDataConsumer
+	CandleConsumers map[string]port.MarketDataConsumer // keyed by bar
+	Repo            port.Repository
+	NotionalUSD     decimal.Decimal
+	MaxOpenOrders   int
+	Logger          *slog.Logger
 
-	candles []domain.Candle // append-only working window, touched only by the candle consumer
+	// candlesMu guards candles: each bar has its own consumer goroutine (see Run), so writes to
+	// this map (even to distinct keys) must be synchronized — concurrent map writes are a fatal
+	// Go runtime error, not just a race.
+	candlesMu sync.Mutex
+	candles   map[string][]domain.Candle // keyed by bar
 }
 
 type tickEvent struct {
@@ -52,8 +66,8 @@ type candleEvent struct {
 	Candle []string `json:"candle"`
 }
 
-// Run seeds the initial candle window via the exchange port, then consumes ticks/candles from
-// the event bus until ctx is cancelled.
+// Run seeds each timeframe's initial candle window via the exchange port, then consumes
+// ticks/candles from the event bus until ctx is cancelled.
 func (e *PaperTrader) Run(ctx context.Context) error {
 	logger := e.Logger
 	if logger == nil {
@@ -61,20 +75,23 @@ func (e *PaperTrader) Run(ctx context.Context) error {
 	}
 
 	if err := e.seedCandles(); err != nil {
-		return fmt.Errorf("seed initial candle window: %w", err)
+		return fmt.Errorf("seed initial candle windows: %w", err)
 	}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 1+len(e.CandleConsumers))
 	go func() {
 		errCh <- e.TickConsumer.Run(ctx, func(ctx context.Context, data []byte) error {
 			return e.handleTick(ctx, data, logger)
 		})
 	}()
-	go func() {
-		errCh <- e.CandleConsumer.Run(ctx, func(ctx context.Context, data []byte) error {
-			return e.handleCandle(ctx, data, logger)
-		})
-	}()
+	for bar, consumer := range e.CandleConsumers {
+		bar, consumer := bar, consumer
+		go func() {
+			errCh <- consumer.Run(ctx, func(ctx context.Context, data []byte) error {
+				return e.handleCandle(ctx, bar, data, logger)
+			})
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -85,16 +102,24 @@ func (e *PaperTrader) Run(ctx context.Context) error {
 }
 
 func (e *PaperTrader) seedCandles() error {
-	candles, err := e.Exchange.GetCandles(e.InstID, e.Bar, e.CandleWindow)
-	if err != nil {
-		return err
+	candles := make(map[string][]domain.Candle, len(e.Bars))
+	for _, bar := range e.Bars {
+		raw, err := e.Exchange.GetCandles(e.InstID, bar, e.CandleWindow)
+		if err != nil {
+			return fmt.Errorf("seed candle window for bar %s: %w", bar, err)
+		}
+		// Exchange returns newest-first; strategies expect oldest-first.
+		out := make([]domain.Candle, len(raw))
+		for i, c := range raw {
+			out[len(raw)-1-i] = c
+		}
+		candles[bar] = out
 	}
-	// Exchange returns newest-first; strategies expect oldest-first.
-	out := make([]domain.Candle, len(candles))
-	for i, c := range candles {
-		out[len(candles)-1-i] = c
-	}
-	e.candles = out
+	// Run before this returns hasn't started the per-bar consumer goroutines yet, so no lock is
+	// strictly needed here, but take it anyway for consistency with every other candles access.
+	e.candlesMu.Lock()
+	e.candles = candles
+	e.candlesMu.Unlock()
 	return nil
 }
 
@@ -113,7 +138,7 @@ func (e *PaperTrader) handleTick(ctx context.Context, data []byte, logger *slog.
 	return e.monitorOpenOrders(ctx, price, logger)
 }
 
-func (e *PaperTrader) handleCandle(ctx context.Context, data []byte, logger *slog.Logger) error {
+func (e *PaperTrader) handleCandle(ctx context.Context, bar string, data []byte, logger *slog.Logger) error {
 	var event candleEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		return fmt.Errorf("decode candle event: %w", err)
@@ -128,25 +153,28 @@ func (e *PaperTrader) handleCandle(ctx context.Context, data []byte, logger *slo
 	}
 	c, err := parseCandleFields(event.Candle[1], event.Candle[2], event.Candle[3], event.Candle[4], event.Candle[5])
 	if err != nil {
-		return fmt.Errorf("parse candle: %w", err)
+		return fmt.Errorf("parse candle (bar %s): %w", bar, err)
 	}
 
-	e.candles = append(e.candles, c)
-	if len(e.candles) > e.CandleWindow {
-		e.candles = e.candles[len(e.candles)-e.CandleWindow:]
+	e.candlesMu.Lock()
+	window := append(e.candles[bar], c)
+	if len(window) > e.CandleWindow {
+		window = window[len(window)-e.CandleWindow:]
 	}
+	e.candles[bar] = window
+	e.candlesMu.Unlock()
 
 	if confirm != "1" {
 		return nil // still forming; wait for the finalized bar before persisting/evaluating
 	}
 	ms, _ := strconv.ParseInt(event.Candle[0], 10, 64)
-	if err := e.Repo.SaveCandle(ctx, port.Candle{InstID: e.InstID, Bar: e.Bar, Ts: time.UnixMilli(ms).UTC(), Candle: c}); err != nil {
-		logger.Warn("failed to persist candle", "instId", e.InstID, "error", err)
+	if err := e.Repo.SaveCandle(ctx, port.Candle{InstID: e.InstID, Bar: bar, Ts: time.UnixMilli(ms).UTC(), Candle: c}); err != nil {
+		logger.Warn("failed to persist candle", "instId", e.InstID, "bar", bar, "error", err)
 	}
-	return e.evaluateStrategies(ctx, c.Close, logger)
+	return e.evaluateStrategies(ctx, bar, c.Close, logger)
 }
 
-func (e *PaperTrader) evaluateStrategies(ctx context.Context, price decimal.Decimal, logger *slog.Logger) error {
+func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) error {
 	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
 	if err != nil {
 		return fmt.Errorf("list open paper orders: %w", err)
@@ -155,10 +183,18 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, price decimal.Deci
 		return nil
 	}
 
-	for _, s := range e.Strategies {
-		signal, err := s.Evaluate(e.candles)
+	e.candlesMu.Lock()
+	window := append([]domain.Candle(nil), e.candles[bar]...) // snapshot: don't hold the lock across Strategy.Evaluate
+	e.candlesMu.Unlock()
+
+	for _, a := range e.Strategies {
+		if a.Bar != bar {
+			continue // only re-evaluate strategies assigned to the timeframe that just closed
+		}
+		s := a.Strategy
+		signal, err := s.Evaluate(window)
 		if err != nil {
-			logger.Warn("strategy evaluation failed", "strategy", s.Name(), "instId", e.InstID, "error", err)
+			logger.Warn("strategy evaluation failed", "strategy", s.Name(), "instId", e.InstID, "bar", bar, "error", err)
 			continue
 		}
 		metrics.StrategySignalsTotal.WithLabelValues(s.Name(), e.InstID, string(signal.Side)).Inc()
@@ -173,7 +209,7 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, price decimal.Deci
 			continue
 		}
 		metrics.PaperOrdersOpenedTotal.WithLabelValues(s.Name(), e.InstID, string(signal.Side)).Inc()
-		logger.Info("opened paper order", "id", id, "strategy", s.Name(), "instId", e.InstID,
+		logger.Info("opened paper order", "id", id, "strategy", s.Name(), "instId", e.InstID, "bar", bar,
 			"side", signal.Side, "entry", price, "confidence", signal.Confidence)
 	}
 	return nil

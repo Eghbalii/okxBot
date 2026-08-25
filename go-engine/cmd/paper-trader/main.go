@@ -13,6 +13,7 @@ import (
 	"github.com/rez/okxBot/go-engine/internal/config"
 	"github.com/rez/okxBot/go-engine/internal/metrics"
 	"github.com/rez/okxBot/go-engine/internal/okx/rest"
+	"github.com/rez/okxBot/go-engine/internal/port"
 	"github.com/rez/okxBot/go-engine/internal/postgres"
 	"github.com/rez/okxBot/go-engine/internal/strategy"
 	"github.com/rez/okxBot/go-engine/internal/stream"
@@ -48,20 +49,33 @@ func main() {
 
 	logger.Info("starting paper trader", "instIds", cfg.Trading.InstIDs)
 
+	// Strategy assignments: which strategy evaluates on which timeframe's candle close. Only
+	// "1m" is populated today (matching the pre-multi-timeframe behavior exactly); the other
+	// configured bars (e.g. "15m", "1h") are ingested and persisted but have no strategy attached
+	// yet — add more StrategyAssignment entries here as strategies for those timeframes exist.
+	strategies := []usecase.StrategyAssignment{
+		{Bar: "1m", Strategy: strategy.NewRSISMA(14, 50)},
+	}
+
 	errCh := make(chan error, len(cfg.Trading.InstIDs))
 	for _, instID := range cfg.Trading.InstIDs {
+		candleConsumers := make(map[string]port.MarketDataConsumer, len(cfg.PaperTrading.Bars))
+		for _, bar := range cfg.PaperTrading.Bars {
+			candleConsumers[bar] = stream.NewConsumer(cfg.Redis.Addr, "okx:candles:"+bar, "paper-trader", instID)
+		}
+
 		engine := &usecase.PaperTrader{
-			InstID:         instID,
-			Bar:            cfg.PaperTrading.Bar,
-			CandleWindow:   cfg.PaperTrading.CandleLimit,
-			Strategies:     []strategy.Strategy{strategy.NewRSISMA(14, 50)},
-			Exchange:       restClient,
-			TickConsumer:   stream.NewConsumer(cfg.Redis.Addr, "okx:tickers", "paper-trader", instID),
-			CandleConsumer: stream.NewConsumer(cfg.Redis.Addr, "okx:candles", "paper-trader", instID),
-			Repo:           repo,
-			NotionalUSD:    cfg.PaperTrading.NotionalUSD,
-			MaxOpenOrders:  cfg.PaperTrading.MaxOpenOrders,
-			Logger:         logger,
+			InstID:          instID,
+			Bars:            cfg.PaperTrading.Bars,
+			CandleWindow:    cfg.PaperTrading.CandleLimit,
+			Strategies:      strategies,
+			Exchange:        restClient,
+			TickConsumer:    stream.NewConsumer(cfg.Redis.Addr, "okx:tickers", "paper-trader", instID),
+			CandleConsumers: candleConsumers,
+			Repo:            repo,
+			NotionalUSD:     cfg.PaperTrading.NotionalUSD,
+			MaxOpenOrders:   cfg.PaperTrading.MaxOpenOrders,
+			Logger:          logger,
 		}
 		go func() { errCh <- engine.Run(ctx) }()
 	}
