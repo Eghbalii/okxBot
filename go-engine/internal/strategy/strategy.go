@@ -2,6 +2,8 @@
 // registry for built-in + configured strategies.
 package strategy
 
+import "github.com/shopspring/decimal"
+
 // Side is the suggested trade direction, or "" for no signal.
 type Side string
 
@@ -14,15 +16,15 @@ const (
 // Signal is what a Strategy emits for one evaluation of an instrument's candle series.
 type Signal struct {
 	Side       Side
-	Confidence float64 // 0..1
+	Confidence decimal.Decimal // 0..1
 	// SLPct/TPPct are suggested stop-loss/take-profit distance from entry, as a fraction of price.
-	SLPct float64
-	TPPct float64
+	SLPct decimal.Decimal
+	TPPct decimal.Decimal
 }
 
 // Candle is the minimal OHLCV shape strategies evaluate over, oldest-first.
 type Candle struct {
-	Open, High, Low, Close, Volume float64
+	Open, High, Low, Close, Volume decimal.Decimal
 }
 
 // Strategy evaluates a candle series for one instrument and returns a trade signal.

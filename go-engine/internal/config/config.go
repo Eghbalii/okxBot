@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/shopspring/decimal"
 	"gopkg.in/yaml.v3"
 )
 
@@ -34,25 +35,25 @@ type Config struct {
 	} `yaml:"rl_service"`
 
 	Trading struct {
-		InstIDs         []string `yaml:"inst_ids"`
-		PollIntervalSec int      `yaml:"poll_interval_sec"`
-		TdMode          string   `yaml:"td_mode"`       // "cross" or "isolated"
-		PosMode         string   `yaml:"pos_mode"`      // "net" or "long_short" (hedge mode)
-		MinOrderUSD     float64  `yaml:"min_order_usd"` // skip rebalancing orders smaller than this
+		InstIDs         []string        `yaml:"inst_ids"`
+		PollIntervalSec int             `yaml:"poll_interval_sec"`
+		TdMode          string          `yaml:"td_mode"`       // "cross" or "isolated"
+		PosMode         string          `yaml:"pos_mode"`      // "net" or "long_short" (hedge mode)
+		MinOrderUSD     decimal.Decimal `yaml:"min_order_usd"` // skip rebalancing orders smaller than this
 	} `yaml:"trading"`
 
 	PaperTrading struct {
-		NotionalUSD   float64 `yaml:"notional_usd"`
-		MaxOpenOrders int     `yaml:"max_open_orders"`
-		Bar           string  `yaml:"bar"`
-		CandleLimit   int     `yaml:"candle_limit"`
+		NotionalUSD   decimal.Decimal `yaml:"notional_usd"`
+		MaxOpenOrders int             `yaml:"max_open_orders"`
+		Bar           string          `yaml:"bar"`
+		CandleLimit   int             `yaml:"candle_limit"`
 	} `yaml:"paper_trading"`
 
 	Risk struct {
-		MaxLeverage             float64 `yaml:"max_leverage"`
-		MaxPositionNotionalUSD  float64 `yaml:"max_position_notional_usd"`
-		MaxDailyDrawdownPct     float64 `yaml:"max_daily_drawdown_pct"`
-		MinLiquidationBufferPct float64 `yaml:"min_liquidation_buffer_pct"`
+		MaxLeverage             decimal.Decimal `yaml:"max_leverage"`
+		MaxPositionNotionalUSD  decimal.Decimal `yaml:"max_position_notional_usd"`
+		MaxDailyDrawdownPct     decimal.Decimal `yaml:"max_daily_drawdown_pct"`
+		MinLiquidationBufferPct decimal.Decimal `yaml:"min_liquidation_buffer_pct"`
 	} `yaml:"risk"`
 }
 
@@ -111,11 +112,11 @@ func Load(path string) (*Config, error) {
 	if cfg.Trading.PosMode == "" {
 		cfg.Trading.PosMode = "net"
 	}
-	if cfg.Trading.MinOrderUSD == 0 {
-		cfg.Trading.MinOrderUSD = 10
+	if cfg.Trading.MinOrderUSD.IsZero() {
+		cfg.Trading.MinOrderUSD = decimal.NewFromInt(10)
 	}
-	if cfg.PaperTrading.NotionalUSD == 0 {
-		cfg.PaperTrading.NotionalUSD = 100
+	if cfg.PaperTrading.NotionalUSD.IsZero() {
+		cfg.PaperTrading.NotionalUSD = decimal.NewFromInt(100)
 	}
 	if cfg.PaperTrading.MaxOpenOrders == 0 {
 		cfg.PaperTrading.MaxOpenOrders = 3
@@ -126,17 +127,17 @@ func Load(path string) (*Config, error) {
 	if cfg.PaperTrading.CandleLimit == 0 {
 		cfg.PaperTrading.CandleLimit = 100
 	}
-	if cfg.Risk.MaxLeverage == 0 {
-		cfg.Risk.MaxLeverage = 5
+	if cfg.Risk.MaxLeverage.IsZero() {
+		cfg.Risk.MaxLeverage = decimal.NewFromInt(5)
 	}
-	if cfg.Risk.MaxPositionNotionalUSD == 0 {
-		cfg.Risk.MaxPositionNotionalUSD = 1000
+	if cfg.Risk.MaxPositionNotionalUSD.IsZero() {
+		cfg.Risk.MaxPositionNotionalUSD = decimal.NewFromInt(1000)
 	}
-	if cfg.Risk.MaxDailyDrawdownPct == 0 {
-		cfg.Risk.MaxDailyDrawdownPct = 5
+	if cfg.Risk.MaxDailyDrawdownPct.IsZero() {
+		cfg.Risk.MaxDailyDrawdownPct = decimal.NewFromInt(5)
 	}
-	if cfg.Risk.MinLiquidationBufferPct == 0 {
-		cfg.Risk.MinLiquidationBufferPct = 15
+	if cfg.Risk.MinLiquidationBufferPct.IsZero() {
+		cfg.Risk.MinLiquidationBufferPct = decimal.NewFromInt(15)
 	}
 
 	return cfg, nil

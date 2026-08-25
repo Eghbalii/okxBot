@@ -6,8 +6,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"time"
+
+	"github.com/shopspring/decimal"
 
 	"github.com/rez/okxBot/go-engine/internal/okx"
 	"github.com/rez/okxBot/go-engine/internal/okx/rest"
@@ -24,7 +25,7 @@ type Trader struct {
 	PollInterval time.Duration
 	TdMode       string // "cross" or "isolated"
 	PosMode      string // "net" or "long_short" (hedge mode)
-	MinOrderUSD  float64
+	MinOrderUSD  decimal.Decimal
 	Logger       *slog.Logger
 }
 
@@ -55,10 +56,7 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("fetch ticker: %w", err)
 	}
-	mid, err := strconv.ParseFloat(mkt.Last, 64)
-	if err != nil {
-		return fmt.Errorf("parse last price %q: %w", mkt.Last, err)
-	}
+	mid := mkt.Last
 
 	positions, err := t.RESTClient.GetPositions("SWAP")
 	if err != nil {
@@ -69,9 +67,9 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 		return fmt.Errorf("fetch balance: %w", err)
 	}
 
-	var equity float64
+	equity := decimal.Zero
 	if len(balances) > 0 {
-		equity, _ = strconv.ParseFloat(balances[0].Eq, 64)
+		equity = balances[0].Eq
 	}
 	t.RiskManager.CheckDrawdown(equity)
 	if halted, reason := t.RiskManager.Halted(); halted {
@@ -86,9 +84,9 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 			break
 		}
 	}
-	posSize, _ := strconv.ParseFloat(pos.Pos, 64)
-	lever, _ := strconv.ParseFloat(pos.Lever, 64)
-	uplRatio, _ := strconv.ParseFloat(pos.UplRatio, 64)
+	posSize := pos.Pos
+	lever := pos.Lever
+	uplRatio := pos.UplRatio
 
 	obs := rlclient.Observation{
 		InstID:           t.InstID,
@@ -115,35 +113,36 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 // touch real money goes through risk.Manager.Approve first.
 func (t *Trader) execute(
 	logger *slog.Logger,
-	mid float64,
+	mid decimal.Decimal,
 	pos okx.Position,
-	posSize, currentLeverage, equity float64,
+	posSize, currentLeverage, equity decimal.Decimal,
 	action *rlclient.Action,
 ) error {
 	limits := t.RiskManager.Limits()
 
-	targetLeverage := 1 + action.LeverageFrac*(limits.MaxLeverage-1)
+	// targetLeverage = 1 + leverageFrac * (maxLeverage - 1)
+	targetLeverage := decimal.NewFromInt(1).Add(action.LeverageFrac.Mul(limits.MaxLeverage.Sub(decimal.NewFromInt(1))))
 
-	currentNotional, _ := strconv.ParseFloat(pos.NotionalUsd, 64)
-	if currentNotional == 0 {
-		currentNotional = posSize * mid
+	currentNotional := pos.NotionalUsd
+	if currentNotional.IsZero() {
+		currentNotional = posSize.Mul(mid)
 	}
 	// Sign the current notional by position direction so exposure math below works for both
 	// long and short starting positions.
-	if posSize < 0 {
-		currentNotional = -currentNotional
+	if posSize.IsNegative() {
+		currentNotional = currentNotional.Neg()
 	}
 
-	targetNotional := action.TargetExposure * limits.MaxPositionNotionalUSD
+	targetNotional := action.TargetExposure.Mul(limits.MaxPositionNotionalUSD)
 
 	// Rough, conservative estimate of distance-to-liquidation as a percentage of mark price:
 	// ignoring maintenance margin and fees, isolated-margin liquidation occurs at roughly a
 	// 1/leverage adverse move. This likely underestimates the true buffer OKX will report (which
 	// includes maintenance margin), so it's a conservative floor for the hard-limit check, not an
 	// exact liquidation price calculation.
-	liqBufferPct := 0.0
-	if targetLeverage > 0 {
-		liqBufferPct = 100 / targetLeverage
+	liqBufferPct := decimal.Zero
+	if targetLeverage.IsPositive() {
+		liqBufferPct = decimal.NewFromInt(100).Div(targetLeverage)
 	}
 
 	approved, err := t.RiskManager.Approve(risk.ProposedAction{
@@ -156,8 +155,8 @@ func (t *Trader) execute(
 		return nil
 	}
 
-	if approved.Leverage != currentLeverage && approved.Leverage > 0 {
-		req := okx.SetLeverageRequest{InstID: t.InstID, Lever: fmt.Sprintf("%.2f", approved.Leverage), MgnMode: t.TdMode}
+	if !approved.Leverage.Equal(currentLeverage) && approved.Leverage.IsPositive() {
+		req := okx.SetLeverageRequest{InstID: t.InstID, Lever: approved.Leverage, MgnMode: t.TdMode}
 		if t.PosMode == "long_short" {
 			req.PosSide = posSideFor(approved.PositionNotionalUSD)
 		}
@@ -170,30 +169,30 @@ func (t *Trader) execute(
 	// Preserve the sign of the (clamped) target notional so a negative TargetExposure still
 	// produces a short target after risk clamping.
 	signedTarget := approved.PositionNotionalUSD
-	if targetNotional < 0 {
-		signedTarget = -approved.PositionNotionalUSD
+	if targetNotional.IsNegative() {
+		signedTarget = approved.PositionNotionalUSD.Neg()
 	}
 
-	deltaNotional := signedTarget - currentNotional
-	if mid <= 0 || (t.MinOrderUSD > 0 && absFloat(deltaNotional) < t.MinOrderUSD) {
+	deltaNotional := signedTarget.Sub(currentNotional)
+	if !mid.IsPositive() || (t.MinOrderUSD.IsPositive() && deltaNotional.Abs().LessThan(t.MinOrderUSD)) {
 		return nil
 	}
 
 	side := "buy"
-	if deltaNotional < 0 {
+	if deltaNotional.IsNegative() {
 		side = "sell"
 	}
 	// NOTE: sz is computed as underlying USD notional / mid price, i.e. it assumes a contract
 	// multiplier of 1. Per-instrument contract-value handling (via /api/v5/public/instruments)
 	// is not yet wired in — revisit before trading instruments with a non-1x contract value.
-	sz := absFloat(deltaNotional) / mid
+	sz := deltaNotional.Abs().Div(mid)
 
 	order := okx.OrderRequest{
 		InstID:  t.InstID,
 		TdMode:  t.TdMode,
 		Side:    side,
 		OrdType: "market",
-		Sz:      fmt.Sprintf("%.8f", sz),
+		Sz:      sz,
 	}
 	if t.PosMode == "long_short" {
 		order.PosSide = posSideFor(signedTarget)
@@ -212,16 +211,9 @@ func (t *Trader) execute(
 }
 
 // posSideFor maps a signed target notional to OKX's hedge-mode posSide values.
-func posSideFor(signedNotional float64) string {
-	if signedNotional < 0 {
+func posSideFor(signedNotional decimal.Decimal) string {
+	if signedNotional.IsNegative() {
 		return "short"
 	}
 	return "long"
-}
-
-func absFloat(f float64) float64 {
-	if f < 0 {
-		return -f
-	}
-	return f
 }

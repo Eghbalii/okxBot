@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 // Client calls the FastAPI inference server's /predict endpoint.
@@ -26,21 +28,25 @@ func New(baseURL string) *Client {
 
 // Observation is the feature vector sent to the RL service for one inference step.
 // Field names match rl_service/env observation construction — keep both sides in sync.
+//
+// NOTE: decimal.Decimal marshals to a JSON string (not a bare number). rl_service's pydantic
+// models must parse these fields as strings (e.g. Decimal or a validator coercing str->float) —
+// verify against rl_service/serve/api.py before running this end-to-end against the RL service.
 type Observation struct {
-	InstID           string    `json:"inst_id"`
-	MidPrice         float64   `json:"mid_price"`
-	Position         float64   `json:"position"` // signed current position size
-	CurrentLeverage  float64   `json:"current_leverage"`
-	UnrealizedPnLPct float64   `json:"unrealized_pnl_pct"`
-	EquityUSD        float64   `json:"equity_usd"`
-	Features         []float64 `json:"features"` // rolling window of engineered features
+	InstID           string            `json:"inst_id"`
+	MidPrice         decimal.Decimal   `json:"mid_price"`
+	Position         decimal.Decimal   `json:"position"` // signed current position size
+	CurrentLeverage  decimal.Decimal   `json:"current_leverage"`
+	UnrealizedPnLPct decimal.Decimal   `json:"unrealized_pnl_pct"`
+	EquityUSD        decimal.Decimal   `json:"equity_usd"`
+	Features         []decimal.Decimal `json:"features"` // rolling window of engineered features
 }
 
 // Action is the RL agent's decision returned by the inference service.
 type Action struct {
-	TargetExposure float64 `json:"target_exposure"` // in [-1, 1]
-	LeverageFrac   float64 `json:"leverage_frac"`   // in [0, 1], mapped to [1x, max_leverage]
-	Confidence     float64 `json:"confidence"`
+	TargetExposure decimal.Decimal `json:"target_exposure"` // in [-1, 1]
+	LeverageFrac   decimal.Decimal `json:"leverage_frac"`   // in [0, 1], mapped to [1x, max_leverage]
+	Confidence     decimal.Decimal `json:"confidence"`
 }
 
 // Predict requests an action from the RL inference service for the given observation.

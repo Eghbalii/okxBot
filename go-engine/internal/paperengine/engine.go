@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/rez/okxBot/go-engine/internal/metrics"
 	"github.com/rez/okxBot/go-engine/internal/okx"
 	"github.com/rez/okxBot/go-engine/internal/okx/rest"
@@ -35,7 +37,7 @@ type Engine struct {
 	TickConsumer   *stream.Consumer
 	CandleConsumer *stream.Consumer
 	Repo           port.Repository
-	NotionalUSD    float64
+	NotionalUSD    decimal.Decimal
 	MaxOpenOrders  int
 	Logger         *slog.Logger
 
@@ -106,7 +108,7 @@ func (e *Engine) handleTick(ctx context.Context, data []byte, logger *slog.Logge
 	if tick.InstID != e.InstID {
 		return nil // shared stream across instruments; this engine only cares about its own
 	}
-	price, err := strconv.ParseFloat(tick.Last, 64)
+	price, err := decimal.NewFromString(tick.Last)
 	if err != nil {
 		return fmt.Errorf("parse tick price %q: %w", tick.Last, err)
 	}
@@ -146,7 +148,7 @@ func (e *Engine) handleCandle(ctx context.Context, data []byte, logger *slog.Log
 	return e.evaluateStrategies(ctx, c.Close, logger)
 }
 
-func (e *Engine) evaluateStrategies(ctx context.Context, price float64, logger *slog.Logger) error {
+func (e *Engine) evaluateStrategies(ctx context.Context, price decimal.Decimal, logger *slog.Logger) error {
 	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
 	if err != nil {
 		return fmt.Errorf("list open paper orders: %w", err)
@@ -179,7 +181,7 @@ func (e *Engine) evaluateStrategies(ctx context.Context, price float64, logger *
 	return nil
 }
 
-func (e *Engine) monitorOpenOrders(ctx context.Context, price float64, logger *slog.Logger) error {
+func (e *Engine) monitorOpenOrders(ctx context.Context, price decimal.Decimal, logger *slog.Logger) error {
 	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
 	if err != nil {
 		return fmt.Errorf("list open paper orders: %w", err)
@@ -197,52 +199,54 @@ func (e *Engine) monitorOpenOrders(ctx context.Context, price float64, logger *s
 			continue
 		}
 		metrics.PaperOrdersClosedTotal.WithLabelValues(e.InstID, reason).Inc()
-		metrics.PaperOrdersRealizedPnL.WithLabelValues(e.InstID).Add(pnl)
+		// Prometheus metrics have no decimal support; InexactFloat64 is acceptable here since
+		// this is write-only telemetry, not a value used in further financial arithmetic.
+		metrics.PaperOrdersRealizedPnL.WithLabelValues(e.InstID).Add(pnl.InexactFloat64())
 		logger.Info("closed paper order", "id", o.ID, "instId", e.InstID, "reason", reason, "closePx", price, "pnl", pnl)
 	}
 	return nil
 }
 
-func closeReason(o port.PaperOrder, price float64) (string, bool) {
+func closeReason(o port.PaperOrder, price decimal.Decimal) (string, bool) {
 	switch o.Side {
 	case "buy":
-		if o.SLPx != nil && price <= *o.SLPx {
+		if o.SLPx != nil && price.LessThanOrEqual(*o.SLPx) {
 			return "sl", true
 		}
-		if o.TPPx != nil && price >= *o.TPPx {
+		if o.TPPx != nil && price.GreaterThanOrEqual(*o.TPPx) {
 			return "tp", true
 		}
 	case "sell":
-		if o.SLPx != nil && price >= *o.SLPx {
+		if o.SLPx != nil && price.GreaterThanOrEqual(*o.SLPx) {
 			return "sl", true
 		}
-		if o.TPPx != nil && price <= *o.TPPx {
+		if o.TPPx != nil && price.LessThanOrEqual(*o.TPPx) {
 			return "tp", true
 		}
 	}
 	return "", false
 }
 
-func realizedPnL(o port.PaperOrder, closePx float64) float64 {
-	direction := 1.0
+func realizedPnL(o port.PaperOrder, closePx decimal.Decimal) decimal.Decimal {
+	direction := decimal.NewFromInt(1)
 	if o.Side == "sell" {
-		direction = -1.0
+		direction = decimal.NewFromInt(-1)
 	}
-	return direction * (closePx - o.EntryPx) / o.EntryPx * o.Size * o.Leverage
+	return direction.Mul(closePx.Sub(o.EntryPx)).Div(o.EntryPx).Mul(o.Size).Mul(o.Leverage)
 }
 
-func buildPaperOrder(instID string, price float64, signal strategy.Signal, notionalUSD float64) port.PaperOrder {
-	var slPx, tpPx *float64
-	direction := 1.0
+func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signal, notionalUSD decimal.Decimal) port.PaperOrder {
+	var slPx, tpPx *decimal.Decimal
+	direction := decimal.NewFromInt(1)
 	if signal.Side == strategy.Sell {
-		direction = -1.0
+		direction = decimal.NewFromInt(-1)
 	}
-	if signal.SLPct > 0 {
-		v := price - direction*signal.SLPct*price
+	if signal.SLPct.IsPositive() {
+		v := price.Sub(direction.Mul(signal.SLPct).Mul(price))
 		slPx = &v
 	}
-	if signal.TPPct > 0 {
-		v := price + direction*signal.TPPct*price
+	if signal.TPPct.IsPositive() {
+		v := price.Add(direction.Mul(signal.TPPct).Mul(price))
 		tpPx = &v
 	}
 
@@ -253,7 +257,7 @@ func buildPaperOrder(instID string, price float64, signal strategy.Signal, notio
 		SLPx:     slPx,
 		TPPx:     tpPx,
 		Size:     notionalUSD,
-		Leverage: 1,
+		Leverage: decimal.NewFromInt(1),
 	}
 }
 
@@ -271,23 +275,23 @@ func toStrategyCandles(raw []okx.Candle) ([]strategy.Candle, error) {
 }
 
 func parseCandle(raw okx.Candle) (strategy.Candle, error) {
-	open, err := strconv.ParseFloat(raw.Open, 64)
+	open, err := decimal.NewFromString(raw.Open)
 	if err != nil {
 		return strategy.Candle{}, fmt.Errorf("parse open %q: %w", raw.Open, err)
 	}
-	high, err := strconv.ParseFloat(raw.High, 64)
+	high, err := decimal.NewFromString(raw.High)
 	if err != nil {
 		return strategy.Candle{}, fmt.Errorf("parse high %q: %w", raw.High, err)
 	}
-	low, err := strconv.ParseFloat(raw.Low, 64)
+	low, err := decimal.NewFromString(raw.Low)
 	if err != nil {
 		return strategy.Candle{}, fmt.Errorf("parse low %q: %w", raw.Low, err)
 	}
-	closePx, err := strconv.ParseFloat(raw.Close, 64)
+	closePx, err := decimal.NewFromString(raw.Close)
 	if err != nil {
 		return strategy.Candle{}, fmt.Errorf("parse close %q: %w", raw.Close, err)
 	}
-	vol, err := strconv.ParseFloat(raw.Vol, 64)
+	vol, err := decimal.NewFromString(raw.Vol)
 	if err != nil {
 		return strategy.Candle{}, fmt.Errorf("parse vol %q: %w", raw.Vol, err)
 	}

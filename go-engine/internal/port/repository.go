@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 // Candle is one OHLCV bar for an instrument.
@@ -13,11 +15,11 @@ type Candle struct {
 	InstID string
 	Bar    string
 	Ts     time.Time
-	Open   float64
-	High   float64
-	Low    float64
-	Close  float64
-	Volume float64
+	Open   decimal.Decimal
+	High   decimal.Decimal
+	Low    decimal.Decimal
+	Close  decimal.Decimal
+	Volume decimal.Decimal
 }
 
 // StrategyConfig is a persisted, pluggable signal-generator configuration (see CLAUDE.md §9).
@@ -37,16 +39,16 @@ type PaperOrder struct {
 	InstID       string
 	StrategyID   *int64
 	Side         string // "buy" or "sell"
-	EntryPx      float64
-	SLPx         *float64
-	TPPx         *float64
-	Size         float64
-	Leverage     float64
+	EntryPx      decimal.Decimal
+	SLPx         *decimal.Decimal
+	TPPx         *decimal.Decimal
+	Size         decimal.Decimal
+	Leverage     decimal.Decimal
 	OpenedAt     time.Time
 	ClosedAt     *time.Time
 	CloseReason  *string // "sl", "tp", "manual", "timeout"
-	ClosePx      *float64
-	RealizedPnL  *float64
+	ClosePx      *decimal.Decimal
+	RealizedPnL  *decimal.Decimal
 	FeaturesJSON json.RawMessage
 }
 
@@ -58,6 +60,6 @@ type Repository interface {
 	ListStrategies(ctx context.Context, instID string, enabledOnly bool) ([]StrategyConfig, error)
 
 	OpenPaperOrder(ctx context.Context, o PaperOrder) (int64, error)
-	ClosePaperOrder(ctx context.Context, id int64, closePx float64, reason string, realizedPnL float64) error
+	ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error
 	ListOpenPaperOrders(ctx context.Context, instID string) ([]PaperOrder, error)
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/rez/okxBot/go-engine/internal/port"
 )
 
@@ -22,7 +24,7 @@ func (r *Repository) OpenPaperOrder(ctx context.Context, o port.PaperOrder) (int
 }
 
 // ClosePaperOrder marks a virtual trade closed with its realized outcome.
-func (r *Repository) ClosePaperOrder(ctx context.Context, id int64, closePx float64, reason string, realizedPnL float64) error {
+func (r *Repository) ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE paper_orders
 		SET closed_at = now(), close_px = $2, close_reason = $3, realized_pnl = $4

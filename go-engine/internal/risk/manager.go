@@ -2,38 +2,44 @@
 // by, the RL model's output. This is the last line of defense against a bad model action.
 package risk
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/shopspring/decimal"
+)
+
+var hundred = decimal.NewFromInt(100)
 
 // Limits holds the configured hard risk limits.
 type Limits struct {
-	MaxLeverage             float64
-	MaxPositionNotionalUSD  float64
-	MaxDailyDrawdownPct     float64
-	MinLiquidationBufferPct float64
+	MaxLeverage             decimal.Decimal
+	MaxPositionNotionalUSD  decimal.Decimal
+	MaxDailyDrawdownPct     decimal.Decimal
+	MinLiquidationBufferPct decimal.Decimal
 }
 
 // Manager evaluates proposed trading actions against hard limits and tracks daily PnL for the
 // drawdown circuit breaker.
 type Manager struct {
 	limits         Limits
-	dayStartEquity float64
+	dayStartEquity decimal.Decimal
 	halted         bool
 	haltReason     string
 }
 
 // NewManager creates a risk Manager. dayStartEquity is the account equity at the start of the
 // current trading day, used as the baseline for the drawdown circuit breaker.
-func NewManager(limits Limits, dayStartEquity float64) *Manager {
+func NewManager(limits Limits, dayStartEquity decimal.Decimal) *Manager {
 	return &Manager{limits: limits, dayStartEquity: dayStartEquity}
 }
 
 // ProposedAction is the RL-suggested (or any) trading action awaiting risk approval.
 type ProposedAction struct {
-	Leverage            float64
-	PositionNotionalUSD float64
+	Leverage            decimal.Decimal
+	PositionNotionalUSD decimal.Decimal
 	// LiquidationBufferPct is the distance between mark price and estimated liquidation price,
 	// expressed as a percentage of mark price, if this action were taken.
-	LiquidationBufferPct float64
+	LiquidationBufferPct decimal.Decimal
 }
 
 // Halted reports whether the circuit breaker has tripped and trading should stop until reset.
@@ -47,7 +53,7 @@ func (m *Manager) Limits() Limits {
 }
 
 // Reset clears the halted state (e.g. after manual review or at the start of a new trading day).
-func (m *Manager) Reset(dayStartEquity float64) {
+func (m *Manager) Reset(dayStartEquity decimal.Decimal) {
 	m.halted = false
 	m.haltReason = ""
 	m.dayStartEquity = dayStartEquity
@@ -55,14 +61,14 @@ func (m *Manager) Reset(dayStartEquity float64) {
 
 // CheckDrawdown updates the circuit breaker based on current equity. Call this on every
 // account-state refresh, independent of whether a new action is being evaluated.
-func (m *Manager) CheckDrawdown(currentEquity float64) {
-	if m.dayStartEquity <= 0 {
+func (m *Manager) CheckDrawdown(currentEquity decimal.Decimal) {
+	if !m.dayStartEquity.IsPositive() {
 		return
 	}
-	drawdownPct := (m.dayStartEquity - currentEquity) / m.dayStartEquity * 100
-	if drawdownPct >= m.limits.MaxDailyDrawdownPct {
+	drawdownPct := m.dayStartEquity.Sub(currentEquity).Div(m.dayStartEquity).Mul(hundred)
+	if drawdownPct.GreaterThanOrEqual(m.limits.MaxDailyDrawdownPct) {
 		m.halted = true
-		m.haltReason = fmt.Sprintf("daily drawdown %.2f%% >= limit %.2f%%", drawdownPct, m.limits.MaxDailyDrawdownPct)
+		m.haltReason = fmt.Sprintf("daily drawdown %s%% >= limit %s%%", drawdownPct.StringFixed(2), m.limits.MaxDailyDrawdownPct.StringFixed(2))
 	}
 }
 
@@ -73,16 +79,16 @@ func (m *Manager) Approve(action ProposedAction) (ProposedAction, error) {
 		return action, fmt.Errorf("trading halted: %s", reason)
 	}
 
-	if action.Leverage > m.limits.MaxLeverage {
+	if action.Leverage.GreaterThan(m.limits.MaxLeverage) {
 		action.Leverage = m.limits.MaxLeverage
 	}
-	if action.PositionNotionalUSD > m.limits.MaxPositionNotionalUSD {
+	if action.PositionNotionalUSD.GreaterThan(m.limits.MaxPositionNotionalUSD) {
 		action.PositionNotionalUSD = m.limits.MaxPositionNotionalUSD
 	}
-	if action.LiquidationBufferPct < m.limits.MinLiquidationBufferPct {
+	if action.LiquidationBufferPct.LessThan(m.limits.MinLiquidationBufferPct) {
 		return action, fmt.Errorf(
-			"rejected: liquidation buffer %.2f%% below minimum %.2f%%",
-			action.LiquidationBufferPct, m.limits.MinLiquidationBufferPct,
+			"rejected: liquidation buffer %s%% below minimum %s%%",
+			action.LiquidationBufferPct.StringFixed(2), m.limits.MinLiquidationBufferPct.StringFixed(2),
 		)
 	}
 	return action, nil

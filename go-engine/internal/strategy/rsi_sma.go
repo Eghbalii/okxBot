@@ -1,14 +1,20 @@
 package strategy
 
+import "github.com/shopspring/decimal"
+
+var (
+	hundred = decimal.NewFromInt(100)
+)
+
 // RSISMA is a built-in strategy: buy when RSI is oversold and price is above the trend SMA
 // (pullback-in-uptrend), sell when RSI is overbought and price is below the trend SMA.
 type RSISMA struct {
 	RSIPeriod     int
 	SMAPeriod     int
-	OversoldMax   float64
-	OverboughtMin float64
-	SLPct         float64
-	TPPct         float64
+	OversoldMax   decimal.Decimal
+	OverboughtMin decimal.Decimal
+	SLPct         decimal.Decimal
+	TPPct         decimal.Decimal
 }
 
 // NewRSISMA creates an RSISMA strategy with sensible defaults for the given periods.
@@ -16,10 +22,10 @@ func NewRSISMA(rsiPeriod, smaPeriod int) *RSISMA {
 	return &RSISMA{
 		RSIPeriod:     rsiPeriod,
 		SMAPeriod:     smaPeriod,
-		OversoldMax:   30,
-		OverboughtMin: 70,
-		SLPct:         0.01,
-		TPPct:         0.02,
+		OversoldMax:   decimal.NewFromInt(30),
+		OverboughtMin: decimal.NewFromInt(70),
+		SLPct:         decimal.NewFromFloat(0.01),
+		TPPct:         decimal.NewFromFloat(0.02),
 	}
 }
 
@@ -37,10 +43,12 @@ func (s *RSISMA) Evaluate(candles []Candle) (Signal, error) {
 	price := candles[len(candles)-1].Close
 
 	switch {
-	case rsi <= s.OversoldMax && price > sma:
-		return Signal{Side: Buy, Confidence: (s.OversoldMax - rsi) / s.OversoldMax, SLPct: s.SLPct, TPPct: s.TPPct}, nil
-	case rsi >= s.OverboughtMin && price < sma:
-		return Signal{Side: Sell, Confidence: (rsi - s.OverboughtMin) / (100 - s.OverboughtMin), SLPct: s.SLPct, TPPct: s.TPPct}, nil
+	case rsi.LessThanOrEqual(s.OversoldMax) && price.GreaterThan(sma):
+		confidence := s.OversoldMax.Sub(rsi).Div(s.OversoldMax)
+		return Signal{Side: Buy, Confidence: confidence, SLPct: s.SLPct, TPPct: s.TPPct}, nil
+	case rsi.GreaterThanOrEqual(s.OverboughtMin) && price.LessThan(sma):
+		confidence := rsi.Sub(s.OverboughtMin).Div(hundred.Sub(s.OverboughtMin))
+		return Signal{Side: Sell, Confidence: confidence, SLPct: s.SLPct, TPPct: s.TPPct}, nil
 	default:
 		return Signal{Side: Hold}, nil
 	}

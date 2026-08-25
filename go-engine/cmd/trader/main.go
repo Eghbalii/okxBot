@@ -6,9 +6,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/shopspring/decimal"
 
 	"github.com/rez/okxBot/go-engine/internal/config"
 	"github.com/rez/okxBot/go-engine/internal/engine"
@@ -41,9 +42,9 @@ func main() {
 		logger.Error("failed to fetch initial balance", "error", err)
 		os.Exit(1)
 	}
-	var startEquity float64
+	startEquity := decimal.Zero
 	if len(balances) > 0 {
-		startEquity, _ = strconv.ParseFloat(balances[0].Eq, 64)
+		startEquity = balances[0].Eq
 	}
 
 	riskLimits := risk.Limits{

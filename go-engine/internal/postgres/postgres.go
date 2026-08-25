@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 
+	pgxdecimal "github.com/jackc/pgx-shopspring-decimal"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -21,7 +23,19 @@ type Repository struct {
 
 // New connects to Postgres using dsn (e.g. "postgres://user:pass@host:5432/db").
 func New(ctx context.Context, dsn string) (*Repository, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres dsn: %w", err)
+	}
+	// pgx's native interface has no default codec for decimal.Decimal against NUMERIC columns;
+	// register the companion codec on every new connection so price/size/PnL fields (all
+	// decimal.Decimal, see CLAUDE.md's precision requirements) encode/scan correctly.
+	poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		pgxdecimal.Register(conn.TypeMap())
+		return nil
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
