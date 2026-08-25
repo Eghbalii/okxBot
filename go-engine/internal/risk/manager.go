@@ -82,8 +82,14 @@ func (m *Manager) Approve(action ProposedAction) (ProposedAction, error) {
 	if action.Leverage.GreaterThan(m.limits.MaxLeverage) {
 		action.Leverage = m.limits.MaxLeverage
 	}
-	if action.PositionNotionalUSD.GreaterThan(m.limits.MaxPositionNotionalUSD) {
-		action.PositionNotionalUSD = m.limits.MaxPositionNotionalUSD
+	// Clamp by magnitude, preserving sign, so a short (negative notional) exceeding the max
+	// position size in absolute terms is clamped too, not just an oversized long.
+	if action.PositionNotionalUSD.Abs().GreaterThan(m.limits.MaxPositionNotionalUSD) {
+		if action.PositionNotionalUSD.IsNegative() {
+			action.PositionNotionalUSD = m.limits.MaxPositionNotionalUSD.Neg()
+		} else {
+			action.PositionNotionalUSD = m.limits.MaxPositionNotionalUSD
+		}
 	}
 	if action.LiquidationBufferPct.LessThan(m.limits.MinLiquidationBufferPct) {
 		return action, fmt.Errorf(

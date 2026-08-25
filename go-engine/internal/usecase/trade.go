@@ -168,12 +168,9 @@ func (t *Trader) execute(
 		logger.Info("leverage updated", "instId", t.InstID, "leverage", approved.Leverage)
 	}
 
-	// Preserve the sign of the (clamped) target notional so a negative TargetExposure still
-	// produces a short target after risk clamping.
+	// risk.Manager.Approve now clamps PositionNotionalUSD by magnitude while preserving sign, so
+	// the (possibly clamped) signed target notional is already correct as returned.
 	signedTarget := approved.PositionNotionalUSD
-	if targetNotional.IsNegative() {
-		signedTarget = approved.PositionNotionalUSD.Neg()
-	}
 
 	deltaNotional := signedTarget.Sub(currentNotional)
 	if !mid.IsPositive() || (t.MinOrderUSD.IsPositive() && deltaNotional.Abs().LessThan(t.MinOrderUSD)) {
