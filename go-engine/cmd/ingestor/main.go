@@ -33,8 +33,6 @@ func main() {
 
 	tickerPub := stream.NewPublisher(cfg.Redis.Addr, "okx:tickers")
 	defer tickerPub.Close()
-	candlePub := stream.NewPublisher(cfg.Redis.Addr, "okx:candles")
-	defer candlePub.Close()
 
 	tickerClient := &ws.PublicClient{
 		URL:     cfg.OKX.PublicWSURL,
@@ -57,35 +55,48 @@ func main() {
 		},
 	}
 
-	// Candlesticks live on the business WS endpoint in OKX v5, separate from public tickers.
-	candleChannel := "candle" + cfg.PaperTrading.Bar
-	candleClient := &ws.PublicClient{
-		URL:     cfg.OKX.BusinessWSURL,
-		Channel: candleChannel,
-		InstIDs: cfg.Trading.InstIDs,
-		Logger:  logger,
-		Handler: func(msg ws.Message) {
-			var bars [][]string
-			if err := json.Unmarshal(msg.Data, &bars); err != nil {
-				logger.Warn("failed to decode candle payload", "error", err)
-				return
-			}
-			for _, bar := range bars {
-				event := candleEvent{InstID: msg.Arg.InstID, Bar: cfg.PaperTrading.Bar, Candle: bar}
-				if err := candlePub.Publish(ctx, event); err != nil {
-					logger.Warn("failed to publish candle to redis", "error", err)
-					continue
+	// Candlesticks live on the business WS endpoint in OKX v5, separate from public tickers. One
+	// WS connection + one Redis stream per configured timeframe, so consumers only ever see the
+	// bar they subscribed to and don't need to filter out other timeframes themselves.
+	candlePubs := make(map[string]*stream.Publisher, len(cfg.PaperTrading.Bars))
+	candleClients := make([]*ws.PublicClient, 0, len(cfg.PaperTrading.Bars))
+	for _, bar := range cfg.PaperTrading.Bars {
+		bar := bar
+		pub := stream.NewPublisher(cfg.Redis.Addr, "okx:candles:"+bar)
+		candlePubs[bar] = pub
+		defer pub.Close()
+
+		candleClients = append(candleClients, &ws.PublicClient{
+			URL:     cfg.OKX.BusinessWSURL,
+			Channel: "candle" + bar,
+			InstIDs: cfg.Trading.InstIDs,
+			Logger:  logger,
+			Handler: func(msg ws.Message) {
+				var bars [][]string
+				if err := json.Unmarshal(msg.Data, &bars); err != nil {
+					logger.Warn("failed to decode candle payload", "bar", bar, "error", err)
+					return
 				}
-				metrics.IngestorEventsTotal.WithLabelValues("candle", msg.Arg.InstID).Inc()
-			}
-		},
+				for _, row := range bars {
+					event := candleEvent{InstID: msg.Arg.InstID, Bar: bar, Candle: row}
+					if err := pub.Publish(ctx, event); err != nil {
+						logger.Warn("failed to publish candle to redis", "bar", bar, "error", err)
+						continue
+					}
+					metrics.IngestorEventsTotal.WithLabelValues("candle", msg.Arg.InstID).Inc()
+				}
+			},
+		})
 	}
 
-	logger.Info("starting okx ingestor", "instIds", cfg.Trading.InstIDs, "candleChannel", candleChannel)
+	logger.Info("starting okx ingestor", "instIds", cfg.Trading.InstIDs, "bars", cfg.PaperTrading.Bars)
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 1+len(candleClients))
 	go func() { errCh <- tickerClient.Run(ctx) }()
-	go func() { errCh <- candleClient.Run(ctx) }()
+	for _, c := range candleClients {
+		c := c
+		go func() { errCh <- c.Run(ctx) }()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -98,8 +109,9 @@ func main() {
 	}
 }
 
-// candleEvent wraps a raw OKX candle array with the instrument id it belongs to, since the
-// candle array itself (unlike ticker payloads) doesn't carry instId.
+// candleEvent wraps a raw OKX candle array with the instrument id and bar it belongs to, since
+// the candle array itself (unlike ticker payloads) doesn't carry instId, and each bar publishes
+// to its own Redis stream but shares this same event shape.
 type candleEvent struct {
 	InstID string   `json:"instId"`
 	Bar    string   `json:"bar"`

@@ -45,7 +45,7 @@ type Config struct {
 	PaperTrading struct {
 		NotionalUSD   decimal.Decimal `yaml:"notional_usd"`
 		MaxOpenOrders int             `yaml:"max_open_orders"`
-		Bar           string          `yaml:"bar"`
+		Bars          []string        `yaml:"bars"` // candle timeframes to subscribe to, e.g. ["1m", "15m", "1h"]
 		CandleLimit   int             `yaml:"candle_limit"`
 	} `yaml:"paper_trading"`
 
@@ -121,8 +121,8 @@ func Load(path string) (*Config, error) {
 	if cfg.PaperTrading.MaxOpenOrders == 0 {
 		cfg.PaperTrading.MaxOpenOrders = 3
 	}
-	if cfg.PaperTrading.Bar == "" {
-		cfg.PaperTrading.Bar = "1m"
+	if len(cfg.PaperTrading.Bars) == 0 {
+		cfg.PaperTrading.Bars = []string{"1m"}
 	}
 	if cfg.PaperTrading.CandleLimit == 0 {
 		cfg.PaperTrading.CandleLimit = 100
