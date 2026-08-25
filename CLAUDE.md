@@ -229,6 +229,18 @@ enabling/disabling live trading never affects the continuous paper-trading/data-
   — a `Strategy`-shaped adapter around an LLM-based sentiment score. No architecture change needed
   when this is added later, which is why the registry pattern is worth building now instead of a
   single hardcoded strategy path.
+- **Multi-timeframe candles (not yet implemented):** today there's exactly one timeframe end to
+  end — `paper_trading.bar` (config, default `"1m"`) controls the single OKX candle WS
+  subscription (`cmd/ingestor`), the single value ever written to `candles.bar`, and the single
+  series `PaperTrader` evaluates strategies against. A strategy wanting 15m/1h/4h/1d data isn't
+  possible until this is built. Decided approach: subscribe directly to OKX's separate per-
+  timeframe candle channels (`candle15m`, `candle1H`, `candle4H`, `candle1D`, ...) rather than
+  aggregating our own 1m candles — real exchange-confirmed candles, same per-channel pattern
+  already used for 1m, no rollup logic to write/maintain. (TimescaleDB continuous aggregates were
+  considered as an alternative for self-rollup, but direct subscription was preferred to start.)
+  Needs: config takes a list of bars instead of one; ingestor subscribes to all of them per
+  instrument; `PaperTrader` keeps a separate candle window per timeframe; a `Strategy` declares
+  which timeframe(s) it needs (e.g. RSI on 1h while the entry trigger checks 1m).
 
 ## 10. Clean architecture for go-engine
 
@@ -350,6 +362,7 @@ Phase 3 — dashboard:
 - [ ] `panel/` frontend (framework TBD — see open question in chat)
 
 Phase 4 — later/optional:
+- [ ] Multi-timeframe candles (§9) — currently single-timeframe (1m) end to end
 - [ ] User-authored strategy scripting layer (§9)
 - [ ] Sentiment/news agents + signal aggregator (§9, §13)
 - [ ] Evaluate migrating the event bus off Redis Streams if scale demands it (§12)
