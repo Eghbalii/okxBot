@@ -11,15 +11,25 @@ trading:
   pos_mode: "net"         # "net" or "long_short" (hedge mode)
   min_order_usd: 10       # skip rebalancing orders smaller than this
 
-paper_trading:
-  notional_usd: 100
-  max_open_orders: 3
-  bars:                    # candle timeframes to subscribe to; OKX channel names, note casing
+# The always-on data collector (cmd/ingestor): a broad, stable set of timeframes it publishes to
+# Redis 24/7, independent of what any given paper-trading/strategy test run actually evaluates.
+ingestion:
+  bars:                    # OKX channel names, note casing (lowercase m, capital H/D)
     - "1m"
-    - "15m"
+    - "3m"
+    - "5m"
     - "1H"
     - "4H"
     - "1D"
+
+paper_trading:
+  notional_usd: 100
+  max_open_orders: 3
+  # The subset of ingestion.bars this run actually maintains candle windows for and evaluates
+  # strategies against — change this freely per test run without touching the ingestor. Must be a
+  # subset of ingestion.bars above (validated at startup).
+  bars:
+    - "1m"
   candle_limit: 100
 
 risk:

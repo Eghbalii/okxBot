@@ -42,11 +42,23 @@ type Config struct {
 		MinOrderUSD     decimal.Decimal `yaml:"min_order_usd"` // skip rebalancing orders smaller than this
 	} `yaml:"trading"`
 
+	// Ingestion controls cmd/ingestor: the always-on, broad set of candle timeframes it collects
+	// from OKX and publishes to Redis, independent of what any given paper-trading/strategy test
+	// run actually evaluates (see PaperTrading.Bars).
+	Ingestion struct {
+		Bars []string `yaml:"bars"`
+	} `yaml:"ingestion"`
+
 	PaperTrading struct {
 		NotionalUSD   decimal.Decimal `yaml:"notional_usd"`
 		MaxOpenOrders int             `yaml:"max_open_orders"`
-		Bars          []string        `yaml:"bars"` // candle timeframes to subscribe to, e.g. ["1m", "15m", "1h"]
-		CandleLimit   int             `yaml:"candle_limit"`
+		// Bars is the subset of Ingestion.Bars that cmd/paper-trader actually maintains candle
+		// windows for and evaluates strategies against — changeable per test run without
+		// touching the always-on ingestor. Must be a subset of Ingestion.Bars (see
+		// ValidatePaperTradingBars); a bar not being collected by the ingestor has no Redis
+		// stream to consume from.
+		Bars        []string `yaml:"bars"`
+		CandleLimit int      `yaml:"candle_limit"`
 	} `yaml:"paper_trading"`
 
 	Risk struct {
@@ -121,6 +133,9 @@ func Load(path string) (*Config, error) {
 	if cfg.PaperTrading.MaxOpenOrders == 0 {
 		cfg.PaperTrading.MaxOpenOrders = 3
 	}
+	if len(cfg.Ingestion.Bars) == 0 {
+		cfg.Ingestion.Bars = []string{"1m", "3m", "5m", "1H", "4H", "1D"}
+	}
 	if len(cfg.PaperTrading.Bars) == 0 {
 		cfg.PaperTrading.Bars = []string{"1m"}
 	}
@@ -141,6 +156,23 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// ValidatePaperTradingBars confirms every bar in PaperTrading.Bars is also present in
+// Ingestion.Bars — cmd/paper-trader consumes a Redis stream per bar that only exists if
+// cmd/ingestor is actually publishing to it, so a bar outside that set would silently receive no
+// data rather than fail loudly.
+func (c *Config) ValidatePaperTradingBars() error {
+	ingested := make(map[string]bool, len(c.Ingestion.Bars))
+	for _, bar := range c.Ingestion.Bars {
+		ingested[bar] = true
+	}
+	for _, bar := range c.PaperTrading.Bars {
+		if !ingested[bar] {
+			return fmt.Errorf("paper_trading.bars contains %q, which is not in ingestion.bars — the ingestor isn't publishing that timeframe", bar)
+		}
+	}
+	return nil
 }
 
 func envOr(key, fallback string) string {

@@ -58,9 +58,9 @@ func main() {
 	// Candlesticks live on the business WS endpoint in OKX v5, separate from public tickers. One
 	// WS connection + one Redis stream per configured timeframe, so consumers only ever see the
 	// bar they subscribed to and don't need to filter out other timeframes themselves.
-	candlePubs := make(map[string]*stream.Publisher, len(cfg.PaperTrading.Bars))
-	candleClients := make([]*ws.PublicClient, 0, len(cfg.PaperTrading.Bars))
-	for _, bar := range cfg.PaperTrading.Bars {
+	candlePubs := make(map[string]*stream.Publisher, len(cfg.Ingestion.Bars))
+	candleClients := make([]*ws.PublicClient, 0, len(cfg.Ingestion.Bars))
+	for _, bar := range cfg.Ingestion.Bars {
 		bar := bar
 		pub := stream.NewPublisher(cfg.Redis.Addr, "okx:candles:"+bar)
 		candlePubs[bar] = pub
@@ -89,7 +89,7 @@ func main() {
 		})
 	}
 
-	logger.Info("starting okx ingestor", "instIds", cfg.Trading.InstIDs, "bars", cfg.PaperTrading.Bars)
+	logger.Info("starting okx ingestor", "instIds", cfg.Trading.InstIDs, "bars", cfg.Ingestion.Bars)
 
 	errCh := make(chan error, 1+len(candleClients))
 	go func() { errCh <- tickerClient.Run(ctx) }()
