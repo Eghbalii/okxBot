@@ -34,6 +34,18 @@ class TrainConfig:
 
 
 @dataclass
+class WarmStartConfig:
+    """CLAUDE.md §15.8: warm-start replay training config — initialization only, not a
+    backtest/evaluation. See rl_service/env/replay_env.py's module docstring."""
+
+    inst_ids: list[str] = field(default_factory=lambda: ["BTC-USDT-SWAP"])
+    bar: str = "1m"
+    total_timesteps: int = 50_000
+    model_out: str = "models/ppo_global.zip"
+    initial_equity_usd: float = 10.0  # CLAUDE.md §15.6: matches the real per-token paper budget
+
+
+@dataclass
 class ServeConfig:
     model_path: str = "models/ppo_okx_futures.zip"
     host: str = "0.0.0.0"
@@ -45,6 +57,7 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    warm_start: WarmStartConfig = field(default_factory=WarmStartConfig)
     serve: ServeConfig = field(default_factory=ServeConfig)
 
 
@@ -61,5 +74,6 @@ def load_config(path: str | None = None) -> Config:
         data=DataConfig(**raw.get("data", {})),
         env=EnvConfig(**raw.get("env", {})),
         train=TrainConfig(**raw.get("train", {})),
+        warm_start=WarmStartConfig(**raw.get("warm_start", {})),
         serve=ServeConfig(**raw.get("serve", {})),
     )

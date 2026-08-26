@@ -21,12 +21,17 @@ services:
     build: ./rl-service
     environment:
       CONFIG_PATH: /app/configs/config.yaml
+      # CLAUDE.md §15.8: train.py --warm-start reads candles/paper_orders from the same Postgres
+      # go-engine writes to; the serving container itself never queries Postgres (only /predict).
+      POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
     volumes:
       - ./rl-service/configs:/app/configs
       - ./rl-service/models:/app/models
       - ./rl-service/data:/app/data
     ports:
       - "8000:8000"
+    depends_on:
+      - timescaledb
 
   ingestor:
     build:

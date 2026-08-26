@@ -3,7 +3,8 @@ data:
 
 env:
   window_size: 32
-  max_leverage: 5.0
+  # CLAUDE.md §15.4: matches go-engine's risk.max_leverage ceiling.
+  max_leverage: 100.0
   max_position_notional_usd: 1000.0
   taker_fee_rate: 0.0005
   funding_rate_per_8h: 0.0001
@@ -15,7 +16,18 @@ train:
   total_timesteps: 500000
   model_out: "models/ppo_okx_futures.zip"
 
+# CLAUDE.md §15.8: warm-start replay training (`python -m rl_service.train --warm-start`) —
+# initialization only against real historical market data already in Postgres, not the deployed
+# model's actual training path (that's live paper-trading). Requires POSTGRES_DSN reachable.
+warm_start:
+  inst_ids:
+    - "BTC-USDT-SWAP"
+  bar: "1m"
+  total_timesteps: 50000
+  model_out: "models/ppo_global.zip"
+  initial_equity_usd: 10.0 # CLAUDE.md §15.6: matches the real per-token paper budget
+
 serve:
-  model_path: "models/ppo_okx_futures.zip"
+  model_path: "models/ppo_global.zip"
   host: "0.0.0.0"
   port: 8000
