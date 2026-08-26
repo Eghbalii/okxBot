@@ -8,3 +8,4 @@ uvicorn[standard]>=0.29
 pydantic>=2.6
 requests>=2.31
 PyYAML>=6.0
+psycopg2-binary>=2.9
