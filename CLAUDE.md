@@ -410,10 +410,9 @@ number/complexity of LLM-based agents grows enough to justify the dependency.
 
 Phases 0-1 (architecture, OKX REST/WS clients, Postgres/TimescaleDB persistence, strategy
 interface, Paper Trading Engine, Prometheus/Grafana metrics) are complete — see git history for
-details. One Phase 1 item remains open, tracked here since it's blocked on external state rather
-than done:
-- [ ] Repoint `rl_service/train.py` at the paper-trading trade log instead of historical replay
-      (blocked on accumulating real paper-trading data first)
+details. The one Phase 1 item that was open here (repointing `train.py` at the paper-trading log)
+is now folded into Phase 5 (§15.8) below, since it's meaningless to do in isolation from the
+per-token training design.
 
 Paper-trading data flow (current design): the ingestor subscribes to
 OKX's public `tickers` channel and business `candle{bar}` channel over a single WS connection
@@ -509,4 +508,257 @@ Phase 4 — later/optional:
 - [ ] Sentiment/news agents + signal aggregator (§9, §13)
 - [ ] Evaluate migrating the event bus off Redis Streams if scale demands it (§12)
 
+Phase 5 — global RL agent over price + strategy signals (§15, current phase):
+- [x] Extend `strategy.Signal`/`domain.Observation`/`rlclient.Action`/`rl_service` Pydantic
+      schemas for the first round of new fields: per-timeframe strategy-signal blocks,
+      recent-performance tail, `strategy_weights`, `sl_adjust_pct`/`tp_adjust_pct`
+      (`schema_version` 2) — done before the global-agent/raw-price-context revision below; still
+      needs the v3 follow-up item just below.
+- [ ] Bump observation schema to v3: add token-identity one-hot and raw-price-context fields (close
+      price series as normalized returns, distance-to-swing-high/low, distance-to-key-MA,
+      distance-to-open-position-SL/TP) per §15.3's revision — land together with the version bump,
+      not separately, per §15.3's explicit instruction
+- [ ] Raise `MAX_LEVERAGE`/`risk.max_leverage` config defaults toward the 10x-100x target range,
+      confirm §5's hard risk caps still independently bound worst case (§15.4)
+- [ ] Go-side ratchet clamp on SL/TP adjustments (only tighten toward locking profit, never widen)
+      (§15.4)
+- [ ] Per-token budget tracking + zero/negative reset-with-logging (paper/demo mode only) (§15.7)
+- [ ] Wire Phase A (BTC + XAU-equivalent instId, ≤5 strategies, 5m/15m/1h) end-to-end with a
+      still-untrained/no-op model before touching training (§15.9)
+- [ ] Persist the actual observation vector sent at decision time (not just the outcome) alongside
+      `paper_orders`, so `train.py` has real offline RL training data (§15.8)
+- [ ] Repoint `train.py` at the pooled paper-trading log across active tokens, producing one
+      `models/ppo_global.zip` (§15.8) — supersedes the older single open item below, which is now
+      folded into this phase
+- [ ] `rl_service/serve/api.py`: load the single global model, route `/predict` for every token
+      through it (token identity as an observation field, not a model-selection key),
+      reject/handle observation-schema-version mismatches (§15.3, §15.8)
+- [ ] Per-token reward/PnL breakdown in training logs (not just aggregate) — the concrete detection
+      mechanism for the "good on average, bad for one token" failure mode (§15.2, §15.5); required
+      before Phase B expands token count
+
 Update the checklist above as work progresses.
+
+## 15. RL training architecture: one global agent, reasoning over price + strategy signals
+
+This section is the concrete design for turning the frozen/no-op RL service (§2, §11.2) into an
+actually-trained decision-maker. Decided 2026-08-26, **revised 2026-08-26** (same day: the
+original per-token-agent framing was replaced by a single global agent after a design discussion —
+see §15.1's "Rejected/superseded" note for why, kept rather than deleted since the tradeoff
+reasoning is still relevant if per-token agents are revisited later at higher token counts).
+Revisit only with an explicit reason (new hardware, materially more paper-trading data, or
+evidence a design assumption below was wrong).
+
+### 15.1 Core decision: one single global PPO agent, not one per token
+
+Explicit product decision, superseding the original "one PPO per token" framing from earlier the
+same day: **one shared policy, trained on the pooled experience of every active token, with token
+identity as an observation input** rather than a separate model per token.
+
+Why the switch: the per-token design was chosen primarily to solve credit-assignment /
+specialization concerns, but at the actual data volumes here (tens of paper trades/day per token
+in Phase A with only 2 tokens live) per-token agents are each individually data-starved, and a
+single agent pooling all tokens' experience learns meaningfully faster and can transfer general
+patterns (e.g. "reduce leverage in high volatility") across tokens before any one token has
+produced much experience on its own. The specialization loss this trades away (a shared policy
+converging toward "good on average" rather than "excellent per token," especially early in
+training before the token-identity input is meaningfully learned) is an accepted, explicit
+tradeoff for Phase A — not an oversight. Revisit toward per-token (or a warm-started/fine-tuned
+hybrid — pretrain global, then fine-tune per-token copies from those weights) once (a) enough
+tokens are live that pooled-vs-per-token data volume no longer favors pooling, or (b) evidence
+shows the global agent's per-token performance (tracked individually, not just in aggregate — see
+§15.5) is diverging in a way that hurts a specific token.
+
+**What did NOT change**: strategies are still "a tool the agent uses," never the decision-maker
+themselves — see §15.3's raw-price-context addition, which is a separate, related correction (the
+observation must let the agent reason about price action directly, not only through strategies'
+interpretation of it) made in the same revision.
+
+**Resource math**: SB3 PPO's memory/CPU cost is dominated by the rollout buffer and parallel envs
+*during an active training update* (`n_steps × n_envs` transitions resident, ~1 core saturated),
+not by how many trained policies exist on disk or serve inference — a loaded-for-inference-only
+PPO policy (small-to-medium MLP given the wider price-context observation, §15.3) costs well under
+1GB RAM and near-zero CPU per `/predict` call. One global agent training is trivially affordable on
+8 cores/16GB; this was never the binding constraint even under the per-token design (which fit
+too, just with more moving parts) — the real reason for the switch is sample efficiency, not
+resource limits.
+
+### 15.2 Phased rollout (start small, expand only with evidence)
+
+- **Phase A (start here):** 2 tokens (BTC-USDT-SWAP, XAU or its OKX equivalent instrument — verify
+  the exact `instId` exists on OKX SWAP before wiring it in), ≤5 of the 12 strategies (pick the
+  ones with the cleanest/most orthogonal signals — e.g. avoid shipping two near-duplicate
+  moving-average-cross variants both in the initial 5), all 3 timeframes (5m, 15m, 1h) folded into
+  the one global agent's observation, token identity as an explicit input field (one-hot over
+  active tokens is enough at this scale — a learned embedding is unnecessary complexity for 2-10
+  tokens). One model: `models/ppo_global.zip`.
+- **Phase B:** expand token count toward the full ~10-token roster and/or the full 12-strategy
+  roster, gated on the global agent showing real learning signal (reward trending up **per token**,
+  not just in aggregate — §15.5) before adding more tokens on top of it.
+- Watch specifically for the failure mode described in §15.1: aggregate reward improving while one
+  token's individual performance degrades (e.g. a dominant-volume token's patterns overwriting a
+  smaller token's). This is the concrete signal that would justify revisiting per-token or a
+  fine-tuned-per-token-from-global-weights approach — don't wait for it to become an obvious loss
+  before checking per-token breakdowns.
+- Do not add a 4th timeframe or expand tokens/strategies "just because it's easy" — each addition
+  grows the one global agent's observation width (§15.3) and the strategy-selection action width
+  (§15.4); re-validate resource usage and per-token reward breakdown after each expansion, not just
+  once at the end.
+
+### 15.3 Observation space (one global agent, per inference call)
+
+One flattened vector, built by `go-engine/internal/rlclient` from live state and sent to
+`POST /predict` (extending the existing `domain.Observation`/rlclient.Action shapes, §11.2 — the
+schema on both sides must stay in sync, same as today):
+- **Token identity**: one-hot over the currently active token roster (Phase A: 2 slots) — this is
+  what lets one shared policy still condition its behavior per token.
+- **Raw price context** (added in this revision — see rationale below): a recent window of close
+  prices per active timeframe, normalized as returns (not raw dollar values, which don't
+  generalize across price regimes/tokens) — e.g. the last N closes' pct-change series. This sits
+  *alongside*, not instead of, the derived features below, and exists specifically so the agent can
+  reason about price action/shape on its own, independent of what any strategy chose to report.
+  Also include a couple of cheap positional/distance features (distance from current price to
+  recent swing high/low, distance to key moving averages, distance to the open position's own
+  SL/TP) — cheap proxies for "how close is price to a level a discretionary trader would watch,"
+  the kind of context a junior trader watching candles picks up visually.
+- **Per-timeframe strategy signal block**, repeated for each active timeframe (5m/15m/1h in Phase
+  A): for each assigned strategy — `Side` (encoded -1/0/1), `Confidence`, `SLPct`, `TPPct` (already
+  emitted by `strategy.Signal`, §9) — plus that timeframe's own derived volatility/momentum
+  features (reuse `rl_service/data/features.py`'s `FEATURE_COLUMNS`). Strategies remain **one input
+  among several**, not the sole gate on what the agent can see or act on — the agent must be able
+  to weigh raw price action against what a strategy is saying, including disagreeing with every
+  strategy, which requires the raw-price-context field above to actually exist.
+- **Account/position tail**: current exposure, current leverage, unrealized PnL %, equity ratio for
+  *this token's* allocated sub-budget (§15.6) — not total account equity, since per-token reward
+  attribution (§15.5) requires the agent to see the capital constraint it's actually operating
+  under for that token, even though one policy serves all tokens.
+- **Recent-performance-of-this-token tail** (needed for §15.7's "give it another chance" behavior
+  to be learnable rather than hardcoded): a short rolling window of this token's own recent
+  realized trade outcomes (e.g. last N paper_orders' PnL, win/loss) and time-since-last-loss — lets
+  the agent itself learn to size down after a losing streak and back up after recovery, per token,
+  despite sharing one policy.
+- **Live mid-price** (`MidPrice`, unchanged from the original design): always present, always the
+  current tick price — required for SL/TP-adjust decisions and PnL math regardless of any of the
+  above. This was already correctly wired before this revision; not a new addition.
+
+Keep the observation schema **additive and versioned** (`schema_version`, already implemented in
+`ObservationSchemaVersion`/`OBSERVATION_SCHEMA_VERSION`) — Phase B's timeframe/strategy/token
+expansion will change the vector width, and `/predict` rejects a shape it wasn't trained for
+(already implemented as a 422 in `rl_service/serve/api.py`) rather than silently misaligning
+features, which would corrupt training invisibly. Bump the version again once the raw-price-context
+fields land in code (this revision moves the design from v2 to a v3 shape — implementation should
+land the version bump together with the field changes, not separately).
+
+### 15.4 Action space (per-request output, one shared policy)
+
+Today's `Action{TargetExposure, LeverageFrac, Confidence}` (§2) becomes, per token:
+1. **`strategy_weights`**: one continuous value per assigned strategy (softmax'd or clamped to
+   [0,1] and normalized) — how much the agent trusts each strategy's current signal *right now*,
+   combined with each strategy's `Confidence` to produce a single effective directional signal.
+   This is what "combine the signal of multiple strategies" (per your original ask) resolves to
+   concretely: a learned weighting, not a fixed voting rule.
+2. **`target_exposure`** (unchanged, [-1, 1]): resulting position as a fraction of *this token's*
+   max allowed notional, sign = side.
+3. **`leverage_frac`** (unchanged, [0, 1]): mapped to `[1x, MAX_LEVERAGE]` — note your target range
+   is 10x-100x, materially higher than the current `EnvConfig.max_leverage` default of 5.0 and
+   `config.example.yaml`'s `risk.max_leverage: 5`; both must be raised together for Phase A,
+   understanding that §5's hard risk caps (independent of RL, Go-side, non-overridable) are what
+   actually bound worst-case loss — the RL agent proposing up to 100x is safe only because those
+   caps clamp it, never trust the agent's own leverage choice as the safety boundary.
+4. **`sl_adjust_pct`, `tp_adjust_pct`** (new, continuous, both allowed negative/positive within a
+   clamped range e.g. ±2% per decision step): in-trade adjustments to the *open* position's SL/TP,
+   evaluated on the same cadence as `monitorOpenOrders` (every tick) or throttled to e.g. once per
+   candle close to avoid overreacting to noise — start with candle-close cadence in Phase A, tick
+   cadence is a possible later tightening once the behavior is validated. This is what "trail SL
+   into profit when safe" (per your ask) resolves to: not a hardcoded trailing-stop rule, but a
+   learned adjustment the agent proposes and the reward function (§15.5) judges after the fact via
+   whether it improved or hurt realized outcomes — exactly as you asked ("it should be screened by
+   the model and trained, is it good or not").
+   - Hard constraint regardless of what the agent proposes: an SL adjustment can never *widen* risk
+     past the position's original risk budget, and can never move SL to a worse (more losing) price
+     than a prior tightening already reached — i.e. only ratchet toward locking in profit / reducing
+     risk, never away from it. Enforce this as a Go-side clamp in the execution path (`internal/risk`
+     or the paper-trader's order-update path), the same non-negotiable pattern as §5's other hard
+     limits — don't rely on the trained policy alone to have learned not to do this.
+
+### 15.5 Reward shaping
+
+Extends the existing `okx_futures_env.py` shaping (realized PnL − fee/funding − drawdown penalty −
+liquidation-proximity penalty, §2) with:
+- A small penalty on `sl_adjust_pct`/`tp_adjust_pct` churn (e.g. proportional to the number of
+  adjustments per trade) so the agent doesn't learn to twitch the SL every tick for free — every
+  adjustment should earn its keep in realized outcome, not be free to try.
+- The per-step/per-trade reward the global agent actually trains on is still computed **per
+  token** (that token's own realized PnL/equity, not a blended cross-token number) — this doesn't
+  change under the global-agent design (§15.1); pooling happens at the *training data* level (all
+  tokens' transitions go into one shared policy update), not at the *reward computation* level.
+  Conflating these two would make a profitable BTC trade mask a losing XAU trade in the numbers
+  the agent sees for that XAU transition, which defeats the point of tracking reward at all.
+- **Required monitoring, not just training-time reward**: because one policy now serves every
+  token, track and log realized PnL / reward **broken out per token** (not only the aggregate
+  training curve) from day one — this is the concrete mechanism for detecting the "good on average,
+  bad for one token" failure mode §15.1/§15.2 call out. Surfacing this on the panel (§11) is a
+  reasonable later addition; at minimum it must be visible in training logs before Phase B expands
+  token count.
+
+### 15.6 Capital allocation across tokens
+
+**Fixed, not learned, in Phase A**: config-level per-token notional (your stated $10/token against
+a <$50 total budget), not a decision the RL agent makes. Rejected letting even the (now single,
+shared) agent dynamically reallocate capital across tokens for Phase A specifically because it
+would make the per-token reward signal (§15.5) depend on a capital-allocation decision made from
+the same pooled policy update — moving capital away from a temporarily-losing-but-still-learning
+token would starve it of the very trades it needs to keep contributing to the shared policy's
+training data, compounding rather than isolating a bad early streak. This is an explicit "later"
+item (add a §14 roadmap entry only once there's a real per-token track record to allocate against),
+not a "we'll get to it eventually, unscoped."
+
+### 15.7 Handling a token's budget going to zero/negative ("give it another chance")
+
+Per your explicit ask: a token whose $10 sub-budget is drawn down to zero (or below, if fees push
+it negative) must not be permanently benched — it should get reset and get another shot, since a
+losing streak early in training is expected/noisy, not necessarily evidence the token/strategy mix
+is bad. Concretely:
+- Track equity **per token**, not just per paper order (a new small piece of state — likely a
+  `token_budgets` table or a computed running value from that token's `paper_orders`, TBD at
+  implementation time) so "this token is at zero" is a fact the system can act on.
+  - The recent-performance tail in the observation (§15.3) is what lets the *agent itself* learn to
+    size down approaching zero, rather than needing a hardcoded halt.
+- **Reset condition** (a hard Go-side rule, not RL-decided — this is a bookkeeping/risk-adjacent
+  action, same "don't trust the model to have learned this" reasoning as §15.4's ratchet
+  constraint): when a token's running budget hits zero/negative, top it back up to the configured
+  per-token notional and record the reset (so training-run analysis can see how often this
+  happens, and it doesn't look like unlimited free money if it resets constantly with no
+  learning — a token resetting every day is itself a signal something's wrong with that
+  token/strategy mix, worth surfacing on the panel eventually, not just silently papering over).
+- This is paper/demo-mode behavior. Real-money trading (§14, not yet wired) must NOT auto-reset a
+  drained budget the same way — that's real capital, and running out is a stop condition requiring
+  a human decision, not an automatic top-up. Keep this distinction explicit whenever real-mode
+  wiring happens; don't let the paper-mode reset logic leak into the real-mode path by accident.
+
+### 15.8 Training loop shape
+
+Per §2's existing decision (forward-test data, not historical replay — unchanged, this section
+doesn't revisit that): `rl_service/train.py` currently targets historical replay via
+`okx_futures_env.py` and is not yet repointed at the paper-trading log (§14's one open Phase-1
+item). This section's design assumes that repointing happens as part of implementing §15, since
+"train the global PPO agent on paper-trading outcomes" is meaningless without it. Concretely:
+`train.py` loads **all active tokens'** `paper_orders` + the observation/action history logged
+alongside them (§15.3's schema needs the *actual observation vector sent at decision time*
+persisted, not just the outcome — likely extending `paper_orders.features_json` or a new table,
+TBD at implementation), pooled into one offline RL-style training set (token identity comes along
+as one of the observation fields, §15.3 — no per-token filtering at training time), and produces
+one `models/ppo_global.zip`, loaded by `rl_service/serve/api.py` and used to answer every token's
+`/predict` calls (the request's `inst_id` selects which token-identity input to set, not which
+model to load — see §15.1 for why this is one shared policy rather than per-token model files).
+
+### 15.9 Implementation phasing (tracked in §14 going forward)
+
+This section is design; §14's checklist is where actual implementation progress against it is
+tracked. The first concrete slice: extend `strategy.Signal`/`domain.Observation`/`rlclient.Action`
+for the new fields (§15.3-15.4, including the raw-price-context fields and token-identity one-hot
+from this revision), then wire Phase A's 2 tokens end-to-end (signal → observation → `/predict`
+with a still-untrained/no-op model → paper order → SL/TP-adjust path → per-token budget/reset
+bookkeeping) before touching `train.py` — get the full loop running with a no-op model first
+(matching the existing fail-safe pattern in `rl_service/serve/api.py`), same incremental-and-
+verified approach used for every phase so far (§14).
