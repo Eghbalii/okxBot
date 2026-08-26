@@ -2,9 +2,11 @@ import type {
   ModelStatus,
   Position,
   PositionMode,
+  SLTPAdjustmentPair,
   StrategyAssignment,
   StrategyConfig,
   StrategyStats,
+  VariantStats,
 } from './types'
 
 // Same-origin in production (the panel is served from behind the OpenVPN-only cmd/api host, per
@@ -109,6 +111,20 @@ export const api = {
     if (opts?.sortBy) params.set('sortBy', opts.sortBy)
     if (opts?.sortDesc) params.set('sortDesc', 'true')
     return requestList<Position>(`/positions?${params}`)
+  },
+
+  // Baseline-vs-rl_adjusted A/B comparison (CLAUDE.md §15.4). `since` is an RFC3339 timestamp
+  // (e.g. `new Date(Date.now() - 7*86400e3).toISOString()` for "the last week").
+  sltpAdjustmentStats: (opts?: { instId?: string; since?: string }) => {
+    const params = new URLSearchParams()
+    if (opts?.instId) params.set('instId', opts.instId)
+    if (opts?.since) params.set('since', opts.since)
+    return requestList<VariantStats>(`/sltp-adjustments/stats?${params}`)
+  },
+  sltpAdjustmentPairs: (opts?: { instId?: string }) => {
+    const params = new URLSearchParams()
+    if (opts?.instId) params.set('instId', opts.instId)
+    return requestList<SLTPAdjustmentPair>(`/sltp-adjustments/pairs?${params}`)
   },
 }
 

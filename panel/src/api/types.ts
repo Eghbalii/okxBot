@@ -50,6 +50,26 @@ export interface Position {
   ClosePx: string | null
   RealizedPnL: string | null
   Mode: PositionMode
+  // ParentOrderID/Variant implement the SL/TP shadow-fork mechanic (CLAUDE.md §15.4): a
+  // 'rl_adjusted' row is a linked copy of its 'baseline' parent carrying an RL-proposed SL/TP
+  // adjustment, tracked to completion for later comparison rather than editing the parent in place.
+  ParentOrderID: number | null
+  Variant: 'baseline' | 'rl_adjusted' | ''
+}
+
+// VariantStats/SLTPAdjustmentPair back the baseline-vs-rl_adjusted A/B comparison (CLAUDE.md §15.4).
+export interface VariantStats {
+  Variant: 'baseline' | 'rl_adjusted'
+  ClosedCount: number
+  Wins: number
+  Losses: number
+  RealizedPnL: string
+}
+
+export interface SLTPAdjustmentPair {
+  InstID: string
+  BaselineOrder: Position
+  RLAdjustedOrder: Position
 }
 
 export interface RLHealth {

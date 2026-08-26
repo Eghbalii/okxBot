@@ -95,6 +95,17 @@ body {
   gap: 1rem;
 }
 
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.stat-row:last-child {
+  border-bottom: none;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
