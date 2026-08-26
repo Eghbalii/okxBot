@@ -1,0 +1,112 @@
+//  TASC Issue: August 2026
+//     Article: Identifying The Best Price Levels For 
+//               Selling Commodity Futures
+//              An Ag Selling Model
+//  Article By: Perry J Kaufman
+//    Language: TradingView's Pine Script® v6
+// Provided By: PineCoders, for tradingview.com
+
+
+//@version=6
+string TITLE      = "TASC 2026.08 An Ag Selling Model"
+string SHORTTITLE = "ASM"
+
+strategy(
+    TITLE, SHORTTITLE, true, 
+    initial_capital = 15000000,
+    pyramiding = 3,
+    slippage = 1,
+    commission_type = strategy.commission.cash_per_contract,
+    commission_value = 300
+)
+
+
+//#region --- Inputs ---
+
+string G1 = "Average & sell level settings"
+float src      = input.source(close, "Source", group = G1)
+int   len      = input.int(40, "MA length", group = G1)
+int   atrLen   = input.int(20, "ATR length", group = G1)
+float atrMulti = input.float(2.5, "ATR factor", group = G1)
+
+string G2 = "Strategy settings"
+int startCropYear = input.int(
+    11, "Month of harvest", 1, 12, group = G2
+)
+int delayMonths = input.int(
+    2, "Delay in months after harvest", 0, 11, group = G2
+)
+int dBetween = input.int(
+    30, "Days between trades", 1, group = G2
+)
+//#endregion
+
+
+//#region --- Strategy logic ---
+
+// State-tracking variables
+var bool active = false
+var int  dSince = 0
+// Count the days since the last sale.
+if strategy.opentrades > 0
+    dSince += 1
+
+// Calculate the average and sell levels.
+float trend     = ta.sma(src, len)
+float atr       = ta.atr(atrLen)
+float sellLevel = trend + atr * atrMulti
+
+// @variable `true` on harvest month, `false` otherwise.
+bool isHarvestMonth = month == startCropYear
+// @variable `true` on the first bar in the crop year.
+bool newCropYr = isHarvestMonth and not isHarvestMonth[1]
+// @variable The month where sales begin.
+int beginSaleMonth = (startCropYear + delayMonths + 1) % 12
+if beginSaleMonth == 0
+    beginSaleMonth := 12
+
+// Reset state-tracking variables when new harvest begins.
+if newCropYr
+    active := false
+    dSince := 0
+
+// Allow trades starting on the target month.
+if month == beginSaleMonth and month[1] != beginSaleMonth
+    active := true
+
+// Place entry orders in the active period, up to the 
+// specified limit, on bars whose `high` value is above 
+// the sell level.
+if active and high >= sellLevel
+    if strategy.opentrades == 0
+        strategy.entry("First sale", strategy.short)
+        dSince := 0
+    else if dSince >= dBetween
+        strategy.entry("Sell", strategy.short)
+        dSince := 0
+
+// Close all open trades at harvest.
+if not active
+    strategy.close_all("Cover")
+//#endregion
+
+
+//#region --- Visuals ---
+
+// Background highlights
+bgcolor(
+    newCropYr ? color.rgb(255, 255, 255, 50) : na, 
+    title = "New crop year"
+)
+bgcolor(
+    isHarvestMonth ? #ffeb3b1a : na, 
+    title = "Harvest month"
+)
+bgcolor(
+    active and not isHarvestMonth ? na : #ff52521a, 
+    title = "No trades allowed"
+)
+// Average and sell levels
+plot(trend, "Average", color.orange)
+plot(sellLevel, "Sell level", color.blue)
+//#endregion
