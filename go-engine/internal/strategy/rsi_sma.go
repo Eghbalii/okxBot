@@ -31,6 +31,41 @@ func NewRSISMA(rsiPeriod, smaPeriod int) *RSISMA {
 
 func (s *RSISMA) Name() string { return "rsi_sma" }
 
+func (s *RSISMA) Params() []ParamSpec {
+	return []ParamSpec{
+		{Name: "rsi_period", Default: decimal.NewFromInt(int64(s.RSIPeriod)), Min: decimal.NewFromInt(2), Max: decimal.NewFromInt(100)},
+		{Name: "sma_period", Default: decimal.NewFromInt(int64(s.SMAPeriod)), Min: decimal.NewFromInt(2), Max: decimal.NewFromInt(300)},
+		{Name: "oversold_max", Default: s.OversoldMax, Min: decimal.NewFromInt(1), Max: decimal.NewFromInt(49)},
+		{Name: "overbought_min", Default: s.OverboughtMin, Min: decimal.NewFromInt(51), Max: decimal.NewFromInt(99)},
+		{Name: "sl_pct", Default: s.SLPct, Min: decimal.NewFromFloat(0.001), Max: decimal.NewFromFloat(0.2)},
+		{Name: "tp_pct", Default: s.TPPct, Min: decimal.NewFromFloat(0.001), Max: decimal.NewFromFloat(0.5)},
+	}
+}
+
+func (s *RSISMA) WithParams(values map[string]decimal.Decimal) Strategy {
+	cp := *s
+	specByName := paramsByName(s.Params())
+	if v, ok := values["rsi_period"]; ok {
+		cp.RSIPeriod = int(ClampParam(specByName["rsi_period"], v).IntPart())
+	}
+	if v, ok := values["sma_period"]; ok {
+		cp.SMAPeriod = int(ClampParam(specByName["sma_period"], v).IntPart())
+	}
+	if v, ok := values["oversold_max"]; ok {
+		cp.OversoldMax = ClampParam(specByName["oversold_max"], v)
+	}
+	if v, ok := values["overbought_min"]; ok {
+		cp.OverboughtMin = ClampParam(specByName["overbought_min"], v)
+	}
+	if v, ok := values["sl_pct"]; ok {
+		cp.SLPct = ClampParam(specByName["sl_pct"], v)
+	}
+	if v, ok := values["tp_pct"]; ok {
+		cp.TPPct = ClampParam(specByName["tp_pct"], v)
+	}
+	return &cp
+}
+
 func (s *RSISMA) Evaluate(candles []Candle) (Signal, error) {
 	rsi, err := RSI(candles, s.RSIPeriod)
 	if err != nil {

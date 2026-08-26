@@ -251,7 +251,9 @@ func TestMonitorOpenOrders_ClosesOnSLHit(t *testing.T) {
 // stubStrategy always returns the configured signal, ignoring the candle input.
 type stubStrategy struct{ signal strategy.Signal }
 
-func (s *stubStrategy) Name() string { return "stub" }
+func (s *stubStrategy) Name() string                                            { return "stub" }
+func (s *stubStrategy) Params() []strategy.ParamSpec                            { return nil }
+func (s *stubStrategy) WithParams(map[string]decimal.Decimal) strategy.Strategy { return s }
 func (s *stubStrategy) Evaluate(candles []strategy.Candle) (strategy.Signal, error) {
 	return s.signal, nil
 }
