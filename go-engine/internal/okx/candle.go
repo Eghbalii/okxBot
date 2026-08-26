@@ -2,6 +2,8 @@ package okx
 
 import (
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/shopspring/decimal"
 
@@ -43,5 +45,12 @@ func (c Candle) ToDomain() (domain.Candle, error) {
 	if err != nil {
 		return domain.Candle{}, fmt.Errorf("parse vol %q: %w", c.Vol, err)
 	}
-	return domain.Candle{Open: open, High: high, Low: low, Close: closePx, Volume: vol}, nil
+	ms, err := strconv.ParseInt(c.Ts, 10, 64)
+	if err != nil {
+		return domain.Candle{}, fmt.Errorf("parse ts %q: %w", c.Ts, err)
+	}
+	return domain.Candle{
+		Timestamp: time.UnixMilli(ms).UTC(),
+		Open:      open, High: high, Low: low, Close: closePx, Volume: vol,
+	}, nil
 }

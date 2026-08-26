@@ -15,9 +15,9 @@ func (r *Repository) SaveCandle(ctx context.Context, c port.Candle) error {
 		ON CONFLICT (inst_id, bar, ts) DO UPDATE SET
 			open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
 			close = EXCLUDED.close, volume = EXCLUDED.volume
-	`, c.InstID, c.Bar, c.Ts, c.Open, c.High, c.Low, c.Close, c.Volume)
+	`, c.InstID, c.Bar, c.Timestamp, c.Open, c.High, c.Low, c.Close, c.Volume)
 	if err != nil {
-		return fmt.Errorf("save candle %s/%s@%s: %w", c.InstID, c.Bar, c.Ts, err)
+		return fmt.Errorf("save candle %s/%s@%s: %w", c.InstID, c.Bar, c.Timestamp, err)
 	}
 	return nil
 }

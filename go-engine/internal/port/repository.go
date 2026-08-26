@@ -12,12 +12,11 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 )
 
-// Candle is one persisted OHLCV bar for an instrument (domain.Candle plus storage identity/key
-// fields).
+// Candle is one persisted OHLCV bar for an instrument (domain.Candle plus storage identity
+// fields). The bar's timestamp lives on the embedded domain.Candle.Timestamp.
 type Candle struct {
 	InstID string
 	Bar    string
-	Ts     time.Time
 	domain.Candle
 }
 

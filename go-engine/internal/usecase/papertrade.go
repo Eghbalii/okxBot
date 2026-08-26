@@ -151,7 +151,7 @@ func (e *PaperTrader) handleCandle(ctx context.Context, bar string, data []byte,
 	if len(event.Candle) >= 9 {
 		confirm = event.Candle[8]
 	}
-	c, err := parseCandleFields(event.Candle[1], event.Candle[2], event.Candle[3], event.Candle[4], event.Candle[5])
+	c, err := parseCandleFields(event.Candle[0], event.Candle[1], event.Candle[2], event.Candle[3], event.Candle[4], event.Candle[5])
 	if err != nil {
 		return fmt.Errorf("parse candle (bar %s): %w", bar, err)
 	}
@@ -167,8 +167,7 @@ func (e *PaperTrader) handleCandle(ctx context.Context, bar string, data []byte,
 	if confirm != "1" {
 		return nil // still forming; wait for the finalized bar before persisting/evaluating
 	}
-	ms, _ := strconv.ParseInt(event.Candle[0], 10, 64)
-	if err := e.Repo.SaveCandle(ctx, port.Candle{InstID: e.InstID, Bar: bar, Ts: time.UnixMilli(ms).UTC(), Candle: c}); err != nil {
+	if err := e.Repo.SaveCandle(ctx, port.Candle{InstID: e.InstID, Bar: bar, Candle: c}); err != nil {
 		logger.Warn("failed to persist candle", "instId", e.InstID, "bar", bar, "error", err)
 	}
 	return e.evaluateStrategies(ctx, bar, c.Close, logger)
@@ -295,7 +294,11 @@ func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signa
 	}
 }
 
-func parseCandleFields(open, high, low, close, vol string) (domain.Candle, error) {
+func parseCandleFields(ts, open, high, low, close, vol string) (domain.Candle, error) {
+	ms, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return domain.Candle{}, fmt.Errorf("parse ts %q: %w", ts, err)
+	}
 	o, err := decimal.NewFromString(open)
 	if err != nil {
 		return domain.Candle{}, fmt.Errorf("parse open %q: %w", open, err)
@@ -316,5 +319,5 @@ func parseCandleFields(open, high, low, close, vol string) (domain.Candle, error
 	if err != nil {
 		return domain.Candle{}, fmt.Errorf("parse vol %q: %w", vol, err)
 	}
-	return domain.Candle{Open: o, High: h, Low: l, Close: c, Volume: v}, nil
+	return domain.Candle{Timestamp: time.UnixMilli(ms).UTC(), Open: o, High: h, Low: l, Close: c, Volume: v}, nil
 }
