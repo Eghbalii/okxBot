@@ -37,7 +37,31 @@ func (r *fakeRepository) SaveCandle(ctx context.Context, c port.Candle) error {
 func (r *fakeRepository) CreateStrategy(ctx context.Context, s port.StrategyConfig) (int64, error) {
 	return 0, nil
 }
+func (r *fakeRepository) GetStrategy(ctx context.Context, id int64) (port.StrategyConfig, error) {
+	return port.StrategyConfig{}, nil
+}
 func (r *fakeRepository) ListStrategies(ctx context.Context, instID string, enabledOnly bool) ([]port.StrategyConfig, error) {
+	return nil, nil
+}
+func (r *fakeRepository) UpdateStrategyConfig(ctx context.Context, id int64, config json.RawMessage, enabled bool) error {
+	return nil
+}
+func (r *fakeRepository) DeleteStrategy(ctx context.Context, id int64) error        { return nil }
+func (r *fakeRepository) ResetStrategyToOrigin(ctx context.Context, id int64) error { return nil }
+func (r *fakeRepository) CreateAssignment(ctx context.Context, a port.StrategyAssignment) (int64, error) {
+	return 0, nil
+}
+func (r *fakeRepository) ListAssignments(ctx context.Context, instID string, enabledOnly bool) ([]port.StrategyAssignment, error) {
+	return nil, nil
+}
+func (r *fakeRepository) SetAssignmentEnabled(ctx context.Context, id int64, enabled bool) error {
+	return nil
+}
+func (r *fakeRepository) DeleteAssignment(ctx context.Context, id int64) error { return nil }
+func (r *fakeRepository) StrategyStatsFor(ctx context.Context, strategyID int64) (port.StrategyStats, error) {
+	return port.StrategyStats{}, nil
+}
+func (r *fakeRepository) ListPositions(ctx context.Context, f port.PositionFilter) ([]port.PaperOrder, error) {
 	return nil, nil
 }
 func (r *fakeRepository) OpenPaperOrder(ctx context.Context, o port.PaperOrder) (int64, error) {
@@ -166,7 +190,7 @@ func TestRealizedPnL_ExactNoFloatDrift(t *testing.T) {
 
 func TestBuildPaperOrder_SLTPForBuyAndSell(t *testing.T) {
 	buySignal := strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}
-	buyOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), buySignal, dec("100"))
+	buyOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), buySignal, dec("100"), 0)
 	if buyOrder.SLPx == nil || !buyOrder.SLPx.Equal(dec("99")) {
 		t.Errorf("expected buy SL=99, got %v", buyOrder.SLPx)
 	}
@@ -175,7 +199,7 @@ func TestBuildPaperOrder_SLTPForBuyAndSell(t *testing.T) {
 	}
 
 	sellSignal := strategy.Signal{Side: strategy.Sell, SLPct: dec("0.01"), TPPct: dec("0.02")}
-	sellOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), sellSignal, dec("100"))
+	sellOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), sellSignal, dec("100"), 0)
 	if sellOrder.SLPx == nil || !sellOrder.SLPx.Equal(dec("101")) {
 		t.Errorf("expected sell SL=101, got %v", sellOrder.SLPx)
 	}

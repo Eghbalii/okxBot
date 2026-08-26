@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -53,16 +54,27 @@ func main() {
 
 	logger.Info("starting paper trader", "instIds", cfg.Trading.InstIDs)
 
-	// Strategy assignments: which strategy evaluates on which timeframe's candle close. Only
-	// "1m" is populated today (matching the pre-multi-timeframe behavior exactly); the other
-	// configured bars (e.g. "15m", "1h") are ingested and persisted but have no strategy attached
-	// yet — add more StrategyAssignment entries here as strategies for those timeframes exist.
-	strategies := []usecase.StrategyAssignment{
-		{Bar: "1m", Strategy: strategy.NewRSISMA(14, 50)},
+	if err := strategy.SeedOrigins(ctx, repo); err != nil {
+		logger.Error("failed to seed origin strategies", "error", err)
+		os.Exit(1)
+	}
+	if err := ensureDefaultAssignment(ctx, repo, cfg.Trading.InstIDs); err != nil {
+		logger.Error("failed to ensure default strategy assignment", "error", err)
+		os.Exit(1)
 	}
 
 	errCh := make(chan error, len(cfg.Trading.InstIDs))
 	for _, instID := range cfg.Trading.InstIDs {
+		// Strategy assignments are durable (strategy_assignments table, CLAUDE.md §11.3): loaded
+		// fresh from Postgres on every start, so a crash/restart resumes with exactly the same
+		// token/timeframe->strategy bindings the panel last configured, not whatever was hardcoded
+		// here in Go.
+		strategies, err := loadStrategyAssignments(ctx, repo, instID)
+		if err != nil {
+			logger.Error("failed to load strategy assignments", "instId", instID, "error", err)
+			os.Exit(1)
+		}
+
 		candleConsumers := make(map[string]port.MarketDataConsumer, len(cfg.PaperTrading.Bars))
 		for _, bar := range cfg.PaperTrading.Bars {
 			candleConsumers[bar] = stream.NewConsumer(cfg.Redis.Addr, "okx:candles:"+bar, "paper-trader", instID)
@@ -93,4 +105,67 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// ensureDefaultAssignment guarantees at least one strategy is assigned on the "1m" bar for every
+// configured instrument, matching the previous hardcoded behavior, so a fresh install still
+// trades out of the box. Once the panel (CLAUDE.md §11) is used to manage assignments, this is a
+// no-op for any instrument that already has one.
+func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, instIDs []string) error {
+	origins, err := repo.ListStrategies(ctx, "", false)
+	if err != nil {
+		return err
+	}
+	var defaultOriginID int64
+	for _, s := range origins {
+		if s.IsOrigin && s.Kind == "rsi_sma" {
+			defaultOriginID = s.ID
+			break
+		}
+	}
+	if defaultOriginID == 0 {
+		return fmt.Errorf("default origin strategy %q not found after seeding", "rsi_sma")
+	}
+
+	for _, instID := range instIDs {
+		assignments, err := repo.ListAssignments(ctx, instID, false)
+		if err != nil {
+			return err
+		}
+		if len(assignments) > 0 {
+			continue
+		}
+		if _, err := repo.CreateAssignment(ctx, port.StrategyAssignment{
+			StrategyID: defaultOriginID,
+			InstID:     instID,
+			Bar:        "1m",
+			Enabled:    true,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadStrategyAssignments resolves an instrument's durable strategy_assignments rows into live
+// usecase.StrategyAssignment values the PaperTrader can run, rebuilding the strategy.Strategy from
+// its DB row's Kind+Config every time (CLAUDE.md §11.3) rather than trusting any in-memory cache.
+func loadStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID string) ([]usecase.StrategyAssignment, error) {
+	rows, err := repo.ListAssignments(ctx, instID, true)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]usecase.StrategyAssignment, 0, len(rows))
+	for _, a := range rows {
+		cfg, err := repo.GetStrategy(ctx, a.StrategyID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve strategy %d for assignment %d: %w", a.StrategyID, a.ID, err)
+		}
+		s, err := strategy.FromConfig(cfg.Kind, cfg.Config)
+		if err != nil {
+			return nil, fmt.Errorf("build strategy %d (kind %q) for assignment %d: %w", a.StrategyID, cfg.Kind, a.ID, err)
+		}
+		out = append(out, usecase.StrategyAssignment{Bar: a.Bar, Strategy: s, StrategyID: a.StrategyID})
+	}
+	return out, nil
 }

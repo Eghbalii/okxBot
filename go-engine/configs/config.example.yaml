@@ -37,3 +37,12 @@ risk:
   max_position_notional_usd: 1000
   max_daily_drawdown_pct: 5
   min_liquidation_buffer_pct: 15
+
+# cmd/api: dashboard/reporting backend (CLAUDE.md §11). No auth in v1 — bind addr to a private
+# interface reachable only over the OpenVPN tunnel, never 0.0.0.0 on a public host.
+api:
+  addr: "127.0.0.1:8090"
+  grafana_url: "http://localhost:3000"
+  process_manager: "docker" # "systemd" or "docker" — how cmd/api queries RL model liveness/uptime/logs
+  units:                    # container/unit names to report on for the RL model status panel
+    - "okxbot-rl-service-1"

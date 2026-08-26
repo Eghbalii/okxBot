@@ -82,6 +82,32 @@ services:
       - redis
       - timescaledb
 
+  api:
+    build:
+      context: ./go-engine
+      dockerfile: Dockerfile.api
+    environment:
+      CONFIG_PATH: /app/configs/config.yaml
+      POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
+      RL_SERVICE_URL: http://rl-service:8000
+      API_ADDR: "0.0.0.0:8090" # container-internal bind; only reachable via the OpenVPN network in prod, see CLAUDE.md §11
+      API_PROCESS_MANAGER: docker
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./go-engine/configs:/app/configs
+      - /var/run/docker.sock:/var/run/docker.sock:ro # lets cmd/api call `docker inspect`/`docker logs` for RL model status, CLAUDE.md §11.2
+    depends_on:
+      - timescaledb
+      - rl-service
+
+  panel:
+    build: ./panel
+    ports:
+      - "8080:80" # bind to the OpenVPN-facing interface only in production, see CLAUDE.md §11
+    depends_on:
+      - api
+
   prometheus:
     image: prom/prometheus:latest
     volumes:

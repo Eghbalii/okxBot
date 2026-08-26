@@ -17,12 +17,17 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 )
 
-// StrategyAssignment pairs a Strategy with the candle timeframe it evaluates against. A
-// PaperTrader can run several strategies across several timeframes concurrently — each strategy
-// only re-evaluates when its own assigned bar closes.
+// StrategyAssignment pairs a live Strategy value with the candle timeframe it evaluates against
+// and the DB row (StrategyID) it was configured from. A PaperTrader can run several strategies
+// across several timeframes concurrently — each strategy only re-evaluates when its own assigned
+// bar closes. StrategyID is threaded onto every paper order this assignment opens (CLAUDE.md
+// §11.3), so it must be populated whenever the assignment is resolved from a durable
+// port.StrategyAssignment/port.StrategyConfig row — 0 is only valid for ad-hoc, unpersisted use
+// (e.g. tests).
 type StrategyAssignment struct {
-	Bar      string
-	Strategy strategy.Strategy
+	Bar        string
+	Strategy   strategy.Strategy
+	StrategyID int64
 }
 
 // PaperTrader implements the Paper Trading Engine (CLAUDE.md §8): it evaluates strategies
@@ -201,7 +206,7 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 			continue
 		}
 
-		order := buildPaperOrder(e.InstID, price, signal, e.NotionalUSD)
+		order := buildPaperOrder(e.InstID, price, signal, e.NotionalUSD, a.StrategyID)
 		id, err := e.Repo.OpenPaperOrder(ctx, order)
 		if err != nil {
 			logger.Error("failed to open paper order", "strategy", s.Name(), "instId", e.InstID, "error", err)
@@ -268,7 +273,7 @@ func realizedPnL(o port.PaperOrder, closePx decimal.Decimal) decimal.Decimal {
 	return direction.Mul(closePx.Sub(o.EntryPx)).Div(o.EntryPx).Mul(o.Size).Mul(o.Leverage)
 }
 
-func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signal, notionalUSD decimal.Decimal) port.PaperOrder {
+func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signal, notionalUSD decimal.Decimal, strategyID int64) port.PaperOrder {
 	var slPx, tpPx *decimal.Decimal
 	direction := decimal.NewFromInt(1)
 	if signal.Side == strategy.Sell {
@@ -283,14 +288,20 @@ func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signa
 		tpPx = &v
 	}
 
+	var strategyIDPtr *int64
+	if strategyID != 0 {
+		strategyIDPtr = &strategyID
+	}
+
 	return port.PaperOrder{
-		InstID:   instID,
-		Side:     string(signal.Side),
-		EntryPx:  price,
-		SLPx:     slPx,
-		TPPx:     tpPx,
-		Size:     notionalUSD,
-		Leverage: decimal.NewFromInt(1),
+		InstID:     instID,
+		StrategyID: strategyIDPtr,
+		Side:       string(signal.Side),
+		EntryPx:    price,
+		SLPx:       slPx,
+		TPPx:       tpPx,
+		Size:       notionalUSD,
+		Leverage:   decimal.NewFromInt(1),
 	}
 }
 

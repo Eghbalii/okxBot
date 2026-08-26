@@ -67,6 +67,16 @@ type Config struct {
 		MaxDailyDrawdownPct     decimal.Decimal `yaml:"max_daily_drawdown_pct"`
 		MinLiquidationBufferPct decimal.Decimal `yaml:"min_liquidation_buffer_pct"`
 	} `yaml:"risk"`
+
+	// API configures cmd/api, the dashboard/reporting backend (CLAUDE.md §11). No auth in v1 — the
+	// panel is only reachable over an OpenVPN tunnel into the server's private network, so
+	// cmd/api's listener should be bound to that interface, not 0.0.0.0, in production.
+	API struct {
+		Addr       string   `yaml:"addr"`
+		GrafanaURL string   `yaml:"grafana_url"`
+		ProcessMgr string   `yaml:"process_manager"` // "systemd" or "docker"
+		Units      []string `yaml:"units"`           // systemd unit names or docker container names to report on
+	} `yaml:"api"`
 }
 
 // Load reads the YAML config at path (if provided) and overlays secrets/endpoints from
@@ -153,6 +163,18 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Risk.MinLiquidationBufferPct.IsZero() {
 		cfg.Risk.MinLiquidationBufferPct = decimal.NewFromInt(15)
+	}
+
+	if cfg.API.Addr == "" {
+		cfg.API.Addr = envOr("API_ADDR", "127.0.0.1:8090")
+	}
+	if cfg.API.ProcessMgr == "" {
+		cfg.API.ProcessMgr = envOr("API_PROCESS_MANAGER", "systemd")
+	}
+	if len(cfg.API.Units) == 0 {
+		// docker-compose's default container naming ("<project>-<service>-1"); override via
+		// api.units in config.yaml or API_UNITS if the actual deployment names differ.
+		cfg.API.Units = []string{"okxbot-rl-service-1"}
 	}
 
 	return cfg, nil

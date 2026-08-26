@@ -1,0 +1,357 @@
+// Package api implements cmd/api, the dashboard/reporting backend (CLAUDE.md §11): RL model
+// status, strategy CRUD + assignments + stats, and the positions panel. No auth in v1 — access
+// control is the OpenVPN tunnel in front of this service, not this package.
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/eghbalii/okxBot/go-engine/internal/port"
+)
+
+// Server holds the dependencies cmd/api's handlers need.
+type Server struct {
+	Repo       port.Repository
+	RLBaseURL  string
+	GrafanaURL string
+	ProcessMgr string
+	Units      []string
+	Logger     *slog.Logger
+}
+
+// Routes builds the HTTP handler for all panel endpoints.
+func (s *Server) Routes() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /api/resources", s.handleResources)
+
+	mux.HandleFunc("GET /api/model/status", s.handleModelStatus)
+	mux.HandleFunc("GET /api/model/logs", s.handleModelLogs)
+
+	mux.HandleFunc("GET /api/strategies", s.handleListStrategies)
+	mux.HandleFunc("POST /api/strategies", s.handleCreateStrategy)
+	mux.HandleFunc("GET /api/strategies/{id}", s.handleGetStrategy)
+	mux.HandleFunc("PUT /api/strategies/{id}", s.handleUpdateStrategy)
+	mux.HandleFunc("DELETE /api/strategies/{id}", s.handleDeleteStrategy)
+	mux.HandleFunc("POST /api/strategies/{id}/reset", s.handleResetStrategy)
+	mux.HandleFunc("GET /api/strategies/{id}/stats", s.handleStrategyStats)
+
+	mux.HandleFunc("GET /api/assignments", s.handleListAssignments)
+	mux.HandleFunc("POST /api/assignments", s.handleCreateAssignment)
+	mux.HandleFunc("PATCH /api/assignments/{id}", s.handleSetAssignmentEnabled)
+	mux.HandleFunc("DELETE /api/assignments/{id}", s.handleDeleteAssignment)
+
+	mux.HandleFunc("GET /api/positions", s.handleListPositions)
+
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	return mux
+}
+
+// handleResources reports where the Grafana dashboard lives (CLAUDE.md §11.1) — cmd/api does not
+// duplicate CPU/RAM/GPU charting itself, Prometheus+Grafana already own that.
+func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"grafanaUrl": s.GrafanaURL})
+}
+
+// handleModelStatus reports RL service liveness (CLAUDE.md §11.2): the /health proxy answers
+// "is a model loaded," and per-unit process-manager status answers "is the process itself up, and
+// for how long, and has it been crash-restarting."
+func (s *Server) handleModelStatus(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	health := FetchRLHealth(ctx, s.RLBaseURL)
+	units := make([]UnitStatus, 0, len(s.Units))
+	for _, u := range s.Units {
+		units = append(units, ProcessStatus(ctx, s.ProcessMgr, u))
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"health": health,
+		"units":  units,
+	})
+}
+
+// handleModelLogs tails one unit's logs, optionally filtered to error-level lines
+// (?unit=...&lines=200&errors=true).
+func (s *Server) handleModelLogs(w http.ResponseWriter, r *http.Request) {
+	unit := r.URL.Query().Get("unit")
+	if unit == "" {
+		writeError(w, http.StatusBadRequest, "missing required query param: unit")
+		return
+	}
+	lines := 200
+	if v := r.URL.Query().Get("lines"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			lines = n
+		}
+	}
+	errorsOnly := r.URL.Query().Get("errors") == "true"
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	out, err := LogTail(ctx, s.ProcessMgr, unit, lines, errorsOnly)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"unit": unit, "logs": out})
+}
+
+func (s *Server) handleListStrategies(w http.ResponseWriter, r *http.Request) {
+	instID := r.URL.Query().Get("instId")
+	enabledOnly := r.URL.Query().Get("enabledOnly") == "true"
+	list, err := s.Repo.ListStrategies(r.Context(), instID, enabledOnly)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleGetStrategy(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt64(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cfg, err := s.Repo.GetStrategy(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, cfg)
+}
+
+// createStrategyRequest clones an existing strategy (origin or another sub-strategy) into a new
+// sub-strategy row — the only way to create a strategy row via the API. Origin rows themselves
+// are seeded by cmd/paper-trader from strategy.Factories, not created here (CLAUDE.md §11.3).
+type createStrategyRequest struct {
+	Name       string          `json:"name"`
+	ClonedFrom int64           `json:"clonedFrom"`
+	InstIDs    []string        `json:"instIds"`
+	Config     json.RawMessage `json:"config"`
+}
+
+func (s *Server) handleCreateStrategy(w http.ResponseWriter, r *http.Request) {
+	var req createStrategyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.ClonedFrom == 0 {
+		writeError(w, http.StatusBadRequest, "clonedFrom is required — every strategy must descend from an origin row")
+		return
+	}
+	source, err := s.Repo.GetStrategy(r.Context(), req.ClonedFrom)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "clonedFrom strategy not found: "+err.Error())
+		return
+	}
+
+	config := req.Config
+	if len(config) == 0 {
+		config = source.Config
+	}
+	originID := req.ClonedFrom
+	id, err := s.Repo.CreateStrategy(r.Context(), port.StrategyConfig{
+		Name:       req.Name,
+		Kind:       source.Kind,
+		InstIDs:    req.InstIDs,
+		Config:     config,
+		Enabled:    true,
+		IsOrigin:   false,
+		ClonedFrom: &originID,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+}
+
+type updateStrategyRequest struct {
+	Config  json.RawMessage `json:"config"`
+	Enabled bool            `json:"enabled"`
+}
+
+func (s *Server) handleUpdateStrategy(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt64(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	existing, err := s.Repo.GetStrategy(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if existing.IsOrigin {
+		writeError(w, http.StatusForbidden, "origin strategies are read-only — clone it into a sub-strategy to customize (CLAUDE.md §11.3)")
+		return
+	}
+
+	var req updateStrategyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := s.Repo.UpdateStrategyConfig(r.Context(), id, req.Config, req.Enabled); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleDeleteStrategy(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt64(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	existing, err := s.Repo.GetStrategy(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if existing.IsOrigin {
+		writeError(w, http.StatusForbidden, "origin strategies cannot be deleted (CLAUDE.md §11.3: \"keep the origin always\")")
+		return
+	}
+	if err := s.Repo.DeleteStrategy(r.Context(), id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleResetStrategy(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt64(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.Repo.ResetStrategyToOrigin(r.Context(), id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleStrategyStats(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt64(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	stats, err := s.Repo.StrategyStatsFor(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) handleListAssignments(w http.ResponseWriter, r *http.Request) {
+	instID := r.URL.Query().Get("instId")
+	enabledOnly := r.URL.Query().Get("enabledOnly") == "true"
+	list, err := s.Repo.ListAssignments(r.Context(), instID, enabledOnly)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleCreateAssignment(w http.ResponseWriter, r *http.Request) {
+	var req port.StrategyAssignment
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	req.Enabled = true
+	id, err := s.Repo.CreateAssignment(r.Context(), req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+}
+
+func (s *Server) handleSetAssignmentEnabled(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt64(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := s.Repo.SetAssignmentEnabled(r.Context(), id, req.Enabled); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleDeleteAssignment(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt64(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.Repo.DeleteAssignment(r.Context(), id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleListPositions serves the positions panel (CLAUDE.md §11.4): filterable by mode
+// (paper/demo/real), instrument, open/closed, sortable by opened_at/closed_at/pnl/inst_id.
+func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	filter := port.PositionFilter{
+		Mode:     q.Get("mode"),
+		InstID:   q.Get("instId"),
+		SortBy:   q.Get("sortBy"),
+		SortDesc: q.Get("sortDesc") == "true",
+	}
+	if v := q.Get("open"); v != "" {
+		open := v == "true"
+		filter.Open = &open
+	}
+
+	list, err := s.Repo.ListPositions(r.Context(), filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func pathInt64(r *http.Request, key string) (int64, error) {
+	return strconv.ParseInt(r.PathValue(key), 10, 64)
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}

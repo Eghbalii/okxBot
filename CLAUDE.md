@@ -84,7 +84,7 @@ okxBot/
 │   │   ├── ingestor/          # connects OKX public WS, publishes ticks/candles to Redis
 │   │   ├── trader/            # main trading loop: reads state, calls RL service, executes orders
 │   │   ├── paper-trader/      # forward-test engine, §8
-│   │   └── api/               # (planned) dashboard/reporting HTTP API, §11
+│   │   └── api/               # dashboard/reporting HTTP API, §11
 │   ├── internal/
 │   │   ├── domain/            # core entities: Candle, Ticker, Position, Balance, Order,
 │   │   │                        LeverageChange, Observation, Action — no framework/IO deps, §10
@@ -114,7 +114,8 @@ okxBot/
 │   │   ├── metrics.py            # (planned) CPU/RAM/GPU + training-progress reporting, §11
 │   │   └── serve/                # FastAPI inference app
 │   └── configs/config.example.yaml
-├── panel/                      # (planned) frontend reporting/strategy-management dashboard, §11
+├── panel/                      # React+TS+Vite frontend for cmd/api: resources/model/strategies/
+│   │                             positions tabs, §11
 └── data/                       # gitignored local data cache (candles, parquet, model artifacts)
 ```
 
@@ -263,25 +264,118 @@ logic, `go-engine` is organized ports-and-adapters style (see §3 for the layout
 
 ## 11. Dashboard / reporting API
 
-A new `cmd/api` service (built on the same use-cases as the trading engine, per §10) exposing:
+**Network model (decision):** the panel is never exposed on the open internet. Access is only
+over an OpenVPN tunnel into the server's private network; the panel itself has **no login/auth in
+v1** — the VPN + firewall (only VPN-sourced traffic can reach `cmd/api`'s port) is the sole gate.
+This is an explicit, revisitable trade-off — if the panel is ever exposed more broadly, add real
+auth before that happens, don't rely on network isolation alone at that point.
 
-- **Training status:** whether training is running, elapsed time, and CPU/RAM/GPU usage. The
-  Python side exposes these via `rl_service/metrics.py` (e.g. `psutil` for CPU/RAM, `pynvml` if a
-  GPU is ever present) on a small endpoint that `cmd/api` polls or that's scraped via Prometheus.
-- **Strategy CRUD:** list, view, edit, clone-to-create, enable/disable per token (§9).
-- **Reports:** total orders/profit/loss with hour/day/week filters, and per-order detail
-  (entry/SL/TP, timestamps, close reason) — the `paper_orders` table (§7) is designed around
-  exactly this. Chart overlay of orders is a `panel/` (frontend) concern for later, not a backend
-  blocker.
+A new `cmd/api` service (built on the same use-cases as the trading engine, per §10) exposing four
+panel sections: **resources**, **RL model status**, **strategies**, **positions**. Foundations
+(schema, ports, endpoints) are the priority for the first pass; the strategy timeline/chart view
+and the parameter-edit-on-hover UI are `panel/` (frontend) concerns to build once the backend
+foundation is in place and there's real data to look at.
 
-**Metrics (implemented): Prometheus + Grafana**, per explicit decision — not reinvented as a
-custom dashboard, kept separate from the product-specific strategy/orders API. `go-engine`
-services expose `/metrics` via `internal/metrics` (`promhttp`), scraped per `prometheus.yml`:
+### 11.1 Server resources
+
+Handled entirely by **Prometheus + Grafana** (already implemented, see below) — `cmd/api` does not
+duplicate this. The panel's "resources" tab embeds/links the relevant Grafana dashboard rather than
+re-implementing CPU/RAM/GPU charts.
+
+### 11.2 RL model status (live/crash/logs)
+
+Deliberately **not** a custom in-process heartbeat table — a crashed process can't reliably report
+its own crash. Instead this is standard process supervision, surfaced through `cmd/api`:
+- **Liveness:** `cmd/api` polls the RL service's existing `GET /health` (`rl_service/serve/api.py`)
+  — returns `{"status": "ok", "model_loaded": bool}`. `model_loaded: false` means the service is up
+  but running with no trained model (safe no-op actions only, see `predict()`'s fail-safe path) —
+  the panel must distinguish "down" from "up but unloaded," they mean very different things.
+- **Uptime / crash / restart history:** owned by the process supervisor, not application code.
+  `rl-service` and `go-engine` processes run under **systemd** (or the Docker restart policy in
+  `docker-compose.yml`, `restart: unless-stopped` + `docker inspect` for restart count/start time)
+  — `cmd/api` shells out to `systemctl show <unit> --property=ActiveState,SubState,ExecMainStartTimestamp,NRestarts`
+  (or the Docker equivalent) to answer "is it live," "how long has it been alive," and "how many
+  times has it crashed/restarted." Don't reinvent this in Go/Python.
+- **Logs/errors:** `journalctl -u <unit> -n 200 --no-pager` (or `docker logs --tail 200`) tailed
+  through a `cmd/api` endpoint, filterable to error-level lines. No separate log-shipping stack
+  (Loki/ELK) for v1 — journald/docker's own log store is enough at this scale.
+- `rl_service/metrics.py` (CPU/RAM/GPU + training-progress numbers, per the original plan) is still
+  useful for the *training* process specifically (elapsed steps, timesteps/sec) and is planned but
+  not implemented — separate concern from liveness/crash status above.
+
+### 11.3 Strategies — parent + override model
+
+Requirement driving this: after a crash/restart, the trader/paper-trader must reload from the
+**database**, not memory, exactly which strategy variant is assigned to which token+timeframe and
+with what parameters — strategy assignment is durable state, not runtime-only config.
+
+- Every strategy row still descends from a **locked "origin"** row (`cloned_from IS NULL`,
+  `is_origin = true`) representing the built-in Go implementation (§9) as shipped — origin rows
+  are never edited in place, only read as the template new variants copy their `kind`/defaults
+  from. This satisfies "keep the origin always."
+- A **sub-strategy** is a child row (`cloned_from = <origin id>`) that stores only: its own
+  `config` (full param JSON — the override values, not a diff, so a crash-recovery read is a
+  single row fetch, no merge-with-parent logic needed at load time) and its `inst_ids` +
+  `assignments` (which token/timeframe pairs it runs on, see below). Editing a sub-strategy edits
+  its own row; the origin is untouched. "Reset to origin" = recopy the origin's default `config`
+  into the child row.
+- **Token+timeframe assignment** is now its own table (`strategy_assignments`: `strategy_id`,
+  `inst_id`, `bar`, `enabled`), not just the `strategies.inst_ids` array — this is what lets the
+  same origin strategy run as different tuned variants on different tokens/timeframes
+  simultaneously, and is exactly the state `PaperTrader.Strategies []StrategyAssignment` (today
+  built in Go code at startup, see `cmd/paper-trader/main.go`) needs to instead load from
+  Postgres via `Repository.ListAssignments(...)` on every process start — this is the crash-safety
+  requirement: the assignment set is never only-in-memory.
+- `paper_orders.strategy_id` (already a column) must actually be populated when a paper order is
+  opened — currently `buildPaperOrder` in `internal/usecase/papertrade.go` leaves it nil. Fixing
+  this is required for the per-strategy stats below to be computable at all.
+- **Per-strategy stats** (derived from `paper_orders` grouped by `strategy_id`, no new counters
+  needed beyond what §7/§11.4 already store): running duration (now − first assignment/first
+  order), signal count, win rate (`close_reason='tp'` vs `'sl'` ratio), realized PnL. Exposed via
+  `cmd/api` as a computed view/query, not a separately maintained table.
+- **Timeline/chart view** (price line with long/short entry markers, red/green SL/TP flags,
+  hover-to-edit params) is explicitly a "foundations first" item — backend must expose the data
+  (candles + paper_orders for a strategy+instrument+time range) via a clean endpoint, but the
+  actual chart rendering is deferred to a later `panel/` pass.
+
+### 11.4 Positions panel
+
+One panel, three **modes** — `paper`, `demo`, `real` — as a `mode` column threaded through from
+day one so the schema/API never need reshaping later, even though `real` has no live writer yet
+(blocked on live `cmd/trader` wiring, §14):
+- `paper` — from `paper_orders` (already implemented).
+- `demo` — OKX demo trading (`x-simulated-trading: 1`, §4) via the same `ExchangeClient`/order
+  path `cmd/trader` will use for real trading, just pointed at demo credentials/hosts.
+- `real` — live `cmd/trader` against real OKX credentials; schema-ready, inactive until that
+  roadmap item (§14) lands.
+- Positions are classified **open** vs **closed** (`closed_at IS NULL` for paper; analogous for
+  demo/real once those tables/rows exist) and sortable by token, date, close reason (SL/TP/manual),
+  and PnL (highest profit/loss) — all directly supported by existing/planned indexed columns, no
+  new derived-data pipeline required.
+- **Sound + browser notification on state change**, per explicit request: distinct cues for (a)
+  position opened, (b) closed by SL, (c) closed by TP. This is a `panel/` frontend concern — the
+  frontend polls/subscribes to `cmd/api` (or a lightweight SSE/WebSocket stream off the same
+  Postgres rows / Redis event bus, §12) for order-state transitions and triggers
+  `new Audio(...).play()` + the browser Notification API client-side. No backend "notification
+  service" needed; `cmd/api` just needs to expose the open/close events promptly.
+
+### 11.5 Strategy CRUD + reports (as originally planned)
+
+- **Strategy CRUD:** list, view, edit (a sub-strategy's own config), clone-to-create (from origin
+  or from another sub-strategy), enable/disable per token+timeframe assignment (§11.3).
+- **Reports:** total orders/profit/loss with hour/day/week filters, per-order detail (entry/SL/TP,
+  timestamps, close reason) across all three position modes (§11.4).
+
+### 11.6 Metrics (implemented): Prometheus + Grafana
+
+Per explicit decision — not reinvented as a custom dashboard, kept separate from the
+product-specific strategy/orders/model-status API above. `go-engine` services expose `/metrics`
+via `internal/metrics` (`promhttp`), scraped per `prometheus.yml`:
 - `okxbot_strategy_signals_total{strategy,inst_id,side}` — every strategy evaluation, incl. holds.
 - `okxbot_paper_orders_opened_total{strategy,inst_id,side}` — virtual trades opened.
 - `okxbot_paper_orders_closed_total{inst_id,reason}` — closed trades by reason; `reason="sl"` /
   `reason="tp"` gives the SL-hit / TP-hit counts directly (rate()/increase() in Grafana for
-  hour/day/week windows, matching the panel's reporting requirement in §11).
+  hour/day/week windows, matching the panel's reporting requirement).
 - `okxbot_paper_orders_open{inst_id}` — current open-order gauge.
 - `okxbot_paper_orders_realized_pnl_usd_total{inst_id}` — cumulative realized PnL gauge.
 - `okxbot_ingestor_events_total{kind,inst_id}` — WS ticks/candles received, for pipeline health.
@@ -355,10 +449,59 @@ Phase 2 — clean architecture refactor & live wiring (current phase):
       OKX's sandboxed demo environment) — needs OKX demo API credentials; deferred until running on
       a server (not yet started).
 
-Phase 3 — dashboard:
-- [ ] `cmd/api` reporting/strategy-management backend (§11)
-- [ ] Training status + CPU/RAM/GPU metrics endpoint (`rl_service/metrics.py`)
-- [ ] `panel/` frontend (framework TBD — see open question in chat)
+Phase 3 — dashboard (current phase, §11):
+- [x] Migration (`000003_strategy_assignments_and_positions_mode`) for `strategy_assignments` +
+      `strategies.is_origin`; `mode` column on `paper_orders` (paper/demo/real, §11.4)
+- [x] Fixed `buildPaperOrder` (`internal/usecase/papertrade.go`) to populate `strategy_id` —
+      required for per-strategy stats to be computable at all
+- [x] `port.Repository` additions: assignment CRUD, `StrategyStatsFor`, `ListPositions`
+      (filterable/sortable across modes); `internal/strategy/factory.go` (kind -> constructor
+      registry) so a DB row's Kind+Config resolves back into a live `strategy.Strategy`;
+      `cmd/paper-trader` now seeds origin rows and loads `strategy_assignments` from Postgres on
+      every start instead of a hardcoded Go slice — the crash-recovery requirement driving §11.3
+- [x] `cmd/api` (`internal/api`): resources (Grafana link-through), RL model status (`/health`
+      proxy + systemd/docker uptime+restart-count+log-tail via `internal/api/procstatus.go`),
+      strategy CRUD + assignments + stats, positions list — no auth (OpenVPN-only network access,
+      §11). `Dockerfile.api` + compose wiring (mounts the Docker socket read-only so it can query
+      sibling containers' status/logs when `api.process_manager: docker`).
+- [x] `panel/` frontend: **React 19 + TypeScript + Vite**, `react-router-dom` for the 4 tabs
+      (Positions/Strategies/RL Model/Resources), no UI framework/component library added (kept
+      dependencies minimal — hand-rolled CSS, dark theme). Same-origin `/api/*` calls in
+      production (nginx reverse-proxies to `cmd/api` inside the compose network, matching the
+      OpenVPN-only model — panel is never meant to be reachable outside that network); a Vite dev
+      proxy (`vite.config.ts`) does the same for local dev against `127.0.0.1:8090`. Positions and
+      Model Status poll on an interval (`usePolling` hook) rather than WebSocket/SSE — simplest
+      option for v1's data volume, revisit if latency becomes noticeable. Sound + browser
+      notifications for open/SL/TP (`usePositionAlerts` hook, generated WAV cues in `src/sounds/`)
+      diff each poll's position list client-side — no backend "notification service" needed to
+      support this. Strategies page includes the hover-to-edit param box on sub-strategies (origin
+      rows render read-only) — the one "ideal view" item that *didn't* need deferring.
+      **Deferred** (foundations-first, per explicit decision): the price-chart timeline overlay
+      (candles + entry/SL/TP markers) — `panel/` has no charting library yet; add one only once
+      there's a concrete design for it.
+- [ ] `rl_service/metrics.py` (CPU/RAM/GPU/training progress) — separate from liveness/crash status
+- [x] End-to-end verification of the panel against a live `cmd/api` + real TimescaleDB (docker
+      compose) + a headless-browser pass (Playwright) over all four routes. Caught and fixed three
+      real bugs this way — none of these showed up from `tsc`/`vite build` alone:
+      1. `cmd/api` never seeded origin strategy rows itself (only `cmd/paper-trader` did) — the
+         Strategies panel was empty on any install where `cmd/api` came up first. Extracted the
+         seeding logic into `internal/strategy.SeedOrigins` (shared by both `main.go`s).
+      2. `CreateStrategy` sent a nil `InstIDs` slice as SQL `NULL` (pgx does not fall back to the
+         column's `NOT NULL DEFAULT '{}'` for a nil slice) — crashed `SeedOrigins` outright.
+         Fixed in `internal/postgres/strategies.go`.
+      3. Panel-side: `api.listStrategies`/`listAssignments`/`listPositions` crashed the Strategies
+         page (`Cannot read properties of null (reading 'map')`) whenever Go returned an empty nil
+         slice (`null`, not `[]`) — e.g. a fresh `strategy_assignments` table. Fixed with a
+         `requestList` wrapper in `panel/src/api/client.ts` that normalizes `null` → `[]`.
+         Separately, `CloneForm`/`AssignmentsPanel` initialized their `<select>`'s backing state
+         from `origins[0]?.ID`/`strategies[0]?.ID` at first render, before either list had loaded
+         — the dropdown displayed a selection once data arrived, but the state variable stayed
+         stuck at the stale initial value, so submitting silently no-op'd on the `!id` guard.
+         Fixed by making the state `nullable` and resolving the real default at submit time.
+      Verified via curl against every `cmd/api` route (strategy CRUD, origin-protection 403s,
+      assignments CRUD, positions filters/sort, model status/logs) and a headless Chromium pass
+      that drove the actual clone-strategy and create-assignment forms through the rendered UI,
+      confirming the POSTs fire and the new rows render — not just that the endpoints respond.
 
 Phase 4 — later/optional:
 - [x] Multi-timeframe candles (§9) — ingestor/PaperTrader multi-bar, live-verified
