@@ -91,12 +91,16 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 	uplRatio := pos.UplRatio
 
 	obs := domain.Observation{
+		SchemaVersion:    domain.ObservationSchemaVersion,
 		InstID:           t.InstID,
 		MidPrice:         mid,
 		Position:         posSize,
 		CurrentLeverage:  lever,
 		UnrealizedPnLPct: uplRatio,
-		EquityUSD:        equity,
+		// TODO(CLAUDE.md §15): cmd/trader is not yet part of the per-token paper-trading/RL loop
+		// (§14, live wiring still open) — TokenEquityUSD is set to total account equity as a
+		// placeholder until this loop is repointed at per-token budgets like the paper-trader path.
+		TokenEquityUSD: equity,
 	}
 
 	action, err := t.Model.Predict(ctx, obs)
