@@ -31,12 +31,23 @@ paper_trading:
   bars:
     - "1m"
   candle_limit: 100
+  # CLAUDE.md §15.6: fixed per-token paper-mode sub-budget for Phase A (not RL-allocated yet).
+  token_budget_usd: 10
+  # CLAUDE.md §15.4: enables the RL-driven in-trade SL/TP adjustment pass (calls rl_service's
+  # /predict at candle close for each open baseline order, forking a linked copy if it proposes a
+  # nonzero adjustment). Off by default — requires rl_service reachable at rl_service.url.
+  rl_sltp_adjust: false
 
 risk:
-  max_leverage: 5
+  # CLAUDE.md §15.4: RL agent's target leverage range is 10x-100x; min_liquidation_buffer_pct below
+  # is the real safety floor that bounds how much of this is reachable in practice.
+  max_leverage: 100
   max_position_notional_usd: 1000
   max_daily_drawdown_pct: 5
-  min_liquidation_buffer_pct: 15
+  # Lowered from 15 so leverage toward the 100x ceiling above is reachable at all (~1-2% buffer at
+  # 50-100x on the conservative 100/leverage estimate) — deliberate tradeoff of liquidation-distance
+  # safety margin for usable leverage range. Revisit before any real-money wiring (§14).
+  min_liquidation_buffer_pct: 2
 
 # cmd/api: dashboard/reporting backend (CLAUDE.md §11). No auth in v1 — bind addr to a private
 # interface reachable only over the OpenVPN tunnel, never 0.0.0.0 on a public host.

@@ -59,6 +59,14 @@ type Config struct {
 		// stream to consume from.
 		Bars        []string `yaml:"bars"`
 		CandleLimit int      `yaml:"candle_limit"`
+		// TokenBudgetUSD is each token's fixed paper-mode sub-budget (CLAUDE.md §15.6/§15.7) — not
+		// learned/RL-allocated in Phase A, just a config value each PaperTrader instance is given.
+		TokenBudgetUSD decimal.Decimal `yaml:"token_budget_usd"`
+		// RLSLTPAdjust enables the RL-driven in-trade SL/TP adjustment pass (CLAUDE.md §15.4). Off
+		// by default: PaperTrader runs exactly as it did before §15 wherever this is false, since a
+		// meaningful decision here requires a trained (or at least deliberately no-op) RL model to
+		// be reachable at RLService.URL.
+		RLSLTPAdjust bool `yaml:"rl_sltp_adjust"`
 	} `yaml:"paper_trading"`
 
 	Risk struct {
@@ -152,8 +160,17 @@ func Load(path string) (*Config, error) {
 	if cfg.PaperTrading.CandleLimit == 0 {
 		cfg.PaperTrading.CandleLimit = 100
 	}
+	if cfg.PaperTrading.TokenBudgetUSD.IsZero() {
+		// CLAUDE.md §15.6: your stated $10/token against a <$50 total budget.
+		cfg.PaperTrading.TokenBudgetUSD = decimal.NewFromInt(10)
+	}
 	if cfg.Risk.MaxLeverage.IsZero() {
-		cfg.Risk.MaxLeverage = decimal.NewFromInt(5)
+		// CLAUDE.md §15.4: raised from the earlier 5x default toward the RL agent's target 10x-100x
+		// range. MinLiquidationBufferPct below is what actually bounds how much of this range is
+		// reachable in practice (risk.Manager.Approve rejects any leverage whose estimated
+		// liquidation buffer falls below that floor) — the two limits do separate jobs: this is a
+		// ceiling, MinLiquidationBufferPct is the real liquidation-distance safety check.
+		cfg.Risk.MaxLeverage = decimal.NewFromInt(100)
 	}
 	if cfg.Risk.MaxPositionNotionalUSD.IsZero() {
 		cfg.Risk.MaxPositionNotionalUSD = decimal.NewFromInt(1000)
@@ -162,7 +179,14 @@ func Load(path string) (*Config, error) {
 		cfg.Risk.MaxDailyDrawdownPct = decimal.NewFromInt(5)
 	}
 	if cfg.Risk.MinLiquidationBufferPct.IsZero() {
-		cfg.Risk.MinLiquidationBufferPct = decimal.NewFromInt(15)
+		// Lowered from 15% so leverage toward the top of the new 100x ceiling is reachable at all
+		// (the conservative 100/leverage buffer estimate in usecase/trade.go gives ~2% buffer at
+		// 50x, ~1% at 100x) — an explicit, deliberate tradeoff of real liquidation-distance safety
+		// margin for usable leverage range, made because the RL agent's leverage choice is a
+		// learned decision under this cap, not because thin buffers are risk-free. Revisit this
+		// value carefully, especially before any real-money wiring (§14) — a 2% floor means a 2%
+		// adverse move liquidates the position outright.
+		cfg.Risk.MinLiquidationBufferPct = decimal.NewFromInt(2)
 	}
 
 	if cfg.API.Addr == "" {

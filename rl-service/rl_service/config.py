@@ -15,7 +15,10 @@ class DataConfig:
 @dataclass
 class EnvConfig:
     window_size: int = 32
-    max_leverage: float = 5.0
+    # CLAUDE.md §15.4: raised from 5.0 to match go-engine's risk.max_leverage ceiling (100) — keep
+    # both sides consistent so the historical/sanity-check env (§2) isn't training/testing against
+    # a materially different leverage range than the live risk manager actually enforces.
+    max_leverage: float = 100.0
     max_position_notional_usd: float = 1000.0
     taker_fee_rate: float = 0.0005
     funding_rate_per_8h: float = 0.0001
