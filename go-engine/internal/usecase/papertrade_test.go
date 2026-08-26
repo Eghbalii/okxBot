@@ -701,3 +701,43 @@ func TestListSLTPAdjustmentPairs_ReturnsLinkedPairsOnly(t *testing.T) {
 			baselineID, forkID, pairs[0].BaselineOrder.ID, pairs[0].RLAdjustedOrder.ID)
 	}
 }
+
+func TestEvaluateStrategies_PersistsDecisionTimeObservation(t *testing.T) {
+	repo := newFakeRepository()
+	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02"), Confidence: dec("0.8")}}
+	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "1m", Strategy: alwaysBuy, StrategyID: 7}})
+	pt.candles["1m"] = []domain.Candle{
+		{Close: dec("98")}, {Close: dec("99")}, {Close: dec("100")},
+	}
+	pt.ActiveTokens = []string{"BTC-USDT-SWAP", "XAU-USD-SWAP"}
+	pt.TokenBudgetUSD = dec("10")
+
+	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if len(open) != 1 {
+		t.Fatalf("expected 1 opened order, got %d", len(open))
+	}
+	if len(open[0].FeaturesJSON) == 0 {
+		t.Fatalf("expected FeaturesJSON to be populated with the decision-time observation")
+	}
+
+	var obs domain.Observation
+	if err := json.Unmarshal(open[0].FeaturesJSON, &obs); err != nil {
+		t.Fatalf("FeaturesJSON did not unmarshal as domain.Observation: %v", err)
+	}
+	if obs.SchemaVersion != domain.ObservationSchemaVersion {
+		t.Errorf("expected schema version %d, got %d", domain.ObservationSchemaVersion, obs.SchemaVersion)
+	}
+	if obs.InstID != "BTC-USDT-SWAP" {
+		t.Errorf("expected InstID BTC-USDT-SWAP, got %q", obs.InstID)
+	}
+	if len(obs.Timeframes) != 1 || len(obs.Timeframes[0].StrategySignals) != 1 {
+		t.Fatalf("expected 1 timeframe block with 1 strategy signal, got %+v", obs.Timeframes)
+	}
+	if obs.Timeframes[0].StrategySignals[0].StrategyID != 7 {
+		t.Errorf("expected strategy signal StrategyID=7, got %d", obs.Timeframes[0].StrategySignals[0].StrategyID)
+	}
+}

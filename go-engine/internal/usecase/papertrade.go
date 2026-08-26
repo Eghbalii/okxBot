@@ -224,6 +224,15 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 		}
 
 		order := buildPaperOrder(e.InstID, price, signal, e.NotionalUSD, a.StrategyID)
+		// CLAUDE.md §15.3/§15.8: persist the actual observation vector at decision time (not just
+		// the realized outcome) so it can later feed live/continued RL training — the whole point
+		// is training data that matches exactly what rlclient would have sent, not a reconstruction.
+		// Best-effort: a marshal/build failure must never block opening the order itself.
+		if obs, err := json.Marshal(e.buildObservation(ctx, bar, price, logger)); err == nil {
+			order.FeaturesJSON = obs
+		} else {
+			logger.Warn("failed to marshal decision-time observation", "instId", e.InstID, "error", err)
+		}
 		id, err := e.Repo.OpenPaperOrder(ctx, order)
 		if err != nil {
 			logger.Error("failed to open paper order", "strategy", s.Name(), "instId", e.InstID, "error", err)
