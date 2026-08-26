@@ -548,18 +548,37 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       from `Trading.InstIDs`/`PaperTrading.TokenBudgetUSD`. Against rl_service's existing fail-safe
       (no model loaded -> flat action, all adjust fields zero), this is a real no-op end-to-end
       loop today. Not yet run against a live OKX feed — that verification is still open (§15.9).
-- [ ] Persist the actual observation vector sent at decision time (not just the outcome) alongside
-      `paper_orders`, so `train.py` has real offline RL training data (§15.8)
-- [ ] Repoint `train.py` at the pooled paper-trading log across active tokens, producing one
-      `models/ppo_global.zip` (§15.8) — supersedes the older single open item below, which is now
-      folded into this phase
+- [x] Persist the actual observation vector sent at decision time (not just the outcome) alongside
+      `paper_orders`: `PaperTrader.evaluateStrategies` now marshals the same `domain.Observation`
+      it would send to `/predict` into `FeaturesJSON` on order open, best-effort (never blocks
+      opening the order) (§15.3, §15.8). Verified with a dedicated test asserting the persisted
+      JSON round-trips as a valid `domain.Observation` with the right strategy/token fields set.
+- [x] Warm-start replay training (§15.8's two-phase design: initialization-only replay, distinct
+      from — and never a replacement for — continued live learning, which is unchanged from §2):
+      `rl_service/env/replay_env.py`'s `ReplayEnv` pools all active tokens' real candle history
+      (Postgres `candles`, written by `PaperTrader` since Phase 1 — no separate CSV pipeline) plus
+      any strategy signals actually logged in `paper_orders.features_json` (empty/hold signal for
+      unlogged quiet bars, matching live reality), and lets PPO do normal on-policy rollouts —
+      the model's own current decisions against real market conditions, never a replay of past
+      decisions. `rl_service/obs.py` extracted as the single shared observation-vectorization
+      source of truth between `/predict` and the replay env, so they can never silently drift
+      apart. `rl_service/data/postgres.py` (new `psycopg2-binary` dependency) is the read-only
+      Postgres access layer. `train.py --warm-start` runs it, producing `models/ppo_global.zip`
+      (`serve.model_path` in `config.example.yaml` updated to match). 5 new tests
+      (`tests/test_replay_env.py`) verify shapes, the token-identity one-hot actually differs per
+      token, multi-token sequencing, and a real PPO training run against the env completes and
+      produces a loadable, predictable model.
+- [ ] Live/continued-training mode (the second half of §15.8 — consuming real paper-trading
+      outcomes as they accumulate, not just the warm-start replay) — not yet built; needs enough
+      live paper-trading history to be meaningful, which is itself gated on running the Phase A
+      no-op loop against a live OKX feed first (§15.9, still open).
 - [x] `rl_service/serve/api.py`: loads the single global model, routes `/predict` for every token
       through it via the token-identity one-hot, rejects observation-schema-version mismatches with
       a 422 (§15.3, §15.8) — implemented as part of the v3 schema bump above.
 - [ ] Per-token reward/PnL breakdown in training logs (not just aggregate) — the concrete detection
       mechanism for the "good on average, bad for one token" failure mode (§15.2, §15.5); required
-      before Phase B expands token count. Not yet meaningful until `train.py` exists (blocked on the
-      two `train.py`/offline-data items above).
+      before Phase B expands token count. Meaningful once the live/continued-training mode above
+      exists — warm-start alone doesn't yet produce a per-token-attributable training signal.
 - [x] A/B comparison tooling for baseline vs. rl_adjusted forks (§15.4):
       `port.Repository.SLTPAdjustmentStats` (aggregate win-rate/PnL per variant, filterable by
       instrument and a `since` lower bound — "the last week" per §15.4 — only counting baseline
@@ -789,21 +808,50 @@ is bad. Concretely:
   a human decision, not an automatic top-up. Keep this distinction explicit whenever real-mode
   wiring happens; don't let the paper-mode reset logic leak into the real-mode path by accident.
 
-### 15.8 Training loop shape
+### 15.8 Training loop shape: warm-start replay + continued live learning
 
-Per §2's existing decision (forward-test data, not historical replay — unchanged, this section
-doesn't revisit that): `rl_service/train.py` currently targets historical replay via
-`okx_futures_env.py` and is not yet repointed at the paper-trading log (§14's one open Phase-1
-item). This section's design assumes that repointing happens as part of implementing §15, since
-"train the global PPO agent on paper-trading outcomes" is meaningless without it. Concretely:
-`train.py` loads **all active tokens'** `paper_orders` + the observation/action history logged
-alongside them (§15.3's schema needs the *actual observation vector sent at decision time*
-persisted, not just the outcome — likely extending `paper_orders.features_json` or a new table,
-TBD at implementation), pooled into one offline RL-style training set (token identity comes along
-as one of the observation fields, §15.3 — no per-token filtering at training time), and produces
-one `models/ppo_global.zip`, loaded by `rl_service/serve/api.py` and used to answer every token's
-`/predict` calls (the request's `inst_id` selects which token-identity input to set, not which
-model to load — see §15.1 for why this is one shared policy rather than per-token model files).
+**Two distinct phases, not one — this distinction matters and must not be collapsed:**
+
+1. **Warm-start (initialization only, not evaluation)**: PPO is on-policy — it learns by rolling
+   out its *own current* decisions against an environment and observing the outcome, not by
+   replaying a fixed log of decisions someone/something else made (most of the paper-trading log
+   so far reflects the still-untrained/no-op model or raw strategy signals, not the policy being
+   trained). So training directly from logged `(state, action, reward)` tuples the way an
+   offline-RL algorithm would is the wrong tool for PPO. Instead: a **replay environment**
+   (`rl_service/env/`, a new Gymnasium env alongside — not replacing — `okx_futures_env.py`) plays
+   back the *sequence* of real market conditions already persisted in Postgres's `candles` table
+   (real OHLCV, written by `PaperTrader` since Phase 1 — not a separate historical CSV pipeline
+   like `okx_futures_env.py`'s), reconstructing the same strategy-signal/price-context observation
+   shape `rlclient` builds live (§15.3), for every active token in sequence. Critically, the
+   **actions taken during these rollouts are the policy's own current choices**, produced fresh at
+   each step exactly like a live rollout — only the *market conditions* are historical, not the
+   decisions. This is standard on-policy PPO training against real data, not backtesting: nothing
+   about this phase evaluates or scores the model against history, and its output is never treated
+   as "proof" the model is good — it only gets the model past pure-random initialization before
+   real capital (even paper capital) is put behind its decisions.
+2. **Continued live learning (unchanged from §2's original decision)**: the warm-started model is
+   then the *same* model that keeps training from live paper-trading outcomes going forward — not
+   a separate "final" model swapped in afterward. §2's core commitment (the deployed model's real
+   training signal comes from live forward-test data, never from replayed history) is fully
+   preserved; the replay phase only changes where the *first* few updates' gradient signal comes
+   from, given a freshly-initialized network would otherwise spend a materially long stretch of
+   scarce live paper-trading data at close to random behavior. Revisit only if evidence shows this
+   warm-start biases the model toward historical patterns in a way live learning doesn't correct
+   for.
+
+Both phases pool **all active tokens** into the one global agent's training data (token identity
+is an observation field, §15.1 — no per-token filtering or separate models). Concretely:
+`train.py` gains a `--warm-start` mode that builds the replay env from Postgres (`candles` +
+re-evaluating each token's assigned strategies via the same `strategy` package logic Go uses, so
+the replayed observations match what `rlclient` actually sends in production) and runs standard
+`model.learn()` against it; a live/continued-training mode (built once §15.9's end-to-end no-op
+loop has accumulated real paper-trading history) consumes the *actual observation vectors logged
+at decision time* (§15.3's schema — needs persisting, not yet done: extending
+`paper_orders.features_json` or a new table, TBD at implementation) paired with their realized
+outcomes. Either mode produces `models/ppo_global.zip`, loaded by `rl_service/serve/api.py` and
+used to answer every token's `/predict` calls (the request's `inst_id` selects which
+token-identity input to set, not which model to load — see §15.1 for why this is one shared policy
+rather than per-token model files).
 
 ### 15.9 Implementation phasing (tracked in §14 going forward)
 
