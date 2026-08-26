@@ -100,6 +100,27 @@ type PaperOrder struct {
 	Variant       string // "baseline" (default) or "rl_adjusted"
 }
 
+// VariantStats summarizes one SL/TP-adjustment variant's closed-trade track record for the
+// baseline-vs-rl_adjusted comparison (CLAUDE.md §15.4) — one of these per variant, so the caller
+// can put them side by side.
+type VariantStats struct {
+	Variant     string // "baseline" or "rl_adjusted"
+	ClosedCount int64
+	Wins        int64 // close_reason = 'tp'
+	Losses      int64 // close_reason = 'sl'
+	RealizedPnL decimal.Decimal
+}
+
+// SLTPAdjustmentPair links one baseline order to its rl_adjusted fork (CLAUDE.md §15.4) for
+// trade-level (not just aggregate) comparison — e.g. a panel table of "this specific decision
+// helped/hurt."  Either side may still be open (ClosedAt/RealizedPnL nil) if the pair hasn't
+// resolved yet.
+type SLTPAdjustmentPair struct {
+	InstID          string
+	BaselineOrder   PaperOrder
+	RLAdjustedOrder PaperOrder
+}
+
 // TokenBudget is a token's running paper/demo-mode sub-budget (CLAUDE.md §15.6/§15.7) — tracked
 // separately from summing paper_orders on every check so "this token is at zero" is a fact the
 // system can act on directly, and so reset events (ResetCount/LastResetAt) are visible for
@@ -164,4 +185,16 @@ type Repository interface {
 	// (CLAUDE.md §15.7's "give it another chance" — paper/demo mode only, never called from a
 	// real-money path). Returns the updated row and whether a reset occurred.
 	ApplyTokenPnL(ctx context.Context, instID string, pnl decimal.Decimal) (TokenBudget, bool, error)
+
+	// SLTPAdjustmentStats aggregates CLOSED baseline vs. rl_adjusted trades into one VariantStats
+	// per variant (CLAUDE.md §15.4's A/B comparison) — instID/since filter the underlying
+	// paper_orders; instID="" means all instruments, since=zero time means no lower bound. Only
+	// baseline orders that actually have an rl_adjusted fork are counted on the "baseline" side, so
+	// the comparison is apples-to-apples (a baseline order nobody ever proposed adjusting isn't
+	// counted as evidence either way).
+	SLTPAdjustmentStats(ctx context.Context, instID string, since time.Time) ([]VariantStats, error)
+	// ListSLTPAdjustmentPairs returns every baseline/rl_adjusted pair for instID (or all
+	// instruments if ""), most-recently-opened first, for trade-level (not just aggregate)
+	// review — CLAUDE.md §15.4.
+	ListSLTPAdjustmentPairs(ctx context.Context, instID string) ([]SLTPAdjustmentPair, error)
 }

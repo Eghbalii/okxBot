@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 
@@ -143,6 +144,64 @@ func (r *fakeRepository) ApplyTokenPnL(ctx context.Context, instID string, pnl d
 	}
 	r.budgets[instID] = tb
 	return tb, reset, nil
+}
+func (r *fakeRepository) SLTPAdjustmentStats(ctx context.Context, instID string, since time.Time) ([]port.VariantStats, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	adjustedBaselineIDs := make(map[int64]bool)
+	for _, o := range r.orders {
+		if o.Variant == "rl_adjusted" && o.ParentOrderID != nil {
+			if b, ok := r.orders[*o.ParentOrderID]; ok && (instID == "" || b.InstID == instID) && !b.OpenedAt.Before(since) {
+				adjustedBaselineIDs[*o.ParentOrderID] = true
+			}
+		}
+	}
+
+	baseline := port.VariantStats{Variant: "baseline", RealizedPnL: decimal.Zero}
+	adjusted := port.VariantStats{Variant: "rl_adjusted", RealizedPnL: decimal.Zero}
+	for _, o := range r.orders {
+		if o.Variant == "baseline" || o.Variant == "" {
+			if !adjustedBaselineIDs[o.ID] {
+				continue
+			}
+			accumulateVariantStats(&baseline, o)
+		} else if o.Variant == "rl_adjusted" && o.ParentOrderID != nil && adjustedBaselineIDs[*o.ParentOrderID] {
+			accumulateVariantStats(&adjusted, o)
+		}
+	}
+	return []port.VariantStats{baseline, adjusted}, nil
+}
+func accumulateVariantStats(vs *port.VariantStats, o port.PaperOrder) {
+	if o.ClosedAt == nil {
+		return
+	}
+	vs.ClosedCount++
+	if o.CloseReason != nil && *o.CloseReason == "tp" {
+		vs.Wins++
+	}
+	if o.CloseReason != nil && *o.CloseReason == "sl" {
+		vs.Losses++
+	}
+	if o.RealizedPnL != nil {
+		vs.RealizedPnL = vs.RealizedPnL.Add(*o.RealizedPnL)
+	}
+}
+func (r *fakeRepository) ListSLTPAdjustmentPairs(ctx context.Context, instID string) ([]port.SLTPAdjustmentPair, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []port.SLTPAdjustmentPair
+	for _, o := range r.orders {
+		if o.Variant != "rl_adjusted" || o.ParentOrderID == nil {
+			continue
+		}
+		b, ok := r.orders[*o.ParentOrderID]
+		if !ok || (instID != "" && b.InstID != instID) {
+			continue
+		}
+		out = append(out, port.SLTPAdjustmentPair{InstID: b.InstID, BaselineOrder: b, RLAdjustedOrder: o})
+	}
+	return out, nil
 }
 func (r *fakeRepository) ListOpenPaperOrders(ctx context.Context, instID string) ([]port.PaperOrder, error) {
 	r.mu.Lock()
@@ -549,5 +608,96 @@ func TestAdjustOpenOrdersWithRL_SkipsWhenNoBaselineOrders(t *testing.T) {
 
 	if model.calls != 0 {
 		t.Errorf("expected Predict never called when there are no open baseline orders, got %d calls", model.calls)
+	}
+}
+
+func TestSLTPAdjustmentStats_AggregatesPairedTradesOnly(t *testing.T) {
+	repo := newFakeRepository()
+	ctx := context.Background()
+
+	// Baseline #1: has a fork, both closed. Baseline wins (tp), fork loses (sl). The fork must be
+	// created (ForkPaperOrderWithSLTP requires an open parent) BEFORE the baseline is closed.
+	closedAt1 := time.Now()
+	pnl1 := dec("5")
+	tpReason := "tp"
+	baseline1ID, _ := repo.OpenPaperOrder(ctx, port.PaperOrder{InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), Variant: "baseline"})
+
+	forkPnl1 := dec("-2")
+	slReason := "sl"
+	fork1ID, err := repo.ForkPaperOrderWithSLTP(ctx, baseline1ID, ptr(dec("95")), ptr(dec("110")))
+	if err != nil {
+		t.Fatalf("fork baseline1: %v", err)
+	}
+	repo.mu.Lock()
+	f1 := repo.orders[fork1ID]
+	f1.ClosedAt = &closedAt1
+	f1.CloseReason = &slReason
+	f1.RealizedPnL = &forkPnl1
+	repo.orders[fork1ID] = f1
+	repo.mu.Unlock()
+
+	repo.mu.Lock()
+	b1 := repo.orders[baseline1ID]
+	b1.ClosedAt = &closedAt1
+	b1.CloseReason = &tpReason
+	b1.RealizedPnL = &pnl1
+	repo.orders[baseline1ID] = b1
+	repo.mu.Unlock()
+
+	// Baseline #2: no fork at all — must be excluded entirely from the comparison.
+	pnl2 := dec("100")
+	baseline2ID, _ := repo.OpenPaperOrder(ctx, port.PaperOrder{InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), Variant: "baseline"})
+	repo.mu.Lock()
+	b2 := repo.orders[baseline2ID]
+	b2.ClosedAt = &closedAt1
+	b2.CloseReason = &tpReason
+	b2.RealizedPnL = &pnl2
+	repo.orders[baseline2ID] = b2
+	repo.mu.Unlock()
+
+	stats, err := repo.SLTPAdjustmentStats(ctx, "", time.Time{})
+	if err != nil {
+		t.Fatalf("SLTPAdjustmentStats: %v", err)
+	}
+	if len(stats) != 2 {
+		t.Fatalf("expected 2 variant rows, got %d", len(stats))
+	}
+
+	var baseline, adjusted port.VariantStats
+	for _, s := range stats {
+		if s.Variant == "baseline" {
+			baseline = s
+		} else {
+			adjusted = s
+		}
+	}
+
+	if baseline.ClosedCount != 1 || baseline.Wins != 1 || !baseline.RealizedPnL.Equal(dec("5")) {
+		t.Errorf("expected baseline{closed=1,wins=1,pnl=5} (baseline2 excluded, no fork), got %+v", baseline)
+	}
+	if adjusted.ClosedCount != 1 || adjusted.Losses != 1 || !adjusted.RealizedPnL.Equal(dec("-2")) {
+		t.Errorf("expected rl_adjusted{closed=1,losses=1,pnl=-2}, got %+v", adjusted)
+	}
+}
+
+func TestListSLTPAdjustmentPairs_ReturnsLinkedPairsOnly(t *testing.T) {
+	repo := newFakeRepository()
+	ctx := context.Background()
+
+	baselineID, _ := repo.OpenPaperOrder(ctx, port.PaperOrder{InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), Variant: "baseline"})
+	forkID, _ := repo.ForkPaperOrderWithSLTP(ctx, baselineID, ptr(dec("95")), ptr(dec("110")))
+	// An unrelated unpaired baseline order should not show up as a pair.
+	_, _ = repo.OpenPaperOrder(ctx, port.PaperOrder{InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), Variant: "baseline"})
+
+	pairs, err := repo.ListSLTPAdjustmentPairs(ctx, "BTC-USDT-SWAP")
+	if err != nil {
+		t.Fatalf("ListSLTPAdjustmentPairs: %v", err)
+	}
+	if len(pairs) != 1 {
+		t.Fatalf("expected exactly 1 pair, got %d", len(pairs))
+	}
+	if pairs[0].BaselineOrder.ID != baselineID || pairs[0].RLAdjustedOrder.ID != forkID {
+		t.Errorf("expected pair baseline=%d fork=%d, got baseline=%d fork=%d",
+			baselineID, forkID, pairs[0].BaselineOrder.ID, pairs[0].RLAdjustedOrder.ID)
 	}
 }
