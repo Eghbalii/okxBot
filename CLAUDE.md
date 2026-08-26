@@ -512,30 +512,59 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
 - [x] Extend `strategy.Signal`/`domain.Observation`/`rlclient.Action`/`rl_service` Pydantic
       schemas for the first round of new fields: per-timeframe strategy-signal blocks,
       recent-performance tail, `strategy_weights`, `sl_adjust_pct`/`tp_adjust_pct`
-      (`schema_version` 2) — done before the global-agent/raw-price-context revision below; still
-      needs the v3 follow-up item just below.
-- [ ] Bump observation schema to v3: add token-identity one-hot and raw-price-context fields (close
-      price series as normalized returns, distance-to-swing-high/low, distance-to-key-MA,
-      distance-to-open-position-SL/TP) per §15.3's revision — land together with the version bump,
-      not separately, per §15.3's explicit instruction
-- [ ] Raise `MAX_LEVERAGE`/`risk.max_leverage` config defaults toward the 10x-100x target range,
-      confirm §5's hard risk caps still independently bound worst case (§15.4)
-- [ ] Go-side ratchet clamp on SL/TP adjustments (only tighten toward locking profit, never widen)
-      (§15.4)
-- [ ] Per-token budget tracking + zero/negative reset-with-logging (paper/demo mode only) (§15.7)
-- [ ] Wire Phase A (BTC + XAU-equivalent instId, ≤5 strategies, 5m/15m/1h) end-to-end with a
-      still-untrained/no-op model before touching training (§15.9)
+      (`schema_version` 2) — done before the global-agent/raw-price-context revision below.
+- [x] Bumped observation schema to v3: token-identity one-hot (`ActiveTokens`) and raw-price-context
+      fields (`PriceContext.ClosePctChanges`, `DistToSwingHighPct`/`DistToSwingLowPct`,
+      `DistToSLPct`/`DistToTPPct`) landed together with the version bump on both sides
+      (`domain.ObservationSchemaVersion` / `OBSERVATION_SCHEMA_VERSION` = 3). Distance-to-key-MA
+      was not added — `Features` (FEATURE_COLUMNS' `sma_ratio_*`) already covers this; revisit only
+      if that proves insufficient once real training data exists.
+- [x] Raised `risk.max_leverage` default 5 -> 100 and `risk.min_liquidation_buffer_pct` 15 -> 2 (an
+      explicit, documented tradeoff of liquidation-distance safety margin for a usable leverage
+      range — see the comments in `config.go`/`config.example.yaml`); `rl_service`'s
+      `EnvConfig.max_leverage` raised to match. §5's hard risk-manager caps still independently
+      bound worst case, confirmed via `risk.Manager.Approve`'s existing clamp/reject logic
+      (untouched by this change).
+- [x] Go-side ratchet clamp on SL/TP adjustments: `usecase.RatchetSLTP`
+      (`internal/usecase/sltp_ratchet.go`), magnitude-clamped to `MaxSLTPAdjustPct` (±2%) then
+      direction-checked so a proposal can only tighten, never widen or undo a prior tightening —
+      8 unit tests covering long/short, widening rejection, ratchet-can't-be-undone, oversized-
+      adjustment clamping, nil SL/TP, and TP-can't-cross-price.
+- [x] Per-token budget tracking + zero/negative reset-with-logging (paper/demo mode only): new
+      `token_budgets` table (migration 000004) + `port.Repository.GetTokenBudget`/`ApplyTokenPnL`;
+      wired into `PaperTrader.monitorOpenOrders` on every baseline-order close, gated to
+      `variant='baseline'` only (§15.4's fork mechanic below never double-counts) (§15.7).
+- [x] Shadow-fork mechanic for SL/TP adjustment (design decision made and implemented during this
+      phase, not originally scoped in §15.4's first draft — see §15.4's "Shadow-fork mechanic"
+      note): `port.Repository.ForkPaperOrderWithSLTP` + migration 000004's `parent_order_id`/
+      `variant` columns; `usecase.PaperTrader.adjustOpenOrdersWithRL` calls the model at
+      candle-close for every open baseline order, ratchets the proposal, and forks a linked
+      `rl_adjusted` copy rather than editing in place — verified with dedicated tests
+      (fork-on-nonzero-adjustment, no-fork-on-zero-action, skip-when-no-baseline-orders).
+- [x] Wired end-to-end with a still-untrained/no-op model: `cmd/paper-trader` constructs
+      `rlclient.New(cfg.RLService.URL)` as `PaperTrader.Model` when the new
+      `paper_trading.rl_sltp_adjust` config flag is enabled (off by default — additive, never
+      required, matching §15's rollout posture throughout); `ActiveTokens`/`TokenBudgetUSD` wired
+      from `Trading.InstIDs`/`PaperTrading.TokenBudgetUSD`. Against rl_service's existing fail-safe
+      (no model loaded -> flat action, all adjust fields zero), this is a real no-op end-to-end
+      loop today. Not yet run against a live OKX feed — that verification is still open (§15.9).
 - [ ] Persist the actual observation vector sent at decision time (not just the outcome) alongside
       `paper_orders`, so `train.py` has real offline RL training data (§15.8)
 - [ ] Repoint `train.py` at the pooled paper-trading log across active tokens, producing one
       `models/ppo_global.zip` (§15.8) — supersedes the older single open item below, which is now
       folded into this phase
-- [ ] `rl_service/serve/api.py`: load the single global model, route `/predict` for every token
-      through it (token identity as an observation field, not a model-selection key),
-      reject/handle observation-schema-version mismatches (§15.3, §15.8)
+- [x] `rl_service/serve/api.py`: loads the single global model, routes `/predict` for every token
+      through it via the token-identity one-hot, rejects observation-schema-version mismatches with
+      a 422 (§15.3, §15.8) — implemented as part of the v3 schema bump above.
 - [ ] Per-token reward/PnL breakdown in training logs (not just aggregate) — the concrete detection
       mechanism for the "good on average, bad for one token" failure mode (§15.2, §15.5); required
-      before Phase B expands token count
+      before Phase B expands token count. Not yet meaningful until `train.py` exists (blocked on the
+      two `train.py`/offline-data items above).
+- [ ] A/B comparison tooling for baseline vs. rl_adjusted forks (§15.4): the data is being recorded
+      (`variant`/`parent_order_id` columns, `ListPositions` already returns both), but nothing yet
+      computes/surfaces win-rate or PnL comparison between paired baseline/fork trades — needed
+      before the "decide after ~a week which performed better" comparison (§15.4) can actually be
+      made from something other than a manual SQL query.
 
 Update the checklist above as work progresses.
 
@@ -677,9 +706,28 @@ Today's `Action{TargetExposure, LeverageFrac, Confidence}` (§2) becomes, per to
    - Hard constraint regardless of what the agent proposes: an SL adjustment can never *widen* risk
      past the position's original risk budget, and can never move SL to a worse (more losing) price
      than a prior tightening already reached — i.e. only ratchet toward locking in profit / reducing
-     risk, never away from it. Enforce this as a Go-side clamp in the execution path (`internal/risk`
-     or the paper-trader's order-update path), the same non-negotiable pattern as §5's other hard
-     limits — don't rely on the trained policy alone to have learned not to do this.
+     risk, never away from it. Enforced as a pure Go-side clamp, `usecase.RatchetSLTP`
+     (`internal/usecase/sltp_ratchet.go`), the same non-negotiable pattern as §5's other hard
+     limits — don't rely on the trained policy alone to have learned not to do this. Any adjustment
+     proposal is also magnitude-clamped to `usecase.MaxSLTPAdjustPct` (±2%) before the direction
+     check, so a single decision step can only move SL/TP a bounded amount regardless of what the
+     model outputs.
+   - **Shadow-fork mechanic, not in-place editing** (explicit product decision): when the agent
+     proposes a nonzero SL/TP adjustment on an open order, the original order is never edited.
+     Instead a linked copy ("fork") is created — same inst_id/side/entry_px/strategy_id/size/
+     leverage/opened_at, but with the ratcheted SL/TP applied — and both the original
+     (`variant='baseline'`) and the fork (`variant='rl_adjusted'`, `parent_order_id` set) are
+     monitored independently to completion against the live price feed. This is deliberate: it
+     turns every adjustment decision into a same-entry, same-signal A/B (baseline vs.
+     RL-adjusted) whose outcomes can be compared afterward (win rate, PnL) — the intended
+     comparison window is roughly a week's worth of paired trades, decided by the operator or later
+     folded into training as evidence for whether adjusting helped — rather than the adjustment
+     silently overwriting ground truth about what the un-adjusted order would have done.
+     `port.Repository.ForkPaperOrderWithSLTP` implements the clone; `usecase.PaperTrader.
+     adjustOpenOrdersWithRL` (called at candle-close cadence, gated on `PaperTrading.RLSLTPAdjust`)
+     is the call site. A fork is **tracking-only**: it is explicitly excluded from token
+     budget/reward accounting (§15.6/§15.7) — only its baseline parent's realized PnL counts
+     toward the token's real running budget, so one signal never draws down the budget twice.
 
 ### 15.5 Reward shaping
 
