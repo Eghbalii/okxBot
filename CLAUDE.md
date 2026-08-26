@@ -560,11 +560,16 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       mechanism for the "good on average, bad for one token" failure mode (§15.2, §15.5); required
       before Phase B expands token count. Not yet meaningful until `train.py` exists (blocked on the
       two `train.py`/offline-data items above).
-- [ ] A/B comparison tooling for baseline vs. rl_adjusted forks (§15.4): the data is being recorded
-      (`variant`/`parent_order_id` columns, `ListPositions` already returns both), but nothing yet
-      computes/surfaces win-rate or PnL comparison between paired baseline/fork trades — needed
-      before the "decide after ~a week which performed better" comparison (§15.4) can actually be
-      made from something other than a manual SQL query.
+- [x] A/B comparison tooling for baseline vs. rl_adjusted forks (§15.4):
+      `port.Repository.SLTPAdjustmentStats` (aggregate win-rate/PnL per variant, filterable by
+      instrument and a `since` lower bound — "the last week" per §15.4 — only counting baseline
+      orders that actually have a fork, so unpaired baselines don't dilute the comparison) and
+      `ListSLTPAdjustmentPairs` (trade-level pairs) implemented in Postgres with unit tests against
+      the fake repository; exposed via `cmd/api` (`GET /api/sltp-adjustments/stats`,
+      `GET /api/sltp-adjustments/pairs`); `panel/` gains an "SL/TP A-B" tab
+      (`SLTPComparisonPage.tsx`) showing both variants' closed-trade counts/win-rate/PnL side by
+      side plus the paired-trades table. The "decide after ~a week" call itself is still yours to
+      make by reading this page — no automated promote/reject action is taken on the comparison.
 
 Update the checklist above as work progresses.
 
