@@ -48,6 +48,9 @@ func (s *Server) Routes() http.Handler {
 
 	mux.HandleFunc("GET /api/positions", s.handleListPositions)
 
+	mux.HandleFunc("GET /api/sltp-adjustments/stats", s.handleSLTPAdjustmentStats)
+	mux.HandleFunc("GET /api/sltp-adjustments/pairs", s.handleListSLTPAdjustmentPairs)
+
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -340,6 +343,40 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// handleSLTPAdjustmentStats serves the baseline-vs-rl_adjusted A/B comparison (CLAUDE.md §15.4):
+// aggregate win-rate/PnL for each variant, optionally filtered to one instrument and/or a lower
+// bound on when the baseline order was opened (e.g. "the last week").
+func (s *Server) handleSLTPAdjustmentStats(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	since := time.Time{}
+	if v := q.Get("since"); v != "" {
+		parsed, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid since (want RFC3339): "+err.Error())
+			return
+		}
+		since = parsed
+	}
+
+	stats, err := s.Repo.SLTPAdjustmentStats(r.Context(), q.Get("instId"), since)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
+// handleListSLTPAdjustmentPairs serves trade-level detail behind handleSLTPAdjustmentStats's
+// aggregate — every baseline/rl_adjusted pair, most-recently-opened first (CLAUDE.md §15.4).
+func (s *Server) handleListSLTPAdjustmentPairs(w http.ResponseWriter, r *http.Request) {
+	pairs, err := s.Repo.ListSLTPAdjustmentPairs(r.Context(), r.URL.Query().Get("instId"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, pairs)
 }
 
 func pathInt64(r *http.Request, key string) (int64, error) {
