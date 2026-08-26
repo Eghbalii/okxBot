@@ -16,6 +16,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
+	"github.com/eghbalii/okxBot/go-engine/internal/rlclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 	"github.com/eghbalii/okxBot/go-engine/internal/stream"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
@@ -63,6 +64,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// CLAUDE.md §15.4: nil unless explicitly enabled, so PaperTrader's SL/TP-adjustment pass is a
+	// strict no-op wherever operators haven't opted in — same "additive, never required" posture
+	// as the rest of §15's rollout.
+	var model port.ModelClient
+	if cfg.PaperTrading.RLSLTPAdjust {
+		model = rlclient.New(cfg.RLService.URL)
+	}
+
 	errCh := make(chan error, len(cfg.Trading.InstIDs))
 	for _, instID := range cfg.Trading.InstIDs {
 		// Strategy assignments are durable (strategy_assignments table, CLAUDE.md §11.3): loaded
@@ -92,6 +101,9 @@ func main() {
 			NotionalUSD:     cfg.PaperTrading.NotionalUSD,
 			MaxOpenOrders:   cfg.PaperTrading.MaxOpenOrders,
 			Logger:          logger,
+			Model:           model,
+			ActiveTokens:    cfg.Trading.InstIDs,
+			TokenBudgetUSD:  cfg.PaperTrading.TokenBudgetUSD,
 		}
 		go func() { errCh <- engine.Run(ctx) }()
 	}

@@ -89,6 +89,28 @@ type PaperOrder struct {
 	RealizedPnL  *decimal.Decimal
 	FeaturesJSON json.RawMessage
 	Mode         string // "paper", "demo", or "real" (CLAUDE.md §11.4); defaults to "paper"
+
+	// ParentOrderID/Variant implement the SL/TP shadow-fork mechanic (CLAUDE.md §15.4): when the RL
+	// agent proposes an in-trade SL/TP adjustment, the original order (Variant="baseline",
+	// ParentOrderID=nil) is never edited — a linked fork (Variant="rl_adjusted", ParentOrderID set
+	// to the original's ID) carries the adjustment instead, and both are monitored to completion
+	// for later comparison. A fork is tracking-only: it must never be double-counted toward a
+	// token's budget/reward (§15.6/§15.7) — callers filter to Variant="baseline" for that.
+	ParentOrderID *int64
+	Variant       string // "baseline" (default) or "rl_adjusted"
+}
+
+// TokenBudget is a token's running paper/demo-mode sub-budget (CLAUDE.md §15.6/§15.7) — tracked
+// separately from summing paper_orders on every check so "this token is at zero" is a fact the
+// system can act on directly, and so reset events (ResetCount/LastResetAt) are visible for
+// training-run analysis rather than looking like unlimited free money.
+type TokenBudget struct {
+	InstID      string
+	BudgetUSD   decimal.Decimal // configured per-token notional a reset tops back up to
+	EquityUSD   decimal.Decimal // current running balance
+	ResetCount  int
+	LastResetAt *time.Time
+	UpdatedAt   time.Time
 }
 
 // Repository is the persistence port. internal/postgres implements this.
@@ -116,8 +138,30 @@ type Repository interface {
 
 	OpenPaperOrder(ctx context.Context, o PaperOrder) (int64, error)
 	ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error
+	// UpdatePaperOrderSLTP applies an in-trade SL/TP adjustment to an open order (CLAUDE.md §15.4).
+	// Callers MUST have already run the proposed new prices through the ratchet clamp
+	// (usecase.RatchetSLTP) before calling this — the repository does not re-validate the ratchet
+	// constraint itself. Deprecated for RL-driven adjustments as of the shadow-fork mechanic below
+	// (kept for any future non-forking/manual SL-TP edit path); the RL loop calls
+	// ForkPaperOrderWithSLTP instead.
+	UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error
+	// ForkPaperOrderWithSLTP implements the SL/TP shadow-fork mechanic (CLAUDE.md §15.4): creates a
+	// new PaperOrder row cloned from the still-open order at parentID (same inst_id/side/entry_px/
+	// strategy_id/size/leverage/opened_at) but with slPx/tpPx applied and Variant="rl_adjusted",
+	// ParentOrderID=parentID. The parent order itself is left untouched. Returns the new fork's id.
+	// Callers MUST have already run slPx/tpPx through the ratchet clamp (usecase.RatchetSLTP).
+	ForkPaperOrderWithSLTP(ctx context.Context, parentID int64, slPx, tpPx *decimal.Decimal) (int64, error)
 	ListOpenPaperOrders(ctx context.Context, instID string) ([]PaperOrder, error)
 	// ListPositions returns positions (open and/or closed) across trading modes for the panel
 	// (CLAUDE.md §11.4), filtered/sorted per f.
 	ListPositions(ctx context.Context, f PositionFilter) ([]PaperOrder, error)
+
+	// GetTokenBudget returns inst_id's current budget row, creating it (seeded at initialBudgetUSD,
+	// EquityUSD=initialBudgetUSD) if it doesn't exist yet — CLAUDE.md §15.7.
+	GetTokenBudget(ctx context.Context, instID string, initialBudgetUSD decimal.Decimal) (TokenBudget, error)
+	// ApplyTokenPnL adds pnl (signed) to inst_id's running equity. If the resulting equity is
+	// <= 0, it is reset back to its configured BudgetUSD and ResetCount/LastResetAt are recorded
+	// (CLAUDE.md §15.7's "give it another chance" — paper/demo mode only, never called from a
+	// real-money path). Returns the updated row and whether a reset occurred.
+	ApplyTokenPnL(ctx context.Context, instID string, pnl decimal.Decimal) (TokenBudget, bool, error)
 }

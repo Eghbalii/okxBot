@@ -53,6 +53,14 @@ type PaperTrader struct {
 	MaxOpenOrders   int
 	Logger          *slog.Logger
 
+	// Model/ActiveTokens/TokenBudgetUSD wire the RL agent's in-trade SL/TP adjustment pass
+	// (CLAUDE.md §15.4). Model may be nil, in which case the adjustment pass is skipped entirely —
+	// this lets PaperTrader run exactly as before (strategy-only) wherever the RL service isn't
+	// configured, same "additive, never required" pattern as the rest of §15's rollout.
+	Model          port.ModelClient
+	ActiveTokens   []string        // the roster used to build the token-identity one-hot, CLAUDE.md §15.3
+	TokenBudgetUSD decimal.Decimal // this token's configured paper-mode sub-budget, CLAUDE.md §15.6/§15.7
+
 	// candlesMu guards candles: each bar has its own consumer goroutine (see Run), so writes to
 	// this map (even to distinct keys) must be synchronized — concurrent map writes are a fatal
 	// Go runtime error, not just a race.
@@ -175,7 +183,16 @@ func (e *PaperTrader) handleCandle(ctx context.Context, bar string, data []byte,
 	if err := e.Repo.SaveCandle(ctx, port.Candle{InstID: e.InstID, Bar: bar, Candle: c}); err != nil {
 		logger.Warn("failed to persist candle", "instId", e.InstID, "bar", bar, "error", err)
 	}
-	return e.evaluateStrategies(ctx, bar, c.Close, logger)
+	if err := e.evaluateStrategies(ctx, bar, c.Close, logger); err != nil {
+		return err
+	}
+	// CLAUDE.md §15.4: RL-driven SL/TP adjustment runs at candle-close cadence (not every tick) to
+	// avoid overreacting to noise. Best-effort: a failure here must never block strategy evaluation
+	// or candle persistence above, which already succeeded.
+	if e.Model != nil {
+		e.adjustOpenOrdersWithRL(ctx, bar, c.Close, logger)
+	}
+	return nil
 }
 
 func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) error {
@@ -241,6 +258,19 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 		// this is write-only telemetry, not a value used in further financial arithmetic.
 		metrics.PaperOrdersRealizedPnL.WithLabelValues(e.InstID).Add(pnl.InexactFloat64())
 		logger.Info("closed paper order", "id", o.ID, "instId", e.InstID, "reason", reason, "closePx", price, "pnl", pnl)
+
+		// CLAUDE.md §15.4/§15.6/§15.7: only a baseline order's outcome counts toward the token's
+		// tracked budget/reward — an rl_adjusted fork is tracking-only (its whole purpose is to be
+		// compared against its baseline parent afterward, not to be treated as a second real bet).
+		if o.Variant == "baseline" || o.Variant == "" {
+			if e.TokenBudgetUSD.IsPositive() {
+				if _, reset, err := e.Repo.ApplyTokenPnL(ctx, e.InstID, pnl); err != nil {
+					logger.Error("failed to apply token pnl", "instId", e.InstID, "error", err)
+				} else if reset {
+					logger.Warn("token budget drained, reset to configured budget", "instId", e.InstID, "budgetUsd", e.TokenBudgetUSD)
+				}
+			}
+		}
 	}
 	return nil
 }

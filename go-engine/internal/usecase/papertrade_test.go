@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -22,10 +23,11 @@ type fakeRepository struct {
 	nextID  int64
 	orders  map[int64]port.PaperOrder
 	candles []port.Candle
+	budgets map[string]port.TokenBudget
 }
 
 func newFakeRepository() *fakeRepository {
-	return &fakeRepository{orders: make(map[int64]port.PaperOrder)}
+	return &fakeRepository{orders: make(map[int64]port.PaperOrder), budgets: make(map[string]port.TokenBudget)}
 }
 
 func (r *fakeRepository) SaveCandle(ctx context.Context, c port.Candle) error {
@@ -85,6 +87,62 @@ func (r *fakeRepository) ClosePaperOrder(ctx context.Context, id int64, closePx 
 	o.RealizedPnL = &pnl
 	r.orders[id] = o
 	return nil
+}
+func (r *fakeRepository) UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.orders[id]
+	if !ok || o.ClosedAt != nil {
+		return nil
+	}
+	o.SLPx = slPx
+	o.TPPx = tpPx
+	r.orders[id] = o
+	return nil
+}
+func (r *fakeRepository) ForkPaperOrderWithSLTP(ctx context.Context, parentID int64, slPx, tpPx *decimal.Decimal) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	parent, ok := r.orders[parentID]
+	if !ok || parent.ClosedAt != nil {
+		return 0, fmt.Errorf("fork: parent order %d not open", parentID)
+	}
+	r.nextID++
+	fork := parent
+	fork.ID = r.nextID
+	fork.SLPx = slPx
+	fork.TPPx = tpPx
+	fork.ParentOrderID = &parentID
+	fork.Variant = "rl_adjusted"
+	r.orders[fork.ID] = fork
+	return fork.ID, nil
+}
+func (r *fakeRepository) GetTokenBudget(ctx context.Context, instID string, initialBudgetUSD decimal.Decimal) (port.TokenBudget, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if tb, ok := r.budgets[instID]; ok {
+		return tb, nil
+	}
+	tb := port.TokenBudget{InstID: instID, BudgetUSD: initialBudgetUSD, EquityUSD: initialBudgetUSD}
+	r.budgets[instID] = tb
+	return tb, nil
+}
+func (r *fakeRepository) ApplyTokenPnL(ctx context.Context, instID string, pnl decimal.Decimal) (port.TokenBudget, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tb, ok := r.budgets[instID]
+	if !ok {
+		return port.TokenBudget{}, false, fmt.Errorf("apply pnl: no budget row for %s", instID)
+	}
+	tb.EquityUSD = tb.EquityUSD.Add(pnl)
+	reset := false
+	if tb.EquityUSD.Sign() <= 0 {
+		tb.EquityUSD = tb.BudgetUSD
+		tb.ResetCount++
+		reset = true
+	}
+	r.budgets[instID] = tb
+	return tb, reset, nil
 }
 func (r *fakeRepository) ListOpenPaperOrders(ctx context.Context, instID string) ([]port.PaperOrder, error) {
 	r.mu.Lock()
@@ -383,5 +441,113 @@ func TestHandleCandle_ConcurrentBarsDoNotRace(t *testing.T) {
 		if len(pt.candles[bar]) == 0 {
 			t.Errorf("expected candles recorded for bar %s after concurrent writes, got none", bar)
 		}
+	}
+}
+
+// fakeModelClientRL returns a fixed action on every Predict call — used to test the SL/TP
+// adjustment/fork path deterministically.
+type fakeModelClientRL struct {
+	action domain.Action
+	calls  int
+}
+
+func (f *fakeModelClientRL) Predict(ctx context.Context, obs domain.Observation) (*domain.Action, error) {
+	f.calls++
+	a := f.action
+	return &a, nil
+}
+
+func TestAdjustOpenOrdersWithRL_ForksOnNonZeroAdjustment(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.candles = map[string][]domain.Candle{"1m": {
+		{Close: dec("100")}, {Close: dec("101")}, {Close: dec("102")}, {Close: dec("105")},
+	}, "15m": nil}
+	pt.TokenBudgetUSD = dec("10")
+	model := &fakeModelClientRL{action: domain.Action{SLAdjustPct: dec("0.02"), TPAdjustPct: dec("0.02")}}
+	pt.Model = model
+
+	sl, tp := dec("95"), dec("110")
+	id, err := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp, Size: dec("100"), Leverage: dec("1"),
+	})
+	if err != nil {
+		t.Fatalf("open baseline order: %v", err)
+	}
+
+	pt.adjustOpenOrdersWithRL(context.Background(), "1m", dec("105"), testLogger())
+
+	if model.calls == 0 {
+		t.Fatalf("expected Predict to be called")
+	}
+
+	orders, err := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if err != nil {
+		t.Fatalf("list open orders: %v", err)
+	}
+	if len(orders) != 2 {
+		t.Fatalf("expected baseline + 1 fork = 2 open orders, got %d", len(orders))
+	}
+
+	var baseline, fork *port.PaperOrder
+	for i := range orders {
+		o := orders[i]
+		if o.ID == id {
+			baseline = &o
+		} else {
+			fork = &o
+		}
+	}
+	if baseline == nil || fork == nil {
+		t.Fatalf("expected to find both baseline (id=%d) and a fork among %+v", id, orders)
+	}
+	if !baseline.SLPx.Equal(sl) || !baseline.TPPx.Equal(tp) {
+		t.Errorf("expected baseline order's SL/TP untouched, got sl=%s tp=%s", baseline.SLPx, baseline.TPPx)
+	}
+	if fork.Variant != "rl_adjusted" || fork.ParentOrderID == nil || *fork.ParentOrderID != id {
+		t.Errorf("expected fork tagged rl_adjusted with parent %d, got variant=%s parent=%v", id, fork.Variant, fork.ParentOrderID)
+	}
+	// SL should have tightened (moved up from 95, toward locking profit at price 105).
+	if !fork.SLPx.GreaterThan(sl) {
+		t.Errorf("expected fork's SL to have tightened above %s, got %s", sl, fork.SLPx)
+	}
+}
+
+func TestAdjustOpenOrdersWithRL_NoOpActionDoesNotFork(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
+	pt.Model = &fakeModelClientRL{action: domain.Action{}} // zero adjustment, matches the no-op fail-safe
+
+	sl := dec("95")
+	_, err := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, Size: dec("100"), Leverage: dec("1"),
+	})
+	if err != nil {
+		t.Fatalf("open baseline order: %v", err)
+	}
+
+	pt.adjustOpenOrdersWithRL(context.Background(), "1m", dec("100"), testLogger())
+
+	orders, err := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if err != nil {
+		t.Fatalf("list open orders: %v", err)
+	}
+	if len(orders) != 1 {
+		t.Errorf("expected no fork for a zero-adjustment action, got %d open orders", len(orders))
+	}
+}
+
+func TestAdjustOpenOrdersWithRL_SkipsWhenNoBaselineOrders(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
+	model := &fakeModelClientRL{action: domain.Action{SLAdjustPct: dec("0.02")}}
+	pt.Model = model
+
+	pt.adjustOpenOrdersWithRL(context.Background(), "1m", dec("100"), testLogger())
+
+	if model.calls != 0 {
+		t.Errorf("expected Predict never called when there are no open baseline orders, got %d calls", model.calls)
 	}
 }
