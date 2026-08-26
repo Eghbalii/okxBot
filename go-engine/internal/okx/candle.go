@@ -5,7 +5,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"github.com/rez/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 )
 
 // Candle is one OHLCV bar from OKX's REST /market/candles (or WS candle channel), still as the

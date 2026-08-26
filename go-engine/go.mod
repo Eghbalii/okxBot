@@ -1,4 +1,4 @@
-module github.com/rez/okxBot/go-engine
+module github.com/eghbalii/okxBot/go-engine
 
 go 1.26.3
 

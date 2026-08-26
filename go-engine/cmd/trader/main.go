@@ -11,11 +11,11 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"github.com/rez/okxBot/go-engine/internal/config"
-	"github.com/rez/okxBot/go-engine/internal/okx/rest"
-	"github.com/rez/okxBot/go-engine/internal/risk"
-	"github.com/rez/okxBot/go-engine/internal/rlclient"
-	"github.com/rez/okxBot/go-engine/internal/usecase"
+	"github.com/eghbalii/okxBot/go-engine/internal/config"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
+	"github.com/eghbalii/okxBot/go-engine/internal/risk"
+	"github.com/eghbalii/okxBot/go-engine/internal/rlclient"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )
 
 func main() {

@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/rez/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 )
 
 // Client calls the FastAPI inference server's /predict endpoint. Implements port.ModelClient.

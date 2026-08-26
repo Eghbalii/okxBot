@@ -11,10 +11,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/rez/okxBot/go-engine/internal/config"
-	"github.com/rez/okxBot/go-engine/internal/metrics"
-	"github.com/rez/okxBot/go-engine/internal/okx/ws"
-	"github.com/rez/okxBot/go-engine/internal/stream"
+	"github.com/eghbalii/okxBot/go-engine/internal/config"
+	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx/ws"
+	"github.com/eghbalii/okxBot/go-engine/internal/stream"
 )
 
 func main() {

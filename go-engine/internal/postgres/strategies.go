@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/rez/okxBot/go-engine/internal/port"
+	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
 // CreateStrategy inserts a new strategy config and returns its id.

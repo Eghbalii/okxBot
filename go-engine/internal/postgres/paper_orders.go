@@ -6,7 +6,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"github.com/rez/okxBot/go-engine/internal/port"
+	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
 // OpenPaperOrder inserts a new virtual trade and returns its id.

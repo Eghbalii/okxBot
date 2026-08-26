@@ -9,7 +9,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"github.com/rez/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 )
 
 // Candle is one persisted OHLCV bar for an instrument (domain.Candle plus storage identity/key

@@ -5,7 +5,7 @@ package strategy
 import (
 	"github.com/shopspring/decimal"
 
-	"github.com/rez/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 )
 
 // Side is the suggested trade direction, or "" for no signal.

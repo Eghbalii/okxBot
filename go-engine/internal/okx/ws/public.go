@@ -11,7 +11,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/rez/okxBot/go-engine/internal/metrics"
+	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 )
 
 // Message is a decoded OKX WS push message.

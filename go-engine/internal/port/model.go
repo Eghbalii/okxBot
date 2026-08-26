@@ -3,7 +3,7 @@ package port
 import (
 	"context"
 
-	"github.com/rez/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 )
 
 // ModelClient is the port use-cases depend on to get the RL agent's trading decision. Implemented

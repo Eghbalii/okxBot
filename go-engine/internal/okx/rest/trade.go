@@ -1,8 +1,8 @@
 package rest
 
 import (
-	"github.com/rez/okxBot/go-engine/internal/domain"
-	"github.com/rez/okxBot/go-engine/internal/okx"
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx"
 )
 
 // PlaceOrder submits an order via POST /api/v5/trade/order.

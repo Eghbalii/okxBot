@@ -10,14 +10,14 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/rez/okxBot/go-engine/internal/config"
-	"github.com/rez/okxBot/go-engine/internal/metrics"
-	"github.com/rez/okxBot/go-engine/internal/okx/rest"
-	"github.com/rez/okxBot/go-engine/internal/port"
-	"github.com/rez/okxBot/go-engine/internal/postgres"
-	"github.com/rez/okxBot/go-engine/internal/strategy"
-	"github.com/rez/okxBot/go-engine/internal/stream"
-	"github.com/rez/okxBot/go-engine/internal/usecase"
+	"github.com/eghbalii/okxBot/go-engine/internal/config"
+	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
+	"github.com/eghbalii/okxBot/go-engine/internal/port"
+	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
+	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
+	"github.com/eghbalii/okxBot/go-engine/internal/stream"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )
 
 func main() {

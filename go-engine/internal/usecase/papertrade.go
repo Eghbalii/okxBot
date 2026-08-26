@@ -11,10 +11,10 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"github.com/rez/okxBot/go-engine/internal/domain"
-	"github.com/rez/okxBot/go-engine/internal/metrics"
-	"github.com/rez/okxBot/go-engine/internal/port"
-	"github.com/rez/okxBot/go-engine/internal/strategy"
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
+	"github.com/eghbalii/okxBot/go-engine/internal/port"
+	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 )
 
 // StrategyAssignment pairs a Strategy with the candle timeframe it evaluates against. A

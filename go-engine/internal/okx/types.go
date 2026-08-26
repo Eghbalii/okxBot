@@ -3,7 +3,7 @@ package okx
 import (
 	"github.com/shopspring/decimal"
 
-	"github.com/rez/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 )
 
 // Ticker is a normalized OKX v5 "tickers" channel / REST market ticker payload.

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"net/url"
 
-	"github.com/rez/okxBot/go-engine/internal/domain"
-	"github.com/rez/okxBot/go-engine/internal/okx"
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx"
 )
 
 // GetPositions fetches open positions via GET /api/v5/account/positions.

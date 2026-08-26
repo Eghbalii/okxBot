@@ -8,9 +8,9 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"github.com/rez/okxBot/go-engine/internal/domain"
-	"github.com/rez/okxBot/go-engine/internal/port"
-	"github.com/rez/okxBot/go-engine/internal/strategy"
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/port"
+	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 )
 
 // fakeRepository is an in-memory port.Repository for testing, no real Postgres needed. Guarded

@@ -1,6 +1,6 @@
 package port
 
-import "github.com/rez/okxBot/go-engine/internal/domain"
+import "github.com/eghbalii/okxBot/go-engine/internal/domain"
 
 // ExchangeClient is the port use-cases depend on for market data and trade execution — the
 // exchange-agnostic interface an OKX (or future Bybit/Binance) adapter implements. See CLAUDE.md

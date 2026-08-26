@@ -11,9 +11,9 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"github.com/rez/okxBot/go-engine/internal/domain"
-	"github.com/rez/okxBot/go-engine/internal/port"
-	"github.com/rez/okxBot/go-engine/internal/risk"
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/port"
+	"github.com/eghbalii/okxBot/go-engine/internal/risk"
 )
 
 // Trader runs the periodic decide-and-execute loop for a single instrument: fetch state, ask the
