@@ -81,7 +81,7 @@ okxBot/
 ├── docker-compose.yml         # kafka + redis + timescaledb + prometheus/grafana + loki/promtail
 │                                 + go services + python services
 ├── loki-config.yml            # log aggregation storage/retention, §11.7
-├── promtail-config.yml        # Docker-service-discovery log shipper -> Loki, §11.7
+├── promtail-config.yml        # tails Docker json-file logs off disk -> Loki, §11.7
 ├── prometheus.yml             # metrics scrape config, §11.6
 ├── grafana/provisioning/      # auto-provisioned Prometheus + Loki datasources, §11.6/§11.7
 ├── go-engine/                 # Go module: data ingestion + order execution + risk + API
@@ -420,21 +420,36 @@ pane of glass for both, not two separate tools to learn.
 
 - **`loki`** (`loki-config.yml`, filesystem storage on the `loki-data` volume — no object store,
   appropriate for one VPS not a multi-node deployment) and **`promtail`** (`promtail-config.yml`)
-  added to `docker-compose.yml`. Promtail uses **Docker service discovery**
-  (`docker_sd_configs`, mounted `/var/run/docker.sock` read-only) to auto-tail every container's
-  stdout/stderr — no per-service config needed as new `cmd/*` services are added, and no
-  application code changes were needed at all: every Go service already logs structured
-  `logfmt` via `slog.NewTextHandler` (§6) to stdout, which Promtail's `logfmt` pipeline stage
-  parses to promote `level` into a real, queryable Loki label
-  (`{service="paper-trader", level="ERROR"}` in Grafana Explore/LogQL) — this is the concrete
-  mechanism behind "save/query each service's errors separately." Non-Go containers (Python
-  services, Postgres, Redis, Kafka) still have their raw log lines land in Loki under
-  `{service=...}`, just without a parsed `level` label (the logfmt stage no-ops, not errors, on
-  non-matching lines) — full-text search still works on those via LogQL's `|= "text"` filter.
-- **`{container_name} -> {service}` relabeling**: Promtail strips the compose project prefix and
-  instance suffix (`/okxbot-paper-trader-1` -> `service="paper-trader"`) so labels match the
-  `cmd/*` names used throughout this doc and the Prometheus metric labels above, not raw Docker
-  container names.
+  added to `docker-compose.yml`. No application code changes were needed at all: every Go service
+  already logs structured `logfmt` via `slog.NewTextHandler` (§6) to stdout, which Promtail's
+  `logfmt` pipeline stage parses to promote `level` into a real, queryable Loki label
+  (`{level="ERROR"}` in Grafana Explore/LogQL) — this is the concrete mechanism behind "save/query
+  each service's errors separately." Non-Go containers (Python services, Postgres, Redis, Kafka)
+  still have their raw log lines land in Loki, just without a parsed `level` label (the logfmt
+  stage no-ops, not errors, on non-matching lines) — full-text search still works on those via
+  LogQL's `|= "text"` filter.
+- **File-based scraping, not Docker service discovery** — this was a real bug caught and fixed
+  during live verification, not a design choice made up front. The first implementation used
+  Promtail's `docker_sd_configs` (live-container discovery, refreshed every 5s), labeled with a
+  `{container_name} -> service` relabel rule. Live-testing it against a real crash
+  (`cmd/paper-trader` exiting ~2s after start on a bad `PUMP-USDT-SWAP` instrument ID already
+  present in `config.yaml`, unrelated to this logging work) showed the crash's own error log
+  **never made it into Loki at all** — the container had already exited and dropped out of
+  `docker ps` before Promtail's discovery loop ever found it, silently losing exactly the kind of
+  log this feature exists to capture. Fixed by switching `promtail-config.yml` to scrape Docker's
+  own `json-file` log driver output directly
+  (`/var/lib/docker/containers/*/*-json.log`, mounted read-only into the `promtail` service in
+  `docker-compose.yml`) — those files persist on disk regardless of whether the container is still
+  running, so a fast crash's logs are captured the same as a long-lived service's. Re-verified with
+  a second, deliberately fresh crash of the same service: the error was queryable in Loki
+  (`{container_id="...", level="ERROR"}`) within ~3 seconds.
+  - **Tradeoff of this fix**: the file-based approach only labels by `container_id` (the 64-char
+    hex id embedded in the log file's own path) since deriving a human-readable `service` label
+    from a file glob needs a second Docker API lookup that would either duplicate ingestion (a
+    second scrape job) or add a dependency this scrape config deliberately doesn't have. Resolve
+    an id to a name with `docker inspect <container_id> --format '{{.Name}}'`, or skip the lookup
+    and just filter on `filename` (which embeds the same id) or full-text search
+    (`|= "paper-trader"` works fine against most log lines even without a label for it).
 - **Grafana datasource auto-provisioning**: `grafana/provisioning/datasources/datasources.yml`
   registers both Prometheus and Loki on Grafana startup — no manual "Add data source" step after a
   fresh `docker compose up`, matching the "foundations first, minimal manual setup" pattern used
@@ -442,10 +457,6 @@ pane of glass for both, not two separate tools to learn.
 - **Retention**: 14 days (`loki-config.yml`'s `retention_period: 336h`) — bounded so disk usage on
   a small VPS doesn't grow unbounded; adjust directly in that file if a longer/shorter window is
   needed later.
-- Live-verified end-to-end while building this: real container logs (ingestor, redis, kafka,
-  timescaledb) were confirmed flowing into Loki with correct `service` labels, and `level` values
-  (`INFO`/`WARN`/`ERROR` from Go's `slog`, lowercase `info`/`warn`/`error` from some other
-  containers' own logging) were confirmed present and queryable via Loki's label-values API.
 - No dashboard/Explore-view saved searches are pre-built yet (mirrors §11.6's own "dashboards
   aren't built yet, add them once there's real data" framing) — querying today means using
   Grafana's Explore tab against the Loki datasource directly.

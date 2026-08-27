@@ -9,31 +9,47 @@ clients:
   - url: http://loki:3100/loki/api/v1/push
 
 scrape_configs:
-  # Docker service discovery: auto-attaches to every container's stdout/stderr on this host, no
-  # per-service config needed as new cmd/* services are added (CLAUDE.md §12's "code against the
-  # interface, transport stays swappable" instinct applied to logging too — this is transport-
-  # agnostic w.r.t. what's actually running).
-  - job_name: docker
-    docker_sd_configs:
-      - host: unix:///var/run/docker.sock
-        refresh_interval: 5s
-    relabel_configs:
-      # Container name (e.g. "/okxbot-paper-trader-1") -> a clean "service" label
-      # ("paper-trader") — strips the leading slash and the compose project prefix/instance
-      # suffix, matching this project's cmd/* naming.
-      - source_labels: [__meta_docker_container_name]
-        regex: "/okxbot-(.*)-[0-9]+"
-        target_label: service
-      - source_labels: [__meta_docker_container_name]
-        target_label: container
-      - source_labels: [__meta_docker_container_log_stream]
-        target_label: stream
+  # File-based scraping of Docker's own json-file log files, not live-container discovery. This
+  # distinction matters: discovery-based scraping (e.g. Promtail's docker_sd_configs, or any
+  # approach that only watches `docker ps`) only tails containers that are running *at scrape
+  # time* — a container that crashes fast (e.g. a bad config value crashing on startup, which
+  # happens in practice) can exit and disappear before Promtail ever discovers it, silently losing
+  # exactly the crash logs "search errors separately" cares about most. Docker's json-file driver
+  # (the default) persists every container's logs to
+  # /var/lib/docker/containers/<id>/<id>-json.log regardless of whether the container is still
+  # running, so tailing that path directly (mounted read-only in docker-compose.yml) captures a
+  # container's full lifetime, startup crash included — live-verified against a real crash
+  # (cmd/paper-trader exiting 2s after start on a bad instrument ID) while building this: the
+  # earlier docker_sd_configs-based version missed it entirely, this version does not.
+  - job_name: docker-containers
+    static_configs:
+      - targets: [localhost]
+        labels:
+          __path__: /var/lib/docker/containers/*/*-json.log
     pipeline_stages:
+      # Docker's json-file format wraps each line as {"log":"...","stream":"stdout","time":"..."}
+      # — the docker stage unwraps that, setting the actual log text as the line content and
+      # "stream" as a label, in one step.
+      - docker: {}
+      # __path__ globs .../<container_id>/<container_id>-json.log — pull the container id straight
+      # out of the matched file path (Docker's own log files carry no human-readable name, only
+      # the id) and keep it as a label. This is the one real tradeoff of the file-based approach
+      # vs. docker_sd_configs: no compose service name label without a second Docker API lookup
+      # (deliberately not added — keeps this scrape config dependency-free and avoids duplicating
+      # log ingestion via two overlapping jobs). Resolve a container_id to its name/service with
+      # `docker inspect <container_id> --format '{{.Name}}'`, or filter first by `filename` (which
+      # does embed the id) or by full-text search across everything with `|= "text"` and skip the
+      # label lookup entirely.
+      - regex:
+          source: filename
+          expression: '.*/(?P<container_id>[0-9a-f]{64})/.*-json\.log$'
+      - labels:
+          container_id:
       # All go-engine services use slog.NewTextHandler (logfmt output: time=... level=... msg=...
       # key=value), so this single logfmt stage works across every Go service uniformly. Promotes
-      # "level" to a real Loki label so {service="paper-trader", level="ERROR"} is queryable
-      # directly, which is the actual "save errors separately" requirement — no application code
-      # changes needed since slog already emits structured output.
+      # "level" to a real Loki label so {level="ERROR"} is queryable directly — the actual "save
+      # errors separately" requirement, no application code changes needed since slog already
+      # emits structured output.
       - logfmt:
           mapping:
             level: level
@@ -41,5 +57,5 @@ scrape_configs:
           level:
       # rl-service/optimizer-service (Python/uvicorn) and timescaledb/redis/kafka don't emit
       # logfmt — the logfmt stage above is a no-op (not an error) on non-matching lines, so their
-      # raw log lines still land in Loki under {service=...}, just without a parsed "level" label.
-      # Good enough for "search all logs"; only the Go services get level-based filtering for now.
+      # raw log lines still land in Loki under {container_id=...}, just without a parsed "level"
+      # label. Good enough for "search all logs"; only the Go services get level-based filtering.

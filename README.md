@@ -31,15 +31,17 @@ manual setup needed. Dashboards aren't pre-built yet, add them once there's real
 data to look at.
 
 **Logs** are aggregated into Loki (`loki-config.yml`) by Promtail (`promtail-config.yml`), which
-auto-discovers every running container via the Docker API — no per-service wiring needed. Query
-them in Grafana's **Explore** tab against the Loki data source, e.g.:
-- `{service="paper-trader"}` — every log line from one service
-- `{service="paper-trader", level="ERROR"}` — just that service's errors (Go services log
-  structured `logfmt` via `slog`, which Promtail parses into a real `level` label)
-- `{service=~"paper-trader|strategy-optimizer"} |= "failed"` — full-text filter across services
+tails every container's Docker `json-file` log off disk directly — not live container discovery,
+which was tried first and found (via a real crash while building this) to silently miss any
+container that exits before Promtail's next discovery cycle. Query in Grafana's **Explore** tab
+against the Loki data source, e.g.:
+- `{level="ERROR"}` — every error, across every service, in one query
+- `{container_id="<id>"}` — one container's full log (get the id from `docker ps -a`)
+- `|= "failed"` — full-text filter across every container's logs, no label needed
 Retention is 14 days by default (`loki-config.yml`); logs from non-Go containers (Python services,
-Postgres, Redis, Kafka) land under their own `service` label too, just without a parsed `level`
-label since they don't emit `logfmt`. See CLAUDE.md §11.7 for the full design/rationale.
+Postgres, Redis, Kafka) are captured too, just without a parsed `level` label since they don't
+emit `logfmt`. See CLAUDE.md §11.7 for the full design/rationale, including why the discovery-based
+approach was replaced.
 
 ## Quickstart (development, OKX demo trading only)
 

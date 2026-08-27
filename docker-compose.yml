@@ -212,8 +212,10 @@ services:
     ports:
       - "3100:3100"
 
-  # Tails every container's stdout/stderr via Docker service discovery (no per-service config as
-  # new cmd/* services are added) and ships to Loki. Parses the Go services' slog logfmt output
+  # Tails every container's Docker json-file log directly off disk (not live container discovery
+  # — see promtail-config.yml's comment: discovery-based scraping can miss a container that
+  # crashes fast, losing exactly the crash logs this exists to capture; live-verified against a
+  # real crash while building this) and ships to Loki. Parses the Go services' slog logfmt output
   # (time=... level=... msg=...) so "level" becomes a queryable Loki label — this is what makes
   # "search/filter a service's errors separately" work with zero application code changes.
   promtail:
@@ -222,6 +224,7 @@ services:
     volumes:
       - ./promtail-config.yml:/etc/promtail/promtail-config.yml:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
     depends_on:
       - loki
 
