@@ -16,7 +16,8 @@ changes.
   (Stable-Baselines3), FastAPI inference server.
 - `optimizer-service/` — Python: minimal FastAPI + Optuna sidecar that proposes candidate strategy
   parameter sets for `cmd/strategy-optimizer` (CLAUDE.md §16.2) — no ML model, no torch.
-- `docker-compose.yml` — Redis + TimescaleDB + Prometheus + Grafana + all Go/Python services.
+- `docker-compose.yml` — Kafka + Redis + TimescaleDB + Prometheus + Grafana + all Go/Python
+  services.
 
 ## Monitoring
 
@@ -35,9 +36,9 @@ cp go-engine/configs/config.example.yaml go-engine/configs/config.yaml
 cp rl-service/configs/config.example.yaml rl-service/configs/config.yaml
 cp .env.example .env   # fill in OKX demo API key/secret/passphrase
 
-docker compose up -d redis timescaledb prometheus grafana
+docker compose up -d kafka redis timescaledb prometheus grafana
 
-# Go: start the market data ingestor (WS -> Redis: ticks + candles)
+# Go: start the market data ingestor (WS -> Kafka: ticks + candles)
 cd go-engine && go run ./cmd/ingestor
 
 # Go: start the Paper Trading Engine (virtual orders, the RL training data source, see CLAUDE.md §8)
@@ -76,7 +77,8 @@ Minimum viable single-node setup for development / early paper-trading (no live 
 | RL training (`rl_service/train.py`)     | 4 vCPU    | 8 GB    | —              | no  |
 | RL inference (`rl_service/serve/api.py`)| 1–2 vCPU  | 1–2 GB  | —              | no  |
 | go-engine (ingestor + trader + api)     | 1–2 vCPU  | 1 GB    | —              | no  |
-| Redis (event bus / stream buffer)       | 1 vCPU    | 512 MB–1 GB | —          | no  |
+| Kafka (event bus, single Kraft-mode broker) | 1 vCPU | 1 GB   | 10 GB+ SSD     | no  |
+| Redis (strategy-optimizer trial state)  | 1 vCPU    | 512 MB–1 GB | —          | no  |
 | TimescaleDB/Postgres                    | 2 vCPU    | 4 GB    | 50 GB+ SSD     | no  |
 | **Total minimum, all-in-one box**       | **8 vCPU**| **16 GB** | **100 GB SSD** | **no** |
 
@@ -88,13 +90,21 @@ Notes:
   for faster wall-clock training, or if storing raw tick-level data for many instruments (prefer
   aggregating to 1s/1m bars for long-term storage; keep raw tick retention short via a Timescale
   retention policy).
-- Redis Streams are used as the internal event bus (ticks, signals, order-fill events) — no
-  separate message broker (Kafka/NATS) is needed at this stage.
+- **Kafka is the internal event bus** (ticks, candles, paper-order open/close events) — a
+  single-broker Kraft-mode deployment (no separate Zookeeper), which is enough at this project's
+  scale; a multi-broker cluster would only make sense at real production traffic volumes this
+  project doesn't have. Consumed by `cmd/paper-trader`, `cmd/strategy-optimizer`, and `cmd/api`'s
+  WebSocket bridge (which pushes real-time position-open/SL/TP-hit events to the panel — see
+  CLAUDE.md §11.4/§12). Worth noting directly: this project started on Redis Streams, which worked
+  fine at this scale — Kafka was adopted specifically for the architecture/ops experience it
+  demonstrates in a public repository, not because Redis Streams hit a real limit. Redis itself
+  stays in the stack for `cmd/strategy-optimizer`'s disposable trial-parameter state (CLAUDE.md
+  §16.3), unrelated to the event bus.
 
 ### Dependencies to run the services
 
-- **Go 1.23+** (see `go-engine/go.mod`), Redis 7+, Postgres 16 + TimescaleDB extension (via
-  `docker-compose.yml`).
+- **Go 1.23+** (see `go-engine/go.mod`), Kafka (Kraft-mode, `apache/kafka` image), Redis 7+,
+  Postgres 16 + TimescaleDB extension (via `docker-compose.yml`).
 - **Python 3.11+** recommended (repo is also tested against 3.9); see
   `rl-service/requirements.txt` for the pinned library set (Gymnasium, Stable-Baselines3, PyTorch
   CPU build, FastAPI, pandas/numpy).

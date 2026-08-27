@@ -61,6 +61,12 @@ type PaperTrader struct {
 	ActiveTokens   []string        // the roster used to build the token-identity one-hot, CLAUDE.md §15.3
 	TokenBudgetUSD decimal.Decimal // this token's configured paper-mode sub-budget, CLAUDE.md §15.6/§15.7
 
+	// OrderEvents publishes a lightweight open/close notification for every paper order this
+	// engine opens or closes, onto the internal event bus (CLAUDE.md §12) — consumed by cmd/api's
+	// WebSocket bridge to push real-time position alerts to the panel. May be nil, in which case
+	// publishing is skipped entirely (best-effort, never blocks the order open/close itself).
+	OrderEvents port.MarketDataPublisher
+
 	// candlesMu guards candles: each bar has its own consumer goroutine (see Run), so writes to
 	// this map (even to distinct keys) must be synchronized — concurrent map writes are a fatal
 	// Go runtime error, not just a race.
@@ -284,6 +290,7 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 		metrics.PaperOrdersOpenedTotal.WithLabelValues(s.Name(), e.InstID, string(signal.Side)).Inc()
 		logger.Info("opened paper order", "id", id, "strategy", s.Name(), "instId", e.InstID, "bar", bar,
 			"side", signal.Side, "entry", price, "confidence", signal.Confidence)
+		e.publishOrderEvent(ctx, "opened", id, logger)
 	}
 	return nil
 }
@@ -310,6 +317,7 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 		// this is write-only telemetry, not a value used in further financial arithmetic.
 		metrics.PaperOrdersRealizedPnL.WithLabelValues(e.InstID).Add(pnl.InexactFloat64())
 		logger.Info("closed paper order", "id", o.ID, "instId", e.InstID, "reason", reason, "closePx", price, "pnl", pnl)
+		e.publishOrderEvent(ctx, "closed", o.ID, logger)
 
 		// CLAUDE.md §15.4/§15.6/§15.7: only a baseline order's outcome counts toward the token's
 		// tracked budget/reward — an rl_adjusted fork is tracking-only (its whole purpose is to be
@@ -325,6 +333,28 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 		}
 	}
 	return nil
+}
+
+// PaperOrderEvent is the lightweight open/close notification published to
+// "okx.paper-order-events" (CLAUDE.md §12) — just enough for cmd/api's WebSocket bridge to tell
+// the panel "something changed," which then re-fetches full position detail via GET /api/positions
+// rather than this event carrying the full port.PaperOrder itself.
+type PaperOrderEvent struct {
+	Type    string `json:"type"` // "opened" or "closed"
+	OrderID int64  `json:"orderId"`
+	InstID  string `json:"instId"`
+}
+
+// publishOrderEvent is best-effort: a publish failure must never block/undo the order
+// open/close it's reporting on. No-op if OrderEvents wasn't configured.
+func (e *PaperTrader) publishOrderEvent(ctx context.Context, eventType string, orderID int64, logger *slog.Logger) {
+	if e.OrderEvents == nil {
+		return
+	}
+	event := PaperOrderEvent{Type: eventType, OrderID: orderID, InstID: e.InstID}
+	if err := e.OrderEvents.Publish(ctx, e.InstID, event); err != nil {
+		logger.Warn("failed to publish paper order event", "type", eventType, "orderId", orderID, "instId", e.InstID, "error", err)
+	}
 }
 
 func closeReason(o port.PaperOrder, price decimal.Decimal) (string, bool) {

@@ -98,8 +98,8 @@ okxBot/
 │   │   │   ├── rest/            # signed REST client: orders, leverage, positions, balance
 │   │   │   └── ws/              # public + private websocket clients (reconnect, heartbeat)
 │   │   ├── postgres/            # TimescaleDB/Postgres adapter (implements port.Repository), §7
-│   │   ├── stream/               # Redis pub/sub + stream helpers — the event bus, §12;
-│   │   │                           implements port.MarketDataConsumer/Publisher
+│   │   ├── kafkastream/           # Kafka producer/consumer + instId dispatcher — the event bus,
+│   │   │                           §12; implements port.MarketDataConsumer/Publisher
 │   │   ├── strategy/              # strategy registry + indicator library, §9
 │   │   ├── risk/                  # hard risk limits (circuit breakers) independent of the RL model
 │   │   └── rlclient/               # HTTP client for the Python inference API (implements port.ModelClient)
@@ -168,10 +168,14 @@ never bypass hard safety limits.
 
 ## 7. Data persistence
 
-Two datastores, different jobs — this is not redundant, each is used for what it's good at:
-- **Redis** (Streams) — the ephemeral real-time event bus (§12): ticks/candles/signals in transit
-  between the ingestor and consumers (paper-trader, trader). Capped (~100k entries), not meant for
-  long-term storage.
+Three datastores, different jobs — this is not redundant, each is used for what it's good at:
+- **Kafka** — the ephemeral real-time event bus (§12): ticks/candles/paper-order events in transit
+  between the ingestor and consumers (paper-trader, strategy-optimizer, cmd/api's WebSocket
+  bridge). Time-based retention (24h default, `KAFKA_LOG_RETENTION_HOURS`), not meant for
+  long-term storage — this replaced an earlier Redis Streams implementation (see §12).
+- **Redis** — now only `internal/optimizer.TrialStore`'s disposable, TTL'd trial state (§16.3):
+  candidate strategy-parameter trials the optimizer runs, deliberately never persisted to Postgres.
+  Unrelated to the event bus.
 - **TimescaleDB** (Postgres + the Timescale extension, not a separate database) — durable storage.
   Schema (`internal/postgres/migrations`), all monetary/price columns `NUMERIC` (§ below on
   `decimal.Decimal`):
@@ -197,7 +201,7 @@ decision (see §2). Flow:
    (buy/sell + suggested entry/SL/TP) — or the RL model does, once it's driving decisions.
 2. The Paper Trading Engine opens a **virtual order** at the live price with the full feature set
    (entry, SL, TP, size, leverage) — no real order is sent to OKX.
-3. The engine subscribes to the live price feed (via the Redis event bus, §12) and monitors the
+3. The engine subscribes to the live price feed (via the Kafka event bus, §12) and monitors the
    virtual order until SL or TP is hit (or a manual/timeout close condition).
 4. On close, the engine persists the trade (entry features, action taken, realized outcome) to
    `paper_orders` (§7). This log is: (a) what the reporting panel (§11) displays, and (b) the
@@ -256,7 +260,7 @@ logic, `go-engine` is organized ports-and-adapters style (see §3 for the layout
 - `internal/port` — interfaces the use-cases depend on: `ExchangeClient`, `Repository`,
   `MarketDataConsumer`/`MarketDataPublisher`, `ModelClient` (the RL inference call).
 - Adapters implement those ports: `internal/okx` (via `internal/okx/rest.Client`) implements
-  `ExchangeClient`, `internal/postgres` implements `Repository`, `internal/stream` implements
+  `ExchangeClient`, `internal/postgres` implements `Repository`, `internal/kafkastream` implements
   `MarketDataConsumer`/`Publisher`, `internal/rlclient` implements `ModelClient`. Adapters convert
   their wire/storage formats to and from `domain` types at the boundary — e.g. `internal/okx`
   keeps OKX-specific JSON field names and string-typed candle arrays internally, exposing
@@ -353,11 +357,19 @@ day one so the schema/API never need reshaping later, even though `real` has no 
   and PnL (highest profit/loss) — all directly supported by existing/planned indexed columns, no
   new derived-data pipeline required.
 - **Sound + browser notification on state change**, per explicit request: distinct cues for (a)
-  position opened, (b) closed by SL, (c) closed by TP. This is a `panel/` frontend concern — the
-  frontend polls/subscribes to `cmd/api` (or a lightweight SSE/WebSocket stream off the same
-  Postgres rows / Redis event bus, §12) for order-state transitions and triggers
-  `new Audio(...).play()` + the browser Notification API client-side. No backend "notification
-  service" needed; `cmd/api` just needs to expose the open/close events promptly.
+  position opened, (b) closed by SL, (c) closed by TP. **Implemented as a real-time WebSocket
+  push, not polling-only** (revised from the original "polls/subscribes" framing once Kafka
+  landed as the event bus, §12): `cmd/paper-trader` publishes a lightweight
+  `usecase.PaperOrderEvent{Type, OrderID, InstID}` to the `okx.paper-order-events` Kafka topic on
+  every open/close; `cmd/api` consumes that topic (consumer group `"api-ws-bridge"`) and
+  broadcasts each event to every connected panel client over `GET /api/ws`
+  (`internal/api/ws.go`'s hand-rolled hub — no pub/sub library needed at this scale). The panel's
+  `usePositionEvents` hook (`panel/src/hooks/`) triggers an immediate `GET /api/positions` refetch
+  on each pushed event; `usePositionAlerts`' existing snapshot-diff logic then fires
+  `new Audio(...).play()` + the browser Notification API off that fresher data — the diffing logic
+  itself didn't need to change, only what triggers it. The original 5s poll (`usePolling`) still
+  runs as a fallback/consistency check independent of the socket's connection state. No backend
+  "notification service" beyond the hub above was needed.
 
 ### 11.5 Strategy CRUD + reports (as originally planned)
 
@@ -387,14 +399,61 @@ at. `rl_service/metrics.py` (CPU/RAM/GPU/training progress) is still planned, no
 ## 12. Event-driven design
 
 Real-money live trading benefits from reacting to events (fills, price ticks, risk breaches)
-rather than polling. The ingestion layer is already event-driven (OKX WS push → Redis Stream).
-Decision: extend that pattern as the **internal event bus from day one** — ticks, strategy
-signals, and order-fill events all flow through Redis Streams/pub-sub (which already supports
-consumer groups), and internal components (risk manager, paper-trading engine, order executor)
-are written as handlers subscribing to that bus. This gets most of the benefit of an event-driven
-architecture without adopting heavier infra (Kafka/NATS) before it's needed. Code against the
-`port.MarketDataConsumer`/`MarketDataPublisher` interfaces (§10) so migrating the transport later,
-if scale ever demands it, is mechanical rather than a rewrite.
+rather than polling. The ingestion layer is event-driven (OKX WS push → Kafka topic), and internal
+components (paper-trading engine, strategy-optimizer, the panel's WebSocket bridge) are written as
+handlers subscribing to that bus. Code against the `port.MarketDataConsumer`/`MarketDataPublisher`
+interfaces (§10) so the transport itself stays swappable behind those two methods.
+
+**Kafka, not Redis Streams** (revised 2026-08-27 — this project started on Redis Streams, which
+worked fine at this scale; the migration to Kafka was a deliberate choice for a public/portfolio
+repository, not a response to any Redis Streams limitation actually hit in practice. If this
+weren't a resume piece, Redis Streams would still be the pragmatic choice for a project this
+size — that tradeoff is worth stating plainly rather than pretending Kafka was required):
+- `internal/kafkastream` (`github.com/segmentio/kafka-go` — pure Go, no cgo/librdkafka, simpler
+  Docker builds than `confluent-kafka-go`) implements `Publisher`/`Consumer` against
+  `port.MarketDataConsumer`/`MarketDataPublisher`, same shape as the Redis Streams implementation
+  it replaced. `Publish(ctx, key, event)` takes an explicit partition key (Redis Streams never
+  needed one) — every publisher keys by `instId`, so one instrument's events stay strictly
+  ordered within their own partition.
+- **Topics**: `okx.tickers` (all instruments, keyed by instId), `okx.candles.<bar>` (one topic per
+  timeframe, e.g. `okx.candles.1m`, also keyed by instId), `okx.paper-order-events` (paper-order
+  open/close notifications for the panel's WebSocket bridge, §11.4). Auto-created on first publish
+  (`AllowAutoTopicCreation`) — a deliberate v1 simplicity choice, not a scale-tested default.
+  Retention is time-based (`KAFKA_LOG_RETENTION_HOURS`, 24h default in `docker-compose.yml`),
+  replacing Redis Streams' count-based `MAXLEN ~100_000` cap.
+- **Consumer groups map directly onto the old Redis Streams group names** (`"paper-trader"`,
+  `"strategy-optimizer"`, plus a new `"api-ws-bridge"` for the WebSocket bridge, §11.4) — each
+  reads the same topics independently, same as before.
+- **Partitioning vs. the old per-instrument consumer identity**: Redis Streams' `XREADGROUP` let
+  each service run one consumer *identity* per instrument (`ConsumerName = instId`) within one
+  shared group, each instance filtering the stream down to its own instId in the handler. Kafka
+  consumer groups instead auto-assign whole *partitions* to readers in the group — there's no
+  per-instrument consumer identity to keep. So each service now runs **one shared reader per
+  topic**, and `internal/kafkastream.Dispatcher` fans out that reader's messages to
+  per-instrument handlers by decoding just the `instId` field and routing in-process
+  (`Dispatcher.Register`/`ForInstrument`) — the actual `handleTick`/`handleCandle` logic in
+  `usecase.PaperTrader` and `cmd/strategy-optimizer` didn't need to change, only the outer
+  consumer-wiring loop in each `main.go` collapsed from N consumers to 1 dispatcher per topic.
+- **Ack/commit semantics preserved as-is**: `Consumer.Run` commits a message's offset after
+  `handler` returns regardless of whether it errored — matching Redis Streams' old unconditional
+  `XAck`-after-handler behavior (no DLQ/retry either before or after this migration; a bad message
+  is not retried forever, `handler` is responsible for its own logging).
+- **Redis didn't go away** — `internal/optimizer.TrialStore`'s disposable trial-parameter state
+  (§16.3) stays on Redis, since that's a KV/TTL use case Kafka doesn't fit, not part of the event
+  bus this section describes.
+- **Deployment**: single-broker Kraft-mode Kafka (`apache/kafka` image, no separate Zookeeper) in
+  `docker-compose.yml` — appropriate for a portfolio project's scale, not a production multi-broker
+  cluster. One deployment gotcha worth documenting: `KAFKA_LISTENERS` must use bare-colon binds
+  (`PLAINTEXT://:9092`), not an explicit `0.0.0.0` host — the image's config tool rejects
+  `0.0.0.0` there with "advertised.listeners cannot use the nonroutable meta-address," even though
+  only `KAFKA_ADVERTISED_LISTENERS` is what actually gets advertised to clients (live-verified
+  against a real running broker while building this). Separately, live-verified end-to-end
+  publish/consume against a fresh broker: the very first publish to a brand-new topic can fail
+  once with "Unknown Topic Or Partition" (a real kafka-go timing quirk — the client's write races
+  the broker's own auto-created-topic metadata propagation) before succeeding on the next publish;
+  this is a one-time, self-resolving startup blip, not a persistent problem, and is already covered
+  by every publisher's existing "log a warning and continue" pattern (no publish call in this
+  codebase treats a publish failure as fatal).
 
 ## 13. AI orchestration (LangChain/CrewAI/"Hermes"-style)
 
@@ -416,14 +475,15 @@ per-token training design.
 
 Paper-trading data flow (current design): the ingestor subscribes to
 OKX's public `tickers` channel and business `candle{bar}` channel over a single WS connection
-each, publishing every event to Redis Streams. The Paper Trading Engine consumes both via
-consumer groups (`internal/stream.Consumer`): every **tick** triggers an immediate SL/TP check
-against open virtual orders (no missed intra-bar wicks, no polling delay), and every **finalized
-candle** triggers strategy re-evaluation and is persisted to Postgres. A REST call
-(`GetCandles`) is used exactly once at startup, to seed the initial in-memory candle window —
-not on an ongoing poll loop. This replaces the earlier REST-polling version, which had a real
-correctness bug (checking SL/TP only against candle-close prices could silently miss a price wick
-that touched SL/TP and reverted within the same bar) in addition to rate-limit/delay concerns.
+each, publishing every event to Kafka (§12 — originally Redis Streams, migrated later). The Paper
+Trading Engine consumes both via consumer groups (`internal/kafkastream.Consumer`/`Dispatcher`):
+every **tick** triggers an immediate SL/TP check against open virtual orders (no missed intra-bar
+wicks, no polling delay), and every **finalized candle** triggers strategy re-evaluation and is
+persisted to Postgres. A REST call (`GetCandles`) is used exactly once at startup, to seed the
+initial in-memory candle window — not on an ongoing poll loop. This replaces the earlier
+REST-polling version, which had a real correctness bug (checking SL/TP only against candle-close
+prices could silently miss a price wick that touched SL/TP and reverted within the same bar) in
+addition to rate-limit/delay concerns.
 
 Phase 2 — clean architecture refactor & live wiring (current phase):
 - [x] All price/size/leverage/PnL/risk-limit fields migrated `float64` → `decimal.Decimal`
@@ -506,7 +566,11 @@ Phase 4 — later/optional:
 - [x] Multi-timeframe candles (§9) — ingestor/PaperTrader multi-bar, live-verified
 - [ ] User-authored strategy scripting layer (§9)
 - [ ] Sentiment/news agents + signal aggregator (§9, §13)
-- [ ] Evaluate migrating the event bus off Redis Streams if scale demands it (§12)
+- [x] Migrated the event bus from Redis Streams to Kafka (§12) — a deliberate portfolio-value
+      choice (public GitHub repo), not a response to a scale limit actually hit. Added a real-time
+      WebSocket bridge (`GET /api/ws`, `internal/api/ws.go`) off the new `okx.paper-order-events`
+      topic at the same time, replacing the panel's polling-only open/SL/TP alerting (§11.4) with
+      a push while keeping the 5s poll as a fallback.
 
 Phase 5 — global RL agent over price + strategy signals (§15, current phase):
 - [x] Extend `strategy.Signal`/`domain.Observation`/`rlclient.Action`/`rl_service` Pydantic
@@ -1042,7 +1106,7 @@ For a given (token, base-strategy) pair, e.g. (XAU-USD-SWAP, `rsi_sma`):
    as lightweight, TTL'd state in Redis (candidate params, entry price, SL/TP, opened-at) —
    deliberately not a durable Postgres row, since these are disposable experiments, not real trades
    or even real paper trades.
-3. On every real-time price tick (the same `okx:tickers` Redis stream `PaperTrader`/`cmd/trader`
+3. On every real-time price tick (the same `okx.tickers` Kafka topic `PaperTrader`/`cmd/trader`
    already consume, CLAUDE.md §12), every open trial for that token is checked for SL/TP touch
    against the live tick price — not candle-close price, for the same correctness reason
    `PaperTrader`'s tick-driven SL/TP check exists (§14: candle-close-only checking can silently

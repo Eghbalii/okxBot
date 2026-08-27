@@ -22,6 +22,34 @@ type Server struct {
 	ProcessMgr string
 	Units      []string
 	Logger     *slog.Logger
+
+	// hub fans out real-time paper-order open/close events to connected panel WebSocket clients
+	// (CLAUDE.md §11.4). Lazily initialized by Routes/Hub so callers never need to construct it
+	// themselves.
+	hub *wsHub
+}
+
+// Hub returns the Server's WebSocket broadcast hub, initializing it on first call — cmd/api's
+// main.go uses this to get a handle for feeding in Kafka-consumed events (Broadcast), and Routes
+// uses it to register the GET /api/ws endpoint. Both must share the same hub instance.
+func (s *Server) Hub() *wsHub {
+	if s.hub == nil {
+		s.hub = newWSHub(s.Logger)
+	}
+	return s.hub
+}
+
+// Broadcast pushes msg (typically a JSON-marshaled usecase.PaperOrderEvent) to every connected
+// panel WebSocket client.
+func (s *Server) Broadcast(msg []byte) {
+	s.Hub().broadcast(msg)
+}
+
+// CloseWS disconnects every connected WebSocket client — called on server shutdown.
+func (s *Server) CloseWS() {
+	if s.hub != nil {
+		s.hub.closeAll()
+	}
 }
 
 // Routes builds the HTTP handler for all panel endpoints.
@@ -29,6 +57,7 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/resources", s.handleResources)
+	mux.HandleFunc("GET /api/ws", s.Hub().handleWS)
 
 	mux.HandleFunc("GET /api/model/status", s.handleModelStatus)
 	mux.HandleFunc("GET /api/model/logs", s.handleModelLogs)

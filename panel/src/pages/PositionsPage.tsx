@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { usePolling } from '../hooks/usePolling'
 import { usePositionAlerts } from '../hooks/usePositionAlerts'
+import { usePositionEvents } from '../hooks/usePositionEvents'
 import { api } from '../api/client'
 import type { CloseReason, Position, PositionMode } from '../api/types'
 
@@ -20,6 +21,7 @@ export default function PositionsPage() {
   const [sortBy, setSortBy] = useState<SortField>('opened_at')
   const [sortDesc, setSortDesc] = useState(true)
   const [alertsEnabled, setAlertsEnabled] = useState(true)
+  const [wsRefreshCount, setWsRefreshCount] = useState(0)
 
   const { data, error } = usePolling(
     () =>
@@ -32,7 +34,15 @@ export default function PositionsPage() {
       }),
     5_000,
     [mode, instId, openFilter, sortBy, sortDesc],
+    wsRefreshCount,
   )
+
+  // CLAUDE.md §11.4/§12: cmd/api pushes a message over WebSocket the moment a paper order
+  // opens/closes; rather than that event carrying full position detail, it just triggers an
+  // immediate refetch here — usePositionAlerts' existing diff-the-snapshot logic then fires the
+  // sound/notification off of that fresher data. The 5s poll above still runs as a fallback/
+  // consistency check independent of the socket's connection state.
+  usePositionEvents(() => setWsRefreshCount((c) => c + 1), true)
 
   usePositionAlerts(data, alertsEnabled)
 

@@ -25,13 +25,13 @@ import (
 
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
 	"github.com/eghbalii/okxBot/go-engine/internal/optimizer"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
-	"github.com/eghbalii/okxBot/go-engine/internal/stream"
 )
 
 func main() {
@@ -94,35 +94,39 @@ func main() {
 		activeRuns: make(map[targetKey]*optimizer.Run),
 	}
 
-	// One tick consumer and one candle consumer per configured target's instrument — mirrors
-	// cmd/paper-trader's per-instrument consumer pattern (see PaperTrader.Run), scoped to the
-	// optimizer's own consumer group name so it never competes for the same Redis Streams
-	// consumer-group offsets as paper-trader/trader.
+	// One shared Kafka consumer-group reader per topic (tickers + the configured bar), fanned out
+	// to each target instrument by instId via kafkastream.Dispatcher — mirrors cmd/paper-trader's
+	// wiring. Kafka consumer groups own whole partitions (no per-instrument consumer identity the
+	// way Redis Streams' XREADGROUP had), scoped to the optimizer's own consumer group name so it
+	// never competes for offsets with paper-trader/trader.
+	tickDispatcher := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.tickers", "strategy-optimizer"))
+	candleDispatcher := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.candles."+cfg.Optimizer.Bar, "strategy-optimizer"))
+
 	instIDs := uniqueInstIDs(cfg.Optimizer.Targets)
 	for _, instID := range instIDs {
 		instID := instID
-		tickConsumer := stream.NewConsumer(cfg.Redis.Addr, "okx:tickers", "strategy-optimizer", instID)
-		go func() {
-			if err := tickConsumer.Run(ctx, func(ctx context.Context, data []byte) error {
-				return svc.handleTick(ctx, instID, data)
-			}); err != nil && ctx.Err() == nil {
-				logger.Error("tick consumer exited", "instId", instID, "error", err)
-			}
-		}()
-
-		candleConsumer := stream.NewConsumer(cfg.Redis.Addr, "okx:candles:"+cfg.Optimizer.Bar, "strategy-optimizer", instID)
-		go func() {
-			if err := candleConsumer.Run(ctx, func(ctx context.Context, data []byte) error {
-				return svc.handleCandle(ctx, instID, data)
-			}); err != nil && ctx.Err() == nil {
-				logger.Error("candle consumer exited", "instId", instID, "error", err)
-			}
-		}()
+		tickDispatcher.Register(instID, func(ctx context.Context, data []byte) error {
+			return svc.handleTick(ctx, instID, data)
+		})
+		candleDispatcher.Register(instID, func(ctx context.Context, data []byte) error {
+			return svc.handleCandle(ctx, instID, data)
+		})
 
 		if err := svc.seedWindow(instID); err != nil {
 			logger.Error("failed to seed initial candle window", "instId", instID, "error", err)
 		}
 	}
+
+	go func() {
+		if err := tickDispatcher.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("tick dispatcher exited", "error", err)
+		}
+	}()
+	go func() {
+		if err := candleDispatcher.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("candle dispatcher exited", "error", err)
+		}
+	}()
 
 	// Built-in scheduler (CLAUDE.md §16 decision 3): fires one time-boxed run per configured
 	// target on cfg.Optimizer.ScheduleInterval, sequentially — bounded, not "everything at once"

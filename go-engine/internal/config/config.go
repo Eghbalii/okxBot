@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/shopspring/decimal"
 	"gopkg.in/yaml.v3"
@@ -22,9 +23,17 @@ type Config struct {
 		PrivateWSURL  string `yaml:"private_ws_url"`
 	} `yaml:"okx"`
 
+	// Redis is still used by internal/optimizer.TrialStore for disposable trial state (CLAUDE.md
+	// §16.3) — unrelated to the event bus, which now runs on Kafka (below).
 	Redis struct {
 		Addr string `yaml:"-"`
 	} `yaml:"redis"`
+
+	// Kafka configures the internal event bus (CLAUDE.md §12): ticks/candles/paper-order events
+	// flow through Kafka topics (internal/kafkastream), replacing the earlier Redis Streams bus.
+	Kafka struct {
+		Brokers []string `yaml:"-"`
+	} `yaml:"kafka"`
 
 	Postgres struct {
 		DSN string `yaml:"-"`
@@ -191,6 +200,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.Redis.Addr = envOr("REDIS_ADDR", "localhost:6379")
+	cfg.Kafka.Brokers = strings.Split(envOr("KAFKA_BROKERS", "localhost:9092"), ",")
 	cfg.Postgres.DSN = envOr("POSTGRES_DSN", "postgres://okxbot:okxbot@localhost:5432/okxbot")
 	cfg.RLService.URL = envOr("RL_SERVICE_URL", "http://localhost:8000")
 

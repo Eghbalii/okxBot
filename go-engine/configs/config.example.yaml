@@ -1,3 +1,6 @@
+# kafka.brokers is set via KAFKA_BROKERS only (comma-separated, e.g. "kafka:9092"), same pattern
+# as postgres/redis below — see CLAUDE.md §12 for why Kafka is the internal event bus.
+
 okx:
   rest_base_url: "https://www.okx.com"
   public_ws_url: "wss://ws.okx.com:8443/ws/v5/public"

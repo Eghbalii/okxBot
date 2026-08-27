@@ -1,10 +1,45 @@
 services:
+  # redis is now only used by cmd/strategy-optimizer's disposable trial state (CLAUDE.md §16.3) —
+  # the tick/candle/paper-order event bus moved to Kafka (below), CLAUDE.md §12.
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
+
+  # Single-broker Kraft-mode Kafka (no separate Zookeeper) — the internal event bus (CLAUDE.md
+  # §12): ticks/candles/paper-order events flow ingestor -> Kafka -> paper-trader/
+  # strategy-optimizer/cmd/api's WebSocket bridge.
+  kafka:
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # Bare-colon bind shorthand, not an explicit 0.0.0.0 host — the apache/kafka image's config
+      # tool rejects "advertised.listeners cannot use the nonroutable meta-address 0.0.0.0" at
+      # startup if KAFKA_LISTENERS spells out 0.0.0.0 explicitly here, even though only
+      # KAFKA_ADVERTISED_LISTENERS (below) is what actually gets advertised.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Time-based retention (24h) is Kafka's equivalent of the old Redis Streams MAXLEN~100k cap —
+      # there's no per-topic override here, just the broker default, which is fine at this scale.
+      KAFKA_LOG_RETENTION_HOURS: 24
+    ports:
+      - "9094:9094" # host-reachable listener, for local dev tooling outside compose
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
 
   timescaledb:
     image: timescale/timescaledb:latest-pg16
@@ -39,14 +74,15 @@ services:
       dockerfile: Dockerfile.ingestor
     environment:
       CONFIG_PATH: /app/configs/config.yaml
-      REDIS_ADDR: redis:6379
+      KAFKA_BROKERS: kafka:9092
       METRICS_ADDR: ":9101"
     ports:
       - "9101:9101"
     volumes:
       - ./go-engine/configs:/app/configs
     depends_on:
-      - redis
+      kafka:
+        condition: service_healthy
 
   trader:
     build:
@@ -72,7 +108,7 @@ services:
       dockerfile: Dockerfile.paper-trader
     environment:
       CONFIG_PATH: /app/configs/config.yaml
-      REDIS_ADDR: redis:6379
+      KAFKA_BROKERS: kafka:9092
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       METRICS_ADDR: ":9102"
       OKX_API_KEY: ${OKX_API_KEY}
@@ -84,8 +120,10 @@ services:
     volumes:
       - ./go-engine/configs:/app/configs
     depends_on:
-      - redis
-      - timescaledb
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_started
 
   optimizer-service:
     build: ./optimizer-service
@@ -98,7 +136,8 @@ services:
       dockerfile: Dockerfile.strategy-optimizer
     environment:
       CONFIG_PATH: /app/configs/config.yaml
-      REDIS_ADDR: redis:6379
+      KAFKA_BROKERS: kafka:9092
+      REDIS_ADDR: redis:6379 # internal/optimizer.TrialStore only — disposable trial state, CLAUDE.md §16.3
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       OPTIMIZER_SERVICE_URL: http://optimizer-service:8001
       OPTIMIZER_ADDR: "0.0.0.0:8091"
@@ -109,9 +148,14 @@ services:
     volumes:
       - ./go-engine/configs:/app/configs
     depends_on:
-      - redis
-      - timescaledb
-      - optimizer-service
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      timescaledb:
+        condition: service_started
+      optimizer-service:
+        condition: service_started
 
   api:
     build:
@@ -119,6 +163,7 @@ services:
       dockerfile: Dockerfile.api
     environment:
       CONFIG_PATH: /app/configs/config.yaml
+      KAFKA_BROKERS: kafka:9092 # consumes okx.paper-order-events for the panel's WebSocket bridge, CLAUDE.md §11.4/§12
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       RL_SERVICE_URL: http://rl-service:8000
       API_ADDR: "0.0.0.0:8090" # container-internal bind; only reachable via the OpenVPN network in prod, see CLAUDE.md §11
@@ -129,8 +174,12 @@ services:
       - ./go-engine/configs:/app/configs
       - /var/run/docker.sock:/var/run/docker.sock:ro # lets cmd/api call `docker inspect`/`docker logs` for RL model status, CLAUDE.md §11.2
     depends_on:
-      - timescaledb
-      - rl-service
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_started
+      rl-service:
+        condition: service_started
 
   panel:
     build: ./panel
@@ -163,6 +212,7 @@ services:
 
 volumes:
   redis-data:
+  kafka-data:
   timescale-data:
   prometheus-data:
   grafana-data:

@@ -12,13 +12,13 @@ import (
 	"syscall"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
+	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/rlclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
-	"github.com/eghbalii/okxBot/go-engine/internal/stream"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )
 
@@ -72,7 +72,25 @@ func main() {
 		model = rlclient.New(cfg.RLService.URL)
 	}
 
-	errCh := make(chan error, len(cfg.Trading.InstIDs))
+	// One shared Kafka consumer-group reader per topic (tickers + each configured bar), fanned out
+	// to each instrument's PaperTrader by instId via kafkastream.Dispatcher — Kafka consumer
+	// groups own whole partitions, unlike Redis Streams' per-instrument consumer identity, so the
+	// per-instrument routing that used to happen via N separate consumers now happens in-process
+	// via one dispatcher per topic (CLAUDE.md §12).
+	tickDispatcher := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.tickers", "paper-trader"))
+	defer tickDispatcher.Close()
+	candleDispatchers := make(map[string]*kafkastream.Dispatcher, len(cfg.PaperTrading.Bars))
+	for _, bar := range cfg.PaperTrading.Bars {
+		d := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.candles."+bar, "paper-trader"))
+		candleDispatchers[bar] = d
+		defer d.Close()
+	}
+
+	// Paper-order open/close events, for the panel's real-time WebSocket bridge (cmd/api).
+	orderEventsPub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "okx.paper-order-events")
+	defer orderEventsPub.Close()
+
+	errCh := make(chan error, len(cfg.Trading.InstIDs)+1+len(candleDispatchers))
 	for _, instID := range cfg.Trading.InstIDs {
 		// Strategy assignments are durable (strategy_assignments table, CLAUDE.md §11.3): loaded
 		// fresh from Postgres on every start, so a crash/restart resumes with exactly the same
@@ -85,8 +103,8 @@ func main() {
 		}
 
 		candleConsumers := make(map[string]port.MarketDataConsumer, len(cfg.PaperTrading.Bars))
-		for _, bar := range cfg.PaperTrading.Bars {
-			candleConsumers[bar] = stream.NewConsumer(cfg.Redis.Addr, "okx:candles:"+bar, "paper-trader", instID)
+		for bar, d := range candleDispatchers {
+			candleConsumers[bar] = d.ForInstrument(instID)
 		}
 
 		engine := &usecase.PaperTrader{
@@ -95,7 +113,7 @@ func main() {
 			CandleWindow:    cfg.PaperTrading.CandleLimit,
 			Strategies:      strategies,
 			Exchange:        restClient,
-			TickConsumer:    stream.NewConsumer(cfg.Redis.Addr, "okx:tickers", "paper-trader", instID),
+			TickConsumer:    tickDispatcher.ForInstrument(instID),
 			CandleConsumers: candleConsumers,
 			Repo:            repo,
 			NotionalUSD:     cfg.PaperTrading.NotionalUSD,
@@ -104,12 +122,26 @@ func main() {
 			Model:           model,
 			ActiveTokens:    cfg.Trading.InstIDs,
 			TokenBudgetUSD:  cfg.PaperTrading.TokenBudgetUSD,
+			OrderEvents:     orderEventsPub,
 		}
 		go func() { errCh <- engine.Run(ctx) }()
 	}
 
-	<-ctx.Done()
-	logger.Info("shutting down paper trader")
+	go func() { errCh <- tickDispatcher.Run(ctx) }()
+	for _, d := range candleDispatchers {
+		d := d
+		go func() { errCh <- d.Run(ctx) }()
+	}
+
+	select {
+	case <-ctx.Done():
+		logger.Info("shutting down paper trader")
+	case err := <-errCh:
+		if err != nil && ctx.Err() == nil {
+			logger.Error("paper trader stopped with error", "error", err)
+			os.Exit(1)
+		}
+	}
 }
 
 func envOr(key, fallback string) string {

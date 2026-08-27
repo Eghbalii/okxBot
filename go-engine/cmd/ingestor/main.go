@@ -1,5 +1,5 @@
 // Command ingestor connects to OKX's public/business WebSockets and streams ticker + candle
-// data into Redis (the internal event bus, CLAUDE.md §12) for downstream consumption by the
+// data into Kafka (the internal event bus, CLAUDE.md §12) for downstream consumption by the
 // Paper Trading Engine, the trading engine, and research/feature building.
 package main
 
@@ -12,9 +12,9 @@ import (
 	"syscall"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
+	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	"github.com/eghbalii/okxBot/go-engine/internal/okx/ws"
-	"github.com/eghbalii/okxBot/go-engine/internal/stream"
 )
 
 func main() {
@@ -31,7 +31,7 @@ func main() {
 
 	metrics.Serve(envOr("METRICS_ADDR", ":9101"), logger)
 
-	tickerPub := stream.NewPublisher(cfg.Redis.Addr, "okx:tickers")
+	tickerPub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "okx.tickers")
 	defer tickerPub.Close()
 
 	tickerClient := &ws.PublicClient{
@@ -46,8 +46,8 @@ func main() {
 				return
 			}
 			for _, r := range raw {
-				if err := tickerPub.Publish(ctx, json.RawMessage(r)); err != nil {
-					logger.Warn("failed to publish tick to redis", "error", err)
+				if err := tickerPub.Publish(ctx, msg.Arg.InstID, json.RawMessage(r)); err != nil {
+					logger.Warn("failed to publish tick to kafka", "error", err)
 					continue
 				}
 				metrics.IngestorEventsTotal.WithLabelValues("tick", msg.Arg.InstID).Inc()
@@ -56,13 +56,15 @@ func main() {
 	}
 
 	// Candlesticks live on the business WS endpoint in OKX v5, separate from public tickers. One
-	// WS connection + one Redis stream per configured timeframe, so consumers only ever see the
-	// bar they subscribed to and don't need to filter out other timeframes themselves.
-	candlePubs := make(map[string]*stream.Publisher, len(cfg.Ingestion.Bars))
+	// WS connection + one Kafka topic per configured timeframe, so consumers only ever see the
+	// bar they subscribed to and don't need to filter out other timeframes themselves. Each
+	// topic's messages are keyed by instId (internal/kafkastream.Publisher), so one instrument's
+	// candles stay strictly ordered within its own partition.
+	candlePubs := make(map[string]*kafkastream.Publisher, len(cfg.Ingestion.Bars))
 	candleClients := make([]*ws.PublicClient, 0, len(cfg.Ingestion.Bars))
 	for _, bar := range cfg.Ingestion.Bars {
 		bar := bar
-		pub := stream.NewPublisher(cfg.Redis.Addr, "okx:candles:"+bar)
+		pub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "okx.candles."+bar)
 		candlePubs[bar] = pub
 		defer pub.Close()
 
@@ -79,8 +81,8 @@ func main() {
 				}
 				for _, row := range bars {
 					event := candleEvent{InstID: msg.Arg.InstID, Bar: bar, Candle: row}
-					if err := pub.Publish(ctx, event); err != nil {
-						logger.Warn("failed to publish candle to redis", "bar", bar, "error", err)
+					if err := pub.Publish(ctx, msg.Arg.InstID, event); err != nil {
+						logger.Warn("failed to publish candle to kafka", "bar", bar, "error", err)
 						continue
 					}
 					metrics.IngestorEventsTotal.WithLabelValues("candle", msg.Arg.InstID).Inc()

@@ -9,6 +9,7 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:8090',
         changeOrigin: true,
+        ws: true, // GET /api/ws (CLAUDE.md §11.4/§12) needs the proxy to upgrade, not treat it as plain HTTP
       },
     },
   },

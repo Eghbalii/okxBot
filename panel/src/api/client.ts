@@ -144,4 +144,55 @@ export const api = {
   },
 }
 
+// PaperOrderEvent mirrors Go's usecase.PaperOrderEvent — the lightweight message pushed over
+// GET /api/ws whenever cmd/paper-trader opens or closes a paper order (CLAUDE.md §11.4/§12).
+export interface PaperOrderEvent {
+  type: 'opened' | 'closed'
+  orderId: number
+  instId: string
+}
+
+// openEventsSocket connects to cmd/api's WebSocket bridge and calls onEvent for every
+// PaperOrderEvent received, reconnecting with backoff if the connection drops. Returns a cleanup
+// function that closes the socket and stops reconnecting.
+export function openEventsSocket(onEvent: (event: PaperOrderEvent) => void): () => void {
+  let socket: WebSocket | null = null
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  let closed = false
+  let backoffMs = 1000
+
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const url = `${proto}//${window.location.host}${BASE}/ws`
+
+  function connect() {
+    if (closed) return
+    socket = new WebSocket(url)
+    socket.onmessage = (msg) => {
+      try {
+        onEvent(JSON.parse(msg.data) as PaperOrderEvent)
+      } catch {
+        // ignore malformed frames
+      }
+    }
+    socket.onopen = () => {
+      backoffMs = 1000
+    }
+    socket.onclose = () => {
+      if (closed) return
+      reconnectTimer = setTimeout(connect, backoffMs)
+      backoffMs = Math.min(backoffMs * 2, 30_000)
+    }
+    socket.onerror = () => {
+      socket?.close()
+    }
+  }
+  connect()
+
+  return () => {
+    closed = true
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    socket?.close()
+  }
+}
+
 export { ApiError }

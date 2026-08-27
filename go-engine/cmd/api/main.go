@@ -15,6 +15,7 @@ import (
 
 	"github.com/eghbalii/okxBot/go-engine/internal/api"
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
+	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 )
@@ -56,14 +57,32 @@ func main() {
 		Units:      cfg.API.Units,
 		Logger:     logger,
 	}
+	routes := srv.Routes() // must be called before Hub() usage below so the same *wsHub backs both
+
+	// CLAUDE.md §11.4/§12: paper-order open/close events published by cmd/paper-trader onto Kafka
+	// are relayed to every connected panel WebSocket client, replacing 5s position polling for the
+	// alert (open/SL/TP) path. A dedicated consumer group ("api-ws-bridge") so this never competes
+	// for offsets with paper-trader/strategy-optimizer's own groups on the same topic.
+	orderEventsConsumer := kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.paper-order-events", "api-ws-bridge")
+	go func() {
+		err := orderEventsConsumer.Run(ctx, func(_ context.Context, data []byte) error {
+			srv.Broadcast(data)
+			return nil
+		})
+		if err != nil && ctx.Err() == nil {
+			logger.Error("paper order events consumer exited", "error", err)
+		}
+	}()
 
 	httpServer := &http.Server{
 		Addr:    cfg.API.Addr,
-		Handler: srv.Routes(),
+		Handler: routes,
 	}
 
 	go func() {
 		<-ctx.Done()
+		srv.CloseWS()
+		_ = orderEventsConsumer.Close()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
