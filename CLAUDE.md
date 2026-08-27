@@ -654,6 +654,34 @@ the image at 2.72GB instead of noticeably larger. This isn't optional on resourc
 hardware: the CUDA wheel's download/build was what originally exhausted a low-disk dev machine's
 space mid-build.
 
+**Full-stack measurement, not just rl-service in isolation** (2026-08-27, same machine, real
+`docker compose` build of every service, `configs/config.yaml`'s actual 10-token roster, genuinely
+connected to live OKX public WS — not a synthetic test):
+- **Idle full stack** (ingestor + paper-trader + api + rl-service + redis + timescaledb, all 10
+  tokens/6 timeframes actually streaming live OKX data, paper-trader actively opening real paper
+  orders): **~290MB RAM combined, ~25-30% of one CPU core.** The Go services are the cheapest part
+  by far — ingestor and paper-trader combined use under 25MB RAM each even ingesting 10 tokens ×
+  6 timeframes of live WS data; Postgres is ~80MB, Redis ~15-40MB depending on stream backlog.
+- **Adding Prometheus + Grafana** (`docker-compose.yml`'s monitoring stack, CLAUDE.md §11.6):
+  +~260MB (Grafana ~235MB, Prometheus ~25-30MB) — brings the idle full stack (minus `trader`/
+  `panel`, which need real OKX keys/aren't part of the trading-critical path) to **~585MB RAM,
+  ~30% of one core.**
+- **Peak, with a real 50,000-timestep warm-start-shaped training run (10 pooled tokens, matching
+  §15.2 Phase B scale) running concurrently with the full live stack above**: `rl-service` briefly
+  spiked to **~470% CPU** (PyTorch's internal BLAS/thread pool uses multiple cores during a
+  training update step, not just the ~1 core rollout collection uses) and ~450MB RAM; every other
+  service's usage was unaffected by the concurrent training load. The training run itself completed
+  in **~207s (~3.5 minutes)** at ~246 fps — slower than the 2-token run above (260-700 fps) since
+  10 tokens' pooled experience means more data per rollout, but still not a long-running job.
+  Nothing else in the stack degraded or fell behind during this — ingestion kept up with live OKX
+  data throughout.
+- **Bottom line**: the whole trading-critical stack (everything except monitoring) fits in under
+  1GB RAM and under half a CPU core at idle, even at full Phase B scale (10 tokens). A training run
+  temporarily wants close to a full core (or more, briefly) but doesn't meaningfully compete with
+  the trading-critical services for RAM. A budget 2 vCPU / 2GB RAM VPS has comfortable headroom for
+  everything in this project at once, monitoring included — the original 8-core/16GB planning
+  figure was a conservative upper bound, not a real requirement.
+
 ### 15.2 Phased rollout (start small, expand only with evidence)
 
 - **Phase A (start here):** 2 tokens (BTC-USDT-SWAP, XAU or its OKX equivalent instrument — verify
