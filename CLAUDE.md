@@ -599,13 +599,29 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       side plus the paired-trades table. The "decide after ~a week" call itself is still yours to
       make by reading this page — no automated promote/reject action is taken on the comparison.
 
-Phase 6 — strategy parameter optimizer (§16, new):
-- [ ] `cmd/strategy-optimizer`: trial lifecycle against real `strategy.Strategy` values (no
-      reimplementation), Redis-backed disposable trial state (not `paper_orders`), tick-driven
-      SL/TP-touch win/loss judgment (§16.3)
-- [ ] Python/Optuna candidate-proposal sidecar + the Go<->Optuna call boundary (§16.2, §16.6)
-- [ ] Winning-candidate persistence as durable sub-strategy rows + assignments, reusing
-      `CreateStrategy`/`CreateAssignment` (§16.3 step 5, §11.3)
+Phase 6 — strategy parameter optimizer (§16, implemented):
+- [x] `cmd/strategy-optimizer`: a long-lived Go service (not a one-shot CLI — see §16.7's revision
+      of §16.4), full trial lifecycle against real `strategy.Strategy` values via `strategy.
+      Factories`/`WithParams` (no reimplementation), Redis-backed disposable trial state
+      (`internal/optimizer.TrialStore`/`OpenTrial` — never `paper_orders`), tick-driven SL/TP-touch
+      win/loss judgment reusing `usecase.SLTPTouchReason` (extracted from `papertrade.go`'s
+      `closeReason` into a shared exported helper so PaperTrader and the optimizer judge trials by
+      the exact same domain logic, §16.3). Pure trial-scoring/candidate-selection logic
+      (`CandidateResult`, `EligibleCandidates`, `BestCandidate`, `ShouldPersist`) lives in
+      `internal/optimizer/scoring.go`, unit-tested without Redis; `internal/optimizer/runner.go`'s
+      `Run` type owns one time-boxed run's lifecycle (`EnsureCandidates`/`EvaluateCandle`/
+      `CheckTick`/`Finalize`); `cmd/strategy-optimizer/main.go` wires per-instrument tick/candle
+      consumers, the scheduler, and `POST /optimize`/`GET /status`.
+- [x] Python/Optuna candidate-proposal sidecar (`optimizer-service/`, its own FastAPI app, no
+      shared code with `rl-service` — it has no torch/CUDA concern at all, §16.2) + the Go<->Optuna
+      `/suggest`/`/report` call boundary (`internal/optimizer.SidecarClient`), using Optuna's
+      `ask`/`tell` API (not `optimize()`) since Go drives the trial loop, keyed by opaque per-
+      candidate `trial_id`s (§16.6).
+- [x] Winning-candidate persistence as durable sub-strategy rows + assignments, reusing
+      `CreateStrategy`/`CreateAssignment` (§16.3 step 5, §11.3), plus a new `strategy_param_changes`
+      table (migration `000005`) + `Repository.RecordParamChange`/`ListParamChanges` logging every
+      change (optimizer- and manual-panel-sourced alike) for the Strategies page's new price-chart
+      marker overlay (§16.7).
 - [x] `rsi_sma_fuzzy` fuzzy-confidence sub-strategy variant (§16.5): trapezoidal membership
       functions replace RSISMA's hard threshold cliff (RSI=29.99 vs 30.01 no longer flips the
       decision discontinuously) — `oversoldMembership`/`overboughtMembership` ramp linearly across
@@ -1067,3 +1083,58 @@ modification to `rsi_sma` itself — origins must stay locked and comparable (§
   default or requires an explicit operator-triggered list (likely the latter, to bound resource use
   — see §15.1's resource-math precedent for why an unbounded "everything at once" default is the
   wrong instinct).
+
+### 16.7 Implementation decisions (resolving §16.4/§16.6, made during this build)
+
+These decisions were made while actually building §16 and **revise §16.4's original
+"manually-triggered only" framing** — recorded here rather than silently changing §16.4's prose,
+since the reasoning for the change is worth keeping alongside the original framing (same pattern
+as §15.1's "rejected/superseded" note).
+
+- **`cmd/strategy-optimizer` is a long-lived service, not a one-shot CLI.** It exposes
+  `POST /optimize {inst_id, kind}` (start one run right now) and `GET /status?run_id=` (poll
+  progress — candidates tried, best score so far, persisted or inconclusive), and it also runs a
+  **built-in scheduler**: on a configurable interval (`optimizer.schedule_interval`, a plain Go
+  duration string, e.g. `"24h"` — not hardcoded daily) it fires one time-boxed run per configured
+  target, **sequentially** (never all targets in parallel), matching §15.1/§16.6's precedent
+  against unbounded "everything at once" resource use. Targets default to
+  `Trading.InstIDs × optimizer.default_kinds` but are fully overridable via `optimizer.targets`.
+- **Time-boxing is now the primary stopping rule, not trial count** — this revises §16.3 step 5's
+  original "minimum trial count" framing to "time-boxed, with a minimum-trades-per-candidate
+  *eligibility floor* within that time box." Each run gets a wall-clock budget
+  (`optimizer.run_duration`, e.g. `"4h"`); within it, candidates are continuously requested from
+  the sidecar (refilled up to `optimizer.candidate_batch_size` as trials complete) and evaluated
+  against live market data. `optimizer.min_trades_per_candidate` (e.g. 15) still gates which
+  candidates are even eligible to win at the time box's close — the noise-rejection reasoning from
+  the original §16.3 step 5 is unchanged, it's just no longer the loop's own exit condition.
+- **Run-end scoring/persistence** (one of §16.6's "resolve at implementation time" items, now
+  resolved): pick the highest-win-rate eligible candidate, ties broken by trade count (more
+  evidence wins). If a clean baseline exists — the strategy currently assigned to that
+  inst_id+bar, with its own closed-trade win rate via `StrategyStatsFor` — the winner must beat it
+  by at least `optimizer.min_improvement_pct` percentage points (e.g. 5pp) to persist. If no clean
+  baseline exists (fresh token/kind pair, or the current assignment has no closed trades yet), the
+  winner must instead clear an absolute floor, `optimizer.min_win_rate_pct_floor` (e.g. 50%). A run
+  that produces no eligible or qualifying candidate is recorded as inconclusive and persists
+  nothing — this is an expected, non-error outcome, not a failure.
+- **Sidecar is a genuinely separate, minimal service** (`optimizer-service/`): its own FastAPI app
+  and `requirements.txt` (`fastapi`, `uvicorn`, `optuna`, `pydantic` — no `torch`/`psycopg2`, unlike
+  `rl-service`), because it has none of `rl-service`'s model-loading or CPU-only-torch-wheel
+  concerns (§15.1's Dockerfile note doesn't apply here at all). `POST /suggest` uses Optuna's
+  `ask()` per candidate (returning the trial's own `trial.number` as an opaque `trial_id` Go must
+  echo back); `POST /report` looks that trial back up and calls `study.tell()`. Studies
+  (`optuna.create_study(direction="maximize")`, one per `"{inst_id}:{kind}"` study id) live only in
+  the sidecar process's memory — a restart starts fresh studies, which is fine per the original
+  "disposable trial state" framing (only a *winning* candidate is ever durable, and that
+  persistence happens Go-side, not in the sidecar).
+- **Parameter-change timeline + chart** (not originally scoped in §16, added because the
+  optimizer needed some visible record of what it changed and when): a new `strategy_param_changes`
+  table (migration `000005_strategy_param_changes`) logs every strategy config change —
+  `source='optimizer'` when `cmd/strategy-optimizer` persists a winning candidate,
+  `source='manual'` when an operator edits a sub-strategy's params via the existing
+  `PUT /api/strategies/:id` panel flow (both call the same new
+  `Repository.RecordParamChange`). `GET /api/candles` (a new, minimal read of the existing
+  `candles` hypertable — no new candle storage) and `GET /api/strategies/:id/param-changes` back a
+  new chart on the Strategies page (`panel/src/components/ParamChangeChart.tsx`): a plain inline
+  SVG price line (no charting library added, keeping with §14 Phase 3's hand-rolled-CSS/minimal-
+  deps convention) with a vertical marker line at each parameter-change timestamp; hovering a
+  marker shows a tooltip diffing old vs. new param values (only the keys that actually changed).

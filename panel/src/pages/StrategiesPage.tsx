@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
+import ParamChangeChart from '../components/ParamChangeChart'
 import type { StrategyAssignment, StrategyConfig, StrategyStats } from '../api/types'
 
 function winRate(stats: StrategyStats | undefined): string {
@@ -288,6 +289,53 @@ function AssignmentsPanel({
   )
 }
 
+function ChartPanel({
+  strategies,
+  assignments,
+}: {
+  strategies: StrategyConfig[]
+  assignments: StrategyAssignment[]
+}) {
+  // Picking a chart target = picking one assignment (strategy + inst + bar together), since the
+  // chart needs all three and a strategy row can be assigned to several tokens/timeframes at once.
+  const [assignmentId, setAssignmentId] = useState<number | null>(null)
+  const effectiveAssignment = assignments.find((a) => a.ID === assignmentId) ?? assignments[0]
+
+  const nameFor = (id: number) => strategies.find((s) => s.ID === id)?.Name ?? `#${id}`
+
+  if (assignments.length === 0) {
+    return (
+      <div className="card">
+        <h2>Parameter change history</h2>
+        <div className="text-dim">No assignments yet — assign a strategy to a token/timeframe above to chart it.</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="card">
+      <h2>Parameter change history</h2>
+      <div className="toolbar" style={{ marginBottom: '0.75rem' }}>
+        <select
+          value={effectiveAssignment.ID}
+          onChange={(e) => setAssignmentId(Number(e.target.value))}
+        >
+          {assignments.map((a) => (
+            <option key={a.ID} value={a.ID}>
+              {nameFor(a.StrategyID)} — {a.InstID} / {a.Bar}
+            </option>
+          ))}
+        </select>
+      </div>
+      <ParamChangeChart
+        strategyId={effectiveAssignment.StrategyID}
+        instId={effectiveAssignment.InstID}
+        bar={effectiveAssignment.Bar}
+      />
+    </div>
+  )
+}
+
 export default function StrategiesPage() {
   const [strategies, setStrategies] = useState<StrategyConfig[]>([])
   const [assignments, setAssignments] = useState<StrategyAssignment[]>([])
@@ -355,6 +403,8 @@ export default function StrategiesPage() {
       </div>
 
       <AssignmentsPanel strategies={strategies} assignments={assignments} onChanged={reload} />
+
+      <ChartPanel strategies={strategies} assignments={assignments} />
     </div>
   )
 }

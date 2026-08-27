@@ -94,3 +94,26 @@ export interface ModelStatus {
   health: RLHealth
   units: UnitStatus[]
 }
+
+// Candle/ParamChange back the Strategies page's price-chart + parameter-change marker overlay
+// (CLAUDE.md §16, the strategy parameter optimizer's chart requirement).
+export interface Candle {
+  InstID: string
+  Bar: string
+  Timestamp: string
+  Open: string
+  High: string
+  Low: string
+  Close: string
+  Volume: string
+}
+
+export interface ParamChange {
+  ID: number
+  StrategyID: number
+  InstID: string
+  OldConfig: Record<string, number> | null
+  NewConfig: Record<string, number>
+  Source: 'optimizer' | 'manual'
+  CreatedAt: string
+}

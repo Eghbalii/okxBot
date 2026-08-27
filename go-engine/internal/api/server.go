@@ -51,6 +51,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/sltp-adjustments/stats", s.handleSLTPAdjustmentStats)
 	mux.HandleFunc("GET /api/sltp-adjustments/pairs", s.handleListSLTPAdjustmentPairs)
 
+	// CLAUDE.md §16 point 6: backs the Strategies page's price-line + parameter-change-marker
+	// chart — candles for the price line, param-changes for the vertical markers.
+	mux.HandleFunc("GET /api/candles", s.handleListCandles)
+	mux.HandleFunc("GET /api/strategies/{id}/param-changes", s.handleListParamChanges)
+
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -210,6 +215,21 @@ func (s *Server) handleUpdateStrategy(w http.ResponseWriter, r *http.Request) {
 	if err := s.Repo.UpdateStrategyConfig(r.Context(), id, req.Config, req.Enabled); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// CLAUDE.md §16, §16.3 step 5: manual panel edits go on the same parameter-change timeline the
+	// optimizer writes to (source="manual"), so the Strategies page's marker overlay shows every
+	// change regardless of who/what made it. Best-effort — the config update itself already
+	// succeeded above, so a logging failure here must not turn into a client-visible error.
+	for _, instID := range existing.InstIDs {
+		if _, err := s.Repo.RecordParamChange(r.Context(), port.ParamChange{
+			StrategyID: id,
+			InstID:     instID,
+			OldConfig:  existing.Config,
+			NewConfig:  req.Config,
+			Source:     "manual",
+		}); err != nil && s.Logger != nil {
+			s.Logger.Warn("failed to record manual param change", "strategyId", id, "instId", instID, "error", err)
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -377,6 +397,72 @@ func (s *Server) handleListSLTPAdjustmentPairs(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeJSON(w, http.StatusOK, pairs)
+}
+
+// handleListCandles serves a plain recent-history read of the durable candles hypertable
+// (?instId=&bar=&limit=, CLAUDE.md §16 point 6) — the price line the Strategies page's chart
+// draws param-change markers on top of.
+func (s *Server) handleListCandles(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	instID := q.Get("instId")
+	bar := q.Get("bar")
+	if instID == "" || bar == "" {
+		writeError(w, http.StatusBadRequest, "instId and bar are required query params")
+		return
+	}
+	limit := 200
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	candles, err := s.Repo.ListCandles(r.Context(), instID, bar, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, candles)
+}
+
+// handleListParamChanges serves a strategy's parameter-change timeline for one instrument
+// (?instId=&since=, CLAUDE.md §16 point 6) — the panel's chart marker data. instId is required:
+// a strategy row's own InstIDs can list several tokens, but the chart is always for one at a
+// time, so the caller (the panel) picks which.
+func (s *Server) handleListParamChanges(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt64(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	instID := r.URL.Query().Get("instId")
+	if instID == "" {
+		writeError(w, http.StatusBadRequest, "instId is a required query param")
+		return
+	}
+	since := time.Time{}
+	if v := r.URL.Query().Get("since"); v != "" {
+		parsed, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid since (want RFC3339): "+err.Error())
+			return
+		}
+		since = parsed
+	}
+	changes, err := s.Repo.ListParamChanges(r.Context(), instID, since)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Filter to this strategy id (ListParamChanges is instID-scoped only — one instrument can have
+	// several strategies' history in principle, though today each inst_id+bar has one active
+	// assignment; filtering here keeps the endpoint correct if that ever changes).
+	out := make([]port.ParamChange, 0, len(changes))
+	for _, c := range changes {
+		if c.StrategyID == id {
+			out = append(out, c)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func pathInt64(r *http.Request, key string) (int64, error) {

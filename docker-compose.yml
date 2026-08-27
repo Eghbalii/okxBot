@@ -87,6 +87,32 @@ services:
       - redis
       - timescaledb
 
+  optimizer-service:
+    build: ./optimizer-service
+    ports:
+      - "8001:8001"
+
+  strategy-optimizer:
+    build:
+      context: ./go-engine
+      dockerfile: Dockerfile.strategy-optimizer
+    environment:
+      CONFIG_PATH: /app/configs/config.yaml
+      REDIS_ADDR: redis:6379
+      POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
+      OPTIMIZER_SERVICE_URL: http://optimizer-service:8001
+      OPTIMIZER_ADDR: "0.0.0.0:8091"
+      METRICS_ADDR: ":9103"
+    ports:
+      - "8091:8091"
+      - "9103:9103"
+    volumes:
+      - ./go-engine/configs:/app/configs
+    depends_on:
+      - redis
+      - timescaledb
+      - optimizer-service
+
   api:
     build:
       context: ./go-engine

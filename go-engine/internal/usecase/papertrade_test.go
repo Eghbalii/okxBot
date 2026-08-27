@@ -20,11 +20,12 @@ import (
 // which can call into the repository concurrently (real Postgres handles this natively; this
 // fake must emulate that instead of assuming single-goroutine test access).
 type fakeRepository struct {
-	mu      sync.Mutex
-	nextID  int64
-	orders  map[int64]port.PaperOrder
-	candles []port.Candle
-	budgets map[string]port.TokenBudget
+	mu           sync.Mutex
+	nextID       int64
+	orders       map[int64]port.PaperOrder
+	candles      []port.Candle
+	budgets      map[string]port.TokenBudget
+	paramChanges []port.ParamChange
 }
 
 func newFakeRepository() *fakeRepository {
@@ -36,6 +37,20 @@ func (r *fakeRepository) SaveCandle(ctx context.Context, c port.Candle) error {
 	defer r.mu.Unlock()
 	r.candles = append(r.candles, c)
 	return nil
+}
+func (r *fakeRepository) ListCandles(ctx context.Context, instID, bar string, limit int) ([]port.Candle, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []port.Candle
+	for _, c := range r.candles {
+		if c.InstID == instID && c.Bar == bar {
+			out = append(out, c)
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out, nil
 }
 func (r *fakeRepository) CreateStrategy(ctx context.Context, s port.StrategyConfig) (int64, error) {
 	return 0, nil
@@ -210,6 +225,25 @@ func (r *fakeRepository) ListOpenPaperOrders(ctx context.Context, instID string)
 	for _, o := range r.orders {
 		if o.InstID == instID && o.ClosedAt == nil {
 			out = append(out, o)
+		}
+	}
+	return out, nil
+}
+func (r *fakeRepository) RecordParamChange(ctx context.Context, c port.ParamChange) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.nextID++
+	c.ID = r.nextID
+	r.paramChanges = append(r.paramChanges, c)
+	return c.ID, nil
+}
+func (r *fakeRepository) ListParamChanges(ctx context.Context, instID string, since time.Time) ([]port.ParamChange, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []port.ParamChange
+	for _, c := range r.paramChanges {
+		if c.InstID == instID && !c.CreatedAt.Before(since) {
+			out = append(out, c)
 		}
 	}
 	return out, nil

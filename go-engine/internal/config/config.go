@@ -85,6 +85,70 @@ type Config struct {
 		ProcessMgr string   `yaml:"process_manager"` // "systemd" or "docker"
 		Units      []string `yaml:"units"`           // systemd unit names or docker container names to report on
 	} `yaml:"api"`
+
+	// Optimizer configures cmd/strategy-optimizer (CLAUDE.md §16): the standing service that
+	// time-boxes real-market-data trial runs of candidate strategy.Strategy parameter sets per
+	// (inst_id, kind) and, on a scheduled interval, persists the best-performing candidate as a
+	// new durable sub-strategy row. Deliberately not folded into PaperTrading — this is a
+	// separate optimization concern with its own trial-lifecycle bookkeeping (§16.1/§16.2).
+	Optimizer struct {
+		// URL is the Python/Optuna sidecar's base URL (optimizer-service/, §16's "Optuna sidecar
+		// is a brand-new service" decision) — set from env only, matching RLService.URL's pattern.
+		URL string `yaml:"-"`
+		// Addr is cmd/strategy-optimizer's own HTTP API bind address (POST /optimize, GET
+		// /status) — analogous to API.Addr.
+		Addr string `yaml:"addr"`
+		// ScheduleInterval is a Go duration string (e.g. "24h") on which the built-in scheduler
+		// automatically fires one optimization pass per configured Target. This REVISES CLAUDE.md
+		// §16.4's original "manually-triggered only" framing — see §16.7.
+		ScheduleInterval string `yaml:"schedule_interval"`
+		// RunDuration is each optimization run's wall-clock time box (e.g. "4h") — the primary
+		// stopping rule (revises §16.3 step 5's "minimum trial count" framing to "time-boxed,
+		// with a minimum-trades-per-candidate eligibility floor" — see MinTradesPerCandidate).
+		RunDuration string `yaml:"run_duration"`
+		// MinTradesPerCandidate is the per-candidate minimum completed trades before it's even
+		// eligible to be scored/win at run end (§16.3 step 5's noise-rejection reasoning).
+		MinTradesPerCandidate int `yaml:"min_trades_per_candidate"`
+		// MinImprovementPct is how many percentage points a winning candidate's win rate must
+		// beat the current baseline's win rate by before it's persisted (e.g. 5.0 = must beat
+		// baseline by >=5pp). If no baseline exists for a target, MinWinRatePctFloor is used
+		// instead (see below) — an explicit, documented implementation choice for one of §16.6's
+		// "resolve at implementation time" items.
+		MinImprovementPct decimal.Decimal `yaml:"min_improvement_pct"`
+		// MinWinRatePctFloor is the win-rate floor a winning candidate must clear when no clean
+		// baseline exists to compare against (e.g. a fresh inst_id+kind with no assignment yet).
+		MinWinRatePctFloor decimal.Decimal `yaml:"min_win_rate_pct_floor"`
+		// Bar is the single candle timeframe each run evaluates candidates against (§16.3: "pick
+		// one bar to optimize against per run target ... make it explicit, not hidden").
+		Bar string `yaml:"bar"`
+		// CandleWindow mirrors PaperTrading.CandleLimit for the optimizer's own candle windows.
+		CandleWindow int `yaml:"candle_window"`
+		// BatchSize is how many candidate parameter sets are requested from the sidecar at once,
+		// refilled as trials complete (§16.3 step 1).
+		BatchSize int `yaml:"batch_size"`
+		// TrialTTLBufferSec pads a trial's Redis TTL beyond the run's remaining time box, so a
+		// stale trial key self-cleans even if the process crashes mid-run (§16.3 step 2's "TTL
+		// should exceed the run's remaining time box comfortably").
+		TrialTTLBufferSec int `yaml:"trial_ttl_buffer_sec"`
+		// Targets is the explicit list of (inst_id, kind) pairs the scheduler optimizes on its
+		// interval. Empty means "derive from Trading.InstIDs x DefaultKinds" (see Load below) —
+		// kept simple per the "your call" instruction rather than a separate DB-backed table,
+		// since this is operator-level config, not per-token runtime state like strategy
+		// assignments (§11.3).
+		Targets []OptimizerTarget `yaml:"targets"`
+		// DefaultKinds is the strategy kinds considered for every Trading.InstIDs entry when
+		// Targets is empty.
+		DefaultKinds []string `yaml:"default_kinds"`
+	} `yaml:"optimizer"`
+}
+
+// OptimizerTarget is one (instrument, strategy-kind) pair cmd/strategy-optimizer's scheduler
+// optimizes on its configured interval (CLAUDE.md §16.6: "whether cmd/strategy-optimizer runs
+// against every configured token/base-strategy pair by default or requires an explicit
+// operator-triggered list" — resolved here as an explicit, config-driven list).
+type OptimizerTarget struct {
+	InstID string `yaml:"inst_id"`
+	Kind   string `yaml:"kind"`
 }
 
 // Load reads the YAML config at path (if provided) and overlays secrets/endpoints from
@@ -199,6 +263,48 @@ func Load(path string) (*Config, error) {
 		// docker-compose's default container naming ("<project>-<service>-1"); override via
 		// api.units in config.yaml or API_UNITS if the actual deployment names differ.
 		cfg.API.Units = []string{"okxbot-rl-service-1"}
+	}
+
+	cfg.Optimizer.URL = envOr("OPTIMIZER_SERVICE_URL", "http://localhost:8001")
+	if cfg.Optimizer.Addr == "" {
+		cfg.Optimizer.Addr = envOr("OPTIMIZER_ADDR", "0.0.0.0:8091")
+	}
+	if cfg.Optimizer.ScheduleInterval == "" {
+		cfg.Optimizer.ScheduleInterval = "24h"
+	}
+	if cfg.Optimizer.RunDuration == "" {
+		cfg.Optimizer.RunDuration = "4h"
+	}
+	if cfg.Optimizer.MinTradesPerCandidate == 0 {
+		cfg.Optimizer.MinTradesPerCandidate = 15
+	}
+	if cfg.Optimizer.MinImprovementPct.IsZero() {
+		cfg.Optimizer.MinImprovementPct = decimal.NewFromInt(5)
+	}
+	if cfg.Optimizer.MinWinRatePctFloor.IsZero() {
+		cfg.Optimizer.MinWinRatePctFloor = decimal.NewFromInt(50)
+	}
+	if cfg.Optimizer.Bar == "" {
+		cfg.Optimizer.Bar = "15m"
+	}
+	if cfg.Optimizer.CandleWindow == 0 {
+		cfg.Optimizer.CandleWindow = 100
+	}
+	if cfg.Optimizer.BatchSize == 0 {
+		cfg.Optimizer.BatchSize = 5
+	}
+	if cfg.Optimizer.TrialTTLBufferSec == 0 {
+		cfg.Optimizer.TrialTTLBufferSec = 3600
+	}
+	if len(cfg.Optimizer.DefaultKinds) == 0 {
+		cfg.Optimizer.DefaultKinds = []string{"rsi_sma"}
+	}
+	if len(cfg.Optimizer.Targets) == 0 {
+		for _, instID := range cfg.Trading.InstIDs {
+			for _, kind := range cfg.Optimizer.DefaultKinds {
+				cfg.Optimizer.Targets = append(cfg.Optimizer.Targets, OptimizerTarget{InstID: instID, Kind: kind})
+			}
+		}
 	}
 
 	return cfg, nil

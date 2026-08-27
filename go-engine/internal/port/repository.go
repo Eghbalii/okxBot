@@ -134,9 +134,28 @@ type TokenBudget struct {
 	UpdatedAt   time.Time
 }
 
+// ParamChange is one recorded strategy parameter-change event (CLAUDE.md §16): either
+// cmd/strategy-optimizer persisting a winning tuned candidate (Source="optimizer") or an operator
+// editing a sub-strategy's params by hand via the panel (Source="manual"). Backs the panel's
+// price-chart marker-line view of "when did this token's strategy params last change."
+type ParamChange struct {
+	ID         int64
+	StrategyID int64
+	InstID     string
+	OldConfig  json.RawMessage // nil if the strategy had no prior config (first-ever change)
+	NewConfig  json.RawMessage
+	Source     string // "optimizer" or "manual"
+	CreatedAt  time.Time
+}
+
 // Repository is the persistence port. internal/postgres implements this.
 type Repository interface {
 	SaveCandle(ctx context.Context, c Candle) error
+	// ListCandles returns the most recent `limit` finalized candles for instID/bar, oldest first —
+	// backs the panel's price-chart marker overlay (GET /api/candles, CLAUDE.md §16 point 6). Reads
+	// the same durable `candles` hypertable PaperTrader writes to (CLAUDE.md §7); no separate
+	// candle store.
+	ListCandles(ctx context.Context, instID, bar string, limit int) ([]Candle, error)
 
 	CreateStrategy(ctx context.Context, s StrategyConfig) (int64, error)
 	GetStrategy(ctx context.Context, id int64) (StrategyConfig, error)
@@ -197,4 +216,13 @@ type Repository interface {
 	// instruments if ""), most-recently-opened first, for trade-level (not just aggregate)
 	// review — CLAUDE.md §15.4.
 	ListSLTPAdjustmentPairs(ctx context.Context, instID string) ([]SLTPAdjustmentPair, error)
+
+	// RecordParamChange appends one entry to a strategy's durable parameter-change timeline
+	// (CLAUDE.md §16, §16.3 step 5) — called both by cmd/strategy-optimizer after persisting a
+	// winning candidate and by cmd/api's manual strategy-update handler, so the panel's timeline
+	// reflects every change regardless of source.
+	RecordParamChange(ctx context.Context, c ParamChange) (int64, error)
+	// ListParamChanges returns instID's parameter-change history at or after since (zero time =
+	// no lower bound), oldest first — the shape the panel's marker-overlay chart consumes.
+	ListParamChanges(ctx context.Context, instID string, since time.Time) ([]ParamChange, error)
 }

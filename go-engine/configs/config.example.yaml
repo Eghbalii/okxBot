@@ -57,3 +57,22 @@ api:
   process_manager: "docker" # "systemd" or "docker" — how cmd/api queries RL model liveness/uptime/logs
   units:                    # container/unit names to report on for the RL model status panel
     - "okxbot-rl-service-1"
+
+# cmd/strategy-optimizer (CLAUDE.md §16/§16.7): standing service that time-boxes real-market-data
+# trial runs of candidate strategy parameter sets and, on a schedule, persists the best-performing
+# candidate as a new sub-strategy. optimizer.url (the Python/Optuna sidecar) is set from
+# OPTIMIZER_SERVICE_URL only, same pattern as rl_service.url — not set here.
+optimizer:
+  addr: "127.0.0.1:8091"
+  schedule_interval: "24h"  # how often the built-in scheduler fires one pass per target
+  run_duration: "4h"        # each run's wall-clock time box
+  min_trades_per_candidate: 15  # a candidate below this trade count at run end is not scoreable
+  min_improvement_pct: 5    # winning candidate must beat the current baseline's win rate by this many pp
+  min_win_rate_pct_floor: 50 # win-rate floor used instead, when no clean baseline exists yet
+  bar: "15m"                 # candle timeframe every run evaluates candidates against
+  candle_window: 100
+  # Explicit (inst_id, kind) pairs the scheduler optimizes on schedule_interval. Leave empty to
+  # fall back to default_kinds x trading.inst_ids instead.
+  targets: []
+  default_kinds:
+    - "rsi_sma"

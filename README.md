@@ -10,14 +10,18 @@ changes.
 ## Layout
 
 - `go-engine/` — Go module: WebSocket ingestor, OKX REST client, paper-trading engine, strategy
-  engine, trading engine, risk manager, Postgres persistence, Prometheus metrics.
+  engine, trading engine, strategy parameter optimizer (`cmd/strategy-optimizer`, CLAUDE.md §16),
+  risk manager, Postgres persistence, Prometheus metrics.
 - `rl-service/` — Python: Gymnasium environment (dev sanity-check only), PPO training
   (Stable-Baselines3), FastAPI inference server.
+- `optimizer-service/` — Python: minimal FastAPI + Optuna sidecar that proposes candidate strategy
+  parameter sets for `cmd/strategy-optimizer` (CLAUDE.md §16.2) — no ML model, no torch.
 - `docker-compose.yml` — Redis + TimescaleDB + Prometheus + Grafana + all Go/Python services.
 
 ## Monitoring
 
-Prometheus scrapes `/metrics` from the ingestor (`:9101`) and paper trader (`:9102`) — see
+Prometheus scrapes `/metrics` from the ingestor (`:9101`), paper trader (`:9102`), and the
+strategy optimizer (`:9103`) — see
 `prometheus.yml`. Metrics include strategy signals, paper orders opened/closed (by SL/TP/manual
 reason), open-order count, and cumulative realized PnL (CLAUDE.md §11 has the full list). Grafana
 is at `http://localhost:3000` (default admin/admin, per `docker-compose.yml`) with Prometheus
@@ -46,6 +50,12 @@ python -m rl_service.train   # optional: run once a paper-trading trade log exis
 
 # Go: start the trading engine (talks to the RL service + OKX)
 cd go-engine && go run ./cmd/trader
+
+# Optional: strategy parameter optimizer (CLAUDE.md §16) — tunes existing strategies' own
+# parameters against real market data, independent of the RL agent. Requires optimizer-service.
+cd optimizer-service && pip install -r requirements.txt
+uvicorn optimizer_service.api:app --port 8001
+cd go-engine && go run ./cmd/strategy-optimizer   # POST /optimize, GET /status on :8091
 ```
 
 **Always run against OKX demo trading (`x-simulated-trading: 1`) until the strategy has been

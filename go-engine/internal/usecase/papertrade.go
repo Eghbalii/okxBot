@@ -285,19 +285,28 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 }
 
 func closeReason(o port.PaperOrder, price decimal.Decimal) (string, bool) {
-	switch o.Side {
+	return SLTPTouchReason(o.Side, o.SLPx, o.TPPx, price)
+}
+
+// SLTPTouchReason is the shared SL/TP-touch comparison — genuine domain logic (CLAUDE.md §16.3's
+// trial mechanics require the exact same touch semantics PaperTrader uses for real paper orders,
+// so cmd/strategy-optimizer's trial checker calls this directly rather than duplicating it).
+// side is "buy" or "sell"; slPx/tpPx may be nil (no touch check on that side). Returns ("sl" or
+// "tp", true) on a touch, or ("", false) if neither has been hit yet at price.
+func SLTPTouchReason(side string, slPx, tpPx *decimal.Decimal, price decimal.Decimal) (string, bool) {
+	switch side {
 	case "buy":
-		if o.SLPx != nil && price.LessThanOrEqual(*o.SLPx) {
+		if slPx != nil && price.LessThanOrEqual(*slPx) {
 			return "sl", true
 		}
-		if o.TPPx != nil && price.GreaterThanOrEqual(*o.TPPx) {
+		if tpPx != nil && price.GreaterThanOrEqual(*tpPx) {
 			return "tp", true
 		}
 	case "sell":
-		if o.SLPx != nil && price.GreaterThanOrEqual(*o.SLPx) {
+		if slPx != nil && price.GreaterThanOrEqual(*slPx) {
 			return "sl", true
 		}
-		if o.TPPx != nil && price.LessThanOrEqual(*o.TPPx) {
+		if tpPx != nil && price.LessThanOrEqual(*tpPx) {
 			return "tp", true
 		}
 	}

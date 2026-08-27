@@ -1,5 +1,7 @@
 import type {
+  Candle,
   ModelStatus,
+  ParamChange,
   Position,
   PositionMode,
   SLTPAdjustmentPair,
@@ -125,6 +127,20 @@ export const api = {
     const params = new URLSearchParams()
     if (opts?.instId) params.set('instId', opts.instId)
     return requestList<SLTPAdjustmentPair>(`/sltp-adjustments/pairs?${params}`)
+  },
+
+  // Candles + param-changes back the Strategies page's price-chart marker overlay (CLAUDE.md
+  // §16): candles draw the price line, param-changes draw the vertical "params changed here"
+  // marker lines on top of it.
+  candles: (opts: { instId: string; bar: string; limit?: number }) => {
+    const params = new URLSearchParams({ instId: opts.instId, bar: opts.bar })
+    if (opts.limit) params.set('limit', String(opts.limit))
+    return requestList<Candle>(`/candles?${params}`)
+  },
+  paramChanges: (strategyId: number, opts: { instId: string; since?: string }) => {
+    const params = new URLSearchParams({ instId: opts.instId })
+    if (opts.since) params.set('since', opts.since)
+    return requestList<ParamChange>(`/strategies/${strategyId}/param-changes?${params}`)
   },
 }
 
