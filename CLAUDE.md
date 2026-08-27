@@ -599,6 +599,16 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       side plus the paired-trades table. The "decide after ~a week" call itself is still yours to
       make by reading this page — no automated promote/reject action is taken on the comparison.
 
+Phase 6 — strategy parameter optimizer (§16, new):
+- [ ] `cmd/strategy-optimizer`: trial lifecycle against real `strategy.Strategy` values (no
+      reimplementation), Redis-backed disposable trial state (not `paper_orders`), tick-driven
+      SL/TP-touch win/loss judgment (§16.3)
+- [ ] Python/Optuna candidate-proposal sidecar + the Go<->Optuna call boundary (§16.2, §16.6)
+- [ ] Winning-candidate persistence as durable sub-strategy rows + assignments, reusing
+      `CreateStrategy`/`CreateAssignment` (§16.3 step 5, §11.3)
+- [ ] `rsi_sma_fuzzy` (or similar) fuzzy-confidence sub-strategy variant (§16.5) — independent
+      track, can land before/after/without the optimizer itself
+
 Update the checklist above as work progresses.
 
 ## 15. RL training architecture: one global agent, reasoning over price + strategy signals
@@ -918,3 +928,134 @@ with a still-untrained/no-op model → paper order → SL/TP-adjust path → per
 bookkeeping) before touching `train.py` — get the full loop running with a no-op model first
 (matching the existing fail-safe pattern in `rl_service/serve/api.py`), same incremental-and-
 verified approach used for every phase so far (§14).
+
+## 16. Strategy parameter optimizer (independent of the RL model)
+
+Decided 2026-08-27, after an extended design discussion. This is a **separate, independent
+service** for tuning each built-in strategy's own numeric parameters (RSI period, MA lengths,
+thresholds, etc. — see `strategy.ParamSpec`, §9) per token, using real market data — deliberately
+decoupled from the RL agent (§15) so the two systems can never contaminate each other's signal.
+
+### 16.1 Why this is separate from the RL agent, and why the RL agent doesn't do this itself
+
+Two independent problems got conflated during early design and needed to be pulled apart:
+
+- **What the RL agent (§15) does**: given a strategy's already-decided signal (side, confidence,
+  SL%, TP%), learn how much to trust it, how to size/leverage the resulting position, and whether
+  to adjust SL/TP in-trade. The RL agent never sees or touches a strategy's *internal* parameters
+  (RSI period, MA length) — it only ever sees the strategy's *output*.
+- **What this optimizer does**: given a strategy's *internal* parameters, find values that make its
+  raw signal quality better (before the RL agent ever weighs in) — measured strictly by whether
+  price touched the strategy's own suggested SL or TP, nothing else.
+
+Explicit product decision on why these must stay separate (raised directly by the user): if the
+RL agent's own trading decisions (position sizing, early closes, SL/TP adjustments) were allowed
+to influence which strategy parameters get judged "good," two real problems follow — (a) a
+good signal could be made to look bad by an unrelated RL sizing/timing decision layered on top of
+it, and (b) the optimizer would be reasoning about a moving target, since the RL agent is itself
+still learning. Keeping the optimizer's win/loss judgment strictly to "did price touch this
+signal's own SL or TP" — never realized PnL, never anything the RL agent touched — removes RL as a
+confound entirely. This is also why feeding raw, unprocessed indicator values (RSI number, MA
+crossover event, etc.) directly into the RL network was rejected as the *general* signal-generation
+approach (§15.3's design still keeps strategies as one input among several, not replaced) — a
+crossover is a discrete event, not a continuous value, and averaging together indicators computed
+over different lookback windows (e.g. RSI-14 and RSI-21) as separate raw inputs is not
+meaningful without something to reconcile them; a raw-indicator-in, decision-out network would
+have to rediscover technical analysis from scratch, which is a much harder learning problem than
+weighting pre-computed opinions given this project's trade-volume constraints (§2). Fuzzy-logic
+preprocessing (turning heterogeneous indicators into comparable, continuous membership degrees
+before any model sees them) was discussed as a real technique for exactly this reconciliation
+problem and is worth a dedicated sub-strategy experiment (§16.6) — but is not a prerequisite for
+this optimizer, whose job is narrower (tune existing parameters, not reconcile heterogeneous raw
+inputs into a new kind of signal).
+
+### 16.2 Architecture: Go does the trials, Python only proposes candidates
+
+**Engineering principle driving this split**: never duplicate domain logic across languages if it
+can be avoided; only reach across language boundaries for a genuinely generic, off-the-shelf tool.
+The 12 built-in strategies' logic is this project's actual domain knowledge and lives in
+`internal/strategy/*.go` — reimplementing it in Python (the same trap warm-start's design
+deliberately avoided, §15.8) would create two copies that drift the moment one is edited and the
+other is forgotten. Bayesian optimization itself (which candidate parameter values to try next,
+given prior trial results) is a generic, domain-independent algorithm with no mature off-the-shelf
+Go library — Python's Optuna is mature and well-tested. So:
+
+- **`cmd/strategy-optimizer`** (new Go service): runs potentially hundreds of parallel parameter
+  trials per (token, base-strategy) pair, using the real `strategy.Strategy` interface directly —
+  no reimplementation, no drift risk. Owns trial lifecycle, signal evaluation, and SL/TP-touch
+  win/loss judgment.
+- **A small Python/Optuna sidecar** (new `rl-service`-adjacent service or an addition to
+  `rl_service`, TBD at implementation — likely its own lightweight FastAPI app given it has no
+  ML-model-loading concerns `rl_service` does): given a trial's parameter ranges (from
+  `strategy.ParamSpec`) and prior trials' results (win/loss), returns the next candidate parameter
+  set to try. Stateless from Go's perspective per call — Go owns trial bookkeeping, Optuna only
+  proposes.
+
+### 16.3 Trial mechanics
+
+For a given (token, base-strategy) pair, e.g. (XAU-USD-SWAP, `rsi_sma`):
+
+1. `cmd/strategy-optimizer` asks Optuna for N candidate parameter sets (bulk-seeded at start, or
+   one at a time as trials complete — implementation detail, not a design commitment yet).
+2. For each candidate, it constructs a live `strategy.Strategy` via `WithParams` (already
+   implemented, §9) and evaluates it against the real live candle window on every relevant candle
+   close, exactly like `PaperTrader.evaluateStrategies` does — same strategy code, same real market
+   data, but **the resulting "trial position" is never written to `paper_orders`**. It is tracked
+   as lightweight, TTL'd state in Redis (candidate params, entry price, SL/TP, opened-at) —
+   deliberately not a durable Postgres row, since these are disposable experiments, not real trades
+   or even real paper trades.
+3. On every real-time price tick (the same `okx:tickers` Redis stream `PaperTrader`/`cmd/trader`
+   already consume, CLAUDE.md §12), every open trial for that token is checked for SL/TP touch
+   against the live tick price — not candle-close price, for the same correctness reason
+   `PaperTrader`'s tick-driven SL/TP check exists (§14: candle-close-only checking can silently
+   miss a wick that touched SL/TP and reverted within the bar).
+4. When a trial's SL or TP is touched, it's recorded as a win or loss (touched TP = win, touched SL
+   = loss) and reported back to Optuna as that trial's outcome, closing the loop for the next
+   candidate suggestion.
+5. After enough trials accumulate (a minimum count per candidate, not a single trial — noisy market
+   events, e.g. a sudden large order or a social-media-driven price spike hitting one otherwise-good
+   parameter set's SL, must not by themselves condemn it; exact minimum-trial-count and
+   how-long-to-run-per-round are tuning parameters to set at implementation, not fixed here) and
+   Optuna's search has converged on one or more promising parameter sets, the best candidate(s) are
+   persisted as new durable sub-strategy rows (`port.Repository.CreateStrategy`, `ClonedFrom` set
+   to the base strategy's origin row, `Config` set to the winning params — CLAUDE.md §11.3's
+   existing parent/override model, unchanged) and assigned to that token/timeframe
+   (`CreateAssignment`) — entering the real signal-generation pipeline `PaperTrader` runs, same as
+   any manually-created sub-strategy today.
+
+### 16.4 What this phase is for, and what's still undecided
+
+Explicit scope, per the user: this optimizer is for the **initial training/bootstrap phase** —
+getting from "default strategy parameters" to "parameters tuned against real recent market
+behavior per token" before the RL agent (§15) starts training in earnest against realistic signal
+quality, not a fixed foundational strategy that never improves after. **Not yet decided**: what
+happens after the system moves into the main live-trading phase — whether/how often re-optimization
+runs again, whether it runs continuously in the background, or whether it's a manual/periodic
+operator action. Do not build an automatic recurring re-optimization loop without an explicit
+decision on this — leave it as a manually-triggered `cmd/strategy-optimizer` run for now.
+
+### 16.5 A fuzzy-logic sub-strategy variant (parallel track, independent of the optimizer above)
+
+Separately from the optimizer itself, the user asked for a **fuzzy-logic version of at least one
+existing strategy** as a new sub-strategy option — e.g. a `rsi_sma`-derived variant whose
+`Confidence` is computed as a smooth, continuous membership degree (how strongly is RSI in the
+"oversold" region, as a 0-1 degree, not a hard threshold crossing) rather than the sharp
+threshold-crossing logic today's strategies use. This is a real, independent technique (not a
+replacement for the optimizer, not a replacement for the RL agent) that directly addresses the
+"nothing in real markets is a hard 0/1 boolean" observation raised during design — smoothing a
+single strategy's confidence calculation is a self-contained, low-risk place to try it, distinct
+from the larger (and explicitly deferred) question of using fuzzy logic to reconcile heterogeneous
+raw indicators as a preprocessing layer ahead of the RL agent (§16.1's Neuro-Fuzzy note). Implement
+as a new `strategy.Strategy` kind (e.g. `rsi_sma_fuzzy`) alongside the existing 12, not a
+modification to `rsi_sma` itself — origins must stay locked and comparable (§11.3).
+
+### 16.6 Open implementation questions (resolve at implementation time, not here)
+
+- Exact minimum-trials-per-candidate and per-round time/trial budget before Optuna's suggestions
+  are trusted enough to persist (§16.3 step 5).
+- Where the Python/Optuna sidecar physically lives (new service vs. an addition to `rl_service`)
+  and its API shape.
+- Whether `cmd/strategy-optimizer` runs against every configured token/base-strategy pair by
+  default or requires an explicit operator-triggered list (likely the latter, to bound resource use
+  — see §15.1's resource-math precedent for why an unbounded "everything at once" default is the
+  wrong instinct).
