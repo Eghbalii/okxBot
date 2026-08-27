@@ -26,8 +26,9 @@ const recentTradesWindow = 10
 // baseline order on this token, ask the RL model for an action and, if it proposes a nonzero
 // SL/TP adjustment, fork a linked copy carrying the ratcheted result rather than editing the
 // original in place (CLAUDE.md §15.4's shadow-fork mechanic — the two are compared later, not
-// merged). Best-effort: any error here is logged and skipped, never propagated, since this must
-// not block the strategy-evaluation/candle-persistence path that already succeeded this bar.
+// merged). Best-effort: any error here is logged and skipped, never propagated. Called from
+// handleTick, throttled to RLAdjustInterval (CLAUDE.md §15.9's freshness fix) — price is always
+// the live tick price, not a candle close.
 func (e *PaperTrader) adjustOpenOrdersWithRL(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) {
 	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
 	if err != nil {
@@ -81,8 +82,12 @@ func (e *PaperTrader) adjustOpenOrdersWithRL(ctx context.Context, bar string, pr
 }
 
 // buildObservation assembles the CLAUDE.md §15.3 v3 observation for this token, shared across all
-// of this token's open orders for one candle-close evaluation (position/PnL/dist-to-SL-TP fields
-// are then overwritten per-order by the caller, since those are order-specific).
+// of this token's open orders for one evaluation pass (position/PnL/dist-to-SL-TP fields are then
+// overwritten per-order by the caller, since those are order-specific). The candle window/strategy
+// signals/price-context (bar-scoped) reflect the most recent finalized candle as before; LastPrice
+// and the per-order PnL/distance fields reflect whatever price the caller passes in — the live tick
+// price when called from handleTick (CLAUDE.md §15.9), a candle close when called from
+// evaluateStrategies' new-order path (still candle-driven by design, §9).
 func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) domain.Observation {
 	e.candlesMu.Lock()
 	window := append([]domain.Candle(nil), e.candles[bar]...)
@@ -110,7 +115,7 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 		SchemaVersion:  domain.ObservationSchemaVersion,
 		InstID:         e.InstID,
 		ActiveTokens:   e.ActiveTokens,
-		MidPrice:       price,
+		LastPrice:      price,
 		Timeframes:     []domain.TimeframeBlock{tb},
 		TokenBudgetUSD: e.TokenBudgetUSD,
 		RecentTrades:   e.recentBaselineTrades(ctx, logger),

@@ -572,15 +572,27 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       outcomes as they accumulate, not just the warm-start replay) — not yet built; needs enough
       live paper-trading history to be meaningful, which is itself gated on running the Phase A
       no-op loop against a live OKX feed first (§15.9, still open).
-- [ ] Audit MidPrice's live-tick freshness across the SL/TP-adjust and open-order-decision paths —
-      explicit user requirement (2026-08-27): the model must see the CURRENT, live tick price for
-      every token with an open position, not a stale/candle-close price. `domain.Observation.
-      MidPrice` and `rlclient`/`usecase/rl_sltp_adjust.go`'s wiring already exist and were verified
-      correct for the candle-close-cadence SL/TP-adjust path (§15.4) earlier in this project, but
-      this needs a fresh, careful re-verification end-to-end (including whether tick-cadence,
-      not just candle-close-cadence, is actually warranted for the "every open position's live
-      price" requirement) before being considered settled — do not just re-assert it's fine without
-      re-checking the actual code paths.
+- [x] Audit MidPrice's live-tick freshness across the SL/TP-adjust and open-order-decision paths
+      (explicit user requirement, 2026-08-27) — **found genuinely stale, not just re-verified**:
+      `adjustOpenOrdersWithRL` was only ever called from `handleCandle` with `c.Close` (the
+      finalized candle's close), never from `handleTick`, so the RL model's SL/TP-adjust decision
+      could reason about a price up to one full bar interval stale (e.g. up to 15 min on a 15m bar)
+      while `monitorOpenOrders` (the actual SL/TP-touch execution check) was correctly checking the
+      live tick every tick the whole time — the model just never got to react to what execution
+      already saw. Fixed: `adjustOpenOrdersWithRL` now runs from `handleTick`
+      (`internal/usecase/papertrade.go`), throttled to `RLAdjustInterval` (2s, a fixed wall-clock
+      throttle chosen over tick-count throttling so the effective call rate stays predictable
+      regardless of OKX's own tick rate) via `shouldRunRLAdjust`'s mutex-guarded
+      check-and-claim — bounds `rl_service` inference load without reintroducing candle-close-scale
+      staleness. `evaluateStrategies`' new-order-open path deliberately stays candle-close-driven
+      (§9: strategies are candle-driven by design; only the in-trade adjust decision needed the
+      live-tick fix). Also renamed `MidPrice` → `LastPrice` (`domain.Observation`/`obs.py`'s
+      `mid_price` → `last_price`, both sides kept in sync) since "midpoint" was never accurate —
+      it's always been OKX's tickers-channel `last` trade price. 2 new tests
+      (`TestHandleTick_TriggersRLAdjustOnLiveTickPrice`, `TestHandleTick_RLAdjustThrottled`) cover
+      the behavior the old test suite had zero coverage for (the existing
+      `TestAdjustOpenOrdersWithRL_*` tests call the adjust function directly, bypassing
+      `handleTick` entirely, so they never exercised cadence).
 - [x] `rl_service/serve/api.py`: loads the single global model, routes `/predict` for every token
       through it via the token-identity one-hot, rejects observation-schema-version mismatches with
       a 422 (§15.3, §15.8) — implemented as part of the v3 schema bump above.
@@ -779,9 +791,11 @@ schema on both sides must stay in sync, same as today):
   realized trade outcomes (e.g. last N paper_orders' PnL, win/loss) and time-since-last-loss — lets
   the agent itself learn to size down after a losing streak and back up after recovery, per token,
   despite sharing one policy.
-- **Live mid-price** (`MidPrice`, unchanged from the original design): always present, always the
-  current tick price — required for SL/TP-adjust decisions and PnL math regardless of any of the
-  above. This was already correctly wired before this revision; not a new addition.
+- **Live last-traded price** (`LastPrice`, renamed from `MidPrice` — see §15.9's audit item, which
+  found this field was actually being fed a stale candle-close price on the SL/TP-adjust path
+  despite this section's original "already correctly wired" note, and fixed it to the live tick):
+  always present, always the current tick price — required for SL/TP-adjust decisions and PnL math
+  regardless of any of the above.
 
 Keep the observation schema **additive and versioned** (`schema_version`, already implemented in
 `ObservationSchemaVersion`/`OBSERVATION_SCHEMA_VERSION`) — Phase B's timeframe/strategy/token

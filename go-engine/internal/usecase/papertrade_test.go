@@ -645,6 +645,66 @@ func TestAdjustOpenOrdersWithRL_SkipsWhenNoBaselineOrders(t *testing.T) {
 	}
 }
 
+// TestHandleTick_TriggersRLAdjustOnLiveTickPrice covers CLAUDE.md §15.9's freshness fix: the RL
+// SL/TP-adjust pass must fire from the tick stream (using the live tick price), not only at
+// candle close — this is the actual behavioral change, previously uncovered by any test since
+// TestAdjustOpenOrdersWithRL_* above call adjustOpenOrdersWithRL directly rather than through
+// handleTick.
+func TestHandleTick_TriggersRLAdjustOnLiveTickPrice(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
+	model := &fakeModelClientRL{action: domain.Action{}}
+	pt.Model = model
+
+	sl := dec("95")
+	_, err := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, Size: dec("100"), Leverage: dec("1"),
+	})
+	if err != nil {
+		t.Fatalf("open baseline order: %v", err)
+	}
+
+	tick, _ := json.Marshal(tickEvent{InstID: "BTC-USDT-SWAP", Last: "103.5"})
+	if err := pt.handleTick(context.Background(), tick, testLogger()); err != nil {
+		t.Fatalf("handleTick: %v", err)
+	}
+
+	if model.calls != 1 {
+		t.Fatalf("expected Predict called once from a tick with an open baseline order, got %d calls", model.calls)
+	}
+}
+
+// TestHandleTick_RLAdjustThrottled covers the RLAdjustInterval throttle: a burst of ticks within
+// the same interval must only trigger one RL SL/TP-adjust pass, so a busy token doesn't call
+// rl_service on every single tick (CLAUDE.md §15.9).
+func TestHandleTick_RLAdjustThrottled(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
+	model := &fakeModelClientRL{action: domain.Action{}}
+	pt.Model = model
+
+	sl := dec("95")
+	_, err := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, Size: dec("100"), Leverage: dec("1"),
+	})
+	if err != nil {
+		t.Fatalf("open baseline order: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		tick, _ := json.Marshal(tickEvent{InstID: "BTC-USDT-SWAP", Last: "103.5"})
+		if err := pt.handleTick(context.Background(), tick, testLogger()); err != nil {
+			t.Fatalf("handleTick #%d: %v", i, err)
+		}
+	}
+
+	if model.calls != 1 {
+		t.Errorf("expected exactly 1 Predict call across a burst of ticks within RLAdjustInterval, got %d", model.calls)
+	}
+}
+
 func TestSLTPAdjustmentStats_AggregatesPairedTradesOnly(t *testing.T) {
 	repo := newFakeRepository()
 	ctx := context.Background()

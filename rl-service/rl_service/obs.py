@@ -50,7 +50,9 @@ class Observation(BaseModel):
     # Ordered roster the token-identity one-hot is built against — must match what the loaded
     # global model was trained with (order defines each slot's index).
     active_tokens: list[str] = Field(default_factory=list)
-    mid_price: float
+    # Renamed from mid_price: this is the live tick ("last") price, not a bid/ask midpoint. Keep
+    # in sync with domain.Observation.LastPrice on the Go side (json tag last_price).
+    last_price: float
     timeframes: list[TimeframeBlock] = Field(default_factory=list)
 
     position: float = 0.0

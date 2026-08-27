@@ -66,7 +66,22 @@ type PaperTrader struct {
 	// Go runtime error, not just a race.
 	candlesMu sync.Mutex
 	candles   map[string][]domain.Candle // keyed by bar
+
+	// rlAdjustMu/lastRLAdjustAt throttle the RL SL/TP-adjust pass to tick cadence (CLAUDE.md's
+	// 2026-08-27 MidPrice-freshness audit): previously this only ran on candle close, so the model
+	// could reason about a price up to one full bar interval stale while an open order's SL/TP was
+	// actually at risk of being hit in real time. Now every tick is a candidate trigger, throttled
+	// to RLAdjustInterval so a busy token doesn't call rl_service on every single tick.
+	rlAdjustMu     sync.Mutex
+	lastRLAdjustAt time.Time
 }
+
+// RLAdjustInterval is the minimum time between RL SL/TP-adjust passes for one instrument
+// (CLAUDE.md §15.4/§15.9's freshness fix) — a fixed wall-clock throttle, not tied to tick count,
+// so the effective call rate stays predictable regardless of how fast OKX's tickers channel is
+// pushing updates. A few seconds of lag behind the live tick stream is an explicit, accepted
+// tradeoff for bounding rl_service's inference load; it is not meant to track every tick.
+const RLAdjustInterval = 2 * time.Second
 
 type tickEvent struct {
 	InstID string `json:"instId"`
@@ -148,7 +163,37 @@ func (e *PaperTrader) handleTick(ctx context.Context, data []byte, logger *slog.
 	if err != nil {
 		return fmt.Errorf("parse tick price %q: %w", tick.Last, err)
 	}
-	return e.monitorOpenOrders(ctx, price, logger)
+	if err := e.monitorOpenOrders(ctx, price, logger); err != nil {
+		return err
+	}
+
+	// CLAUDE.md §15.4/§15.9: RL SL/TP-adjust now runs on the live tick stream (throttled to
+	// RLAdjustInterval), not just at candle close — see the audit note on lastRLAdjustAt's
+	// declaration for why this changed. Best-effort/never blocking, same as the old call site.
+	if e.Model != nil && e.shouldRunRLAdjust() {
+		// bar is only used to select which timeframe's strategy signals/price-context feed the
+		// observation (CLAUDE.md §15.3) — pick the first configured bar as a reasonable default
+		// context for a tick-driven decision, since a single tick doesn't belong to one bar.
+		bar := ""
+		if len(e.Bars) > 0 {
+			bar = e.Bars[0]
+		}
+		e.adjustOpenOrdersWithRL(ctx, bar, price, logger)
+	}
+	return nil
+}
+
+// shouldRunRLAdjust reports whether enough time has passed since the last RL SL/TP-adjust pass to
+// run another one now, and if so, atomically claims the slot (updates lastRLAdjustAt) so
+// concurrent ticks can't both pass the check and double-fire.
+func (e *PaperTrader) shouldRunRLAdjust() bool {
+	e.rlAdjustMu.Lock()
+	defer e.rlAdjustMu.Unlock()
+	if time.Since(e.lastRLAdjustAt) < RLAdjustInterval {
+		return false
+	}
+	e.lastRLAdjustAt = time.Now()
+	return true
 }
 
 func (e *PaperTrader) handleCandle(ctx context.Context, bar string, data []byte, logger *slog.Logger) error {
@@ -186,12 +231,10 @@ func (e *PaperTrader) handleCandle(ctx context.Context, bar string, data []byte,
 	if err := e.evaluateStrategies(ctx, bar, c.Close, logger); err != nil {
 		return err
 	}
-	// CLAUDE.md §15.4: RL-driven SL/TP adjustment runs at candle-close cadence (not every tick) to
-	// avoid overreacting to noise. Best-effort: a failure here must never block strategy evaluation
-	// or candle persistence above, which already succeeded.
-	if e.Model != nil {
-		e.adjustOpenOrdersWithRL(ctx, bar, c.Close, logger)
-	}
+	// RL SL/TP-adjust now runs on the tick stream instead of here (see handleTick) — CLAUDE.md
+	// §15.4/§15.9's freshness fix: candle-close cadence meant the model could reason about a price
+	// up to one full bar interval stale while an open order's SL/TP was actually at risk in real
+	// time.
 	return nil
 }
 

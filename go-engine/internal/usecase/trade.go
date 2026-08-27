@@ -93,7 +93,7 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 	obs := domain.Observation{
 		SchemaVersion:    domain.ObservationSchemaVersion,
 		InstID:           t.InstID,
-		MidPrice:         mid,
+		LastPrice:        mid,
 		Position:         posSize,
 		CurrentLeverage:  lever,
 		UnrealizedPnLPct: uplRatio,

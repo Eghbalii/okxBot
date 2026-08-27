@@ -187,7 +187,7 @@ class ReplayEnv(gym.Env):
         return Observation(
             inst_id=series.inst_id,
             active_tokens=self.active_tokens,
-            mid_price=float(row["close"]),
+            last_price=float(row["close"]),
             timeframes=[tb],
             position=1.0 if self.position_notional > 0 else (-1.0 if self.position_notional < 0 else 0.0),
             current_leverage=self.leverage,

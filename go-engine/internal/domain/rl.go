@@ -69,9 +69,14 @@ type Observation struct {
 	InstID        string `json:"inst_id"`
 	// ActiveTokens is the ordered roster the token-identity one-hot is built against — must match
 	// what the global model was trained with (order matters: it defines each slot's index).
-	ActiveTokens []string         `json:"active_tokens"`
-	MidPrice     decimal.Decimal  `json:"mid_price"`
-	Timeframes   []TimeframeBlock `json:"timeframes"`
+	ActiveTokens []string `json:"active_tokens"`
+	// LastPrice is the current live price for this token — the most recent tick, not a candle
+	// close (renamed from MidPrice, which read as "bid/ask midpoint" and didn't reflect what's
+	// actually sent: OKX's tickers channel "last" trade price). CLAUDE.md's 2026-08-27 MidPrice
+	// freshness audit found the SL/TP-adjust caller was passing a candle-close price here instead
+	// of the live tick — see usecase/papertrade.go's tick-driven adjustOpenOrdersWithRL for the fix.
+	LastPrice  decimal.Decimal  `json:"last_price"`
+	Timeframes []TimeframeBlock `json:"timeframes"`
 
 	Position         decimal.Decimal `json:"position"` // signed current position size
 	CurrentLeverage  decimal.Decimal `json:"current_leverage"`
