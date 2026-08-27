@@ -17,6 +17,7 @@ type Factory func() Strategy
 // built-in strategy should be creatable/assignable from the panel.
 var Factories = map[string]Factory{
 	"rsi_sma":              func() Strategy { return NewRSISMA(14, 50) },
+	"rsi_sma_fuzzy":        func() Strategy { return NewRSISMAFuzzy() },
 	"double_top_bottom":    func() Strategy { return NewDoubleTopBottom() },
 	"dual_ma_atr":          func() Strategy { return NewDualMAATR() },
 	"ema_cross_trailing":   func() Strategy { return NewEMACrossTrailing() },

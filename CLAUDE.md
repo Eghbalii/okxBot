@@ -606,8 +606,16 @@ Phase 6 — strategy parameter optimizer (§16, new):
 - [ ] Python/Optuna candidate-proposal sidecar + the Go<->Optuna call boundary (§16.2, §16.6)
 - [ ] Winning-candidate persistence as durable sub-strategy rows + assignments, reusing
       `CreateStrategy`/`CreateAssignment` (§16.3 step 5, §11.3)
-- [ ] `rsi_sma_fuzzy` (or similar) fuzzy-confidence sub-strategy variant (§16.5) — independent
-      track, can land before/after/without the optimizer itself
+- [x] `rsi_sma_fuzzy` fuzzy-confidence sub-strategy variant (§16.5): trapezoidal membership
+      functions replace RSISMA's hard threshold cliff (RSI=29.99 vs 30.01 no longer flips the
+      decision discontinuously) — `oversoldMembership`/`overboughtMembership` ramp linearly across
+      a configurable transition zone (`OversoldMin`/`OversoldMax`, `OverboughtMin`/`OverboughtMax`),
+      with a `MinMembership` floor so the strategy doesn't emit noise-level signals on every candle.
+      Registered in `Factories` as `"rsi_sma_fuzzy"`, a separate `strategy.Strategy` kind from
+      `RSISMA` (not a modification — origins stay independently comparable, §11.3). 6 tests verify
+      the membership ramp's exact values, that adjacent RSI steps never jump discontinuously (the
+      actual "no cliff" property), buy-signal construction, the min-membership hold gate,
+      `WithParams` repairing a degenerate/inverted zone, and factory registration.
 
 Update the checklist above as work progresses.
 
