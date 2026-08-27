@@ -199,6 +199,32 @@ services:
       - ingestor
       - paper-trader
 
+  # Single-node log aggregation (CLAUDE.md §11.2/§11.6 revised): Loki indexes only labels
+  # (service, level), not full text, which is what keeps this lightweight next to
+  # Elasticsearch/ELK at this project's log volume. No object store — filesystem storage on the
+  # loki-data volume is appropriate for a single VPS, not a multi-node deployment.
+  loki:
+    image: grafana/loki:latest
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+
+  # Tails every container's stdout/stderr via Docker service discovery (no per-service config as
+  # new cmd/* services are added) and ships to Loki. Parses the Go services' slog logfmt output
+  # (time=... level=... msg=...) so "level" becomes a queryable Loki label — this is what makes
+  # "search/filter a service's errors separately" work with zero application code changes.
+  promtail:
+    image: grafana/promtail:latest
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
   grafana:
     image: grafana/grafana:latest
     environment:
@@ -207,8 +233,10 @@ services:
       - "3000:3000"
     volumes:
       - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
+      - loki
 
 volumes:
   redis-data:
@@ -216,3 +244,4 @@ volumes:
   timescale-data:
   prometheus-data:
   grafana-data:
+  loki-data:

@@ -16,18 +16,30 @@ changes.
   (Stable-Baselines3), FastAPI inference server.
 - `optimizer-service/` — Python: minimal FastAPI + Optuna sidecar that proposes candidate strategy
   parameter sets for `cmd/strategy-optimizer` (CLAUDE.md §16.2) — no ML model, no torch.
-- `docker-compose.yml` — Kafka + Redis + TimescaleDB + Prometheus + Grafana + all Go/Python
-  services.
+- `docker-compose.yml` — Kafka + Redis + TimescaleDB + Prometheus + Grafana + Loki/Promtail + all
+  Go/Python services.
 
-## Monitoring
+## Monitoring & logs
 
 Prometheus scrapes `/metrics` from the ingestor (`:9101`), paper trader (`:9102`), and the
 strategy optimizer (`:9103`) — see
 `prometheus.yml`. Metrics include strategy signals, paper orders opened/closed (by SL/TP/manual
 reason), open-order count, and cumulative realized PnL (CLAUDE.md §11 has the full list). Grafana
-is at `http://localhost:3000` (default admin/admin, per `docker-compose.yml`) with Prometheus
-(`http://prometheus:9090`) as a data source — dashboards aren't pre-built yet, add them once
-there's real paper-trading data to look at.
+is at `http://localhost:3000` (default admin/admin, per `docker-compose.yml`) with **both
+Prometheus and Loki auto-provisioned as data sources** (`grafana/provisioning/datasources/`) — no
+manual setup needed. Dashboards aren't pre-built yet, add them once there's real paper-trading
+data to look at.
+
+**Logs** are aggregated into Loki (`loki-config.yml`) by Promtail (`promtail-config.yml`), which
+auto-discovers every running container via the Docker API — no per-service wiring needed. Query
+them in Grafana's **Explore** tab against the Loki data source, e.g.:
+- `{service="paper-trader"}` — every log line from one service
+- `{service="paper-trader", level="ERROR"}` — just that service's errors (Go services log
+  structured `logfmt` via `slog`, which Promtail parses into a real `level` label)
+- `{service=~"paper-trader|strategy-optimizer"} |= "failed"` — full-text filter across services
+Retention is 14 days by default (`loki-config.yml`); logs from non-Go containers (Python services,
+Postgres, Redis, Kafka) land under their own `service` label too, just without a parsed `level`
+label since they don't emit `logfmt`. See CLAUDE.md §11.7 for the full design/rationale.
 
 ## Quickstart (development, OKX demo trading only)
 
@@ -36,7 +48,7 @@ cp go-engine/configs/config.example.yaml go-engine/configs/config.yaml
 cp rl-service/configs/config.example.yaml rl-service/configs/config.yaml
 cp .env.example .env   # fill in OKX demo API key/secret/passphrase
 
-docker compose up -d kafka redis timescaledb prometheus grafana
+docker compose up -d kafka redis timescaledb prometheus grafana loki promtail
 
 # Go: start the market data ingestor (WS -> Kafka: ticks + candles)
 cd go-engine && go run ./cmd/ingestor
@@ -80,6 +92,7 @@ Minimum viable single-node setup for development / early paper-trading (no live 
 | Kafka (event bus, single Kraft-mode broker) | 1 vCPU | 1 GB   | 10 GB+ SSD     | no  |
 | Redis (strategy-optimizer trial state)  | 1 vCPU    | 512 MB–1 GB | —          | no  |
 | TimescaleDB/Postgres                    | 2 vCPU    | 4 GB    | 50 GB+ SSD     | no  |
+| Loki + Promtail (log aggregation)       | 1 vCPU    | 512 MB–1 GB | 10 GB+ SSD | no  |
 | **Total minimum, all-in-one box**       | **8 vCPU**| **16 GB** | **100 GB SSD** | **no** |
 
 Notes:

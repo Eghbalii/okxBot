@@ -78,7 +78,12 @@ core trading/paper-trading loops. Items marked `(planned)` don't exist yet — s
 okxBot/
 ├── CLAUDE.md                  # this file
 ├── README.md                  # human quickstart + infra/resource requirements
-├── docker-compose.yml         # redis + timescaledb + go services + python service
+├── docker-compose.yml         # kafka + redis + timescaledb + prometheus/grafana + loki/promtail
+│                                 + go services + python services
+├── loki-config.yml            # log aggregation storage/retention, §11.7
+├── promtail-config.yml        # Docker-service-discovery log shipper -> Loki, §11.7
+├── prometheus.yml             # metrics scrape config, §11.6
+├── grafana/provisioning/      # auto-provisioned Prometheus + Loki datasources, §11.6/§11.7
 ├── go-engine/                 # Go module: data ingestion + order execution + risk + API
 │   ├── cmd/
 │   │   ├── ingestor/          # connects OKX public WS, publishes ticks/candles to Redis
@@ -301,8 +306,14 @@ its own crash. Instead this is standard process supervision, surfaced through `c
   (or the Docker equivalent) to answer "is it live," "how long has it been alive," and "how many
   times has it crashed/restarted." Don't reinvent this in Go/Python.
 - **Logs/errors:** `journalctl -u <unit> -n 200 --no-pager` (or `docker logs --tail 200`) tailed
-  through a `cmd/api` endpoint, filterable to error-level lines. No separate log-shipping stack
-  (Loki/ELK) for v1 — journald/docker's own log store is enough at this scale.
+  through a `cmd/api` endpoint, filterable to error-level lines — this remains the *live tail* path
+  for the RL model-status panel specifically. **Revised 2026-08-27**: a lightweight log-shipping
+  stack (Grafana Loki + Promtail, §11.6) was added on top of this for cross-service historical
+  search/filtering — the original "journald/docker's own log store is enough" call didn't account
+  for wanting to *query* (not just tail) errors across services after the fact. ELK was
+  deliberately rejected in favor of Loki: Elasticsearch alone is the single heaviest component
+  measured anywhere in this stack (§15.1), and Loki's label-only indexing (not full-text) is a
+  better fit at this project's log volume while still slotting into the Grafana UI already in use.
 - `rl_service/metrics.py` (CPU/RAM/GPU + training-progress numbers, per the original plan) is still
   useful for the *training* process specifically (elapsed steps, timesteps/sec) and is planned but
   not implemented — separate concern from liveness/crash status above.
@@ -395,6 +406,49 @@ via `internal/metrics` (`promhttp`), scraped per `prometheus.yml`:
 Grafana dashboards themselves (panels/layout) aren't built yet — only the metrics + scrape config
 are wired; building the actual dashboard JSON is a small follow-up once there's real data to look
 at. `rl_service/metrics.py` (CPU/RAM/GPU/training progress) is still planned, not implemented.
+
+### 11.7 Logs (implemented): Grafana Loki + Promtail
+
+**Added 2026-08-27**, revising §11.2's original "no separate log-shipping stack for v1" call —
+that call covered *live-tailing* a single service's logs (still true, §11.2 unchanged for that),
+but didn't address wanting to *search/filter* errors across services after the fact, which is a
+different, genuinely useful capability journald/`docker logs` alone don't give you. ELK was
+considered and rejected: Elasticsearch alone is the single heaviest component measured anywhere in
+this stack (§15.1's resource-math precedent), and Loki's label-only indexing (not full-text) fits
+this project's actual log volume while reusing the Grafana UI already deployed for metrics — one
+pane of glass for both, not two separate tools to learn.
+
+- **`loki`** (`loki-config.yml`, filesystem storage on the `loki-data` volume — no object store,
+  appropriate for one VPS not a multi-node deployment) and **`promtail`** (`promtail-config.yml`)
+  added to `docker-compose.yml`. Promtail uses **Docker service discovery**
+  (`docker_sd_configs`, mounted `/var/run/docker.sock` read-only) to auto-tail every container's
+  stdout/stderr — no per-service config needed as new `cmd/*` services are added, and no
+  application code changes were needed at all: every Go service already logs structured
+  `logfmt` via `slog.NewTextHandler` (§6) to stdout, which Promtail's `logfmt` pipeline stage
+  parses to promote `level` into a real, queryable Loki label
+  (`{service="paper-trader", level="ERROR"}` in Grafana Explore/LogQL) — this is the concrete
+  mechanism behind "save/query each service's errors separately." Non-Go containers (Python
+  services, Postgres, Redis, Kafka) still have their raw log lines land in Loki under
+  `{service=...}`, just without a parsed `level` label (the logfmt stage no-ops, not errors, on
+  non-matching lines) — full-text search still works on those via LogQL's `|= "text"` filter.
+- **`{container_name} -> {service}` relabeling**: Promtail strips the compose project prefix and
+  instance suffix (`/okxbot-paper-trader-1` -> `service="paper-trader"`) so labels match the
+  `cmd/*` names used throughout this doc and the Prometheus metric labels above, not raw Docker
+  container names.
+- **Grafana datasource auto-provisioning**: `grafana/provisioning/datasources/datasources.yml`
+  registers both Prometheus and Loki on Grafana startup — no manual "Add data source" step after a
+  fresh `docker compose up`, matching the "foundations first, minimal manual setup" pattern used
+  elsewhere in this project.
+- **Retention**: 14 days (`loki-config.yml`'s `retention_period: 336h`) — bounded so disk usage on
+  a small VPS doesn't grow unbounded; adjust directly in that file if a longer/shorter window is
+  needed later.
+- Live-verified end-to-end while building this: real container logs (ingestor, redis, kafka,
+  timescaledb) were confirmed flowing into Loki with correct `service` labels, and `level` values
+  (`INFO`/`WARN`/`ERROR` from Go's `slog`, lowercase `info`/`warn`/`error` from some other
+  containers' own logging) were confirmed present and queryable via Loki's label-values API.
+- No dashboard/Explore-view saved searches are pre-built yet (mirrors §11.6's own "dashboards
+  aren't built yet, add them once there's real data" framing) — querying today means using
+  Grafana's Explore tab against the Loki datasource directly.
 
 ## 12. Event-driven design
 

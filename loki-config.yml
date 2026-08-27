@@ -1,0 +1,42 @@
+# Minimal single-binary Loki config for a single-node deployment (CLAUDE.md §11.2/§11.6's
+# "no separate log-shipping stack for v1" was revisited — this is the lightweight version of that:
+# Loki indexes only labels (service name, container), not full text, which keeps it cheap at this
+# project's log volume compared to Elasticsearch. Filesystem storage, no object store (S3/GCS)
+# needed — appropriate for one VPS, not a multi-node deployment.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+# Keep logs for 14 days by default — enough to debug a recent incident without the disk growing
+# unbounded on a small VPS. Adjust via LOKI_RETENTION_HOURS-equivalent (edit this file) if needed.
+limits_config:
+  retention_period: 336h
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
