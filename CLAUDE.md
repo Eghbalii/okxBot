@@ -636,6 +636,24 @@ PPO policy (small-to-medium MLP given the wider price-context observation, §15.
 too, just with more moving parts) — the real reason for the switch is sample efficiency, not
 resource limits.
 
+**Measured, not estimated** (2026-08-27, on a 2015 MacBook i5/8GB via Colima, `rl-service`'s actual
+Docker image, CPU-only PyTorch — see the Dockerfile note below): idle `rl-service` container ~180MB
+RAM; a real PPO warm-start-shaped run (2 pooled tokens, `n_steps=2048`, `batch_size=64`) sustained
+~430MB RAM and ~1 CPU core at 260-700 fps, completing 20,480 timesteps in 78s. Memory stays flat
+regardless of `total_timesteps` (SB3's rollout buffer size is fixed by `n_steps`, not total
+steps) — so `WarmStartConfig`'s default 50,000 timesteps is ~70-125s, not a long-running job, and
+this fits comfortably even on hardware well below the original 8-core/16GB planning assumption.
+Widening the observation (more strategies/timeframes/tokens, §15.2's Phase B) grows the policy
+network slightly but the rollout-buffer-dominated memory profile above is the right order of
+magnitude to plan around, not a hard ceiling that's already been hit.
+
+**PyTorch's default wheel pulls in the full CUDA/nvidia-\* GPU toolkit** (several GB) even with no
+GPU present — `rl-service/Dockerfile` installs the CPU-only build explicitly
+(`--index-url https://download.pytorch.org/whl/cpu`) before `requirements.txt`, which is what kept
+the image at 2.72GB instead of noticeably larger. This isn't optional on resource-constrained
+hardware: the CUDA wheel's download/build was what originally exhausted a low-disk dev machine's
+space mid-build.
+
 ### 15.2 Phased rollout (start small, expand only with evidence)
 
 - **Phase A (start here):** 2 tokens (BTC-USDT-SWAP, XAU or its OKX equivalent instrument — verify
