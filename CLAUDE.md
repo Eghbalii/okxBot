@@ -572,6 +572,15 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       outcomes as they accumulate, not just the warm-start replay) — not yet built; needs enough
       live paper-trading history to be meaningful, which is itself gated on running the Phase A
       no-op loop against a live OKX feed first (§15.9, still open).
+- [ ] Audit MidPrice's live-tick freshness across the SL/TP-adjust and open-order-decision paths —
+      explicit user requirement (2026-08-27): the model must see the CURRENT, live tick price for
+      every token with an open position, not a stale/candle-close price. `domain.Observation.
+      MidPrice` and `rlclient`/`usecase/rl_sltp_adjust.go`'s wiring already exist and were verified
+      correct for the candle-close-cadence SL/TP-adjust path (§15.4) earlier in this project, but
+      this needs a fresh, careful re-verification end-to-end (including whether tick-cadence,
+      not just candle-close-cadence, is actually warranted for the "every open position's live
+      price" requirement) before being considered settled — do not just re-assert it's fine without
+      re-checking the actual code paths.
 - [x] `rl_service/serve/api.py`: loads the single global model, routes `/predict` for every token
       through it via the token-identity one-hot, rejects observation-schema-version mismatches with
       a 422 (§15.3, §15.8) — implemented as part of the v3 schema bump above.
