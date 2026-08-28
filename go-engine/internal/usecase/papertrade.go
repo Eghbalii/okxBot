@@ -210,6 +210,19 @@ func (e *PaperTrader) marketView(bar string) strategy.MarketView {
 	return strategy.MarketView{Bar: bar, Candles: bars[bar], Bars: bars}
 }
 
+// trackPnLExtremes advances an open order's peak/trough unrealized PnL (CLAUDE.md §15.11). Only
+// writes when a new extreme is actually reached, so a position sitting still doesn't generate a
+// database write on every tick.
+func (e *PaperTrader) trackPnLExtremes(ctx context.Context, o port.PaperOrder, price decimal.Decimal, logger *slog.Logger) {
+	upl := unrealizedPnLPct(o, price)
+	if !upl.GreaterThan(o.PnLMaxPct) && !upl.LessThan(o.PnLMinPct) {
+		return
+	}
+	if err := e.Repo.UpdatePaperOrderPnLExtremes(ctx, o.ID, upl, upl); err != nil {
+		logger.Warn("failed to update pnl extremes", "instId", e.InstID, "orderId", o.ID, "error", err)
+	}
+}
+
 // accountMode is the trading mode whose balance this engine moves. Defaults to "paper" so an
 // engine constructed without an explicit Mode can never accidentally write to the demo or real
 // account's balance (CLAUDE.md §15.7's real-mode carve-out).
@@ -344,8 +357,17 @@ func (e *PaperTrader) handleCandle(ctx context.Context, bar string, data []byte,
 		return fmt.Errorf("parse candle (bar %s): %w", bar, err)
 	}
 
+	// OKX pushes the same bar repeatedly as it forms (confirm=0) and once more when it closes
+	// (confirm=1). Appending every push would fill the window with partial copies of one bar, so a
+	// push REPLACES the last entry whenever it carries the same timestamp — the window then always
+	// ends with the live forming candle, which is what the observation's OHLC reports (§15.11).
 	e.candlesMu.Lock()
-	window := append(e.candles[bar], c)
+	window := e.candles[bar]
+	if n := len(window); n > 0 && window[n-1].Timestamp.Equal(c.Timestamp) {
+		window[n-1] = c
+	} else {
+		window = append(window, c)
+	}
 	if len(window) > e.CandleWindow {
 		window = window[len(window)-e.CandleWindow:]
 	}
@@ -436,6 +458,12 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 	metrics.PaperOrdersOpenGauge.WithLabelValues(e.InstID).Set(float64(len(open)))
 
 	for _, o := range open {
+		// Track how far this position has travelled in each direction before checking for a close
+		// (CLAUDE.md §15.11) — a trade that ran deep into profit and round-tripped must still show
+		// that peak even on the tick that stops it out. Best-effort: this is model input, never a
+		// reason to block the close itself.
+		e.trackPnLExtremes(ctx, o, price, logger)
+
 		reason, hit := closeReason(o, price)
 		if !hit {
 			continue

@@ -18,12 +18,62 @@ const (
 )
 
 // Signal is what a Strategy emits for one evaluation of an instrument's candle series.
+//
+// SL/TP can be expressed two ways, and both are supported on purpose (CLAUDE.md §15.11):
+//
+//   - **Price levels** (EntryPx/SLPx/TPPx) — what a strategy reading chart structure actually
+//     produces: a stop below a swing low, a target at a fair-value gap. This is the richer form,
+//     since a level carries information a percentage cannot.
+//   - **Percentages** (SLPct/TPPct) — a configured distance from entry, which is what most of the
+//     built-in strategies currently use.
+//
+// A strategy sets whichever it genuinely computes; ResolveLevels fills in the other from the live
+// price so downstream code always has prices. Converting a real level *into* a percentage would
+// discard the structure that produced it, which is why the price fields are primary and the
+// percentages are the fallback rather than the reverse.
 type Signal struct {
 	Side       Side
 	Confidence decimal.Decimal // 0..1
+
 	// SLPct/TPPct are suggested stop-loss/take-profit distance from entry, as a fraction of price.
 	SLPct decimal.Decimal
 	TPPct decimal.Decimal
+
+	// EntryPx/SLPx/TPPx are explicit price levels. Zero means "not specified" — ResolveLevels then
+	// derives them from the percentages above. Auditing which strategies can populate these
+	// directly is tracked as its own task (CLAUDE.md §14).
+	EntryPx decimal.Decimal
+	SLPx    decimal.Decimal
+	TPPx    decimal.Decimal
+}
+
+// ResolveLevels returns a copy of s with EntryPx/SLPx/TPPx populated, deriving any that the
+// strategy left unset from its percentage fields against price. Levels the strategy set explicitly
+// are never overwritten — a strategy that read a real level off the chart keeps it.
+//
+// Direction matters: a long's stop sits below entry and its target above, and a short's is
+// mirrored, so the sign is taken from the signal's own side rather than assumed.
+func (s Signal) ResolveLevels(price decimal.Decimal) Signal {
+	if !price.IsPositive() || s.Side == Hold {
+		return s
+	}
+
+	if !s.EntryPx.IsPositive() {
+		s.EntryPx = price
+	}
+
+	direction := decimal.NewFromInt(1)
+	if s.Side == Sell {
+		direction = decimal.NewFromInt(-1)
+	}
+
+	if !s.SLPx.IsPositive() && s.SLPct.IsPositive() {
+		s.SLPx = s.EntryPx.Sub(direction.Mul(s.SLPct).Mul(s.EntryPx))
+	}
+	if !s.TPPx.IsPositive() && s.TPPct.IsPositive() {
+		s.TPPx = s.EntryPx.Add(direction.Mul(s.TPPct).Mul(s.EntryPx))
+	}
+	return s
 }
 
 // Candle is the OHLCV shape strategies evaluate over, oldest-first.

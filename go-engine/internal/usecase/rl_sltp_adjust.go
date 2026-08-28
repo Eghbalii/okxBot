@@ -50,32 +50,32 @@ func (e *PaperTrader) adjustOpenOrdersWithRL(ctx context.Context, bar string, pr
 	obs := e.buildObservation(ctx, bar, price, logger)
 
 	for _, o := range baseline {
-		obs.Position = decimal.NewFromInt(1)
-		if o.Side == "sell" {
-			obs.Position = decimal.NewFromInt(-1)
-		}
-		obs.UnrealizedPnLPct = unrealizedPnLPct(o, price)
-		obs.DistToSLPct = distPct(o.SLPx, price)
-		obs.DistToTPPct = distPct(o.TPPx, price)
+		// Position-specific fields are per-order; the rest of the observation is shared across this
+		// pass, so only these are overwritten per iteration.
 		obs.OrderID = o.ID
-		obs.PositionState = positionStateOf(o)
+		obs.PositionState = positionStateOf(o, price)
 
 		action, err := e.Model.Predict(ctx, obs)
 		if err != nil {
 			logger.Warn("rl sl/tp adjust: predict failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 			continue
 		}
-		// The order-action head decides whether to touch this position at all (CLAUDE.md §15.10).
-		// Adjust magnitudes are only consulted once it has actually asked to adjust — otherwise a
-		// model that means "leave it alone" would still fork on incidental nonzero outputs.
-		if action.OrderAction != domain.OrderActionAdjust {
-			continue
-		}
-		if action.SLAdjustPct.IsZero() && action.TPAdjustPct.IsZero() {
+		// The action head decides whether to touch this position at all (CLAUDE.md §15.11). A model
+		// meaning "leave it alone" must not fork just because its continuous price outputs happen
+		// to differ from the current levels, which for a continuous output is essentially always.
+		if action.Action != domain.ActionUpdate {
 			continue
 		}
 
-		newSL, newTP := RatchetSLTP(o, price, action.SLAdjustPct, action.TPAdjustPct)
+		// The model now sets LEVELS rather than proposing percentage nudges (§15.11), so convert to
+		// the adjustment the ratchet expects: how far each level moves as a fraction of live price.
+		slAdjust := levelAdjustPct(o.SLPx, action.SLPx, price)
+		tpAdjust := levelAdjustPct(o.TPPx, action.TPPx, price)
+		if slAdjust.IsZero() && tpAdjust.IsZero() {
+			continue
+		}
+
+		newSL, newTP := RatchetSLTP(o, price, slAdjust, tpAdjust)
 		if samePriceOrNil(newSL, o.SLPx) && samePriceOrNil(newTP, o.TPPx) {
 			continue // ratchet rejected the proposal entirely; nothing to fork
 		}
@@ -91,8 +91,8 @@ func (e *PaperTrader) adjustOpenOrdersWithRL(ctx context.Context, bar string, pr
 }
 
 // rlSizing asks the RL agent how much of the SHARED account to put behind a strategy signal that
-// has already decided to trade (CLAUDE.md §15.4/§15.6): TargetExposure is a fraction of current
-// account equity, LeverageFrac maps onto [1x, MaxLeverage]. Returns ok=false — leaving the caller's
+// has already decided to trade (CLAUDE.md §15.6/§15.11): SizePct is a fraction of current account
+// equity, LeverageFrac maps onto [1x, MaxLeverage]. Returns ok=false — leaving the caller's
 // fixed sizing untouched — when RL sizing is disabled, unconfigured, the model errors, or the model
 // asks for effectively no exposure.
 //
@@ -137,11 +137,17 @@ func (e *PaperTrader) rlSizing(
 		return decimal.Zero, decimal.Zero, false
 	}
 
-	exposure := clampUnit(action.TargetExposure.Abs())
+	// A `skip` is the model declining this signal outright (CLAUDE.md §15.11) — a decision it can
+	// now express, where before sizing to zero was indistinguishable from "no opinion".
+	if action.Action == domain.ActionSkip {
+		logger.Info("rl sizing: model declined the signal", "instId", e.InstID, "side", signal.Side)
+		return decimal.Zero, decimal.Zero, false
+	}
+
+	exposure := clampUnit(action.SizePct.Abs())
 	if !exposure.IsPositive() {
-		// The agent wants no exposure behind this signal. Sizing to zero would open a meaningless
-		// order, so keep the fixed sizing and let the trade stand as the strategy proposed it —
-		// declining to trade entirely is not this pass's decision to make (CLAUDE.md §9).
+		// No exposure requested but no explicit skip either; keep the fixed sizing rather than
+		// opening a meaningless zero-size order.
 		return decimal.Zero, decimal.Zero, false
 	}
 
@@ -222,12 +228,16 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 		if err != nil {
 			continue // best-effort: a failing strategy just doesn't contribute a signal this round
 		}
+		// Strategies may express SL/TP as levels or as percentages; resolve to levels here so the
+		// observation always carries prices (CLAUDE.md §15.11).
+		resolved := sig.ResolveLevels(price)
 		tb.StrategySignals = append(tb.StrategySignals, domain.StrategySignal{
 			StrategyID: a.StrategyID,
 			Side:       string(sig.Side),
 			Confidence: sig.Confidence,
-			SLPct:      sig.SLPct,
-			TPPct:      sig.TPPct,
+			EntryPx:    resolved.EntryPx,
+			SLPx:       resolved.SLPx,
+			TPPx:       resolved.TPPx,
 			Kind:       a.Kind,
 			Bar:        a.Bar,
 		})
@@ -240,12 +250,10 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 		LastPrice:         price,
 		Timeframes:        []domain.TimeframeBlock{tb},
 		AccountInitialUSD: e.AccountInitialUSD,
-		RecentTrades:      e.recentBaselineTrades(ctx, logger),
 		// The lifecycle category and per-call Signal are set by the caller, which knows which
-		// decision it is asking for (CLAUDE.md §15.10). CategoryUpdate is the safe default: it is
+		// decision it is asking for (CLAUDE.md §15.11). CategoryUpdate is the safe default: it is
 		// what a price-driven call is, and it never claims a strategy spoke when none did.
-		Category:      domain.CategoryUpdate,
-		MarketContext: marketContextFrom(tb.StrategySignals),
+		Category: domain.CategoryUpdate,
 	}
 
 	if acct, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), e.AccountInitialUSD); err == nil {
@@ -258,58 +266,43 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 	return obs
 }
 
+// levelAdjustPct expresses "move this level from current to proposed" as a fraction of the live
+// price, which is the form RatchetSLTP takes. The model emits levels (CLAUDE.md §15.11) while the
+// ratchet reasons in relative moves, so this is the seam between the two.
+//
+// Returns zero when either level is missing or the price is unusable, so a nil SL/TP simply means
+// "nothing proposed" rather than a spurious move away from zero.
+func levelAdjustPct(current *decimal.Decimal, proposed, price decimal.Decimal) decimal.Decimal {
+	if current == nil || !proposed.IsPositive() || !price.IsPositive() {
+		return decimal.Zero
+	}
+	return proposed.Sub(*current).Div(price)
+}
+
 // positionStateOf describes an open order for the observation (CLAUDE.md §15.10). Prices are sent
 // as-is; rl_service converts them to fractions of the live price at vectorization time, so one
 // shared policy generalizes across instruments at wildly different price scales.
-func positionStateOf(o port.PaperOrder) domain.PositionState {
+func positionStateOf(o port.PaperOrder, price decimal.Decimal) domain.PositionState {
+	side := decimal.NewFromInt(1)
+	if o.Side == "sell" {
+		side = decimal.NewFromInt(-1)
+	}
 	ps := domain.PositionState{
-		PositionOpen: true,
-		EntryPx:      o.EntryPx,
-		SizeUSD:      o.Size,
-		Leverage:     o.Leverage,
-		IsFork:       o.Variant == "rl_adjusted",
-	}
-	if o.SLPx != nil {
-		ps.SLPx = *o.SLPx
-	}
-	if o.TPPx != nil {
-		ps.TPPx = *o.TPPx
+		PositionOpen:     true,
+		Side:             side,
+		SizeUSD:          o.Size,
+		Leverage:         o.Leverage,
+		IsFork:           o.Variant == "rl_adjusted",
+		UnrealizedPnLPct: unrealizedPnLPct(o, price),
+		PnLMaxPct:        o.PnLMaxPct,
+		PnLMinPct:        o.PnLMinPct,
+		DistToSLPct:      distPct(o.SLPx, price),
+		DistToTPPct:      distPct(o.TPPx, price),
 	}
 	if !o.OpenedAt.IsZero() {
 		ps.AgeSeconds = int64(time.Since(o.OpenedAt).Seconds())
 	}
 	return ps
-}
-
-// marketContextFrom summarizes a set of live signals into the fixed-width confluence block
-// (CLAUDE.md §15.10). One signal per /predict call means the model can't otherwise see two
-// strategies agreeing within one decision — this restores that without naming them individually,
-// so the block's width never depends on how many strategies are registered.
-//
-// Callers pass the signals OTHER than the one the call is about; passing the full set (as the
-// price-driven update path does, where no single signal is the subject) is also correct.
-func marketContextFrom(signals []domain.StrategySignal) domain.MarketContext {
-	mc := domain.MarketContext{}
-	var confidenceSum decimal.Decimal
-	var counted int
-
-	for _, s := range signals {
-		switch s.Side {
-		case "buy":
-			mc.OthersLong++
-		case "sell":
-			mc.OthersShort++
-		default:
-			continue // a hold isn't an opinion; counting it would dilute mean confidence
-		}
-		confidenceSum = confidenceSum.Add(s.Confidence)
-		counted++
-	}
-
-	if counted > 0 {
-		mc.MeanConfidence = confidenceSum.Div(decimal.NewFromInt(int64(counted)))
-	}
-	return mc
 }
 
 // openExposure sums the notional of every open baseline position across ALL tokens (CLAUDE.md
@@ -334,40 +327,17 @@ func (e *PaperTrader) openExposure(ctx context.Context, logger *slog.Logger) dec
 	return total
 }
 
-// recentBaselineTrades fetches the most-recent closed baseline trades for this token, oldest-last
-// input reversed to most-recent-last per RecentTrade's documented order (CLAUDE.md §15.3).
-func (e *PaperTrader) recentBaselineTrades(ctx context.Context, logger *slog.Logger) []domain.RecentTrade {
-	closedFlag := false
-	positions, err := e.Repo.ListPositions(ctx, port.PositionFilter{
-		Mode: "paper", InstID: e.InstID, Open: &closedFlag, SortBy: "closed_at", SortDesc: true,
-	})
-	if err != nil {
-		logger.Warn("rl observation: list recent trades failed", "instId", e.InstID, "error", err)
-		return nil
-	}
-
-	var out []domain.RecentTrade
-	for _, p := range positions {
-		if p.Variant != "baseline" && p.Variant != "" {
-			continue
-		}
-		if p.RealizedPnL == nil || p.CloseReason == nil {
-			continue
-		}
-		out = append(out, domain.RecentTrade{RealizedPnLUSD: *p.RealizedPnL, Win: *p.CloseReason == "tp"})
-		if len(out) >= recentTradesWindow {
-			break
-		}
-	}
-	// positions came back most-recent-first (SortDesc); RecentTrade wants most-recent-last.
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
-	return out
-}
-
 func buildPriceContext(window []domain.Candle) domain.PriceContext {
 	pc := domain.PriceContext{}
+	if len(window) == 0 {
+		return pc
+	}
+
+	// The last entry is the LIVE FORMING candle (handleCandle replaces rather than appends while a
+	// bar is open), so its OHLC is current rather than up to a full bar stale — CLAUDE.md §15.11.
+	live := window[len(window)-1]
+	pc.Open, pc.High, pc.Low, pc.Close = live.Open, live.High, live.Low, live.Close
+
 	if len(window) < 2 {
 		return pc
 	}

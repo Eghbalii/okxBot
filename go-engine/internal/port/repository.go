@@ -90,6 +90,15 @@ type PaperOrder struct {
 	FeaturesJSON json.RawMessage
 	Mode         string // "paper", "demo", or "real" (CLAUDE.md §11.4); defaults to "paper"
 
+	// PnLMaxPct/PnLMinPct are the peak and trough unrealized PnL this position has reached while
+	// open (CLAUDE.md §15.11) — model input, not reporting. A trade that ran to 90% of its target
+	// and gave it back is a different lesson from one that drifted sideways to the same current PnL.
+	// Persisted rather than kept in memory because a restart would otherwise reset the high-water
+	// mark to the current PnL, telling the model a round-tripped trade had never been in profit.
+	// PnLMinPct is negative-ranged.
+	PnLMaxPct decimal.Decimal
+	PnLMinPct decimal.Decimal
+
 	// ParentOrderID/Variant implement the SL/TP shadow-fork mechanic (CLAUDE.md §15.4): when the RL
 	// agent proposes an in-trade SL/TP adjustment, the original order (Variant="baseline",
 	// ParentOrderID=nil) is never edited — a linked fork (Variant="rl_adjusted", ParentOrderID set
@@ -210,6 +219,9 @@ type Repository interface {
 	// Callers MUST have already run slPx/tpPx through the ratchet clamp (usecase.RatchetSLTP).
 	ForkPaperOrderWithSLTP(ctx context.Context, parentID int64, slPx, tpPx *decimal.Decimal) (int64, error)
 	ListOpenPaperOrders(ctx context.Context, instID string) ([]PaperOrder, error)
+	// UpdatePaperOrderPnLExtremes records new peak/trough unrealized PnL for an open order
+	// (CLAUDE.md §15.11). Both are written together since they move as one high-water pair.
+	UpdatePaperOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error
 	// ListPositions returns positions (open and/or closed) across trading modes for the panel
 	// (CLAUDE.md §11.4), filtered/sorted per f.
 	ListPositions(ctx context.Context, f PositionFilter) ([]PaperOrder, error)

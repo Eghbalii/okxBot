@@ -79,7 +79,7 @@ func TestStep_HaltedRiskManagerSkipsExecution(t *testing.T) {
 		ticker:   domain.Ticker{Last: dec("50000")},
 		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("500")}}, // large drawdown from dayStart
 	}
-	model := &fakeModelClient{action: domain.Action{TargetExposure: dec("1"), LeverageFrac: dec("0.5")}}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("1"), LeverageFrac: dec("0.5")}}
 
 	limits := risk.Limits{
 		MaxLeverage: dec("5"), MaxPositionNotionalUSD: dec("1000"),
@@ -108,7 +108,7 @@ func TestStep_LeverageClampedToMax(t *testing.T) {
 	}
 	// leverageFrac=1.0 => targetLeverage = 1 + 1*(maxLeverage-1) = maxLeverage exactly; use a
 	// frac that would overshoot if not clamped by testing against MaxLeverage directly instead.
-	model := &fakeModelClient{action: domain.Action{TargetExposure: dec("0.5"), LeverageFrac: dec("1")}}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("1")}}
 
 	limits := risk.Limits{
 		MaxLeverage: dec("5"), MaxPositionNotionalUSD: dec("1000"),
@@ -137,7 +137,7 @@ func TestStep_RejectedWhenLiquidationBufferTooThin(t *testing.T) {
 	}
 	// leverageFrac=1 with MaxLeverage=20 => targetLeverage=20 => liqBufferPct=100/20=5%,
 	// below MinLiquidationBufferPct=15 => Approve must reject.
-	model := &fakeModelClient{action: domain.Action{TargetExposure: dec("0.5"), LeverageFrac: dec("1")}}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("1")}}
 
 	limits := risk.Limits{
 		MaxLeverage: dec("20"), MaxPositionNotionalUSD: dec("1000"),
@@ -165,7 +165,7 @@ func TestStep_OrderBelowMinSizeSkipped(t *testing.T) {
 		balances:  []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
 	}
 	// Tiny target exposure => tiny target notional => delta below MinOrderUSD (10).
-	model := &fakeModelClient{action: domain.Action{TargetExposure: dec("0.001"), LeverageFrac: dec("0")}}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.001"), LeverageFrac: dec("0")}}
 
 	limits := risk.Limits{
 		MaxLeverage: dec("5"), MaxPositionNotionalUSD: dec("1000"),
@@ -189,7 +189,9 @@ func TestStep_ShortTargetSetsHedgePosSide(t *testing.T) {
 		positions: []domain.Position{{InstID: "BTC-USDT-SWAP", Pos: dec("0"), Lever: dec("1")}},
 		balances:  []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
 	}
-	model := &fakeModelClient{action: domain.Action{TargetExposure: dec("-0.5"), LeverageFrac: dec("0")}}
+	model := &fakeModelClient{action: domain.Action{
+		Action: domain.ActionOpen, Side: "sell", SizePct: dec("0.5"), LeverageFrac: dec("0"),
+	}}
 
 	limits := risk.Limits{
 		MaxLeverage: dec("5"), MaxPositionNotionalUSD: dec("1000"),
@@ -207,7 +209,7 @@ func TestStep_ShortTargetSetsHedgePosSide(t *testing.T) {
 		t.Fatalf("expected exactly 1 order placed, got %d", len(exchange.placedOrders))
 	}
 	if exchange.placedOrders[0].PosSide != "short" {
-		t.Errorf("expected posSide=short for negative target exposure, got %q", exchange.placedOrders[0].PosSide)
+		t.Errorf("expected posSide=short when the action asks to sell, got %q", exchange.placedOrders[0].PosSide)
 	}
 	if exchange.placedOrders[0].Side != "sell" {
 		t.Errorf("expected side=sell for a new short from flat, got %q", exchange.placedOrders[0].Side)
@@ -222,7 +224,7 @@ func TestStep_ExactNotionalNoFloatDrift(t *testing.T) {
 		positions: []domain.Position{{InstID: "BTC-USDT-SWAP", Pos: dec("0"), Lever: dec("1")}},
 		balances:  []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
 	}
-	model := &fakeModelClient{action: domain.Action{TargetExposure: dec("1"), LeverageFrac: dec("0")}}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("1"), LeverageFrac: dec("0")}}
 
 	limits := risk.Limits{
 		MaxLeverage: dec("5"), MaxPositionNotionalUSD: dec("900"),
@@ -262,7 +264,7 @@ func TestStep_ObservationCarriesTokenIdentityAndAccountEquity(t *testing.T) {
 		ticker:   domain.Ticker{Last: dec("50000")},
 		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("5000")}},
 	}
-	model := &fakeModelClient{action: domain.Action{TargetExposure: dec("0"), LeverageFrac: dec("0")}}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0"), LeverageFrac: dec("0")}}
 	trader := newTestTrader(exchange, model, risk.NewManager(testLimits(), dec("5000")))
 	trader.ActiveTokens = []string{"BTC-USDT-SWAP", "XAU-USD-SWAP"}
 	trader.AccountInitialUSD = dec("100")
@@ -291,7 +293,7 @@ func TestStep_ObservationFallsBackToLiveEquityWithoutConfiguredInitial(t *testin
 		ticker:   domain.Ticker{Last: dec("50000")},
 		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("5000")}},
 	}
-	model := &fakeModelClient{action: domain.Action{TargetExposure: dec("0"), LeverageFrac: dec("0")}}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0"), LeverageFrac: dec("0")}}
 	trader := newTestTrader(exchange, model, risk.NewManager(testLimits(), dec("5000")))
 
 	if err := trader.step(context.Background(), testLogger()); err != nil {

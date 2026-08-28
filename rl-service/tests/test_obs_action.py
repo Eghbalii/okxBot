@@ -233,3 +233,44 @@ def test_decimal_strings_from_go_are_coerced():
     assert obs.signal.sl_px == 95.0
     assert obs.position_state.size_usd == 25.0
     assert obs.last_price == 100.5
+
+
+def test_nested_null_lists_from_go_are_accepted():
+    """Go marshals nil slices as null at EVERY level, not just the top.
+
+    A timeframe block with no strategy signals -- the normal case on a quiet bar -- would otherwise
+    fail validation and surface to the caller as a schema mismatch. Caught by round-tripping Go's
+    real JSON rather than a hand-written sample.
+    """
+    raw = (
+        '{"schema_version": 6, "inst_id": "BTC-USDT-SWAP", "active_tokens": ["BTC-USDT-SWAP"],'
+        ' "last_price": "100.5", "category": "update",'
+        ' "timeframes": [{"bar": "5m", "strategy_signals": null, "features": null,'
+        '                 "price_context": {"open": "99", "close": "100",'
+        '                                   "close_pct_changes": null}}]}'
+    )
+    obs = Observation.model_validate_json(raw)
+    assert obs.timeframes[0].strategy_signals == []
+    assert obs.timeframes[0].features == []
+    assert obs.timeframes[0].price_context.close_pct_changes == []
+    # And it must still vectorize rather than blowing up downstream.
+    assert len(observation_features(obs)) > 0
+
+
+def test_live_candle_ohlc_reaches_the_model():
+    """The forming candle's OHLC is fed relative to live price (CLAUDE.md §15.11) -- on a 1H bar the
+    last CLOSED candle can be 59 minutes stale."""
+    flat = observation_features(_obs(timeframes=[TimeframeBlock(
+        bar="5m", price_context=PriceContext(open=100.0, high=100.0, low=100.0, close=100.0))]))
+    ranging = observation_features(_obs(timeframes=[TimeframeBlock(
+        bar="5m", price_context=PriceContext(open=98.0, high=103.0, low=97.0, close=101.0))]))
+    assert not np.array_equal(flat, ranging), "candle shape must change the model's input"
+
+
+def test_pnl_extremes_reach_the_model():
+    """A trade that ran to +8% and came back must look different from one that drifted sideways."""
+    round_tripped = observation_tail(_obs(position_state=PositionState(
+        position_open=1.0, unrealized_pnl_pct=0.01, pnl_max_pct=0.08, pnl_min_pct=-0.01)))
+    drifted = observation_tail(_obs(position_state=PositionState(
+        position_open=1.0, unrealized_pnl_pct=0.01, pnl_max_pct=0.01, pnl_min_pct=0.0)))
+    assert not np.array_equal(round_tripped, drifted)

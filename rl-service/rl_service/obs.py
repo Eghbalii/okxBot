@@ -181,6 +181,11 @@ class PriceContext(BaseModel):
     59 minutes stale — the same freshness problem §15.9's audit found on the SL/TP path.
     """
 
+    @field_validator("close_pct_changes", mode="before")
+    @classmethod
+    def _null_to_empty(cls, v):
+        return [] if v is None else v
+
     open: float = 0.0
     high: float = 0.0
     low: float = 0.0
@@ -191,6 +196,14 @@ class PriceContext(BaseModel):
 
 
 class TimeframeBlock(BaseModel):
+    # Go marshals nil slices as JSON `null` (see Observation's validator) and these are nested one
+    # level deeper, so they need the same coercion — a timeframe with no strategy signals is the
+    # normal case on a quiet bar, not an error.
+    @field_validator("strategy_signals", "features", mode="before")
+    @classmethod
+    def _null_to_empty(cls, v):
+        return [] if v is None else v
+
     bar: str
     strategy_signals: list[StrategySignal] = Field(default_factory=list)
     features: list[float] = Field(default_factory=list)
@@ -295,6 +308,10 @@ class Action(BaseModel):
     action_schema_version: int = ACTION_SCHEMA_VERSION
     # One of ACTIONS: open | skip on a buy/sell call, none | update | close on an update call.
     action: str = "skip"
+    # Which way to open, for callers with no strategy layer to take direction from (cmd/trader's
+    # poll loop). The paper path ignores this — there, direction belongs to the strategy that
+    # produced the signal and the model only sizes the trade. Echoed from the request's signal.
+    side: str = ""
     # PRICES, not percentages — the model SETS these, it does not merely nudge them. Derived from
     # the policy's chosen distance times the live price, since a network output cannot know an
     # instrument's price scale.
@@ -489,6 +506,9 @@ def decode_action(raw: np.ndarray, obs: Observation) -> Action:
 
     return Action(
         action=action,
+        # Direction is never the model's to choose (CLAUDE.md §15.11) — echo the requesting
+        # signal's side so a caller without a strategy layer still gets one.
+        side=obs.signal.side if obs.signal else "",
         sl_px=obs.last_price * (1.0 + sl_offset) if obs.last_price else 0.0,
         tp_px=obs.last_price * (1.0 + tp_offset) if obs.last_price else 0.0,
         size_pct=size_pct,

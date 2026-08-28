@@ -137,15 +137,12 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 		return fmt.Errorf("rl predict: %w", err)
 	}
 
-	logger.Info("rl action received", "instId", t.InstID, "targetExposure", action.TargetExposure,
-		"leverageFrac", action.LeverageFrac, "confidence", action.Confidence)
+	logger.Info("rl action received", "instId", t.InstID, "action", action.Action,
+		"sizePct", action.SizePct, "leverageFrac", action.LeverageFrac, "confidence", action.Confidence)
 
 	return t.execute(logger, mid, pos, posSize, lever, equity, action)
 }
 
-// execute translates the RL agent's action into a leverage change and/or order, after running it
-// through the risk manager. It is the only place live orders are placed, so every path that could
-// touch real money goes through risk.Manager.Approve first.
 // recordEquity keeps this mode's equity timeline in step with what the exchange reports, so the
 // panel can chart demo/real balance over time the same way it charts paper (CLAUDE.md §15.7's
 // requirement that a drain be reviewable after the fact, in every mode).
@@ -179,6 +176,9 @@ func (t *Trader) recordEquity(ctx context.Context, equity, initial decimal.Decim
 	}
 }
 
+// execute translates the RL agent's action into a leverage change and/or order, after running it
+// through the risk manager. It is the only place live orders are placed, so every path that could
+// touch real money goes through risk.Manager.Approve first.
 func (t *Trader) execute(
 	logger *slog.Logger,
 	mid decimal.Decimal,
@@ -201,7 +201,17 @@ func (t *Trader) execute(
 		currentNotional = currentNotional.Neg()
 	}
 
-	targetNotional := action.TargetExposure.Mul(limits.MaxPositionNotionalUSD)
+	// SizePct is UNSIGNED (CLAUDE.md §15.11) because in the paper path direction belongs to the
+	// strategy that produced the signal. This loop has no strategy feeding it — it polls the model
+	// directly (§14's open live-wiring item) — so it takes the side from Action.Side instead.
+	// Anything other than an open means flat: skip/none/close all resolve to no exposure here.
+	targetNotional := decimal.Zero
+	if action.Action == domain.ActionOpen {
+		targetNotional = action.SizePct.Mul(limits.MaxPositionNotionalUSD)
+		if action.Side == "sell" {
+			targetNotional = targetNotional.Neg()
+		}
+	}
 
 	// Rough, conservative estimate of distance-to-liquidation as a percentage of mark price:
 	// ignoring maintenance margin and fees, isolated-margin liquidation occurs at roughly a

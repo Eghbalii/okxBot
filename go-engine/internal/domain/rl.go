@@ -16,12 +16,17 @@ import "github.com/shopspring/decimal"
 // shared-account fields AccountEquityUSD/AccountInitialUSD/OpenExposureUSD (CLAUDE.md §15.6's
 // 2026-08-28 revision) — capital is one pool the agent sizes against, not a per-token constant.
 //
-// v5 (current): the event-driven signal lifecycle (CLAUDE.md §15.10). Added Category, a single
+// v5: the event-driven signal lifecycle (CLAUDE.md §15.10). Added Category, a single
 // per-call Signal (carrying strategy kind, timeframe, live win rate and staleness), MarketContext
 // and PositionState — and, critically, rl_service now actually feeds strategy signals and
 // RecentTrades into the model's input vector, which v3/v4 never did despite both sides carrying
 // them over the wire the whole time.
-const ObservationSchemaVersion = 5
+//
+// v6 (current): CLAUDE.md §15.11. Signal SL/TP became PRICES rather than percentages (a strategy
+// derives a level from chart structure; a percentage discards that) and gained EntryPx; the two
+// overlapping position blocks merged into one carrying PnLMax/PnLMin and age; price context gained
+// the live forming candle's OHLC; MarketContext and RecentTrades dropped.
+const ObservationSchemaVersion = 6
 
 // ActionSchemaVersion tracks the Action's layout independently of the observation's — a model
 // trained against a narrower action space can't answer the full CLAUDE.md §15.4 action, and that's
@@ -31,11 +36,13 @@ const ObservationSchemaVersion = 5
 // rl_service/obs.py, which rejects an incompatible loaded model with a 503 rather than returning
 // neutral defaults that would look like a working model proposing no adjustments.
 //
-// v3 (current): dropped StrategyWeights and added the order-action head (CLAUDE.md §15.10).
-// Dropping the weights is what removed the fixed ceiling on strategy count — with one signal per
-// call, nothing in the action scales with the roster, so strategies can be added or removed
-// without an action-space change or a retrain.
-const ActionSchemaVersion = 3
+// v3: dropped StrategyWeights and added an order-action head. Dropping the weights is what removed
+// the fixed ceiling on strategy count — with one signal per call, nothing in the action scales with
+// the roster, so strategies can be added or removed without an action-space change or a retrain.
+//
+// v4 (current): the model SETS SLPx/TPPx as prices rather than proposing percentage adjustments,
+// and one Action field covers the whole lifecycle (CLAUDE.md §15.11).
+const ActionSchemaVersion = 4
 
 // Signal lifecycle categories (CLAUDE.md §15.10) — which decision a /predict call is asking for.
 // Must match SIGNAL_CATEGORIES in rl_service/obs.py, including order (it defines the one-hot index).
@@ -48,12 +55,22 @@ const (
 	CategoryClosedEarly = "closed_early" // terminal: the model closed it before either level
 )
 
-// Order-action values the model returns for an open position (CLAUDE.md §15.10). Must match
-// ORDER_ACTIONS in rl_service/obs.py.
+// Action values the model returns (CLAUDE.md §15.11). Deliberately named to match the request
+// categories above so the same word means the same thing on both sides of the call. Which are
+// valid depends on the request's category — the model always emits one and the controller accepts
+// it only where it makes sense (a "close" on a buy call has nothing to close):
+//
+//	buy / sell -> ActionOpen | ActionSkip
+//	update     -> ActionNone | ActionUpdate | ActionClose
+//	closed_*   -> ignored; that call exists to deliver reward, not to ask anything
+//
+// Must match ACTIONS in rl_service/obs.py, including order (it defines the argmax index).
 const (
-	OrderActionNone   = "none"
-	OrderActionAdjust = "adjust"
-	OrderActionClose  = "close"
+	ActionOpen   = "open"
+	ActionSkip   = "skip"
+	ActionNone   = "none"
+	ActionUpdate = "update"
+	ActionClose  = "close"
 )
 
 // IsTerminalCategory reports whether c is a close event. Terminal calls carry the realized outcome
@@ -70,8 +87,14 @@ type StrategySignal struct {
 	StrategyID int64           `json:"strategy_id"`
 	Side       string          `json:"side"` // "buy", "sell", or "" for hold
 	Confidence decimal.Decimal `json:"confidence"`
-	SLPct      decimal.Decimal `json:"sl_pct"`
-	TPPct      decimal.Decimal `json:"tp_pct"`
+
+	// PRICES, not percentages (CLAUDE.md §15.11). A strategy derives these from chart structure —
+	// a stop below a swing low, a target at a fair-value gap — and expressing a level as a
+	// percentage discards exactly the structure that produced it. rl_service vectorizes them as
+	// offsets from the live price, so one shared policy still generalizes across instruments.
+	EntryPx decimal.Decimal `json:"entry_px"`
+	SLPx    decimal.Decimal `json:"sl_px"`
+	TPPx    decimal.Decimal `json:"tp_px"`
 
 	// Kind/Bar are what let one shared policy tell signals apart (CLAUDE.md §15.10): which strategy
 	// produced this and on which timeframe. Kind is the strategy.Factories registry name, NOT the
@@ -87,40 +110,34 @@ type StrategySignal struct {
 	// strategy roster change without retraining.
 	WinRate    decimal.Decimal `json:"win_rate"`
 	TradeCount int             `json:"trade_count"`
-
-	// AgeSeconds is how stale this signal is. A higher-timeframe signal stays meaningful between
-	// its candles, so signals are carried forward and aged rather than vanishing — that's what
-	// makes an `update` observation complete instead of full of ambiguous zeros.
-	AgeSeconds int64 `json:"age_seconds"`
-}
-
-// MarketContext summarizes the OTHER strategies currently holding an opinion on this instrument
-// (CLAUDE.md §15.10). One signal per /predict call means the model can't see two strategies
-// agreeing within a single decision, and confluence is usually the strongest read there is — this
-// restores that without naming strategies individually, so its width stays independent of the
-// roster size and the ceiling stays gone.
-type MarketContext struct {
-	OthersLong        int             `json:"others_long"`
-	OthersShort       int             `json:"others_short"`
-	MeanConfidence    decimal.Decimal `json:"mean_confidence"`
-	SecondsSinceOther int64           `json:"seconds_since_other"`
 }
 
 // PositionState is the open position a call is about, for `update` and terminal categories
 // (CLAUDE.md §15.10). Zero-valued on a buy/sell call, where the decision is whether to open at all.
 type PositionState struct {
 	PositionOpen bool            `json:"position_open"`
-	EntryPx      decimal.Decimal `json:"entry_px"`
-	SLPx         decimal.Decimal `json:"sl_px"`
-	TPPx         decimal.Decimal `json:"tp_px"`
+	Side         decimal.Decimal `json:"side"` // +1 long, -1 short, 0 flat
 	SizeUSD      decimal.Decimal `json:"size_usd"`
 	Leverage     decimal.Decimal `json:"leverage"`
-	AgeSeconds   int64           `json:"age_seconds"`
+
+	// AgeSeconds is what separates "+30% in 10 minutes" from "-5% after 4 hours" — current PnL
+	// alone cannot express that difference, and they are very different trades.
+	AgeSeconds int64 `json:"age_seconds"`
+
+	UnrealizedPnLPct decimal.Decimal `json:"unrealized_pnl_pct"`
+	// How far this position travelled in each direction, not just where it sits now (CLAUDE.md
+	// §15.11). A trade that reached 90% of its target and gave it all back teaches something
+	// completely different from one that drifted sideways to the same current PnL. PnLMinPct is
+	// negative-ranged.
+	PnLMaxPct decimal.Decimal `json:"pnl_max_pct"`
+	PnLMinPct decimal.Decimal `json:"pnl_min_pct"`
+
+	DistToSLPct decimal.Decimal `json:"dist_to_sl_pct"`
+	DistToTPPct decimal.Decimal `json:"dist_to_tp_pct"`
 
 	// RealizedPnLUSD is meaningful only on a terminal category, where it IS the reward signal.
-	// Entry/SL/TP/size are deliberately NOT zeroed on close: the outcome has to stay attached to
-	// the decision that produced it, or the model can't learn which SL placement caused which
-	// result (CLAUDE.md §15.10).
+	// Entry/SL/TP are not repeated here — they are already on the signal, and duplicating them
+	// would spend input width on the same numbers twice (CLAUDE.md §15.11).
 	RealizedPnLUSD decimal.Decimal `json:"realized_pnl_usd"`
 
 	// IsFork marks a shadow fork, which tracks its baseline parent rather than committing separate
@@ -136,6 +153,15 @@ type PositionState struct {
 // normalized as pct-change returns (ClosePctChanges), not raw dollar values, so the vector
 // generalizes across tokens/price regimes; distances are also fractions of price, not absolute.
 type PriceContext struct {
+	// Open/High/Low/Close of the LIVE FORMING candle, not the last closed one (CLAUDE.md §15.11).
+	// OKX pushes the in-progress bar on the same WS channel, so this needs no extra REST call; on a
+	// 1H timeframe the last *closed* candle can be 59 minutes stale, which is the same freshness
+	// problem §15.9's audit found on the SL/TP path.
+	Open  decimal.Decimal `json:"open"`
+	High  decimal.Decimal `json:"high"`
+	Low   decimal.Decimal `json:"low"`
+	Close decimal.Decimal `json:"close"`
+
 	// ClosePctChanges is the most-recent-last window of bar-over-bar close returns, e.g.
 	// [(c[t-N]-c[t-N-1])/c[t-N-1], ..., (c[t]-c[t-1])/c[t-1]].
 	ClosePctChanges []decimal.Decimal `json:"close_pct_changes"`
@@ -154,13 +180,6 @@ type TimeframeBlock struct {
 	StrategySignals []StrategySignal  `json:"strategy_signals"`
 	Features        []decimal.Decimal `json:"features"` // reuses rl_service's FEATURE_COLUMNS shape
 	PriceContext    PriceContext      `json:"price_context"`
-}
-
-// RecentTrade is one closed paper order's outcome, part of the recent-performance tail (CLAUDE.md
-// §15.3) that lets the agent itself learn to size down after a losing streak.
-type RecentTrade struct {
-	RealizedPnLUSD decimal.Decimal `json:"realized_pnl_usd"`
-	Win            bool            `json:"win"` // close_reason == "tp"
 }
 
 // Observation is the feature vector sent to the RL service for one inference step. As of v3
@@ -192,7 +211,6 @@ type Observation struct {
 	// update, where no strategy spoke and only price/PnL moved — rl_service flags that explicitly
 	// rather than sending ambiguous zeros.
 	Signal        *StrategySignal `json:"signal,omitempty"`
-	MarketContext MarketContext   `json:"market_context"`
 	PositionState PositionState   `json:"position_state"`
 	// OrderID ties a decision back to the position it was about, so an outcome landing much later
 	// can be paired with the observation that produced it. Not fed to the model (an id has no
@@ -220,8 +238,6 @@ type Observation struct {
 	// for more — without it, one policy serving N tokens has no way to avoid over-committing.
 	OpenExposureUSD decimal.Decimal `json:"open_exposure_usd"`
 
-	RecentTrades []RecentTrade `json:"recent_trades"` // most-recent-last
-
 	Features []decimal.Decimal `json:"features"` // legacy flat window, kept for the no-op/pre-Phase-A path
 }
 
@@ -235,23 +251,32 @@ type Action struct {
 	// service itself refuses to serve an incompatible model, so this is a diagnostic, not a gate.
 	ActionSchemaVersion int `json:"action_schema_version"`
 
-	// OrderAction is what to do with the open position this call was about: OrderActionNone,
-	// OrderActionAdjust, or OrderActionClose (CLAUDE.md §15.10). Meaningful only for
-	// CategoryUpdate — on buy/sell the decision is TargetExposure, and on a terminal category
-	// nothing is being decided at all. This replaced the idea of an "optimize" strategy side: the
-	// decision belongs where the live price and position state are, which is here, not in a
-	// strategy that only sees candles.
-	OrderAction string `json:"order_action"`
+	// Action is the model's decision — one of the Action* constants above (CLAUDE.md §15.11).
+	Action string `json:"action"`
 
-	TargetExposure decimal.Decimal `json:"target_exposure"` // in [-1, 1]
-	LeverageFrac   decimal.Decimal `json:"leverage_frac"`   // in [0, 1], mapped to [1x, max_leverage]
+	// Side is which way to open, for callers that have no strategy layer to take direction from.
+	// The paper path IGNORES this: there, direction belongs to the strategy that produced the
+	// signal (§9/§16.1) and the model only sizes the trade. cmd/trader has no strategy feeding it
+	// (§14's open live-wiring item), so it polls the model directly and needs a side from
+	// somewhere. Empty means long.
+	Side string `json:"side"`
 
-	// SLAdjustPct/TPAdjustPct are proposed in-trade adjustments to an already-open position's
-	// SL/TP, evaluated at candle-close cadence in Phase A (CLAUDE.md §15.4). The caller MUST clamp
-	// these through a ratchet (only tighten toward locking in profit / reducing risk, never widen)
-	// before applying them — never trust the model's own output as that safety boundary.
-	SLAdjustPct decimal.Decimal `json:"sl_adjust_pct"`
-	TPAdjustPct decimal.Decimal `json:"tp_adjust_pct"`
+	// SLPx/TPPx are PRICE LEVELS the model sets, not percentage nudges (CLAUDE.md §15.11): on an
+	// open it places the initial stop/target, on an update it moves them. The caller MUST still
+	// clamp these — minimum/maximum stop distance, a minimum TP:SL ratio — and run an update
+	// through the ratchet so a stop can only tighten. Never trust the model's own output as the
+	// safety boundary; early in training it is effectively random.
+	SLPx decimal.Decimal `json:"sl_px"`
+	TPPx decimal.Decimal `json:"tp_px"`
+
+	// SizePct is the fraction of account equity to commit; LeverageFrac in [0, 1] maps to
+	// [1x, MaxLeverage].
+	SizePct      decimal.Decimal `json:"size_pct"`
+	LeverageFrac decimal.Decimal `json:"leverage_frac"`
+
+	// OrderID is echoed from the request so the controller can pair a response to the position it
+	// asked about.
+	OrderID int64 `json:"order_id"`
 
 	Confidence decimal.Decimal `json:"confidence"`
 }

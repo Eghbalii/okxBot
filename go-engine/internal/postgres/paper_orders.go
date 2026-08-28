@@ -83,7 +83,7 @@ func (r *Repository) UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, t
 // SL/TP independently; only reward/budget attribution filters by Variant, CLAUDE.md §15.4).
 func (r *Repository) ListOpenPaperOrders(ctx context.Context, instID string) ([]port.PaperOrder, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, parent_order_id, variant
+		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, parent_order_id, variant, pnl_max_pct, pnl_min_pct
 		FROM paper_orders
 		WHERE inst_id = $1 AND closed_at IS NULL
 		ORDER BY opened_at
@@ -96,7 +96,7 @@ func (r *Repository) ListOpenPaperOrders(ctx context.Context, instID string) ([]
 	var out []port.PaperOrder
 	for rows.Next() {
 		var o port.PaperOrder
-		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.OpenedAt, &o.FeaturesJSON, &o.ParentOrderID, &o.Variant); err != nil {
+		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.OpenedAt, &o.FeaturesJSON, &o.ParentOrderID, &o.Variant, &o.PnLMaxPct, &o.PnLMinPct); err != nil {
 			return nil, fmt.Errorf("scan paper order: %w", err)
 		}
 		out = append(out, o)
@@ -161,4 +161,21 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// UpdatePaperOrderPnLExtremes advances an open order's peak/trough unrealized PnL (CLAUDE.md
+// §15.11). GREATEST/LEAST are applied in SQL rather than in Go so a concurrent writer can never
+// walk a high-water mark backwards — the tick handler and any other caller may both be updating
+// the same order, and a read-modify-write in Go would lose whichever update landed first.
+func (r *Repository) UpdatePaperOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE paper_orders
+		SET pnl_max_pct = GREATEST(pnl_max_pct, $2),
+			pnl_min_pct = LEAST(pnl_min_pct, $3)
+		WHERE id = $1 AND closed_at IS NULL
+	`, id, maxPct, minPct)
+	if err != nil {
+		return fmt.Errorf("update pnl extremes for paper order %d: %w", id, err)
+	}
+	return nil
 }

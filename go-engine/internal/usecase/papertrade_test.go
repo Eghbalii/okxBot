@@ -134,6 +134,23 @@ func (r *fakeRepository) ForkPaperOrderWithSLTP(ctx context.Context, parentID in
 	r.orders[fork.ID] = fork
 	return fork.ID, nil
 }
+func (r *fakeRepository) UpdatePaperOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.orders[id]
+	if !ok || o.ClosedAt != nil {
+		return nil
+	}
+	if maxPct.GreaterThan(o.PnLMaxPct) {
+		o.PnLMaxPct = maxPct
+	}
+	if minPct.LessThan(o.PnLMinPct) {
+		o.PnLMinPct = minPct
+	}
+	r.orders[id] = o
+	return nil
+}
+
 func (r *fakeRepository) GetAccountEquity(ctx context.Context, mode string, initialUSD decimal.Decimal) (port.AccountEquity, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -591,7 +608,7 @@ func TestAdjustOpenOrdersWithRL_ForksOnNonZeroAdjustment(t *testing.T) {
 	pt.candles = map[string][]domain.Candle{"1m": {
 		{Close: dec("100")}, {Close: dec("101")}, {Close: dec("102")}, {Close: dec("105")},
 	}, "15m": nil}
-	model := &fakeModelClientRL{action: domain.Action{OrderAction: domain.OrderActionAdjust, SLAdjustPct: dec("0.02"), TPAdjustPct: dec("0.02")}}
+	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionUpdate, SLPx: dec("97"), TPPx: dec("108")}}
 	pt.Model = model
 
 	sl, tp := dec("95"), dec("110")
@@ -669,7 +686,7 @@ func TestAdjustOpenOrdersWithRL_SkipsWhenNoBaselineOrders(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
 	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
-	model := &fakeModelClientRL{action: domain.Action{OrderAction: domain.OrderActionAdjust, SLAdjustPct: dec("0.02")}}
+	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionUpdate, SLPx: dec("97")}}
 	pt.Model = model
 
 	pt.adjustOpenOrdersWithRL(context.Background(), "1m", dec("100"), testLogger())
@@ -904,7 +921,7 @@ func openedOrder(t *testing.T, repo port.Repository) port.PaperOrder {
 // leverage/exposure variance for §15.8's continued-live-learning phase to learn sizing from.
 func TestEvaluateStrategies_RLSizingSetsNotionalAndLeverage(t *testing.T) {
 	repo := newFakeRepository()
-	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("0.5"), LeverageFrac: dec("0.1")}}
+	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.1")}}
 	pt := newSizingTestPaperTrader(repo, model)
 	pt.RLSizing = true
 
@@ -927,7 +944,7 @@ func TestEvaluateStrategies_RLSizingSetsNotionalAndLeverage(t *testing.T) {
 // signal must size the order, never flip it to a sell.
 func TestEvaluateStrategies_RLSizingNeverFlipsSignalDirection(t *testing.T) {
 	repo := newFakeRepository()
-	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("-0.4"), LeverageFrac: dec("0")}}
+	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.4"), LeverageFrac: dec("0")}}
 	pt := newSizingTestPaperTrader(repo, model)
 	pt.RLSizing = true
 
@@ -947,7 +964,7 @@ func TestEvaluateStrategies_RLSizingNeverFlipsSignalDirection(t *testing.T) {
 
 func TestEvaluateStrategies_RLSizingDisabledKeepsFixedSizing(t *testing.T) {
 	repo := newFakeRepository()
-	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("0.5"), LeverageFrac: dec("1")}}
+	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("1")}}
 	pt := newSizingTestPaperTrader(repo, model) // RLSizing left false
 
 	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
@@ -988,7 +1005,7 @@ func TestEvaluateStrategies_RLSizingFallsBackWhenModelErrors(t *testing.T) {
 // whole account, so total open exposure is bounded independently.
 func TestRLSizing_TotalExposureCeilingBlocksNewPosition(t *testing.T) {
 	repo := newFakeRepository()
-	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("1"), LeverageFrac: dec("0")}}
+	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("1"), LeverageFrac: dec("0")}}
 	pt := newSizingTestPaperTrader(repo, model)
 	pt.RLSizing = true
 
@@ -1011,7 +1028,7 @@ func TestRLSizing_TotalExposureCeilingBlocksNewPosition(t *testing.T) {
 
 func TestRLSizing_TrimsToRemainingExposureHeadroom(t *testing.T) {
 	repo := newFakeRepository()
-	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("1"), LeverageFrac: dec("0")}}
+	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("1"), LeverageFrac: dec("0")}}
 	pt := newSizingTestPaperTrader(repo, model)
 	pt.RLSizing = true
 
@@ -1039,7 +1056,7 @@ func TestRLSizing_TrimsToRemainingExposureHeadroom(t *testing.T) {
 // counting them toward the exposure ceiling would double-charge one signal.
 func TestRLSizing_ForksDoNotCountTowardExposureCeiling(t *testing.T) {
 	repo := newFakeRepository()
-	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("0.1"), LeverageFrac: dec("0")}}
+	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.1"), LeverageFrac: dec("0")}}
 	pt := newSizingTestPaperTrader(repo, model)
 	pt.RLSizing = true
 
@@ -1060,7 +1077,7 @@ func TestRLSizing_ForksDoNotCountTowardExposureCeiling(t *testing.T) {
 
 func TestRLSizing_DeclinesOnDrainedAccount(t *testing.T) {
 	repo := newFakeRepository()
-	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("1"), LeverageFrac: dec("0")}}
+	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("1"), LeverageFrac: dec("0")}}
 	pt := newSizingTestPaperTrader(repo, model)
 	pt.RLSizing = true
 
@@ -1259,7 +1276,7 @@ func TestAdjustOpenOrdersWithRL_RequiresAdjustOrderAction(t *testing.T) {
 	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
 	// Nonzero adjustments, but the model is saying "none" — no fork may be created.
 	pt.Model = &fakeModelClientRL{action: domain.Action{
-		OrderAction: domain.OrderActionNone, SLAdjustPct: dec("0.02"), TPAdjustPct: dec("0.02"),
+		Action: domain.ActionNone, SLPx: dec("97"), TPPx: dec("108"),
 	}}
 
 	sl := dec("95")
@@ -1304,29 +1321,6 @@ func TestBuildObservation_SignalsCarryKindAndBar(t *testing.T) {
 	}
 }
 
-func TestMarketContextFrom_CountsSidesAndAveragesConfidence(t *testing.T) {
-	mc := marketContextFrom([]domain.StrategySignal{
-		{Side: "buy", Confidence: dec("0.8")},
-		{Side: "buy", Confidence: dec("0.6")},
-		{Side: "sell", Confidence: dec("0.4")},
-		{Side: "", Confidence: dec("0.9")}, // a hold is not an opinion; must not dilute the mean
-	})
-
-	if mc.OthersLong != 2 || mc.OthersShort != 1 {
-		t.Errorf("want 2 long / 1 short, got %d / %d", mc.OthersLong, mc.OthersShort)
-	}
-	if !mc.MeanConfidence.Equal(dec("0.6")) { // (0.8+0.6+0.4)/3, the hold excluded
-		t.Errorf("want mean confidence 0.6 over the three real opinions, got %s", mc.MeanConfidence)
-	}
-}
-
-func TestMarketContextFrom_EmptyIsZeroNotDivideByZero(t *testing.T) {
-	mc := marketContextFrom(nil)
-	if mc.OthersLong != 0 || mc.OthersShort != 0 || !mc.MeanConfidence.IsZero() {
-		t.Errorf("want a zero context for no signals, got %+v", mc)
-	}
-}
-
 // A fork must be identifiable in the observation: fork outcomes are compared against their baseline
 // parent (§15.4), so the model needs to know which it is reasoning about.
 func TestPositionStateOf_MarksForks(t *testing.T) {
@@ -1335,15 +1329,155 @@ func TestPositionStateOf_MarksForks(t *testing.T) {
 	fork := base
 	fork.Variant = "rl_adjusted"
 
-	if positionStateOf(base).IsFork {
+	price := dec("104")
+	if positionStateOf(base, price).IsFork {
 		t.Error("baseline must not be marked as a fork")
 	}
-	if !positionStateOf(fork).IsFork {
+	if !positionStateOf(fork, price).IsFork {
 		t.Error("rl_adjusted variant must be marked as a fork")
 	}
 
-	ps := positionStateOf(base)
-	if !ps.PositionOpen || !ps.EntryPx.Equal(dec("100")) || !ps.SLPx.Equal(dec("95")) || !ps.TPPx.Equal(dec("110")) {
-		t.Errorf("position state did not carry the order's own levels: %+v", ps)
+	// Entry/SL/TP live on the signal now (CLAUDE.md §15.11); what the position block adds is the
+	// trade's own state — side, size, and where price sits relative to its levels.
+	ps := positionStateOf(base, price)
+	if !ps.PositionOpen || !ps.Side.Equal(dec("1")) || !ps.SizeUSD.Equal(dec("25")) {
+		t.Errorf("position state did not carry the order's own state: %+v", ps)
+	}
+	if !ps.UnrealizedPnLPct.Equal(dec("0.04")) { // (104-100)/100 on a long
+		t.Errorf("want unrealized PnL 0.04, got %s", ps.UnrealizedPnLPct)
+	}
+}
+
+// TestHandleCandle_FormingCandleReplacesRatherThanAppends covers the live-OHLC fix (CLAUDE.md
+// §15.11). OKX pushes the same bar repeatedly as it forms; appending each push would fill the
+// window with partial copies of one candle, and the observation's "live OHLC" would then be
+// whichever partial copy happened to land last.
+func TestHandleCandle_FormingCandleReplacesRatherThanAppends(t *testing.T) {
+	ctx := context.Background()
+	pt := newTestPaperTrader(newFakeRepository(), nil)
+
+	ts := "1700000000000"
+	forming := func(closePx string) []byte {
+		b, _ := json.Marshal(candleEvent{
+			InstID: "BTC-USDT-SWAP", Bar: "1m",
+			Candle: []string{ts, "100", "105", "99", closePx, "10", "0", "0", "0"},
+		})
+		return b
+	}
+
+	for _, px := range []string{"101", "102", "103"} {
+		if err := pt.handleCandle(ctx, "1m", forming(px), testLogger()); err != nil {
+			t.Fatalf("handleCandle: %v", err)
+		}
+	}
+
+	pt.candlesMu.Lock()
+	window := pt.candles["1m"]
+	pt.candlesMu.Unlock()
+
+	if len(window) != 1 {
+		t.Fatalf("expected one candle for one forming bar, got %d", len(window))
+	}
+	if !window[0].Close.Equal(dec("103")) {
+		t.Errorf("window must hold the LATEST forming state, got close %s", window[0].Close)
+	}
+}
+
+// A genuinely new bar must append rather than overwrite the previous one.
+func TestHandleCandle_NewBarAppends(t *testing.T) {
+	ctx := context.Background()
+	pt := newTestPaperTrader(newFakeRepository(), nil)
+
+	for _, ts := range []string{"1700000000000", "1700000060000"} {
+		b, _ := json.Marshal(candleEvent{
+			InstID: "BTC-USDT-SWAP", Bar: "1m",
+			Candle: []string{ts, "100", "105", "99", "102", "10", "0", "0", "0"},
+		})
+		if err := pt.handleCandle(ctx, "1m", b, testLogger()); err != nil {
+			t.Fatalf("handleCandle: %v", err)
+		}
+	}
+
+	pt.candlesMu.Lock()
+	n := len(pt.candles["1m"])
+	pt.candlesMu.Unlock()
+
+	if n != 2 {
+		t.Errorf("expected two distinct bars to append, got %d", n)
+	}
+}
+
+// The observation's price context must report the live forming candle's OHLC (CLAUDE.md §15.11) —
+// on a 1H bar the last CLOSED candle can be an hour stale.
+func TestBuildPriceContext_ReportsLiveCandleOHLC(t *testing.T) {
+	pc := buildPriceContext([]domain.Candle{
+		{Open: dec("90"), High: dec("95"), Low: dec("89"), Close: dec("94")},
+		{Open: dec("94"), High: dec("99"), Low: dec("93"), Close: dec("98")}, // the forming bar
+	})
+
+	if !pc.Open.Equal(dec("94")) || !pc.High.Equal(dec("99")) ||
+		!pc.Low.Equal(dec("93")) || !pc.Close.Equal(dec("98")) {
+		t.Errorf("price context must carry the LAST (forming) candle's OHLC, got %+v", pc)
+	}
+}
+
+// TestTrackPnLExtremes covers the pnl_max/pnl_min inputs (CLAUDE.md §15.11): a trade that ran deep
+// into profit and round-tripped must still show that peak, which current PnL alone cannot express.
+func TestTrackPnLExtremes_RecordsPeakAndTrough(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+
+	id, err := repo.OpenPaperOrder(ctx, port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), Size: dec("100"), Leverage: dec("1"),
+	})
+	if err != nil {
+		t.Fatalf("open order: %v", err)
+	}
+
+	// Runs to +8%, falls back to -3%, recovers to +1%.
+	for _, px := range []string{"108", "97", "101"} {
+		open, _ := repo.ListOpenPaperOrders(ctx, "BTC-USDT-SWAP")
+		pt.trackPnLExtremes(ctx, open[0], dec(px), testLogger())
+	}
+
+	open, _ := repo.ListOpenPaperOrders(ctx, "BTC-USDT-SWAP")
+	o := open[0]
+	if o.ID != id {
+		t.Fatalf("unexpected order %d", o.ID)
+	}
+	if !o.PnLMaxPct.Equal(dec("0.08")) {
+		t.Errorf("want peak 0.08 retained after the round trip, got %s", o.PnLMaxPct)
+	}
+	if !o.PnLMinPct.Equal(dec("-0.03")) {
+		t.Errorf("want trough -0.03, got %s", o.PnLMinPct)
+	}
+}
+
+// Strategies may express SL/TP as levels or as percentages; the observation must always carry
+// levels (CLAUDE.md §15.11).
+func TestSignalResolveLevels_DerivesPricesFromPercentages(t *testing.T) {
+	long := strategy.Signal{Side: strategy.Buy, SLPct: dec("0.02"), TPPct: dec("0.04")}.ResolveLevels(dec("100"))
+	if !long.EntryPx.Equal(dec("100")) || !long.SLPx.Equal(dec("98")) || !long.TPPx.Equal(dec("104")) {
+		t.Errorf("long: want entry 100 / SL 98 / TP 104, got %s / %s / %s", long.EntryPx, long.SLPx, long.TPPx)
+	}
+
+	// A short's stop sits ABOVE entry and its target below — the sign comes from the signal's side.
+	short := strategy.Signal{Side: strategy.Sell, SLPct: dec("0.02"), TPPct: dec("0.04")}.ResolveLevels(dec("100"))
+	if !short.SLPx.Equal(dec("102")) || !short.TPPx.Equal(dec("96")) {
+		t.Errorf("short: want SL 102 / TP 96, got %s / %s", short.SLPx, short.TPPx)
+	}
+}
+
+func TestSignalResolveLevels_KeepsExplicitLevels(t *testing.T) {
+	// A strategy that read a real level off the chart must keep it — deriving over the top would
+	// discard exactly the structure that made it a level.
+	s := strategy.Signal{
+		Side: strategy.Buy, SLPct: dec("0.02"), TPPct: dec("0.04"),
+		SLPx: dec("93.5"), TPPx: dec("117"),
+	}.ResolveLevels(dec("100"))
+
+	if !s.SLPx.Equal(dec("93.5")) || !s.TPPx.Equal(dec("117")) {
+		t.Errorf("explicit levels must survive resolution, got SL %s / TP %s", s.SLPx, s.TPPx)
 	}
 }
