@@ -57,6 +57,7 @@ func (s *PivotReversal) WithParams(values map[string]decimal.Decimal) Strategy {
 	if v, ok := values["tp_pct"]; ok {
 		cp.TPPct = ClampParam(specByName["tp_pct"], v)
 	}
+	cp.resetState()
 	return &cp
 }
 
@@ -100,13 +101,45 @@ func (s *PivotReversal) Evaluate(candles []Candle) (Signal, error) {
 
 	last := candles[len(candles)-1]
 
+	// The armed pivot IS the entry level (CLAUDE.md §15.11): this strategy trades the breakout
+	// through that price, so the pivot is where the trade is meant to be taken — not wherever the
+	// candle happened to close after running through it. That distinction is the whole reason the
+	// observation carries entry_px separately from the live price.
+	//
+	// The stop deliberately stays percentage-derived: the opposite pivot would be the structural
+	// choice, but only one side is armed at a time here, so the other is frequently stale or unset.
+	// Reaching for it would sometimes place the stop at a pivot from an unrelated earlier swing,
+	// which is worse than an honest fixed distance — a wrong level is more misleading to the model
+	// than no level.
 	if s.hasHigh && last.High.GreaterThan(s.armedHigh) {
+		entry := s.armedHigh
 		s.hasHigh = false
-		return Signal{Side: Buy, Confidence: decimal.NewFromFloat(0.55), SLPct: s.SLPct, TPPct: s.TPPct}, nil
+		return Signal{
+			Side: Buy, Confidence: decimal.NewFromFloat(0.55),
+			EntryPx: entry, SLPct: s.SLPct, TPPct: s.TPPct,
+		}, nil
 	}
 	if s.hasLow && last.Low.LessThan(s.armedLow) {
+		entry := s.armedLow
 		s.hasLow = false
-		return Signal{Side: Sell, Confidence: decimal.NewFromFloat(0.55), SLPct: s.SLPct, TPPct: s.TPPct}, nil
+		return Signal{
+			Side: Sell, Confidence: decimal.NewFromFloat(0.55),
+			EntryPx: entry, SLPct: s.SLPct, TPPct: s.TPPct,
+		}, nil
 	}
 	return Signal{Side: Hold}, nil
+}
+
+// resetState clears accumulated evaluation state, returning the strategy to how it behaves when
+// freshly constructed. Called by WithParams, whose copy must not inherit it (see
+// Strategy.WithParams for why).
+//
+// This lives beside the state fields on purpose: it is the one place that has to know what they
+// are, so adding a field means updating the reset right here rather than remembering a zeroing
+// line buried at the bottom of WithParams.
+// An armed pivot was found with different LeftBars/RightBars and is not a pivot under the new
+// configuration.
+func (s *PivotReversal) resetState() {
+	s.armedHigh, s.armedLow = decimal.Zero, decimal.Zero
+	s.hasHigh, s.hasLow = false, false
 }

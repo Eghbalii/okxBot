@@ -119,6 +119,7 @@ func (s *TrendConfluence) WithParams(values map[string]decimal.Decimal) Strategy
 	if v, ok := values["risk_reward"]; ok {
 		cp.RiskReward = ClampParam(specByName["risk_reward"], v)
 	}
+	cp.resetState()
 	return &cp
 }
 
@@ -330,22 +331,47 @@ func (s *TrendConfluence) Evaluate(candles []Candle) (Signal, error) {
 	if err != nil {
 		return Signal{}, err
 	}
+	// slDist is a real ATR-scaled distance, so the levels are emitted as prices rather than being
+	// round-tripped through a percentage (CLAUDE.md §15.11) — same distance either way, but the
+	// model then reasons about the level the strategy actually chose.
 	slDist := atr.Mul(s.ATRMultiplierSL)
 	if close.IsZero() {
 		return Signal{Side: Hold}, nil
 	}
 	slPct := slDist.Div(close)
 	tpPct := slPct.Mul(s.RiskReward)
+	tpDist := slDist.Mul(s.RiskReward)
 
 	buy := crossedUp && volatilityFilter && bbTrendFilterLong && rsiFilterLong && macdFilterLong && stochFilterLong && adxFilter && trendFilterLong
 	sell := crossedDown && volatilityFilter && bbTrendFilterShort && rsiFilterShort && macdFilterShort && stochFilterShort && adxFilter && trendFilterShort
 
 	switch {
 	case buy:
-		return Signal{Side: Buy, Confidence: decimal.NewFromFloat(0.7), SLPct: slPct, TPPct: tpPct}, nil
+		return Signal{
+			Side: Buy, Confidence: decimal.NewFromFloat(0.7),
+			EntryPx: close, SLPx: close.Sub(slDist), TPPx: close.Add(tpDist),
+			SLPct: slPct, TPPct: tpPct,
+		}, nil
 	case sell:
-		return Signal{Side: Sell, Confidence: decimal.NewFromFloat(0.7), SLPct: slPct, TPPct: tpPct}, nil
+		return Signal{
+			Side: Sell, Confidence: decimal.NewFromFloat(0.7),
+			EntryPx: close, SLPx: close.Add(slDist), TPPx: close.Sub(tpDist),
+			SLPct: slPct, TPPct: tpPct,
+		}, nil
 	default:
 		return Signal{Side: Hold}, nil
 	}
+}
+
+// resetState clears accumulated evaluation state, returning the strategy to how it behaves when
+// freshly constructed. Called by WithParams, whose copy must not inherit it (see
+// Strategy.WithParams for why).
+//
+// This lives beside the state fields on purpose: it is the one place that has to know what they
+// are, so adding a field means updating the reset right here rather than remembering a zeroing
+// line buried at the bottom of WithParams.
+// Crossover detection must compare this variant's own MAs, not ones computed with different
+// lengths.
+func (s *TrendConfluence) resetState() {
+	s.prevShortMA, s.prevLongMA, s.hasPrev = decimal.Zero, decimal.Zero, false
 }

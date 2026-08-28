@@ -58,6 +58,7 @@ func (s *DoubleTopBottom) WithParams(values map[string]decimal.Decimal) Strategy
 	if v, ok := values["fib_target"]; ok {
 		cp.FibTarget = ClampParam(specByName["fib_target"], v)
 	}
+	cp.resetState()
 	return &cp
 }
 
@@ -121,7 +122,27 @@ func (s *DoubleTopBottom) Evaluate(candles []Candle) (Signal, error) {
 	diff := p2.Sub(p4).Abs().Div(height).Mul(hundred)
 	withinTolerance := diff.LessThanOrEqual(s.Tolerance)
 
-	target := p3.Sub(height.Mul(s.FibTarget).Div(hundred))
+	// The Fib target projects beyond the neckline in whichever direction the pattern breaks: DOWN
+	// from a double top, UP from a double bottom.
+	//
+	// The Pine source gets this for free by keeping height SIGNED (`height = avg(y2,y4) - y3`, then
+	// `_t = y3 - height * fib/100`): for a bottom the two lows sit below the neckline, height is
+	// negative, and subtracting it projects upward. This port took .Abs() of height, so the target
+	// always projected downward and was upside-down for a double bottom. It went unnoticed because
+	// only the .Abs()'d DISTANCE was ever emitted as a percentage — the magnitude was right, and the
+	// wrong direction never became visible until the level itself started being reported (§15.11).
+	//
+	// signedHeight restores the source's convention; absHeight is kept for the tolerance comparison
+	// below, which is a pure magnitude test.
+	signedHeight := p2.Add(p4).Div(decimal.NewFromInt(2)).Sub(p3)
+	target := p3.Sub(signedHeight.Mul(s.FibTarget).Div(hundred))
+
+	// This pattern produces genuinely structural levels, so it emits PRICES (CLAUDE.md §15.11):
+	// the stop sits at p2, the pattern's own extreme — the price that invalidates the pattern —
+	// and the target at the Fib projection beyond the neckline. Both are levels the chart chose,
+	// not distances from wherever price happens to be trading when the signal fires. Percentages
+	// are still emitted alongside so anything reading SLPct/TPPct keeps working; ResolveLevels
+	// leaves an explicitly-set level alone, so the price is what actually reaches the model.
 	if isTop {
 		risingIn := p1.LessThan(p3)
 		brokeNeckline := close.LessThan(p3)
@@ -132,6 +153,9 @@ func (s *DoubleTopBottom) Evaluate(candles []Candle) (Signal, error) {
 				return Signal{
 					Side:       Sell,
 					Confidence: decimal.NewFromFloat(0.65),
+					EntryPx:    close,
+					SLPx:       p2,
+					TPPx:       target,
 					SLPct:      stopDist.Div(close),
 					TPPct:      tpDist.Div(close),
 				}, nil
@@ -147,6 +171,9 @@ func (s *DoubleTopBottom) Evaluate(candles []Candle) (Signal, error) {
 				return Signal{
 					Side:       Buy,
 					Confidence: decimal.NewFromFloat(0.65),
+					EntryPx:    close,
+					SLPx:       p2,
+					TPPx:       target,
 					SLPct:      stopDist.Div(close),
 					TPPct:      tpDist.Div(close),
 				}, nil
@@ -154,4 +181,17 @@ func (s *DoubleTopBottom) Evaluate(candles []Candle) (Signal, error) {
 		}
 	}
 	return Signal{Side: Hold}, nil
+}
+
+// resetState clears accumulated evaluation state, returning the strategy to how it behaves when
+// freshly constructed. Called by WithParams, whose copy must not inherit it (see
+// Strategy.WithParams for why).
+//
+// This lives beside the state fields on purpose: it is the one place that has to know what they
+// are, so adding a field means updating the reset right here rather than remembering a zeroing
+// line buried at the bottom of WithParams.
+// The slices are nilled rather than copied: a shallow struct copy hands both strategies the
+// SAME backing array, so one appending a pivot could overwrite the other's log.
+func (s *DoubleTopBottom) resetState() {
+	s.pivots, s.pivotIsHigh, s.dir = nil, nil, 0
 }

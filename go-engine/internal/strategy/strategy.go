@@ -97,6 +97,22 @@ type Strategy interface {
 	Params() []ParamSpec
 	// WithParams returns a copy of the strategy configured with the given param values, keyed by
 	// ParamSpec.Name. Values for unrecognized or missing keys keep their current setting.
+	//
+	// The copy must be RESET: any accumulated evaluation state (previous MA values, trend
+	// direction, armed pivots, trailing bands, "have I seen a bar yet" flags) starts fresh, as if
+	// the strategy had just been constructed. Only configuration carries over.
+	//
+	// This matters because the natural Go implementation — `cp := *s` — copies those fields too. A
+	// strategy warmed up on hundreds of candles would hand its trend direction and trailing bands
+	// to a differently-configured variant, which would then evaluate its first bar mid-trend using
+	// state that belongs to another configuration. cmd/strategy-optimizer tunes parameters by
+	// exactly this call, so a leak here would score candidates against contaminated state and the
+	// resulting comparison would be meaningless.
+	//
+	// The built-ins that keep state implement a private resetState() beside their state fields and
+	// call it here, so the field list lives next to the fields themselves rather than as a zeroing
+	// line at the bottom of WithParams that a later field is easy to forget.
+	// TestWithParams_DoesNotCarryAccumulatedState enforces this across every kind in Factories.
 	WithParams(values map[string]decimal.Decimal) Strategy
 	// Evaluate reads the candle window of the timeframe this strategy is assigned to. A strategy
 	// that also wants higher-timeframe context implements MultiTimeframeStrategy below instead of

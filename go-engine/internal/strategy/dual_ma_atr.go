@@ -71,6 +71,7 @@ func (s *DualMAATR) WithParams(values map[string]decimal.Decimal) Strategy {
 	if v, ok := values["risk_reward"]; ok {
 		cp.RiskReward = ClampParam(specByName["risk_reward"], v)
 	}
+	cp.resetState()
 	return &cp
 }
 
@@ -130,12 +131,24 @@ func (s *DualMAATR) Evaluate(candles []Candle) (Signal, error) {
 		if err != nil {
 			return Signal{}, err
 		}
+		// The stop is a structural level — the recent swing low, pushed out by ATR so ordinary
+		// volatility doesn't clip it — so it's emitted as a PRICE (CLAUDE.md §15.11), with the
+		// target projected from that same risk at the configured reward multiple. Percentages are
+		// kept alongside for callers that still read them.
 		stop := lowestLow.Sub(atr.Mul(s.RiskMultiplier))
 		risk := close.Sub(stop)
 		if risk.IsPositive() {
 			slPct := risk.Div(close)
 			tpPct := slPct.Mul(s.RiskReward)
-			return Signal{Side: Buy, Confidence: decimal.NewFromFloat(0.5), SLPct: slPct, TPPct: tpPct}, nil
+			return Signal{
+				Side:       Buy,
+				Confidence: decimal.NewFromFloat(0.5),
+				EntryPx:    close,
+				SLPx:       stop,
+				TPPx:       close.Add(risk.Mul(s.RiskReward)),
+				SLPct:      slPct,
+				TPPct:      tpPct,
+			}, nil
 		}
 		return Signal{Side: Hold}, nil
 	}
@@ -149,7 +162,28 @@ func (s *DualMAATR) Evaluate(candles []Candle) (Signal, error) {
 	if risk.IsPositive() {
 		slPct := risk.Div(close)
 		tpPct := slPct.Mul(s.RiskReward)
-		return Signal{Side: Sell, Confidence: decimal.NewFromFloat(0.5), SLPct: slPct, TPPct: tpPct}, nil
+		return Signal{
+			Side:       Sell,
+			Confidence: decimal.NewFromFloat(0.5),
+			EntryPx:    close,
+			SLPx:       stop,
+			TPPx:       close.Sub(risk.Mul(s.RiskReward)),
+			SLPct:      slPct,
+			TPPct:      tpPct,
+		}, nil
 	}
 	return Signal{Side: Hold}, nil
+}
+
+// resetState clears accumulated evaluation state, returning the strategy to how it behaves when
+// freshly constructed. Called by WithParams, whose copy must not inherit it (see
+// Strategy.WithParams for why).
+//
+// This lives beside the state fields on purpose: it is the one place that has to know what they
+// are, so adding a field means updating the reset right here rather than remembering a zeroing
+// line buried at the bottom of WithParams.
+// Crossover detection must compare this variant's own MAs, not ones computed with different
+// lengths.
+func (s *DualMAATR) resetState() {
+	s.prevFast, s.prevSlow, s.hasPrev = decimal.Zero, decimal.Zero, false
 }

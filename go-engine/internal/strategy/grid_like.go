@@ -51,6 +51,7 @@ func (s *GridLike) WithParams(values map[string]decimal.Decimal) Strategy {
 	if v, ok := values["tp_pct"]; ok {
 		cp.TPPct = ClampParam(specByName["tp_pct"], v)
 	}
+	cp.resetState()
 	return &cp
 }
 
@@ -81,4 +82,17 @@ func (s *GridLike) Evaluate(candles []Candle) (Signal, error) {
 		return Signal{Side: Buy, Confidence: decimal.NewFromInt(1), SLPct: s.SLPct, TPPct: s.TPPct}, nil
 	}
 	return Signal{Side: Sell, Confidence: decimal.NewFromInt(1), SLPct: s.SLPct, TPPct: s.TPPct}, nil
+}
+
+// resetState clears accumulated evaluation state, returning the strategy to how it behaves when
+// freshly constructed. Called by WithParams, whose copy must not inherit it (see
+// Strategy.WithParams for why).
+//
+// This lives beside the state fields on purpose: it is the one place that has to know what they
+// are, so adding a field means updating the reset right here rather than remembering a zeroing
+// line buried at the bottom of WithParams.
+// The baseline is the price this grid is anchored to — inheriting it would leave a variant
+// measuring its offsets from a price captured during a completely different run.
+func (s *GridLike) resetState() {
+	s.baseline, s.hasPrev = decimal.Zero, false
 }

@@ -806,11 +806,13 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
 - [x] Paper → demo → real progression guardrails (§15.6): mode derived from `okx.simulated` so it
       can never disagree with the credentials in use, plus `trading.allow_real_money` (default
       false) which `cmd/trader` refuses to start without against non-demo keys.
-- [ ] **Audit all 14 strategies for entry_px / sl_px / tp_px** (§15.11): the observation now carries
-      a strategy's proposed entry price and SL/TP *levels*, but not every built-in strategy
-      necessarily produces them. Each one either gets updated to emit all three, or is removed from
-      the roster — a strategy that leaves them empty gives the model nothing to reason about and
-      silently degrades the signal block to zeros.
+- [x] **Audited all 14 strategies for entry_px / sl_px / tp_px (2026-08-28, §15.11)** — see §16.8
+      for the full result. Nothing was deleted: 7 strategies computed genuinely structural levels
+      and were discarding them (converting to a percentage, then having ResolveLevels reconstruct an
+      approximation), and the other 7 have no structural level in their logic at all, where a
+      percentage is the honest output — inventing one would give the model a level no strategy
+      chose, which is worse than none. The audit surfaced four separate pre-existing bugs, one of
+      which had made a registered strategy permanently silent.
 - [x] **Continuous learning on SAC (§15.11)** — `rl-service` now keeps learning from live outcomes
       instead of serving frozen weights between periodic retrains, which PPO structurally could not
       do at this trade volume. `rl_service/learner.py` holds each decision as *pending* keyed by
@@ -857,9 +859,10 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       reported in `info` so a falling curve can be attributed to risk vs. bad entries. Caught a
       latent bug in the process: `step` re-stamped `self.leverage` every step, so a position opened
       at 100x silently read as 1x while held. 10 new tests.
-- [ ] **(3) Strategy audit for `entry_px`/`sl_px`/`tp_px`** (already listed below) — everything
-      currently falls back to percentage-derived levels, which works but wastes the price-level
-      design and leaves the model reasoning about levels no strategy actually chose.
+- [x] **(3) Strategy audit for `entry_px`/`sl_px`/`tp_px`** — done 2026-08-28, full result in
+      §16.8. 7 of 14 now emit the structural levels they were computing and discarding; the other 7
+      legitimately have none. Turned up four pre-existing bugs, including `pmax` being unable to
+      emit a signal at all and EMA's precision growing without bound.
 - [ ] **(4) Then it can genuinely run**: warm-start against real candle history, enable
       `paper_trading.rl_sizing` + `rl_sltp_adjust` + `serve.learning_enabled` in paper mode, and let
       it accumulate. The reward now flows end to end and the objective no longer rewards
@@ -1892,3 +1895,87 @@ as §15.1's "rejected/superseded" note).
   SVG price line (no charting library added, keeping with §14 Phase 3's hand-rolled-CSS/minimal-
   deps convention) with a vertical marker line at each parameter-change timestamp; hovering a
   marker shows a tooltip diffing old vs. new param values (only the keys that actually changed).
+
+### 16.8 Strategy audit: structural price levels (2026-08-28)
+
+§15.11 made a strategy's proposed `entry_px`/`sl_px`/`tp_px` part of the observation, because a
+level derived from chart structure (a stop below a swing low, a target at a fair-value gap) carries
+information a percentage cannot. This audit checked all 14 registered kinds against that.
+
+**Result: nothing was deleted.** All 14 were emitting percentages only, but the split is not
+"good vs. bad strategies" — it is whether the logic actually *computes* a structural level:
+
+| strategy | what it was discarding |
+|---|---|
+| `double_top_bottom` | `p2` (the pattern's own extreme) as the stop, the Fib projection as the target |
+| `dual_ma_atr` | swing low − ATR×mult as the stop |
+| `pmax` | its own ATR trailing band — the strategy's literal definition of "I am wrong here" |
+| `trend_confluence` | an ATR-scaled distance, round-tripped through a percentage |
+| `pivot_reversal` | the armed pivot it breaks out *through* → entry |
+| `seasonal_atr_short` | `sellLevel` (SMA + ATR×mult) → entry |
+| `weekly_dip_buy` | `dipLevel` off the week's open → entry |
+
+The other seven — `rsi_sma`, `rsi_sma_fuzzy`, `sma_cross_fixed_exit`, `ema_cross_trailing`,
+`stepped_trailing`, `stoch_cross`, `grid_like` — are pure oscillators/crossovers with no structural
+level in their logic (for `sma_cross_fixed_exit`, fixed exits *are* the strategy). They keep
+percentages deliberately: inventing a level would hand the model one no strategy chose, and a wrong
+level misleads it more than no level does. The same reasoning applies *within* `pivot_reversal`,
+which gained an entry but kept percentage stops — only one pivot is armed at a time there, so the
+opposite one is frequently stale and would sometimes place the stop at an unrelated earlier swing.
+
+Percentages are still emitted alongside the prices, so anything reading `SLPct`/`TPPct` is
+unaffected; `ResolveLevels` leaves an explicitly-set level alone, so the price is what reaches the
+model. Note one real behavior change: because `ResolveLevels` derives percentage levels from
+`EntryPx`, the strategies that now report a structural entry measure their risk from *that* price
+rather than from a candle close that may have overshot it.
+
+**Four pre-existing bugs surfaced**, none related to the level work itself — they were simply
+invisible while only percentages were emitted:
+
+1. **`pmax` could never emit a signal at all.** It compared the current bar's moving average against
+   a band derived from that *same* average (`ma > ma + multiplier*atr`) — impossible for any
+   positive ATR, so the trend never left its initial `+1`. The strategy was registered in
+   `Factories`, assignable from the panel, and silently returning `Hold` forever. The Pine source
+   (`strategy_PMax Explorer`, lines 82-90) compares against the PREVIOUS bar's *ratcheted* band; the
+   port had dropped both the ratchet and the `Prev`. Nothing caught it because no test asserted the
+   strategy ever fires.
+2. **`double_top_bottom`'s target was inverted for double bottoms.** The Pine source keeps `height`
+   signed (`avg(y2,y4) - y3`), so `_t = y3 - height*fib/100` projects down from a top and up from a
+   bottom with one formula. The port took `.Abs()` of height, so the target always projected
+   downward. `.Abs()` on the resulting *distance* hid it: the magnitude was right, and the wrong
+   direction only became visible once the level itself was reported. Fixed by restoring the source's
+   signed-height convention rather than branching per direction — the branch produced correct
+   numbers but diverged structurally from the source, which is what made the bug possible.
+3. **`EMA`'s precision grew without bound.** Alpha is a repeating decimal for most periods (2/11 at
+   period 10) and the recurrence multiplies the running value by `(1-alpha)` every bar;
+   `decimal.Decimal` is arbitrary-precision, so nothing truncated it. Measured 498 digits at 40
+   candles, 1,139 at 80, 4,659 at 300 — growing linearly with the candle window forever.
+   `PaperTrader` maintains long windows and several strategies use EMA, so these values were
+   reaching `NUMERIC` columns and every model observation. Now rounded to `emaScale` (12dp) *per
+   step* — rounding the accumulator is what stops the growth, since the previous value feeds the
+   next multiplication. Flat at ~15 digits at any window size. `emaScale` is deliberately NOT a
+   `ParamSpec`: it is a numerical guard, not a trading parameter, and exposing it would add a
+   meaningless dimension to the optimizer's search.
+4. **`WithParams` leaked accumulated state in 7 of 14 strategies.** The natural Go implementation is
+   `cp := *s`, which copies evaluation state (previous MA values, trend direction, armed pivots,
+   trailing bands, the grid's anchor price) along with the configuration. A strategy warmed up on
+   hundreds of candles would hand that state to a differently-configured variant, which then
+   evaluates its first bar mid-trend using numbers computed with *different parameters* — e.g.
+   comparing an MA-20 `prevShortMA` against an MA-50 `shortMANow`, a meaningless comparison that
+   manufactures a crossover that never happened. `grid_like` was the worst case: it carries
+   `baseline`, the price the grid is anchored to. `double_top_bottom` was subtler still — its
+   `pivots` slice was *shared* by a shallow copy, so two variants could overwrite each other's log.
+   - **Not broken in production today**: `internal/optimizer/runner.go`'s `buildStrategy` calls this
+     on a fresh `factory()` instance. But nothing enforced that, and a leak here would score tuning
+     candidates against contaminated state — silently meaningless results, not a visible failure.
+   - Each stateful strategy now implements a private `resetState()` **beside its state fields** and
+     calls it from `WithParams`. The field list lives next to the fields it resets, so adding a
+     field means updating the reset in the same place rather than remembering a zeroing line at the
+     bottom of `WithParams`. `Strategy.WithParams`' doc comment now states the requirement.
+   - `TestWithParams_DoesNotCarryAccumulatedState` enforces it across **every** kind in `Factories`
+     by warming an instance on 400 candles and asserting a copy made from it behaves identically to
+     one made from a fresh instance. That test is what found `grid_like`, which a by-eye field-name
+     scan had missed.
+
+15 new tests (185 Go total). The `pmax`, EMA, and state-isolation fixes are mutation-checked:
+reverting each one fails the test written for it.

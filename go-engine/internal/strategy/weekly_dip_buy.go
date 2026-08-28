@@ -68,9 +68,14 @@ func (s *WeeklyDipBuy) Evaluate(candles []Candle) (Signal, error) {
 	if last.Low.GreaterThan(dipLevel) {
 		return Signal{Side: Hold}, nil // dip level not reached this bar
 	}
+	// dipLevel is the limit price this strategy buys at — the bar only has to trade down THROUGH it
+	// (the trigger is last.Low), so the close is often well above it. Reporting the level as the
+	// entry (CLAUDE.md §15.11) describes the intended fill rather than where the bar happened to
+	// settle, and it anchors the breakeven stop and target to that same price.
 	return Signal{
 		Side:       Buy,
 		Confidence: decimal.NewFromFloat(0.5),
+		EntryPx:    dipLevel,
 		SLPct:      s.BreakevenPct,
 		TPPct:      s.TargetPct,
 	}, nil

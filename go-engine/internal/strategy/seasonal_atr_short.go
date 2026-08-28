@@ -73,6 +73,7 @@ func (s *SeasonalATRShort) WithParams(values map[string]decimal.Decimal) Strateg
 	if v, ok := values["tp_pct"]; ok {
 		cp.TPPct = ClampParam(specByName["tp_pct"], v)
 	}
+	cp.resetState()
 	return &cp
 }
 
@@ -129,5 +130,28 @@ func (s *SeasonalATRShort) Evaluate(candles []Candle) (Signal, error) {
 
 	s.hasOpenTrade = true
 	s.daysSinceLastSale = 0
-	return Signal{Side: Sell, Confidence: decimal.NewFromFloat(0.5), SLPct: s.SLPct, TPPct: s.TPPct}, nil
+	// sellLevel (SMA + ATR x multiplier) is the price this strategy is actually selling INTO — the
+	// bar merely has to touch it, which is why the trigger is last.High, not the close. Reporting
+	// it as the entry (CLAUDE.md §15.11) describes the trade the strategy intends; the close can be
+	// well below the level on a bar that spiked through and came back.
+	//
+	// SL/TP stay percentage-derived, now measured from sellLevel rather than from the close: this
+	// strategy has no second structural level, and ATR is already spent defining the entry itself.
+	return Signal{
+		Side: Sell, Confidence: decimal.NewFromFloat(0.5),
+		EntryPx: sellLevel, SLPct: s.SLPct, TPPct: s.TPPct,
+	}, nil
+}
+
+// resetState clears accumulated evaluation state, returning the strategy to how it behaves when
+// freshly constructed. Called by WithParams, whose copy must not inherit it (see
+// Strategy.WithParams for why).
+//
+// This lives beside the state fields on purpose: it is the one place that has to know what they
+// are, so adding a field means updating the reset right here rather than remembering a zeroing
+// line buried at the bottom of WithParams.
+// The seasonal window and trade spacing are re-established from this variant's own month
+// parameters.
+func (s *SeasonalATRShort) resetState() {
+	s.daysSinceLastSale, s.hasOpenTrade, s.active = 0, false, false
 }
