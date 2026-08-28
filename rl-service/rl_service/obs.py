@@ -8,6 +8,8 @@ features. Keep in sync with `domain.Observation` / `domain.Action` on the Go sid
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 from pydantic import BaseModel, Field
 
@@ -15,31 +17,40 @@ from pydantic import BaseModel, Field
 # one-hot) and price_context (raw price series + positional/distance features) per timeframe block,
 # plus dist_to_sl_pct/dist_to_tp_pct on the top-level observation.
 #
-# v4 (current): replaced the per-token sub-budget fields (token_equity_usd/token_budget_usd) with
-# the shared-account fields account_equity_usd/account_initial_usd/open_exposure_usd (CLAUDE.md
-# §15.6's 2026-08-28 revision) — capital is one pool the agent sizes trades against, not a per-token
-# constant. Must match domain.ObservationSchemaVersion on the Go side.
-OBSERVATION_SCHEMA_VERSION = 4
+# v4: replaced the per-token sub-budget fields (token_equity_usd/token_budget_usd) with the
+# shared-account fields account_equity_usd/account_initial_usd/open_exposure_usd (CLAUDE.md §15.6's
+# 2026-08-28 revision) — capital is one pool the agent sizes trades against, not a per-token
+# constant.
+#
+# v5 (current): the event-driven signal lifecycle (CLAUDE.md §15.10). Added category, a single
+# per-call `signal` (with strategy kind, timeframe, win rate and staleness), market_context and
+# position_state — and, critically, actually fed strategy signals and recent_trades INTO the model's
+# input vector, which v3/v4 never did despite carrying both over the wire. Must match
+# domain.ObservationSchemaVersion on the Go side.
+OBSERVATION_SCHEMA_VERSION = 5
 
-# MAX_STRATEGY_SLOTS bounds the policy's fixed-width strategy_weights output (CLAUDE.md §15.4).
-# PPO's action space must be a fixed shape, but the number of strategies assigned to a given
-# token+timeframe varies per request — so the policy emits this many weight slots and the
-# observation's strategy signals are read positionally against them: slot i corresponds to the i-th
-# strategy signal in the request (ordered as go-engine's buildObservation appends them, which is
-# assignment order). Signals beyond this count are ignored by the weighting; slots beyond the number
-# of present signals are dropped from the response. Raising this changes the action width and
-# invalidates existing trained models — bump ACTION_SCHEMA_VERSION with it.
-MAX_STRATEGY_SLOTS = 8
+# ORDER_ACTIONS is the decision head for an OPEN position (CLAUDE.md §15.10's `update` category):
+# leave it alone, move its SL/TP, or close it now. This replaced the idea of an "optimize" signal
+# side — the decision belongs on the output, where the model has live price and position state,
+# not on the strategy, which only sees candles.
+#
+# Order defines the argmax index and must stay stable.
+ORDER_ACTIONS = ["none", "adjust", "close"]
 
 # ACTION_SCHEMA_VERSION tracks the ACTION vector's layout, independently of the observation's
-# schema_version — a model trained against a narrower action space cannot serve a caller expecting
-# the wider one. v1 was the original Box(2,) [target_exposure, leverage_frac]; v2 is the full
-# CLAUDE.md §15.4 action: [target_exposure, leverage_frac, sl_adjust_pct, tp_adjust_pct,
-# w_0..w_{MAX_STRATEGY_SLOTS-1}]. Keep in sync with domain.ActionSchemaVersion on the Go side.
-ACTION_SCHEMA_VERSION = 2
+# schema_version — a model trained against a different action space cannot serve a caller expecting
+# this one. v1: Box(2,) [target_exposure, leverage_frac]. v2: added sl/tp_adjust plus fixed
+# strategy_weight slots. v3 (current): dropped strategy_weights entirely and added the order-action
+# head (CLAUDE.md §15.10).
+#
+# Dropping the weights is what removes the fixed ceiling on strategy count: one signal per call
+# means nothing in the action scales with the roster, so strategies can be added or removed without
+# changing the action width or retraining. Trust in a strategy is now an INPUT (its live win rate)
+# rather than a score the model has to invent. Keep in sync with domain.ActionSchemaVersion.
+ACTION_SCHEMA_VERSION = 3
 
-# ACTION_DIM is the policy's output width: the 4 scalar decisions plus the strategy-weight slots.
-ACTION_DIM = 4 + MAX_STRATEGY_SLOTS
+# ACTION_DIM: target_exposure, leverage_frac, sl_adjust_pct, tp_adjust_pct + the order-action head.
+ACTION_DIM = 4 + len(ORDER_ACTIONS)
 
 # SL/TP adjustment outputs are emitted in [-1, 1] by the policy and scaled to a fraction of price by
 # MAX_SLTP_ADJUST_PCT. This mirrors usecase.MaxSLTPAdjustPct on the Go side (CLAUDE.md §15.4's "±2%
@@ -49,12 +60,84 @@ ACTION_DIM = 4 + MAX_STRATEGY_SLOTS
 MAX_SLTP_ADJUST_PCT = 0.02
 
 
+# SIGNAL_CATEGORIES is the lifecycle stage a /predict call represents (CLAUDE.md §15.10). The
+# category tells the model which decision it is being asked to make, which is why it replaced a
+# flat buy/sell/hold plus a separate "optimize" action: opening a position, managing an open one,
+# and being told how one ended are genuinely different questions over the same fields.
+#
+# Order defines the one-hot index and must stay stable — inserting a category in the middle would
+# silently reassign every later slot's meaning to an already-trained model.
+SIGNAL_CATEGORIES = [
+    "buy",           # strategy fired, no open position on this token -> open or skip
+    "sell",          # same, short side
+    "update",        # position open: another signal fired, or PnL moved past the threshold
+    "closed_tp",     # terminal: take-profit hit
+    "closed_sl",     # terminal: stop-loss hit
+    "closed_early",  # terminal: the model closed it before either level
+]
+
+# Terminal categories carry the realized outcome and are what the reward is computed from
+# (CLAUDE.md §15.10) — the close event IS the reward, not a separate pipeline.
+TERMINAL_CATEGORIES = frozenset({"closed_tp", "closed_sl", "closed_early"})
+
+# STRATEGY_KINDS mirrors go-engine's strategy.Factories registry. The model needs to know WHICH
+# strategy produced a signal, and identity has to be stable across restarts and roster changes —
+# so it is keyed by kind name, not by the strategies table's row id (which differs per deployment
+# and per cloned sub-strategy). A kind the model was not trained on one-hots to all zeros, which
+# reads as "some strategy I don't recognize" rather than colliding with a known one.
+#
+# Keep in sync with strategy.Factories; appending is safe, reordering is not.
+STRATEGY_KINDS = [
+    "rsi_sma",
+    "rsi_sma_fuzzy",
+    "double_top_bottom",
+    "dual_ma_atr",
+    "ema_cross_trailing",
+    "grid_like",
+    "pivot_reversal",
+    "pmax",
+    "seasonal_atr_short",
+    "sma_cross_fixed_exit",
+    "stepped_trailing",
+    "stoch_cross",
+    "trend_confluence",
+    "weekly_dip_buy",
+]
+
+# TIMEFRAMES is the decision-cadence roster (CLAUDE.md §9): the bars strategies decide on. Context
+# timeframes (4H/1D) are read by strategies but never carry a signal, so they need no slot here.
+TIMEFRAMES = ["5m", "15m", "1H"]
+
+
+def _one_hot(value: str, vocabulary: list[str]) -> np.ndarray:
+    """One-hot over a fixed vocabulary; an unknown value yields all zeros rather than raising, so a
+    newly-registered strategy kind degrades to "unrecognized" instead of crashing inference."""
+    vec = np.zeros(len(vocabulary), dtype=np.float32)
+    if value in vocabulary:
+        vec[vocabulary.index(value)] = 1.0
+    return vec
+
+
 class StrategySignal(BaseModel):
     strategy_id: int
     side: str = ""
     confidence: float = 0.0
     sl_pct: float = 0.0
     tp_pct: float = 0.0
+    # kind/bar are what let one shared policy tell signals apart (CLAUDE.md §15.10): which strategy
+    # produced this, and on which timeframe. Without them every signal looks alike to the model.
+    kind: str = ""
+    bar: str = ""
+    # This strategy's realized track record on this instrument, fed as input so the model can learn
+    # to discount weak strategies. This is what replaced the strategy_weights output: win rate is a
+    # better answer to "how much do I trust this" than a score the model has to invent, and it costs
+    # no action-space width, so the strategy roster can change without retraining.
+    win_rate: float = 0.0
+    trade_count: float = 0.0
+    # age_seconds is how stale this signal is. A higher-timeframe signal stays meaningful between
+    # its candles, so signals are carried forward and aged rather than vanishing — this is what
+    # makes an `update` observation complete instead of full of ambiguous zeros.
+    age_seconds: float = 0.0
 
 
 class PriceContext(BaseModel):
@@ -75,6 +158,42 @@ class RecentTrade(BaseModel):
     win: bool
 
 
+class MarketContext(BaseModel):
+    """Fixed-width summary of the OTHER strategies currently holding an opinion on this instrument.
+
+    One signal per /predict call (CLAUDE.md §15.10) means the model can't see two strategies
+    agreeing within a single decision — and confluence is usually the strongest read there is. This
+    block restores that without naming strategies individually, so its width is independent of the
+    roster size and the ceiling stays gone.
+    """
+
+    others_long: float = 0.0        # count of other live signals currently on the long side
+    others_short: float = 0.0
+    mean_confidence: float = 0.0    # across those other live signals
+    seconds_since_other: float = 0.0  # age of the most recent other signal
+
+
+class PositionState(BaseModel):
+    """The open position this call is about, for `update` and terminal categories (§15.10).
+
+    Absent (position_open=0) on a buy/sell call, where the decision is whether to open at all.
+    """
+
+    position_open: float = 0.0
+    entry_px: float = 0.0
+    sl_px: float = 0.0
+    tp_px: float = 0.0
+    size_usd: float = 0.0
+    leverage: float = 0.0
+    age_seconds: float = 0.0
+    # Realized PnL is meaningful only on a terminal category, where it IS the reward signal
+    # (CLAUDE.md §15.10). Zero elsewhere.
+    realized_pnl_usd: float = 0.0
+    # A fork tracks its baseline parent rather than committing separate capital (§15.4); the model
+    # should know it is reasoning about one, since fork outcomes are compared against the baseline.
+    is_fork: float = 0.0
+
+
 class Observation(BaseModel):
     schema_version: int = OBSERVATION_SCHEMA_VERSION
     inst_id: str
@@ -85,6 +204,23 @@ class Observation(BaseModel):
     # in sync with domain.Observation.LastPrice on the Go side (json tag last_price).
     last_price: float
     timeframes: list[TimeframeBlock] = Field(default_factory=list)
+
+    # --- signal lifecycle (CLAUDE.md §15.10) ---
+    # category is which decision this call represents; see SIGNAL_CATEGORIES. Empty is treated as
+    # "update" so a caller that predates this field still produces a well-formed vector.
+    category: str = "update"
+    # The single signal this call is about — one signal per call, so the model always knows exactly
+    # which strategy and timeframe it is answering (§15.10). None on a pure price-driven update,
+    # where no strategy spoke and only price/PnL moved.
+    # typing.Optional, not `StrategySignal | None`: Pydantic evaluates annotations at runtime, and
+    # the deployment target includes Python 3.9 where PEP 604 unions are not valid there.
+    signal: Optional[StrategySignal] = None
+    market_context: MarketContext = Field(default_factory=MarketContext)
+    position_state: PositionState = Field(default_factory=PositionState)
+    # Stable id of the order this call refers to, so a decision can be tied back to the position it
+    # was about when the outcome finally lands. Not fed to the model (an id has no ordinal meaning);
+    # carried for the caller's own bookkeeping and for training-time pairing.
+    order_id: int = 0
 
     position: float = 0.0
     current_leverage: float = 0.0
@@ -110,11 +246,14 @@ class Observation(BaseModel):
 
 class Action(BaseModel):
     action_schema_version: int = ACTION_SCHEMA_VERSION
-    strategy_weights: dict[str, float] = Field(default_factory=dict)
     target_exposure: float
     leverage_frac: float
     sl_adjust_pct: float = 0.0
     tp_adjust_pct: float = 0.0
+    # What to do with the open position this call was about: "none", "adjust", or "close"
+    # (CLAUDE.md §15.10). Meaningful only for the `update` category — on buy/sell the decision is
+    # target_exposure, and on a terminal category nothing is being decided at all.
+    order_action: str = "none"
     confidence: float
 
 
@@ -152,8 +291,94 @@ def observation_tail(obs: Observation) -> np.ndarray:
                 ],
                 dtype=np.float32,
             ),
+            # The two blocks that §15.3 specified but that never actually reached the model until
+            # the §15.10 redesign — the whole point of that revision.
+            signal_block(obs),
+            recent_trades_block(obs),
         ]
     )
+
+
+def signal_block(obs: Observation) -> np.ndarray:
+    """The signal lifecycle block: category, the signal itself, market context, position state.
+
+    This is the part that was MISSING (CLAUDE.md §15.10): strategy signals were built in Go, sent,
+    and parsed, but never reached the model's input vector — so the policy was asked to weigh
+    strategies whose opinions it could not see. Everything here is fixed-width regardless of how
+    many strategies are registered, because exactly one signal is carried per call.
+
+    `present` disambiguates "no strategy spoke" from "a strategy said zero": without it a
+    price-driven update is indistinguishable from a signal with zero confidence, and the model would
+    learn from the ambiguity.
+    """
+    sig = obs.signal
+    present = 1.0 if sig is not None else 0.0
+    side = 0.0
+    if sig is not None:
+        side = 1.0 if sig.side == "buy" else (-1.0 if sig.side == "sell" else 0.0)
+
+    scalars = [
+        present,
+        side,
+        sig.confidence if sig else 0.0,
+        sig.sl_pct if sig else 0.0,
+        sig.tp_pct if sig else 0.0,
+        sig.win_rate if sig else 0.0,
+        # Trade count is compressed: the difference between 5 and 50 trades of evidence matters far
+        # more than between 500 and 545, and an uncompressed count would dominate the vector's scale.
+        np.log1p(sig.trade_count) if sig else 0.0,
+        # Minutes, not seconds — keeps staleness on a similar scale to the other inputs.
+        (sig.age_seconds / 60.0) if sig else 0.0,
+    ]
+
+    mc = obs.market_context
+    ps = obs.position_state
+    scalars.extend([
+        mc.others_long,
+        mc.others_short,
+        mc.mean_confidence,
+        mc.seconds_since_other / 60.0,
+        ps.position_open,
+        ps.leverage,
+        ps.age_seconds / 60.0,
+        ps.is_fork,
+        # Position prices are fed RELATIVE to the live price, never as raw dollars: an entry of
+        # 65000 and one of 0.15 are the same decision in different tokens, and raw levels would not
+        # generalize across instruments the way one shared policy requires.
+        _rel(ps.entry_px, obs.last_price),
+        _rel(ps.sl_px, obs.last_price),
+        _rel(ps.tp_px, obs.last_price),
+        # Size as a fraction of the account, for the same scale-free reason (CLAUDE.md §15.6).
+        (ps.size_usd / obs.account_equity_usd) if obs.account_equity_usd else 0.0,
+    ])
+
+    return np.concatenate([
+        _one_hot(obs.category, SIGNAL_CATEGORIES),
+        _one_hot(sig.kind if sig else "", STRATEGY_KINDS),
+        _one_hot(sig.bar if sig else "", TIMEFRAMES),
+        np.array(scalars, dtype=np.float32),
+    ])
+
+
+def _rel(level: float, price: float) -> float:
+    """A price level as a signed fraction of the live price; 0.0 when either is absent."""
+    if not level or not price:
+        return 0.0
+    return (level - price) / price
+
+
+def recent_trades_block(obs: Observation, window: int = 10) -> np.ndarray:
+    """Fixed-width tail of this token's recent realized outcomes (CLAUDE.md §15.3).
+
+    Specified in §15.3 so the agent can learn to size down after a losing streak, but — like the
+    strategy signals — it was being sent and then dropped before reaching the model. Padded at the
+    FRONT so the most recent trade always lands in the last slot regardless of how many exist.
+    """
+    trades = obs.recent_trades[-window:]
+    pnl = [t.realized_pnl_usd for t in trades]
+    wins = [1.0 if t.win else -1.0 for t in trades]
+    pad = window - len(trades)
+    return np.array([0.0] * pad + pnl + [0.0] * pad + wins, dtype=np.float32)
 
 
 def observation_features(obs: Observation) -> np.ndarray:
@@ -189,37 +414,19 @@ def to_vector(obs: Observation, expected_dim: int) -> np.ndarray:
     return vec
 
 
-def ordered_strategy_ids(obs: Observation) -> list[int]:
-    """The strategy ids the policy's weight slots map onto, in slot order (CLAUDE.md §15.4).
-
-    Flattened across timeframe blocks in request order — the same order go-engine's
-    buildObservation appends them — and truncated to MAX_STRATEGY_SLOTS. Duplicate ids (the same
-    strategy assigned to more than one timeframe) each get their own slot, since they carry
-    genuinely different signals; the response dict then keys by id, so the last one wins there.
-    """
-    ids: list[int] = []
-    for block in obs.timeframes:
-        for sig in block.strategy_signals:
-            ids.append(sig.strategy_id)
-            if len(ids) >= MAX_STRATEGY_SLOTS:
-                return ids
-    return ids
-
-
 def decode_action(raw: np.ndarray, obs: Observation) -> Action:
     """Turns the policy's raw ACTION_DIM vector into the typed Action the Go caller consumes.
 
-    Layout (CLAUDE.md §15.4), all emitted by the policy in tanh-ish ranges and mapped here:
+    Layout (CLAUDE.md §15.4/§15.10), all emitted by the policy in tanh-ish ranges and mapped here:
       [0] target_exposure  in [-1, 1]  -> used as-is (sign = side)
       [1] leverage_frac    in [0, 1]   -> mapped to [1x, max_leverage] by the caller
       [2] sl_adjust_pct    in [-1, 1]  -> scaled by MAX_SLTP_ADJUST_PCT to a fraction of price
       [3] tp_adjust_pct    in [-1, 1]  -> scaled by MAX_SLTP_ADJUST_PCT to a fraction of price
-      [4:] strategy weight slots       -> clipped to [0, 1] and normalized to sum to 1 across the
-                                          strategies actually present in this request
+      [4:] order-action head           -> argmax over ORDER_ACTIONS
 
-    Only the slots backed by a real strategy signal are returned, so a request carrying two
-    strategies gets a two-entry dict regardless of MAX_STRATEGY_SLOTS. The Go side still applies its
-    own ratchet/risk clamps to everything here — none of this is a safety boundary (CLAUDE.md §15.4).
+    Nothing here scales with the number of registered strategies — that is what lets the roster
+    change without an action-space change or a retrain (§15.10). The Go side still applies its own
+    ratchet/risk clamps to everything here — none of this is a safety boundary (CLAUDE.md §15.4).
     """
     vec = np.asarray(raw, dtype=np.float32).reshape(-1)
     if vec.shape[0] < ACTION_DIM:
@@ -230,19 +437,12 @@ def decode_action(raw: np.ndarray, obs: Observation) -> Action:
     sl_adjust_pct = float(np.clip(vec[2], -1.0, 1.0)) * MAX_SLTP_ADJUST_PCT
     tp_adjust_pct = float(np.clip(vec[3], -1.0, 1.0)) * MAX_SLTP_ADJUST_PCT
 
-    ids = ordered_strategy_ids(obs)
-    weights = np.clip(vec[4 : 4 + len(ids)], 0.0, 1.0)
-    total = float(weights.sum())
-    # An all-zero output means the policy trusts none of them; fall back to uniform rather than
-    # emitting a dict of zeros, which the caller would read as "no directional signal at all" and
-    # which is indistinguishable from a bug on its side.
-    if total <= 0.0:
-        weights = np.full(len(ids), 1.0 / len(ids), dtype=np.float32) if ids else weights
-    else:
-        weights = weights / total
+    # The order-action head is an argmax over ORDER_ACTIONS rather than a threshold, so exactly one
+    # action is always selected and the choice is scale-free.
+    order_action = ORDER_ACTIONS[int(np.argmax(vec[4 : 4 + len(ORDER_ACTIONS)]))]
 
     return Action(
-        strategy_weights={str(sid): float(w) for sid, w in zip(ids, weights)},
+        order_action=order_action,
         target_exposure=target_exposure,
         leverage_frac=leverage_frac,
         sl_adjust_pct=sl_adjust_pct,
