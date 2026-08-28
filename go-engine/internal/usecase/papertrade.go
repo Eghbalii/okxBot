@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	mathrand "math/rand"
 	"strconv"
 	"sync"
 	"time"
@@ -321,7 +322,11 @@ func (e *PaperTrader) seedCandles() error {
 				break
 			}
 			if attempt < seedCandleRetries {
-				time.Sleep(seedCandleRetryDelay)
+				// Jittered rather than a fixed delay: several instruments' engines retry at
+				// roughly the same time (they all failed together), and a fixed delay would
+				// just have them collide again on the retry.
+				jitter := time.Duration(mathrand.Int63n(int64(seedCandleRetryDelay)))
+				time.Sleep(seedCandleRetryDelay/2 + jitter)
 			}
 		}
 		if err != nil {

@@ -25,14 +25,24 @@ type Client struct {
 }
 
 // New creates an OKX REST client. baseURL is typically "https://www.okx.com".
+//
+// One Client is shared across every PaperTrader engine (one per configured instrument,
+// CLAUDE.md §15.2 Phase B), so at 10 instruments its Transport routinely serves 10+ concurrent
+// requests to the same host during startup candle-seeding. http.DefaultTransport's
+// MaxIdleConnsPerHost is 2 — well under that concurrency — which forces most of those requests
+// onto freshly-dialed, non-reused connections instead of the pool. Sized here rather than left at
+// the default to avoid connection churn/contention under that load being a confound the next time
+// a transient okx.com error needs diagnosing.
 func New(baseURL, apiKey, apiSecret, passphrase string, simulated bool) *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 20
 	return &Client{
 		BaseURL:    baseURL,
 		APIKey:     apiKey,
 		APISecret:  apiSecret,
 		Passphrase: passphrase,
 		Simulated:  simulated,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		httpClient: &http.Client{Timeout: 10 * time.Second, Transport: transport},
 	}
 }
 
