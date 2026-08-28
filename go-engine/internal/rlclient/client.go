@@ -28,9 +28,10 @@ func New(baseURL string) *Client {
 
 // Predict requests an action from the RL inference service for the given observation.
 //
-// NOTE: decimal.Decimal marshals to a JSON string (not a bare number). rl_service's pydantic
-// models must parse these fields as strings (e.g. Decimal or a validator coercing str->float) —
-// verify against rl_service/serve/api.py before running this end-to-end against the RL service.
+// decimal.Decimal marshals to a JSON string rather than a bare number; rl_service's Pydantic
+// models declare these as float and coerce the string in Pydantic's default lax mode, so the
+// observation crosses the boundary intact. The response direction returns bare JSON numbers, which
+// decimal.Decimal unmarshals directly — both verified against the real schemas.
 func (c *Client) Predict(ctx context.Context, obs domain.Observation) (*domain.Action, error) {
 	body, err := json.Marshal(obs)
 	if err != nil {

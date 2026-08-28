@@ -90,7 +90,6 @@ services:
       dockerfile: Dockerfile.trader
     environment:
       CONFIG_PATH: /app/configs/config.yaml
-      REDIS_ADDR: redis:6379
       RL_SERVICE_URL: http://rl-service:8000
       OKX_API_KEY: ${OKX_API_KEY}
       OKX_API_SECRET: ${OKX_API_SECRET}
@@ -98,8 +97,10 @@ services:
       OKX_SIMULATED_TRADING: ${OKX_SIMULATED_TRADING:-1}
     volumes:
       - ./go-engine/configs:/app/configs
+    # No redis/kafka/postgres dependency: cmd/trader's loop is REST-poll + rl-service only (it
+    # reads none of cfg.Redis/Kafka/Postgres). Redis was listed here from before the event bus
+    # moved to Kafka (§12) and was never actually used by this service.
     depends_on:
-      - redis
       - rl-service
 
   paper-trader:

@@ -218,6 +218,13 @@ func (r *Run) EvaluateCandle(ctx context.Context, window []domain.Candle, price 
 			r.logger.Warn("failed to build candidate strategy", "kind", r.Kind, "trialId", w.trialID, "error", err)
 			continue
 		}
+		// Deliberately the single-timeframe path (plain Evaluate, not strategy.EvaluateWith): a
+		// tuning run evaluates one kind on one bar (CLAUDE.md §16.3), and this Run only maintains
+		// that bar's window. Handing a MultiTimeframeStrategy a MarketView containing just its own
+		// bar would let it silently score as if higher-timeframe confirmation were unavailable,
+		// which is a different strategy than the one that would run in production — better to use
+		// the interface that honestly reflects what this loop can supply. Optimizing a
+		// multi-timeframe strategy needs the runner to maintain those bars first.
 		signal, err := s.Evaluate(window)
 		if err != nil {
 			r.logger.Warn("candidate strategy evaluation failed", "kind", r.Kind, "trialId", w.trialID, "error", err)

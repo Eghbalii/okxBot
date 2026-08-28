@@ -50,10 +50,12 @@ func (f *fakeExchangeClient) SetLeverage(req domain.LeverageChange) error {
 
 // fakeModelClient is a hand-rolled port.ModelClient returning a configured Action.
 type fakeModelClient struct {
-	action domain.Action
+	action  domain.Action
+	lastObs domain.Observation // captured so tests can assert what the model was actually asked
 }
 
 func (f *fakeModelClient) Predict(ctx context.Context, obs domain.Observation) (*domain.Action, error) {
+	f.lastObs = obs
 	a := f.action
 	return &a, nil
 }
@@ -240,5 +242,63 @@ func TestStep_ExactNotionalNoFloatDrift(t *testing.T) {
 	wantSz := dec("100")
 	if !exchange.placedOrders[0].Sz.Equal(wantSz) {
 		t.Errorf("expected sz=%s exactly (no float drift), got %s", wantSz, exchange.placedOrders[0].Sz)
+	}
+}
+
+func testLimits() risk.Limits {
+	return risk.Limits{
+		MaxLeverage: dec("5"), MaxPositionNotionalUSD: dec("1000"),
+		MaxDailyDrawdownPct: dec("5"), MinLiquidationBufferPct: dec("1"),
+	}
+}
+
+// TestStep_ObservationCarriesTokenIdentityAndAccountEquity covers the live/demo path's train-serve
+// consistency (CLAUDE.md §15.1/§15.6): the global model conditions on a token-identity one-hot
+// built from ActiveTokens and was trained on per-token equity, so cmd/trader must send the same
+// roster and this token's own sub-budget — not an empty roster and total account equity, which is a
+// distribution the model never saw in training.
+func TestStep_ObservationCarriesTokenIdentityAndAccountEquity(t *testing.T) {
+	exchange := &fakeExchangeClient{
+		ticker:   domain.Ticker{Last: dec("50000")},
+		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("5000")}},
+	}
+	model := &fakeModelClient{action: domain.Action{TargetExposure: dec("0"), LeverageFrac: dec("0")}}
+	trader := newTestTrader(exchange, model, risk.NewManager(testLimits(), dec("5000")))
+	trader.ActiveTokens = []string{"BTC-USDT-SWAP", "XAU-USD-SWAP"}
+	trader.AccountInitialUSD = dec("100")
+
+	if err := trader.step(context.Background(), testLogger()); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+
+	if len(model.lastObs.ActiveTokens) != 2 {
+		t.Errorf("expected the 2-token roster for the identity one-hot, got %v", model.lastObs.ActiveTokens)
+	}
+	// Demo/real equity is the exchange's reported balance (ground truth), reported alongside the
+	// configured starting balance so drawdown is visible the same way it is in paper mode.
+	if !model.lastObs.AccountEquityUSD.Equal(dec("5000")) {
+		t.Errorf("expected the exchange's reported equity (5000), got %s", model.lastObs.AccountEquityUSD)
+	}
+	if !model.lastObs.AccountInitialUSD.Equal(dec("100")) {
+		t.Errorf("expected the configured starting balance (100), got %s", model.lastObs.AccountInitialUSD)
+	}
+}
+
+// With no configured starting balance, the exchange's current equity stands in for it — the
+// documented fallback, so drawdown reads as zero rather than as a nonsense ratio against zero.
+func TestStep_ObservationFallsBackToLiveEquityWithoutConfiguredInitial(t *testing.T) {
+	exchange := &fakeExchangeClient{
+		ticker:   domain.Ticker{Last: dec("50000")},
+		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("5000")}},
+	}
+	model := &fakeModelClient{action: domain.Action{TargetExposure: dec("0"), LeverageFrac: dec("0")}}
+	trader := newTestTrader(exchange, model, risk.NewManager(testLimits(), dec("5000")))
+
+	if err := trader.step(context.Background(), testLogger()); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+
+	if !model.lastObs.AccountInitialUSD.Equal(dec("5000")) {
+		t.Errorf("expected the live-equity fallback (5000), got %s", model.lastObs.AccountInitialUSD)
 	}
 }

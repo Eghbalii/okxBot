@@ -39,15 +39,33 @@ class WarmStartConfig:
     backtest/evaluation. See rl_service/env/replay_env.py's module docstring."""
 
     inst_ids: list[str] = field(default_factory=lambda: ["BTC-USDT-SWAP"])
-    bar: str = "1m"
+    # The timeframe ReplayEnv steps through. Warm-start is deliberately SINGLE-bar even though the
+    # deployed agent decides on 5m/15m/1H (CLAUDE.md §9): the replay env advances one candle per
+    # step, and interleaving timeframes with different step durations in one pooled sequence would
+    # make "one step" mean different amounts of elapsed time depending on which bar it came from —
+    # the reward signal would be inconsistent across steps. Warm-start only has to get the policy
+    # off random initialization (§15.8); the multi-timeframe distribution is learned from live
+    # paper-trading, which is where the real training signal comes from anyway.
+    # 15m is the middle of the three decision timeframes — enough history to accumulate quickly,
+    # slow enough that the price action resembles the higher bars too.
+    bar: str = "15m"
     total_timesteps: int = 50_000
     model_out: str = "models/ppo_global.zip"
-    initial_equity_usd: float = 10.0  # CLAUDE.md §15.6: matches the real per-token paper budget
+    # CLAUDE.md §15.6 (revised 2026-08-28): ONE shared account across every pooled token, matching
+    # go-engine's account.initial_usd — not a per-token sub-budget.
+    initial_equity_usd: float = 100.0
+    # Mirror account.max_position_pct / account.max_total_exposure_pct on the Go side, so the policy
+    # trains under the same caps production enforces.
+    max_position_pct: float = 0.25
+    max_total_exposure_pct: float = 0.60
 
 
 @dataclass
 class ServeConfig:
-    model_path: str = "models/ppo_okx_futures.zip"
+    # The global agent's artifact (CLAUDE.md §15.1), matching warm_start.model_out — NOT the legacy
+    # okx_futures_env sanity-check env's output. A default pointing at the legacy path meant a
+    # deployment without an explicit config.yaml would look for a file --warm-start never writes.
+    model_path: str = "models/ppo_global.zip"
     host: str = "0.0.0.0"
     port: int = 8000
 

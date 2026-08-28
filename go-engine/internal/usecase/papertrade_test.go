@@ -24,12 +24,13 @@ type fakeRepository struct {
 	nextID       int64
 	orders       map[int64]port.PaperOrder
 	candles      []port.Candle
-	budgets      map[string]port.TokenBudget
+	accounts     map[string]port.AccountEquity
+	equityPoints []port.EquityPoint
 	paramChanges []port.ParamChange
 }
 
 func newFakeRepository() *fakeRepository {
-	return &fakeRepository{orders: make(map[int64]port.PaperOrder), budgets: make(map[string]port.TokenBudget)}
+	return &fakeRepository{orders: make(map[int64]port.PaperOrder), accounts: make(map[string]port.AccountEquity)}
 }
 
 func (r *fakeRepository) SaveCandle(ctx context.Context, c port.Candle) error {
@@ -133,33 +134,61 @@ func (r *fakeRepository) ForkPaperOrderWithSLTP(ctx context.Context, parentID in
 	r.orders[fork.ID] = fork
 	return fork.ID, nil
 }
-func (r *fakeRepository) GetTokenBudget(ctx context.Context, instID string, initialBudgetUSD decimal.Decimal) (port.TokenBudget, error) {
+func (r *fakeRepository) GetAccountEquity(ctx context.Context, mode string, initialUSD decimal.Decimal) (port.AccountEquity, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if tb, ok := r.budgets[instID]; ok {
-		return tb, nil
+	if ae, ok := r.accounts[mode]; ok {
+		return ae, nil
 	}
-	tb := port.TokenBudget{InstID: instID, BudgetUSD: initialBudgetUSD, EquityUSD: initialBudgetUSD}
-	r.budgets[instID] = tb
-	return tb, nil
+	ae := port.AccountEquity{Mode: mode, InitialUSD: initialUSD, EquityUSD: initialUSD}
+	r.accounts[mode] = ae
+	r.equityPoints = append(r.equityPoints, port.EquityPoint{Mode: mode, EquityUSD: initialUSD, Reason: "seed"})
+	return ae, nil
 }
-func (r *fakeRepository) ApplyTokenPnL(ctx context.Context, instID string, pnl decimal.Decimal) (port.TokenBudget, bool, error) {
+
+func (r *fakeRepository) ApplyRealizedPnL(ctx context.Context, mode string, pnl decimal.Decimal, orderID *int64, instID string) (port.AccountEquity, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	tb, ok := r.budgets[instID]
+	ae, ok := r.accounts[mode]
 	if !ok {
-		return port.TokenBudget{}, false, fmt.Errorf("apply pnl: no budget row for %s", instID)
+		return port.AccountEquity{}, false, fmt.Errorf("apply pnl: no account row for mode %s", mode)
 	}
-	tb.EquityUSD = tb.EquityUSD.Add(pnl)
+	ae.EquityUSD = ae.EquityUSD.Add(pnl)
+	r.equityPoints = append(r.equityPoints, port.EquityPoint{
+		Mode: mode, EquityUSD: ae.EquityUSD, DeltaUSD: pnl, Reason: "trade", OrderID: orderID, InstID: instID,
+	})
+
 	reset := false
-	if tb.EquityUSD.Sign() <= 0 {
-		tb.EquityUSD = tb.BudgetUSD
-		tb.ResetCount++
+	// Real mode never auto-resets a drained balance (CLAUDE.md §15.7) — mirrored here so tests
+	// exercise the same carve-out the Postgres implementation enforces.
+	if ae.EquityUSD.Sign() <= 0 && mode != "real" {
+		drained := ae.EquityUSD
+		ae.EquityUSD = ae.InitialUSD
+		ae.ResetCount++
 		reset = true
+		r.equityPoints = append(r.equityPoints, port.EquityPoint{
+			Mode: mode, EquityUSD: ae.EquityUSD, DeltaUSD: ae.EquityUSD.Sub(drained), Reason: "reset", InstID: instID,
+		})
 	}
-	r.budgets[instID] = tb
-	return tb, reset, nil
+	r.accounts[mode] = ae
+	return ae, reset, nil
 }
+
+func (r *fakeRepository) ListEquityHistory(ctx context.Context, mode string, since time.Time, limit int) ([]port.EquityPoint, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []port.EquityPoint
+	for _, p := range r.equityPoints {
+		if p.Mode == mode {
+			out = append(out, p)
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out, nil
+}
+
 func (r *fakeRepository) SLTPAdjustmentStats(ctx context.Context, instID string, since time.Time) ([]port.VariantStats, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -289,11 +318,17 @@ func newTestPaperTrader(repo port.Repository, strategies []StrategyAssignment) *
 			"1m":  noopConsumer{},
 			"15m": noopConsumer{},
 		},
-		Repo:          repo,
-		NotionalUSD:   dec("100"),
-		MaxOpenOrders: 3,
-		Logger:        testLogger(),
-		candles:       map[string][]domain.Candle{"1m": nil, "15m": nil},
+		Repo:        repo,
+		NotionalUSD: dec("100"),
+		// Shared-account defaults (CLAUDE.md §15.6): a $1000 pool with the production caps, so
+		// sizing tests exercise the real cap arithmetic rather than an unbounded path.
+		Mode:                "paper",
+		AccountInitialUSD:   dec("1000"),
+		MaxPositionPct:      dec("0.25"),
+		MaxTotalExposurePct: dec("0.60"),
+		MaxOpenOrders:       3,
+		Logger:              testLogger(),
+		candles:             map[string][]domain.Candle{"1m": nil, "15m": nil},
 	}
 }
 
@@ -556,7 +591,6 @@ func TestAdjustOpenOrdersWithRL_ForksOnNonZeroAdjustment(t *testing.T) {
 	pt.candles = map[string][]domain.Candle{"1m": {
 		{Close: dec("100")}, {Close: dec("101")}, {Close: dec("102")}, {Close: dec("105")},
 	}, "15m": nil}
-	pt.TokenBudgetUSD = dec("10")
 	model := &fakeModelClientRL{action: domain.Action{SLAdjustPct: dec("0.02"), TPAdjustPct: dec("0.02")}}
 	pt.Model = model
 
@@ -656,6 +690,7 @@ func TestHandleTick_TriggersRLAdjustOnLiveTickPrice(t *testing.T) {
 	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
 	model := &fakeModelClientRL{action: domain.Action{}}
 	pt.Model = model
+	pt.RLSLTPAdjust = true
 
 	sl := dec("95")
 	_, err := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
@@ -684,6 +719,7 @@ func TestHandleTick_RLAdjustThrottled(t *testing.T) {
 	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
 	model := &fakeModelClientRL{action: domain.Action{}}
 	pt.Model = model
+	pt.RLSLTPAdjust = true
 
 	sl := dec("95")
 	_, err := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
@@ -804,7 +840,6 @@ func TestEvaluateStrategies_PersistsDecisionTimeObservation(t *testing.T) {
 		{Close: dec("98")}, {Close: dec("99")}, {Close: dec("100")},
 	}
 	pt.ActiveTokens = []string{"BTC-USDT-SWAP", "XAU-USD-SWAP"}
-	pt.TokenBudgetUSD = dec("10")
 
 	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -833,5 +868,382 @@ func TestEvaluateStrategies_PersistsDecisionTimeObservation(t *testing.T) {
 	}
 	if obs.Timeframes[0].StrategySignals[0].StrategyID != 7 {
 		t.Errorf("expected strategy signal StrategyID=7, got %d", obs.Timeframes[0].StrategySignals[0].StrategyID)
+	}
+}
+
+// errModelClient always fails, covering the RL-sizing fallback path: a model error must never
+// block opening the order, it just falls back to the configured fixed sizing.
+type errModelClient struct{ calls int }
+
+func (f *errModelClient) Predict(ctx context.Context, obs domain.Observation) (*domain.Action, error) {
+	f.calls++
+	return nil, fmt.Errorf("rl-service unavailable")
+}
+
+func newSizingTestPaperTrader(repo port.Repository, model port.ModelClient) *PaperTrader {
+	buy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "1m", Strategy: buy}})
+	pt.candles["1m"] = []domain.Candle{{Open: dec("100"), High: dec("101"), Low: dec("99"), Close: dec("100"), Volume: dec("1")}}
+	pt.Model = model
+	pt.MaxLeverage = dec("100")
+	return pt
+}
+
+func openedOrder(t *testing.T, repo port.Repository) port.PaperOrder {
+	t.Helper()
+	open, err := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if err != nil || len(open) != 1 {
+		t.Fatalf("expected exactly 1 open order (err=%v), got %d", err, len(open))
+	}
+	return open[0]
+}
+
+// TestEvaluateStrategies_RLSizingSetsNotionalAndLeverage covers CLAUDE.md §15.4's sizing action:
+// with rl_sizing on, a new order's size/leverage come from the model's TargetExposure/LeverageFrac
+// instead of the fixed NotionalUSD at 1x — without this, the paper_orders log has no
+// leverage/exposure variance for §15.8's continued-live-learning phase to learn sizing from.
+func TestEvaluateStrategies_RLSizingSetsNotionalAndLeverage(t *testing.T) {
+	repo := newFakeRepository()
+	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("0.5"), LeverageFrac: dec("0.1")}}
+	pt := newSizingTestPaperTrader(repo, model)
+	pt.RLSizing = true
+
+	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies: %v", err)
+	}
+
+	o := openedOrder(t, repo)
+	// 0.5 exposure of the $1000 account = $500, capped to MaxPositionPct (25% = $250).
+	if !o.Size.Equal(dec("250")) {
+		t.Errorf("expected size capped to 250 (25%% of a 1000 account), got %s", o.Size)
+	}
+	// leverage_frac 0.1 maps onto [1x, 100x]: 1 + 0.1*99
+	if !o.Leverage.Equal(dec("10.9")) {
+		t.Errorf("expected leverage 10.9 from frac 0.1 against a 100x cap, got %s", o.Leverage)
+	}
+}
+
+// The strategy layer owns direction (CLAUDE.md §9/§16.1) — a negative TargetExposure against a buy
+// signal must size the order, never flip it to a sell.
+func TestEvaluateStrategies_RLSizingNeverFlipsSignalDirection(t *testing.T) {
+	repo := newFakeRepository()
+	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("-0.4"), LeverageFrac: dec("0")}}
+	pt := newSizingTestPaperTrader(repo, model)
+	pt.RLSizing = true
+
+	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies: %v", err)
+	}
+
+	o := openedOrder(t, repo)
+	if o.Side != "buy" {
+		t.Errorf("expected the strategy's buy side preserved, got %q", o.Side)
+	}
+	// Magnitude only: |−0.4| * 1000 = 400, capped to 25% of equity = 250.
+	if !o.Size.Equal(dec("250")) {
+		t.Errorf("expected the exposure magnitude sized and capped to 250, got %s", o.Size)
+	}
+}
+
+func TestEvaluateStrategies_RLSizingDisabledKeepsFixedSizing(t *testing.T) {
+	repo := newFakeRepository()
+	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("0.5"), LeverageFrac: dec("1")}}
+	pt := newSizingTestPaperTrader(repo, model) // RLSizing left false
+
+	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies: %v", err)
+	}
+
+	o := openedOrder(t, repo)
+	if !o.Size.Equal(dec("100")) || !o.Leverage.Equal(dec("1")) {
+		t.Errorf("expected the fixed 100 @ 1x while rl_sizing is off, got %s @ %sx", o.Size, o.Leverage)
+	}
+	if model.calls != 0 {
+		t.Errorf("expected the model never consulted while rl_sizing is off, got %d calls", model.calls)
+	}
+}
+
+// A failing rl-service must degrade to the fixed sizing, never block the trade.
+func TestEvaluateStrategies_RLSizingFallsBackWhenModelErrors(t *testing.T) {
+	repo := newFakeRepository()
+	model := &errModelClient{}
+	pt := newSizingTestPaperTrader(repo, model)
+	pt.RLSizing = true
+
+	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies must not fail when the model errors: %v", err)
+	}
+
+	o := openedOrder(t, repo)
+	if !o.Size.Equal(dec("100")) || !o.Leverage.Equal(dec("1")) {
+		t.Errorf("expected fallback to the fixed 100 @ 1x, got %s @ %sx", o.Size, o.Leverage)
+	}
+	if model.calls != 1 {
+		t.Errorf("expected one Predict attempt before falling back, got %d", model.calls)
+	}
+}
+
+// TestRLSizing_TotalExposureCeilingBlocksNewPosition covers the second Go-side cap (CLAUDE.md
+// §15.6): the per-position cap alone still permits enough simultaneous positions to commit the
+// whole account, so total open exposure is bounded independently.
+func TestRLSizing_TotalExposureCeilingBlocksNewPosition(t *testing.T) {
+	repo := newFakeRepository()
+	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("1"), LeverageFrac: dec("0")}}
+	pt := newSizingTestPaperTrader(repo, model)
+	pt.RLSizing = true
+
+	// 600 already open == the whole 60% ceiling on a 1000 account: no headroom left.
+	_, err := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), Size: dec("600"), Leverage: dec("1"),
+	})
+	if err != nil {
+		t.Fatalf("seed open order: %v", err)
+	}
+
+	obs := domain.Observation{AccountEquityUSD: dec("1000")}
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	_, _, ok := pt.rlSizing(context.Background(), obs, strategy.Signal{Side: strategy.Buy}, open, testLogger())
+
+	if ok {
+		t.Error("expected RL sizing to decline once the total-exposure ceiling is reached")
+	}
+}
+
+func TestRLSizing_TrimsToRemainingExposureHeadroom(t *testing.T) {
+	repo := newFakeRepository()
+	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("1"), LeverageFrac: dec("0")}}
+	pt := newSizingTestPaperTrader(repo, model)
+	pt.RLSizing = true
+
+	// 500 open against a 600 ceiling leaves 100 of headroom, below the 250 per-position cap.
+	_, err := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), Size: dec("500"), Leverage: dec("1"),
+	})
+	if err != nil {
+		t.Fatalf("seed open order: %v", err)
+	}
+
+	obs := domain.Observation{AccountEquityUSD: dec("1000")}
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	notional, _, ok := pt.rlSizing(context.Background(), obs, strategy.Signal{Side: strategy.Buy}, open, testLogger())
+
+	if !ok {
+		t.Fatal("expected sizing to succeed with headroom remaining")
+	}
+	if !notional.Equal(dec("100")) {
+		t.Errorf("expected the position trimmed to the 100 of remaining headroom, got %s", notional)
+	}
+}
+
+// Forks shadow their baseline parent rather than committing separate capital (CLAUDE.md §15.4), so
+// counting them toward the exposure ceiling would double-charge one signal.
+func TestRLSizing_ForksDoNotCountTowardExposureCeiling(t *testing.T) {
+	repo := newFakeRepository()
+	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("0.1"), LeverageFrac: dec("0")}}
+	pt := newSizingTestPaperTrader(repo, model)
+	pt.RLSizing = true
+
+	obs := domain.Observation{AccountEquityUSD: dec("1000")}
+	open := []port.PaperOrder{
+		{InstID: "BTC-USDT-SWAP", Size: dec("300"), Variant: "baseline"},
+		{InstID: "BTC-USDT-SWAP", Size: dec("300"), Variant: "rl_adjusted"}, // must not count
+	}
+	notional, _, ok := pt.rlSizing(context.Background(), obs, strategy.Signal{Side: strategy.Buy}, open, testLogger())
+
+	if !ok {
+		t.Fatal("expected sizing to succeed: only the 300 baseline counts against the 600 ceiling")
+	}
+	if !notional.Equal(dec("100")) { // 0.1 * 1000, under both caps
+		t.Errorf("expected 100, got %s", notional)
+	}
+}
+
+func TestRLSizing_DeclinesOnDrainedAccount(t *testing.T) {
+	repo := newFakeRepository()
+	model := &fakeModelClientRL{action: domain.Action{TargetExposure: dec("1"), LeverageFrac: dec("0")}}
+	pt := newSizingTestPaperTrader(repo, model)
+	pt.RLSizing = true
+
+	obs := domain.Observation{AccountEquityUSD: decimal.Zero}
+	_, _, ok := pt.rlSizing(context.Background(), obs, strategy.Signal{Side: strategy.Buy}, nil, testLogger())
+
+	if ok {
+		t.Error("expected sizing to decline against a drained account rather than sizing off a stale constant")
+	}
+	if model.calls != 0 {
+		t.Errorf("expected no model call when there's no equity to size against, got %d", model.calls)
+	}
+}
+
+// TestMonitorOpenOrders_DrainedAccountResetsAndRecordsTimeline covers CLAUDE.md §15.7: a paper
+// account drained to zero is topped back up, and — the part that matters for reviewing it after
+// the fact — both the drop and the reset land in the equity timeline the panel charts.
+func TestMonitorOpenOrders_DrainedAccountResetsAndRecordsTimeline(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.AccountInitialUSD = dec("100")
+
+	if _, err := repo.GetAccountEquity(ctx, "paper", dec("100")); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	// A losing long: entry 100, SL 95, size 2000 => -100 realized, draining the account exactly.
+	sl := dec("95")
+	if _, err := repo.OpenPaperOrder(ctx, port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, Size: dec("2000"), Leverage: dec("1"),
+	}); err != nil {
+		t.Fatalf("open order: %v", err)
+	}
+
+	if err := pt.monitorOpenOrders(ctx, dec("95"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders: %v", err)
+	}
+
+	acct, _ := repo.GetAccountEquity(ctx, "paper", dec("100"))
+	if !acct.EquityUSD.Equal(dec("100")) {
+		t.Errorf("expected the drained account reset to its 100 initial, got %s", acct.EquityUSD)
+	}
+	if acct.ResetCount != 1 {
+		t.Errorf("expected reset_count 1, got %d", acct.ResetCount)
+	}
+
+	history, err := repo.ListEquityHistory(ctx, "paper", time.Time{}, 0)
+	if err != nil {
+		t.Fatalf("list equity history: %v", err)
+	}
+	var sawTrade, sawReset bool
+	for _, p := range history {
+		switch p.Reason {
+		case "trade":
+			sawTrade = true
+		case "reset":
+			sawReset = true
+		}
+	}
+	if !sawTrade || !sawReset {
+		t.Errorf("expected both the losing trade and the reset in the timeline, got %+v", history)
+	}
+}
+
+// Real money is never auto-topped-up (CLAUDE.md §15.7): running out is a stop condition for a
+// human, not a bookkeeping event.
+func TestApplyRealizedPnL_RealModeNeverAutoResets(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "real", dec("100")); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	acct, reset, err := repo.ApplyRealizedPnL(ctx, "real", dec("-150"), nil, "BTC-USDT-SWAP")
+	if err != nil {
+		t.Fatalf("apply pnl: %v", err)
+	}
+	if reset {
+		t.Error("real mode must never auto-reset a drained balance")
+	}
+	if !acct.EquityUSD.Equal(dec("-50")) {
+		t.Errorf("expected the real balance left at -50, got %s", acct.EquityUSD)
+	}
+}
+
+// TestDecisionBar_DefaultsToShortestConfiguredBar covers the replacement for the old Bars[0]
+// selection (CLAUDE.md §15.9): a tick belongs to no single bar, so the decision context is chosen
+// deliberately — the shortest timeframe, being the freshest read of what price is doing right now.
+// Array order silently changing meaning when the config list is reordered was the old behavior.
+func TestDecisionBar_DefaultsToShortestConfiguredBar(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		bars []string
+		want string
+	}{
+		{"ordered", []string{"5m", "15m", "1H"}, "5m"},
+		{"reversed", []string{"1H", "15m", "5m"}, "5m"},
+		{"hours only", []string{"4H", "1H"}, "1H"},
+		{"single", []string{"15m"}, "15m"},
+		{"with days", []string{"1D", "4H", "15m"}, "15m"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pt := &PaperTrader{Bars: tc.bars}
+			if got := pt.decisionBar(); got != tc.want {
+				t.Errorf("bars %v: want %q, got %q", tc.bars, tc.want, got)
+			}
+		})
+	}
+}
+
+func TestDecisionBar_ExplicitConfigWins(t *testing.T) {
+	pt := &PaperTrader{Bars: []string{"5m", "15m", "1H"}, RLDecisionBar: "1H"}
+	if got := pt.decisionBar(); got != "1H" {
+		t.Errorf("want the explicitly configured 1H, got %q", got)
+	}
+}
+
+func TestBarSeconds_OrdersTimeframes(t *testing.T) {
+	if barSeconds("5m") >= barSeconds("15m") {
+		t.Error("5m must sort before 15m")
+	}
+	if barSeconds("15m") >= barSeconds("1H") {
+		t.Error("15m must sort before 1H")
+	}
+	if barSeconds("1H") >= barSeconds("4H") {
+		t.Error("1H must sort before 4H")
+	}
+	if barSeconds("4H") >= barSeconds("1D") {
+		t.Error("4H must sort before 1D")
+	}
+	// Case-insensitive on the unit: a mis-cased bar is rejected by config validation, but ordering
+	// must not silently misbehave if one reaches here.
+	if barSeconds("1h") != barSeconds("1H") {
+		t.Error("hour ordering must not depend on casing")
+	}
+	// 'm' is minutes, 'M' is months in OKX's scheme — these must not collide.
+	if barSeconds("1m") >= barSeconds("1M") {
+		t.Error("1m (minute) must sort well before 1M (month)")
+	}
+	if barSeconds("") != barSeconds("nonsense") {
+		t.Error("unrecognized bars should both sort last")
+	}
+}
+
+// A multi-timeframe strategy must receive every maintained bar, not just its own, when the engine
+// evaluates it (CLAUDE.md §9).
+func TestMarketView_CarriesAllMaintainedBars(t *testing.T) {
+	pt := newTestPaperTrader(newFakeRepository(), nil)
+	pt.candles = map[string][]domain.Candle{
+		"5m":  {{Close: dec("1")}, {Close: dec("2")}},
+		"15m": {{Close: dec("3")}},
+		"1H":  {{Close: dec("4")}},
+	}
+
+	v := pt.marketView("5m")
+
+	if v.Bar != "5m" {
+		t.Errorf("want decision bar 5m, got %q", v.Bar)
+	}
+	if len(v.Candles) != 2 {
+		t.Errorf("want the 5m window of 2, got %d", len(v.Candles))
+	}
+	if len(v.Bars) != 3 {
+		t.Errorf("want all 3 maintained bars available, got %d", len(v.Bars))
+	}
+	if h, ok := v.Higher("1H", 1); !ok || len(h) != 1 {
+		t.Errorf("want 1H context reachable, got ok=%v len=%d", ok, len(h))
+	}
+}
+
+// marketView must hand out a snapshot: a strategy holding the returned slices must not observe
+// later engine writes, and must not be able to mutate engine state.
+func TestMarketView_IsASnapshot(t *testing.T) {
+	pt := newTestPaperTrader(newFakeRepository(), nil)
+	pt.candles = map[string][]domain.Candle{"5m": {{Close: dec("1")}}}
+
+	v := pt.marketView("5m")
+	pt.candlesMu.Lock()
+	pt.candles["5m"] = append(pt.candles["5m"], domain.Candle{Close: dec("2")})
+	pt.candlesMu.Unlock()
+
+	if len(v.Bars["5m"]) != 1 {
+		t.Errorf("snapshot must not see later appends, got %d candles", len(v.Bars["5m"]))
 	}
 }

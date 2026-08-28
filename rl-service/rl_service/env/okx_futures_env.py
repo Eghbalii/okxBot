@@ -25,7 +25,7 @@ class OkxFuturesEnv(gym.Env):
         self,
         df,
         window_size: int = 32,
-        max_leverage: float = 5.0,
+        max_leverage: float = 100.0,  # matches EnvConfig.max_leverage / go-engine risk.max_leverage
         max_position_notional_usd: float = 1000.0,
         taker_fee_rate: float = 0.0005,
         funding_rate_per_8h: float = 0.0001,

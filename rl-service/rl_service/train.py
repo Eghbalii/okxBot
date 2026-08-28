@@ -64,9 +64,10 @@ def make_warm_start_env(cfg, dsn: str | None = None):
             bar=cfg.warm_start.bar,
             active_tokens=cfg.warm_start.inst_ids,
             max_leverage=cfg.env.max_leverage,
-            max_position_notional_usd=cfg.env.max_position_notional_usd,
             taker_fee_rate=cfg.env.taker_fee_rate,
             initial_equity_usd=cfg.warm_start.initial_equity_usd,
+            max_position_pct=cfg.warm_start.max_position_pct,
+            max_total_exposure_pct=cfg.warm_start.max_total_exposure_pct,
         )
         return Monitor(env)
 

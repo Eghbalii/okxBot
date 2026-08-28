@@ -68,7 +68,7 @@ func main() {
 	// strict no-op wherever operators haven't opted in — same "additive, never required" posture
 	// as the rest of §15's rollout.
 	var model port.ModelClient
-	if cfg.PaperTrading.RLSLTPAdjust {
+	if cfg.PaperTrading.RLSLTPAdjust || cfg.PaperTrading.RLSizing {
 		model = rlclient.New(cfg.RLService.URL)
 	}
 
@@ -120,9 +120,18 @@ func main() {
 			MaxOpenOrders:   cfg.PaperTrading.MaxOpenOrders,
 			Logger:          logger,
 			Model:           model,
+			RLSLTPAdjust:    cfg.PaperTrading.RLSLTPAdjust,
+			RLDecisionBar:   cfg.PaperTrading.RLDecisionBar,
+			RLSizing:        cfg.PaperTrading.RLSizing,
+			MaxLeverage:     cfg.Risk.MaxLeverage,
 			ActiveTokens:    cfg.Trading.InstIDs,
-			TokenBudgetUSD:  cfg.PaperTrading.TokenBudgetUSD,
-			OrderEvents:     orderEventsPub,
+			// One shared account across every token (CLAUDE.md §15.6): each per-instrument engine
+			// trades against the same "paper" balance row, not a slice of it.
+			Mode:                "paper",
+			AccountInitialUSD:   cfg.Account.InitialUSD,
+			MaxPositionPct:      cfg.Account.MaxPositionPct,
+			MaxTotalExposurePct: cfg.Account.MaxTotalExposurePct,
+			OrderEvents:         orderEventsPub,
 		}
 		go func() { errCh <- engine.Run(ctx) }()
 	}

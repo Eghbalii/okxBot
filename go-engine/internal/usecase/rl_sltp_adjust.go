@@ -81,6 +81,118 @@ func (e *PaperTrader) adjustOpenOrdersWithRL(ctx context.Context, bar string, pr
 	}
 }
 
+// rlSizing asks the RL agent how much of the SHARED account to put behind a strategy signal that
+// has already decided to trade (CLAUDE.md §15.4/§15.6): TargetExposure is a fraction of current
+// account equity, LeverageFrac maps onto [1x, MaxLeverage]. Returns ok=false — leaving the caller's
+// fixed sizing untouched — when RL sizing is disabled, unconfigured, the model errors, or the model
+// asks for effectively no exposure.
+//
+// Two hard Go-side caps bound the result regardless of what the model proposes, the same
+// "never trust the model as the safety boundary" pattern as §15.4's SL/TP ratchet and §5's risk
+// manager:
+//
+//   - MaxPositionPct — no single position may exceed this fraction of equity, so one confident
+//     early decision can't put most of the account into one trade.
+//   - MaxTotalExposurePct — the sum of all currently-open positions' notionals is capped too,
+//     since the per-position cap alone still permits N simultaneous positions at the cap.
+//
+// Deliberately magnitude-only: the strategy layer owns direction (CLAUDE.md §9/§16.1 — strategies
+// decide *when* there's a tradeable signal, the agent decides *how much*), so a model that
+// disagrees with the signal's side expresses that by sizing down toward zero, never by flipping
+// the order's side out from under the strategy that generated it.
+func (e *PaperTrader) rlSizing(
+	ctx context.Context,
+	obs domain.Observation,
+	signal strategy.Signal,
+	openOrders []port.PaperOrder,
+	logger *slog.Logger,
+) (notional, leverage decimal.Decimal, ok bool) {
+	if !e.RLSizing || e.Model == nil || !e.MaxLeverage.IsPositive() {
+		return decimal.Zero, decimal.Zero, false
+	}
+
+	equity := obs.AccountEquityUSD
+	if !equity.IsPositive() {
+		// A drained (or unreadable) account has nothing to size against. Falling back to the fixed
+		// notional here would quietly ignore the drain, so decline instead and let the caller's
+		// own budget check decide whether to trade at all.
+		logger.Warn("rl sizing: no positive account equity to size against, falling back",
+			"instId", e.InstID, "equity", equity)
+		return decimal.Zero, decimal.Zero, false
+	}
+
+	action, err := e.Model.Predict(ctx, obs)
+	if err != nil {
+		logger.Warn("rl sizing: predict failed, falling back to fixed sizing",
+			"instId", e.InstID, "error", err)
+		return decimal.Zero, decimal.Zero, false
+	}
+
+	exposure := clampUnit(action.TargetExposure.Abs())
+	if !exposure.IsPositive() {
+		// The agent wants no exposure behind this signal. Sizing to zero would open a meaningless
+		// order, so keep the fixed sizing and let the trade stand as the strategy proposed it —
+		// declining to trade entirely is not this pass's decision to make (CLAUDE.md §9).
+		return decimal.Zero, decimal.Zero, false
+	}
+
+	notional = equity.Mul(exposure)
+
+	if e.MaxPositionPct.IsPositive() {
+		if cap := equity.Mul(e.MaxPositionPct); notional.GreaterThan(cap) {
+			logger.Info("rl sizing: position capped", "instId", e.InstID,
+				"requested", notional, "cap", cap, "maxPositionPct", e.MaxPositionPct)
+			notional = cap
+		}
+	}
+
+	if e.MaxTotalExposurePct.IsPositive() {
+		var openNotional decimal.Decimal
+		for _, o := range openOrders {
+			// Forks are tracking-only shadows of their baseline parent (CLAUDE.md §15.4), not
+			// separate capital at risk — counting them would double-charge one signal's exposure.
+			if o.Variant == "baseline" || o.Variant == "" {
+				openNotional = openNotional.Add(o.Size)
+			}
+		}
+		headroom := equity.Mul(e.MaxTotalExposurePct).Sub(openNotional)
+		if headroom.LessThanOrEqual(decimal.Zero) {
+			logger.Info("rl sizing: total exposure ceiling reached, falling back",
+				"instId", e.InstID, "openNotional", openNotional,
+				"maxTotalExposurePct", e.MaxTotalExposurePct)
+			return decimal.Zero, decimal.Zero, false
+		}
+		if notional.GreaterThan(headroom) {
+			logger.Info("rl sizing: position trimmed to remaining exposure headroom",
+				"instId", e.InstID, "requested", notional, "headroom", headroom)
+			notional = headroom
+		}
+	}
+
+	if !notional.IsPositive() {
+		return decimal.Zero, decimal.Zero, false
+	}
+
+	leverage = decimal.NewFromInt(1).Add(clampUnit(action.LeverageFrac).Mul(e.MaxLeverage.Sub(decimal.NewFromInt(1))))
+
+	logger.Debug("rl sizing applied", "instId", e.InstID, "side", signal.Side,
+		"equity", equity, "exposure", exposure, "notional", notional, "leverage", leverage)
+	return notional, leverage, true
+}
+
+// clampUnit clamps d into [0, 1] — the range every fractional model output is defined over.
+func clampUnit(d decimal.Decimal) decimal.Decimal {
+	one := decimal.NewFromInt(1)
+	switch {
+	case d.IsNegative():
+		return decimal.Zero
+	case d.GreaterThan(one):
+		return one
+	default:
+		return d
+	}
+}
+
 // buildObservation assembles the CLAUDE.md §15.3 v3 observation for this token, shared across all
 // of this token's open orders for one evaluation pass (position/PnL/dist-to-SL-TP fields are then
 // overwritten per-order by the caller, since those are order-specific). The candle window/strategy
@@ -89,16 +201,15 @@ func (e *PaperTrader) adjustOpenOrdersWithRL(ctx context.Context, bar string, pr
 // price when called from handleTick (CLAUDE.md §15.9), a candle close when called from
 // evaluateStrategies' new-order path (still candle-driven by design, §9).
 func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) domain.Observation {
-	e.candlesMu.Lock()
-	window := append([]domain.Candle(nil), e.candles[bar]...)
-	e.candlesMu.Unlock()
+	view := e.marketView(bar)
+	window := view.Candles
 
 	tb := domain.TimeframeBlock{Bar: bar, PriceContext: buildPriceContext(window)}
 	for _, a := range e.Strategies {
 		if a.Bar != bar {
 			continue
 		}
-		sig, err := a.Strategy.Evaluate(window)
+		sig, err := strategy.EvaluateWith(a.Strategy, view)
 		if err != nil {
 			continue // best-effort: a failing strategy just doesn't contribute a signal this round
 		}
@@ -112,22 +223,45 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 	}
 
 	obs := domain.Observation{
-		SchemaVersion:  domain.ObservationSchemaVersion,
-		InstID:         e.InstID,
-		ActiveTokens:   e.ActiveTokens,
-		LastPrice:      price,
-		Timeframes:     []domain.TimeframeBlock{tb},
-		TokenBudgetUSD: e.TokenBudgetUSD,
-		RecentTrades:   e.recentBaselineTrades(ctx, logger),
+		SchemaVersion:     domain.ObservationSchemaVersion,
+		InstID:            e.InstID,
+		ActiveTokens:      e.ActiveTokens,
+		LastPrice:         price,
+		Timeframes:        []domain.TimeframeBlock{tb},
+		AccountInitialUSD: e.AccountInitialUSD,
+		RecentTrades:      e.recentBaselineTrades(ctx, logger),
 	}
 
-	if tb2, err := e.Repo.GetTokenBudget(ctx, e.InstID, e.TokenBudgetUSD); err == nil {
-		obs.TokenEquityUSD = tb2.EquityUSD
+	if acct, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), e.AccountInitialUSD); err == nil {
+		obs.AccountEquityUSD = acct.EquityUSD
 	} else {
-		logger.Warn("rl observation: get token budget failed", "instId", e.InstID, "error", err)
+		logger.Warn("rl observation: get account equity failed", "mode", e.accountMode(), "error", err)
 	}
+	obs.OpenExposureUSD = e.openExposure(ctx, logger)
 
 	return obs
+}
+
+// openExposure sums the notional of every open baseline position across ALL tokens (CLAUDE.md
+// §15.6): with one shared account, the agent has to see how much of it is already committed
+// elsewhere before asking for more. Forks are excluded — they shadow their baseline parent rather
+// than putting separate capital at risk (§15.4). Best-effort: a read failure reports zero exposure
+// rather than blocking the decision, and the Go-side caps in rlSizing still bound the result.
+func (e *PaperTrader) openExposure(ctx context.Context, logger *slog.Logger) decimal.Decimal {
+	openOnly := true
+	positions, err := e.Repo.ListPositions(ctx, port.PositionFilter{Mode: e.accountMode(), Open: &openOnly})
+	if err != nil {
+		logger.Warn("rl observation: list open positions failed", "mode", e.accountMode(), "error", err)
+		return decimal.Zero
+	}
+
+	var total decimal.Decimal
+	for _, p := range positions {
+		if p.Variant == "baseline" || p.Variant == "" {
+			total = total.Add(p.Size)
+		}
+	}
+	return total
 }
 
 // recentBaselineTrades fetches the most-recent closed baseline trades for this token, oldest-last

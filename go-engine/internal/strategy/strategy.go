@@ -48,7 +48,62 @@ type Strategy interface {
 	// WithParams returns a copy of the strategy configured with the given param values, keyed by
 	// ParamSpec.Name. Values for unrecognized or missing keys keep their current setting.
 	WithParams(values map[string]decimal.Decimal) Strategy
+	// Evaluate reads the candle window of the timeframe this strategy is assigned to. A strategy
+	// that also wants higher-timeframe context implements MultiTimeframeStrategy below instead of
+	// changing this signature.
 	Evaluate(candles []Candle) (Signal, error)
+}
+
+// MarketView is the multi-timeframe read handed to a MultiTimeframeStrategy (CLAUDE.md §9): the
+// bar the strategy is assigned to (its decision cadence), that bar's own window, and every other
+// timeframe the ingestor is collecting for this instrument.
+//
+// The point is that trading a 5m signal while confirming trend on 1h/4h is normal discretionary
+// practice, and a strategy restricted to one window structurally cannot express it. Which
+// timeframes a strategy *decides* on stays separate from which it may *look at*.
+type MarketView struct {
+	// Bar is the timeframe whose candle just closed — the strategy's decision cadence.
+	Bar string
+	// Candles is Bars[Bar]: the assigned timeframe's window, identical to what Evaluate receives.
+	Candles []Candle
+	// Bars holds every timeframe currently maintained for this instrument, keyed by bar
+	// ("5m", "15m", "1H", ...). Read-only: the map and its slices are a snapshot the caller owns.
+	// A requested bar may be absent or too short to compute an indicator over — Higher() returns
+	// ok=false rather than a partial window, and a strategy must degrade gracefully when it does
+	// (the engine keeps running through a warm-up period where longer timeframes are still filling).
+	Bars map[string][]Candle
+}
+
+// Higher returns another timeframe's window, reporting ok=false when that bar isn't being
+// collected or hasn't accumulated at least minLen candles yet. Callers should treat !ok as "no
+// higher-timeframe opinion available right now" and fall back to their single-timeframe logic,
+// never as an error — during warm-up this is the normal case, not a failure.
+func (v MarketView) Higher(bar string, minLen int) ([]Candle, bool) {
+	c, ok := v.Bars[bar]
+	if !ok || len(c) < minLen {
+		return nil, false
+	}
+	return c, true
+}
+
+// MultiTimeframeStrategy is the OPTIONAL capability a Strategy implements when it wants context
+// from timeframes other than the one it's assigned to. The engine type-asserts for it and calls
+// EvaluateView instead of Evaluate; a strategy that doesn't implement it is unaffected, which is
+// why this is a separate interface rather than a change to Strategy's own signature (14 built-in
+// strategies would otherwise all need editing to gain a parameter most of them ignore).
+type MultiTimeframeStrategy interface {
+	Strategy
+	EvaluateView(view MarketView) (Signal, error)
+}
+
+// EvaluateWith runs s against view, using its multi-timeframe path when it has one and falling
+// back to plain Evaluate otherwise. Every engine call site goes through this, so adding
+// higher-timeframe awareness to a strategy needs no change at the call sites.
+func EvaluateWith(s Strategy, view MarketView) (Signal, error) {
+	if mt, ok := s.(MultiTimeframeStrategy); ok {
+		return mt.EvaluateView(view)
+	}
+	return s.Evaluate(view.Candles)
 }
 
 // ClampParam clamps a proposed value to a ParamSpec's [Min, Max] range. Strategy.WithParams

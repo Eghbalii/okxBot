@@ -7,11 +7,30 @@ import "github.com/shopspring/decimal"
 // checks this against what the loaded global model was trained for and rejects a mismatch rather
 // than silently misaligning features into the wrong vector positions.
 //
-// v3 (current): switched from one-agent-per-token to a single global agent (CLAUDE.md §15.1) —
-// added ActiveTokens (for the token-identity one-hot) and PriceContext (raw price series +
+// v3: switched from one-agent-per-token to a single global agent (CLAUDE.md §15.1) — added
+// ActiveTokens (for the token-identity one-hot) and PriceContext (raw price series +
 // positional/distance features, CLAUDE.md §15.3) so the agent can reason about price action
 // directly instead of only through strategies' interpretation of it.
-const ObservationSchemaVersion = 3
+//
+// v4 (current): replaced the per-token sub-budget fields (TokenEquityUSD/TokenBudgetUSD) with the
+// shared-account fields AccountEquityUSD/AccountInitialUSD/OpenExposureUSD (CLAUDE.md §15.6's
+// 2026-08-28 revision) — capital is one pool the agent sizes against, not a per-token constant.
+const ObservationSchemaVersion = 4
+
+// ActionSchemaVersion tracks the Action's layout independently of the observation's — a model
+// trained against a narrower action space can't answer the full CLAUDE.md §15.4 action, and that's
+// a different failure from an observation-width mismatch. v1 was the original 2-output
+// [TargetExposure, LeverageFrac]; v2 is the full action below, including SLAdjustPct/TPAdjustPct
+// and the fixed-width StrategyWeights slots. Must match ACTION_SCHEMA_VERSION in
+// rl_service/obs.py, which rejects an incompatible loaded model with a 503 rather than returning
+// neutral defaults that would look like a working model proposing no adjustments.
+const ActionSchemaVersion = 2
+
+// MaxStrategySlots mirrors MAX_STRATEGY_SLOTS in rl_service/obs.py: the policy emits this many
+// fixed-width strategy-weight slots, mapped positionally onto the strategy signals in the request's
+// Observation.Timeframes (assignment order). Strategy signals past this count get no weight, so an
+// assignment set larger than this needs both sides raised and the model retrained.
+const MaxStrategySlots = 8
 
 // StrategySignal is one assigned strategy's current read for one timeframe, feeding into the
 // per-token agent's strategy_weights action (CLAUDE.md §15.3, §15.4). Mirrors strategy.Signal's
@@ -86,11 +105,18 @@ type Observation struct {
 	DistToSLPct decimal.Decimal `json:"dist_to_sl_pct"`
 	DistToTPPct decimal.Decimal `json:"dist_to_tp_pct"`
 
-	// TokenEquityUSD/TokenBudgetUSD are this token's own sub-budget (CLAUDE.md §15.6/§15.7), not
-	// total account equity — reward/training stays attributed per token (§15.5) even though one
-	// shared policy serves every token's requests.
-	TokenEquityUSD decimal.Decimal `json:"token_equity_usd"`
-	TokenBudgetUSD decimal.Decimal `json:"token_budget_usd"`
+	// AccountEquityUSD/AccountInitialUSD are the SHARED account balance every token trades against
+	// (CLAUDE.md §15.6, revised 2026-08-28 — these replaced the per-token TokenEquityUSD/
+	// TokenBudgetUSD sub-budgets). The agent sees the real running balance and its starting point,
+	// which is what makes TargetExposure a meaningful "how much of my account do I commit here"
+	// decision rather than a fraction of a per-token constant. Reward/training attribution stays
+	// per token (§15.5) — that's independent of capital being pooled.
+	AccountEquityUSD  decimal.Decimal `json:"account_equity_usd"`
+	AccountInitialUSD decimal.Decimal `json:"account_initial_usd"`
+	// OpenExposureUSD is the summed notional of all currently-open baseline positions across every
+	// token, so the agent can see how much of the shared account is already committed before asking
+	// for more — without it, one policy serving N tokens has no way to avoid over-committing.
+	OpenExposureUSD decimal.Decimal `json:"open_exposure_usd"`
 
 	RecentTrades []RecentTrade `json:"recent_trades"` // most-recent-last
 
@@ -103,6 +129,11 @@ type Observation struct {
 // Observation.Timeframes — the caller normalizes/combines them with each strategy's own Confidence
 // to produce the effective directional signal.
 type Action struct {
+	// ActionSchemaVersion is echoed by rl_service so a mismatch is visible in logs/panel; the
+	// service itself refuses to serve an incompatible model, so this is a diagnostic, not a gate.
+	ActionSchemaVersion int `json:"action_schema_version"`
+
+	// StrategyWeights are normalized to sum to 1 across the strategies present in the request.
 	StrategyWeights map[string]decimal.Decimal `json:"strategy_weights"`
 
 	TargetExposure decimal.Decimal `json:"target_exposure"` // in [-1, 1]

@@ -49,6 +49,12 @@ type Config struct {
 		TdMode          string          `yaml:"td_mode"`       // "cross" or "isolated"
 		PosMode         string          `yaml:"pos_mode"`      // "net" or "long_short" (hedge mode)
 		MinOrderUSD     decimal.Decimal `yaml:"min_order_usd"` // skip rebalancing orders smaller than this
+		// AllowRealMoney must be explicitly true before cmd/trader will run against real (non-demo)
+		// OKX credentials — it refuses to start otherwise (CLAUDE.md §15.6's paper -> demo -> real
+		// progression). This exists because reaching real trading by simply *not setting*
+		// OKX_SIMULATED_TRADING would make an unset env var the difference between a sandbox and
+		// real capital; going live should require saying so.
+		AllowRealMoney bool `yaml:"allow_real_money"`
 	} `yaml:"trading"`
 
 	// Ingestion controls cmd/ingestor: the always-on, broad set of candle timeframes it collects
@@ -68,15 +74,39 @@ type Config struct {
 		// stream to consume from.
 		Bars        []string `yaml:"bars"`
 		CandleLimit int      `yaml:"candle_limit"`
-		// TokenBudgetUSD is each token's fixed paper-mode sub-budget (CLAUDE.md §15.6/§15.7) — not
-		// learned/RL-allocated in Phase A, just a config value each PaperTrader instance is given.
-		TokenBudgetUSD decimal.Decimal `yaml:"token_budget_usd"`
 		// RLSLTPAdjust enables the RL-driven in-trade SL/TP adjustment pass (CLAUDE.md §15.4). Off
 		// by default: PaperTrader runs exactly as it did before §15 wherever this is false, since a
 		// meaningful decision here requires a trained (or at least deliberately no-op) RL model to
 		// be reachable at RLService.URL.
 		RLSLTPAdjust bool `yaml:"rl_sltp_adjust"`
+		// RLSizing lets the RL agent size each new paper order (notional + leverage) from its
+		// TargetExposure/LeverageFrac action instead of opening every order at NotionalUSD and 1x
+		// (CLAUDE.md §15.4). Off by default, and independent of RLSLTPAdjust — but note that while
+		// it's off, the paper_orders log records no leverage or exposure variance whatsoever, which
+		// is the training signal §15.8's continued-live-learning phase needs in order to learn
+		// sizing at all. Turn it on once a model with the current action schema is actually loaded.
+		RLSizing bool `yaml:"rl_sizing"`
+		// RLDecisionBar picks which timeframe's strategy signals/price context feed a tick-driven
+		// RL SL/TP-adjust decision (CLAUDE.md §15.3/§15.9). A tick belongs to no single bar, so this
+		// has to be chosen. Empty defaults to the shortest bar in Bars — freshest read of what price
+		// is doing right now, which is what an in-trade adjustment reacts to. Must be one of Bars.
+		RLDecisionBar string `yaml:"rl_decision_bar"`
 	} `yaml:"paper_trading"`
+
+	// Account is the shared capital pool every token trades against (CLAUDE.md §15.6, revised
+	// 2026-08-28 — this replaced per-token sub-budgets). Applies across all three modes, which is
+	// why it isn't nested under paper_trading.
+	Account struct {
+		// InitialUSD is the starting balance, and what a drained paper/demo account resets back to.
+		// Real mode never auto-resets (§15.7).
+		InitialUSD decimal.Decimal `yaml:"initial_usd"`
+		// MaxPositionPct caps any single position at this fraction of account equity, and
+		// MaxTotalExposurePct caps the sum of all open positions. These bound the RL agent's sizing
+		// proposal Go-side — the model is never the safety boundary (§5, §15.4). Expressed as
+		// fractions (0.25 = 25%), not percentages.
+		MaxPositionPct      decimal.Decimal `yaml:"max_position_pct"`
+		MaxTotalExposurePct decimal.Decimal `yaml:"max_total_exposure_pct"`
+	} `yaml:"account"`
 
 	Risk struct {
 		MaxLeverage             decimal.Decimal `yaml:"max_leverage"`
@@ -234,9 +264,21 @@ func Load(path string) (*Config, error) {
 	if cfg.PaperTrading.CandleLimit == 0 {
 		cfg.PaperTrading.CandleLimit = 100
 	}
-	if cfg.PaperTrading.TokenBudgetUSD.IsZero() {
-		// CLAUDE.md §15.6: your stated $10/token against a <$50 total budget.
-		cfg.PaperTrading.TokenBudgetUSD = decimal.NewFromInt(10)
+	if cfg.Account.InitialUSD.IsZero() {
+		// CLAUDE.md §15.6: one $100 account shared across every token, replacing the earlier
+		// $10-per-token split.
+		cfg.Account.InitialUSD = decimal.NewFromInt(100)
+	}
+	if cfg.Account.MaxPositionPct.IsZero() {
+		// 25% of equity in any one position. Deliberately not "whatever the model asks for": at
+		// 100x leverage a single uncapped position is an account-ending event, and §5's risk manager
+		// only guards the live path, not paper.
+		cfg.Account.MaxPositionPct = decimal.NewFromFloat(0.25)
+	}
+	if cfg.Account.MaxTotalExposurePct.IsZero() {
+		// 60% of equity across all open positions combined — the per-position cap alone would still
+		// allow four simultaneous 25% positions committing the whole account.
+		cfg.Account.MaxTotalExposurePct = decimal.NewFromFloat(0.60)
 	}
 	if cfg.Risk.MaxLeverage.IsZero() {
 		// CLAUDE.md §15.4: raised from the earlier 5x default toward the RL agent's target 10x-100x
@@ -333,6 +375,49 @@ func (c *Config) ValidatePaperTradingBars() error {
 		if !ingested[bar] {
 			return fmt.Errorf("paper_trading.bars contains %q, which is not in ingestion.bars — the ingestor isn't publishing that timeframe", bar)
 		}
+	}
+
+	if b := c.PaperTrading.RLDecisionBar; b != "" {
+		found := false
+		for _, bar := range c.PaperTrading.Bars {
+			if bar == b {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("paper_trading.rl_decision_bar is %q, which is not in paper_trading.bars — "+
+				"the RL decision context must be a timeframe this process actually maintains a candle window for", b)
+		}
+	}
+
+	return validateBarNames(append(append([]string{}, c.Ingestion.Bars...), c.PaperTrading.Bars...))
+}
+
+// okxBarNames are the candle timeframes OKX's WS channels accept, in OKX's exact casing. The
+// casing is not cosmetic: the ingestor subscribes to "candle"+bar literally, so "1h" instead of
+// "1H" silently subscribes to a channel that pushes nothing — the pipeline looks healthy while
+// that timeframe never produces a candle. Rejecting it at startup turns a silent data gap into an
+// immediate, obvious failure.
+var okxBarNames = map[string]bool{
+	"1m": true, "3m": true, "5m": true, "15m": true, "30m": true,
+	"1H": true, "2H": true, "4H": true, "6H": true, "12H": true,
+	"1D": true, "2D": true, "3D": true, "1W": true, "1M": true,
+}
+
+func validateBarNames(bars []string) error {
+	for _, bar := range bars {
+		if okxBarNames[bar] {
+			continue
+		}
+		// Point at the exact fix when it's only a casing mistake, since that's the likely error.
+		for name := range okxBarNames {
+			if strings.EqualFold(name, bar) {
+				return fmt.Errorf("bar %q has the wrong case for OKX's channel names — use %q "+
+					"(OKX capitalizes hours/days/weeks: 1H, 4H, 1D; minutes stay lowercase: 5m, 15m)", bar, name)
+			}
+		}
+		return fmt.Errorf("bar %q is not an OKX candle timeframe", bar)
 	}
 	return nil
 }

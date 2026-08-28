@@ -57,9 +57,44 @@ type PaperTrader struct {
 	// (CLAUDE.md §15.4). Model may be nil, in which case the adjustment pass is skipped entirely —
 	// this lets PaperTrader run exactly as before (strategy-only) wherever the RL service isn't
 	// configured, same "additive, never required" pattern as the rest of §15's rollout.
-	Model          port.ModelClient
-	ActiveTokens   []string        // the roster used to build the token-identity one-hot, CLAUDE.md §15.3
-	TokenBudgetUSD decimal.Decimal // this token's configured paper-mode sub-budget, CLAUDE.md §15.6/§15.7
+	Model        port.ModelClient
+	ActiveTokens []string // the roster used to build the token-identity one-hot, CLAUDE.md §15.3
+
+	// Mode is which account balance this engine trades against — "paper" here; cmd/trader uses
+	// "demo"/"real". All three are tracked simultaneously (CLAUDE.md §15.6), and only non-real
+	// modes ever auto-reset a drained balance (§15.7).
+	Mode string
+	// AccountInitialUSD is the shared account's configured starting balance — what a drained
+	// paper/demo account resets back to. Every token trades against this one pool rather than a
+	// per-token slice of it (CLAUDE.md §15.6's 2026-08-28 revision).
+	AccountInitialUSD decimal.Decimal
+	// MaxPositionPct / MaxTotalExposurePct bound how much of account equity the RL agent may put
+	// into one position, and into all open positions combined. Hard Go-side caps on the model's
+	// proposal — the same "never trust the model as the safety boundary" pattern as §15.4's SL/TP
+	// ratchet. Zero disables the respective cap.
+	MaxPositionPct      decimal.Decimal
+	MaxTotalExposurePct decimal.Decimal
+
+	// RLSizing lets the RL agent set each new order's notional and leverage from its
+	// TargetExposure/LeverageFrac action (CLAUDE.md §15.4), instead of every order being opened at
+	// the fixed NotionalUSD and 1x. Off by default and independent of the SL/TP-adjust flag: until
+	// it's on, the paper_orders log carries no leverage/exposure variance at all, which is exactly
+	// the training signal §15.8's continued-live-learning phase needs to learn sizing from.
+	// Requires Model and MaxLeverage to be set; falls back to the fixed sizing on any model error.
+	RLSizing bool
+	// RLSLTPAdjust enables the in-trade SL/TP adjustment pass (CLAUDE.md §15.4). Kept separate from
+	// RLSizing so either can run without the other — they're independent decisions that happen to
+	// share one model client.
+	RLSLTPAdjust bool
+	// RLDecisionBar selects which timeframe's strategy signals/price context feed a tick-driven RL
+	// SL/TP-adjust decision (CLAUDE.md §15.3). Empty means "the shortest configured bar" — see
+	// decisionBar. Must be one of Bars.
+	RLDecisionBar string
+	// MaxLeverage is the ceiling LeverageFrac maps onto ([1x, MaxLeverage]). This mirrors the
+	// config's risk.max_leverage so paper orders can't record leverage the live risk manager would
+	// reject outright (CLAUDE.md §5) — the risk manager remains the real boundary for live trading;
+	// this is the paper-mode equivalent so the two produce comparable data.
+	MaxLeverage decimal.Decimal
 
 	// OrderEvents publishes a lightweight open/close notification for every paper order this
 	// engine opens or closes, onto the internal event bus (CLAUDE.md §12) — consumed by cmd/api's
@@ -88,6 +123,97 @@ type PaperTrader struct {
 // pushing updates. A few seconds of lag behind the live tick stream is an explicit, accepted
 // tradeoff for bounding rl_service's inference load; it is not meant to track every tick.
 const RLAdjustInterval = 2 * time.Second
+
+// defaultPaperLeverage is what a paper order records when the RL sizing pass isn't active.
+var defaultPaperLeverage = decimal.NewFromInt(1)
+
+// barSeconds converts an OKX bar name ("1m", "15m", "1H", "4H", "1D", "1W") to its duration in
+// seconds, for ordering timeframes shortest-to-longest. Unknown names sort last rather than
+// erroring — this only picks a default decision context, and a bar nobody recognizes is a poor
+// choice for it anyway.
+//
+// The unit is matched case-INSENSITIVELY on purpose. OKX's channel names are case-sensitive
+// ("1H" and "1D" are capitalized, minutes are not), and a config written as "1h" is a real and
+// easy mistake; sorting must not silently misbehave on it. Note that fixing the ordering here does
+// NOT make a mis-cased bar work end-to-end — the ingestor still needs OKX's exact casing to
+// subscribe at all, which is why config.ValidateBarNames rejects it at startup instead.
+func barSeconds(bar string) int {
+	if bar == "" {
+		return 1 << 30
+	}
+	n := 0
+	i := 0
+	for ; i < len(bar) && bar[i] >= '0' && bar[i] <= '9'; i++ {
+		n = n*10 + int(bar[i]-'0')
+	}
+	if n == 0 || i >= len(bar) {
+		return 1 << 30
+	}
+	switch bar[i] {
+	case 'm': // minutes — lowercase only; 'M' is months in OKX's scheme, handled below
+		return n * 60
+	case 'H', 'h':
+		return n * 3600
+	case 'D', 'd':
+		return n * 86400
+	case 'W', 'w':
+		return n * 604800
+	case 'M':
+		return n * 2592000 // ~30d; only used for ordering, never for arithmetic on real timestamps
+	default:
+		return 1 << 30
+	}
+}
+
+// decisionBar picks which timeframe's strategy signals and price context feed a TICK-driven RL
+// decision (CLAUDE.md §15.3/§15.9). A tick doesn't belong to any one bar, so this has to be chosen
+// rather than inferred.
+//
+// Configured explicitly via paper_trading.rl_decision_bar; otherwise the SHORTEST configured bar,
+// because an in-trade SL/TP adjustment is a reaction to what price is doing right now and the
+// shortest timeframe carries the freshest read of that. This used to be Bars[0] — array order,
+// which silently meant "whichever bar happens to be listed first" and would quietly change meaning
+// if the config list were reordered.
+//
+// Note this selects the DECISION context only. The observation still reports one timeframe block,
+// but a multi-timeframe strategy contributing signals to it sees every bar (marketView), so
+// higher-timeframe context still reaches the model through those signals.
+func (e *PaperTrader) decisionBar() string {
+	if e.RLDecisionBar != "" {
+		return e.RLDecisionBar
+	}
+	shortest := ""
+	for _, b := range e.Bars {
+		if shortest == "" || barSeconds(b) < barSeconds(shortest) {
+			shortest = b
+		}
+	}
+	return shortest
+}
+
+// marketView snapshots every maintained timeframe under one lock, so a multi-timeframe strategy
+// (CLAUDE.md §9) sees bars that are consistent with each other, and so no lock is held across a
+// Strategy.Evaluate call. bar is the timeframe that just closed — the decision cadence.
+func (e *PaperTrader) marketView(bar string) strategy.MarketView {
+	e.candlesMu.Lock()
+	bars := make(map[string][]domain.Candle, len(e.candles))
+	for b, window := range e.candles {
+		bars[b] = append([]domain.Candle(nil), window...)
+	}
+	e.candlesMu.Unlock()
+
+	return strategy.MarketView{Bar: bar, Candles: bars[bar], Bars: bars}
+}
+
+// accountMode is the trading mode whose balance this engine moves. Defaults to "paper" so an
+// engine constructed without an explicit Mode can never accidentally write to the demo or real
+// account's balance (CLAUDE.md §15.7's real-mode carve-out).
+func (e *PaperTrader) accountMode() string {
+	if e.Mode == "" {
+		return "paper"
+	}
+	return e.Mode
+}
 
 type tickEvent struct {
 	InstID string `json:"instId"`
@@ -176,15 +302,8 @@ func (e *PaperTrader) handleTick(ctx context.Context, data []byte, logger *slog.
 	// CLAUDE.md §15.4/§15.9: RL SL/TP-adjust now runs on the live tick stream (throttled to
 	// RLAdjustInterval), not just at candle close — see the audit note on lastRLAdjustAt's
 	// declaration for why this changed. Best-effort/never blocking, same as the old call site.
-	if e.Model != nil && e.shouldRunRLAdjust() {
-		// bar is only used to select which timeframe's strategy signals/price-context feed the
-		// observation (CLAUDE.md §15.3) — pick the first configured bar as a reasonable default
-		// context for a tick-driven decision, since a single tick doesn't belong to one bar.
-		bar := ""
-		if len(e.Bars) > 0 {
-			bar = e.Bars[0]
-		}
-		e.adjustOpenOrdersWithRL(ctx, bar, price, logger)
+	if e.Model != nil && e.RLSLTPAdjust && e.shouldRunRLAdjust() {
+		e.adjustOpenOrdersWithRL(ctx, e.decisionBar(), price, logger)
 	}
 	return nil
 }
@@ -253,16 +372,17 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 		return nil
 	}
 
-	e.candlesMu.Lock()
-	window := append([]domain.Candle(nil), e.candles[bar]...) // snapshot: don't hold the lock across Strategy.Evaluate
-	e.candlesMu.Unlock()
+	// Snapshot every timeframe, not just the one that closed: a strategy assigned to 5m may consult
+	// 1h/4h for trend context via MultiTimeframeStrategy (CLAUDE.md §9). Taken under one lock so all
+	// bars are consistent with each other, and released before any Evaluate call.
+	view := e.marketView(bar)
 
 	for _, a := range e.Strategies {
 		if a.Bar != bar {
 			continue // only re-evaluate strategies assigned to the timeframe that just closed
 		}
 		s := a.Strategy
-		signal, err := s.Evaluate(window)
+		signal, err := strategy.EvaluateWith(s, view)
 		if err != nil {
 			logger.Warn("strategy evaluation failed", "strategy", s.Name(), "instId", e.InstID, "bar", bar, "error", err)
 			continue
@@ -273,12 +393,20 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 		}
 
 		order := buildPaperOrder(e.InstID, price, signal, e.NotionalUSD, a.StrategyID)
+
+		// The same observation is used for both the RL sizing decision and the persisted
+		// decision-time record below, so what's stored is exactly what the model was asked.
+		obs := e.buildObservation(ctx, bar, price, logger)
+		if notional, leverage, ok := e.rlSizing(ctx, obs, signal, open, logger); ok {
+			order.Size, order.Leverage = notional, leverage
+		}
+
 		// CLAUDE.md §15.3/§15.8: persist the actual observation vector at decision time (not just
 		// the realized outcome) so it can later feed live/continued RL training — the whole point
 		// is training data that matches exactly what rlclient would have sent, not a reconstruction.
 		// Best-effort: a marshal/build failure must never block opening the order itself.
-		if obs, err := json.Marshal(e.buildObservation(ctx, bar, price, logger)); err == nil {
-			order.FeaturesJSON = obs
+		if raw, err := json.Marshal(obs); err == nil {
+			order.FeaturesJSON = raw
 		} else {
 			logger.Warn("failed to marshal decision-time observation", "instId", e.InstID, "error", err)
 		}
@@ -319,15 +447,19 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 		logger.Info("closed paper order", "id", o.ID, "instId", e.InstID, "reason", reason, "closePx", price, "pnl", pnl)
 		e.publishOrderEvent(ctx, "closed", o.ID, logger)
 
-		// CLAUDE.md §15.4/§15.6/§15.7: only a baseline order's outcome counts toward the token's
-		// tracked budget/reward — an rl_adjusted fork is tracking-only (its whole purpose is to be
-		// compared against its baseline parent afterward, not to be treated as a second real bet).
+		// CLAUDE.md §15.4/§15.6/§15.7: only a baseline order's outcome moves the shared account
+		// balance — an rl_adjusted fork is tracking-only (its whole purpose is to be compared
+		// against its baseline parent afterward, not to be treated as a second real bet).
 		if o.Variant == "baseline" || o.Variant == "" {
-			if e.TokenBudgetUSD.IsPositive() {
-				if _, reset, err := e.Repo.ApplyTokenPnL(ctx, e.InstID, pnl); err != nil {
-					logger.Error("failed to apply token pnl", "instId", e.InstID, "error", err)
+			if e.AccountInitialUSD.IsPositive() {
+				orderID := o.ID
+				if acct, reset, err := e.Repo.ApplyRealizedPnL(ctx, e.accountMode(), pnl, &orderID, e.InstID); err != nil {
+					logger.Error("failed to apply realized pnl to account", "instId", e.InstID, "error", err)
 				} else if reset {
-					logger.Warn("token budget drained, reset to configured budget", "instId", e.InstID, "budgetUsd", e.TokenBudgetUSD)
+					// Recorded as a reason="reset" point in the equity timeline too, so a drain that
+					// happens overnight is visible in the panel's chart afterward, not just here.
+					logger.Warn("account balance drained, reset to initial", "mode", e.accountMode(),
+						"instId", e.InstID, "initialUsd", acct.InitialUSD, "resetCount", acct.ResetCount)
 				}
 			}
 		}
@@ -422,7 +554,10 @@ func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signa
 		SLPx:       slPx,
 		TPPx:       tpPx,
 		Size:       notionalUSD,
-		Leverage:   decimal.NewFromInt(1),
+		// 1x is the un-sized default: the strategy layer has no view on leverage, so an order
+		// opened without the RL sizing pass (PaperTrader.RLSizing) records the unlevered position
+		// the signal itself implies. The caller overwrites Size/Leverage when RL sizing is on.
+		Leverage: defaultPaperLeverage,
 	}
 }
 

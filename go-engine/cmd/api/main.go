@@ -56,6 +56,10 @@ func main() {
 		ProcessMgr: cfg.API.ProcessMgr,
 		Units:      cfg.API.Units,
 		Logger:     logger,
+		// Must match what the trading services seed their account row with (CLAUDE.md §15.6) —
+		// both read through GetAccountEquity, so a different value here would seed a balance the
+		// engine never actually traded against.
+		AccountInitialUSD: cfg.Account.InitialUSD,
 	}
 	routes := srv.Routes() // must be called before Hub() usage below so the same *wsHub backs both
 

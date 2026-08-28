@@ -15,14 +15,18 @@ from __future__ import annotations
 import logging
 import os
 
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from stable_baselines3 import PPO
 
 from rl_service.config import load_config
 from rl_service.obs import (
+    ACTION_DIM,
+    ACTION_SCHEMA_VERSION,
     OBSERVATION_SCHEMA_VERSION,
     Action,
     Observation,
+    decode_action,
     flat_action,
     to_vector,
 )
@@ -55,7 +59,16 @@ def _load_model() -> None:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": _model is not None}
+    # action_compatible distinguishes "up but unloaded" from "up with a model too old to serve the
+    # current action schema" — CLAUDE.md §11.2 makes the same point about model_loaded, and the
+    # panel needs to tell these apart for the same reason: they mean very different things.
+    action_compatible = _model is not None and _model.action_space.shape[0] == ACTION_DIM
+    return {
+        "status": "ok",
+        "model_loaded": _model is not None,
+        "action_schema_version": ACTION_SCHEMA_VERSION,
+        "action_compatible": action_compatible,
+    }
 
 
 @app.post("/predict", response_model=Action)
@@ -78,22 +91,20 @@ def predict(obs: Observation) -> Action:
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
-    action, _ = _model.predict(obs_vec, deterministic=True)
-    target_exposure, leverage_frac = float(action[0][0]), float(action[0][1])
+    # A model trained against the old Box(2,) action space cannot answer the full CLAUDE.md §15.4
+    # action — refuse rather than silently returning zeros for sl/tp_adjust and uniform strategy
+    # weights, which would look like a working model proposing no adjustments (exactly the failure
+    # this endpoint used to have with its hardcoded defaults).
+    action_dim = _model.action_space.shape[0]
+    if action_dim != ACTION_DIM:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"loaded model has a {action_dim}-dim action space; this service serves "
+                f"action_schema_version {ACTION_SCHEMA_VERSION} ({ACTION_DIM} dims). Retrain "
+                "against the current env (python -m rl_service.train --warm-start)."
+            ),
+        )
 
-    # strategy_weights/sl_adjust_pct/tp_adjust_pct are not yet produced by a trained model (today's
-    # action_space is still the original Box(2,) in okx_futures_env.py) — returned as neutral
-    # defaults until the env/training side is extended to the full CLAUDE.md §15.4 action space.
-    strategy_weights = {
-        str(sig.strategy_id): 1.0 / max(1, sum(len(b.strategy_signals) for b in obs.timeframes))
-        for block in obs.timeframes
-        for sig in block.strategy_signals
-    }
-    return Action(
-        strategy_weights=strategy_weights,
-        target_exposure=target_exposure,
-        leverage_frac=leverage_frac,
-        sl_adjust_pct=0.0,
-        tp_adjust_pct=0.0,
-        confidence=1.0,
-    )
+    raw, _ = _model.predict(obs_vec, deterministic=True)
+    return decode_action(np.asarray(raw).reshape(-1), obs)

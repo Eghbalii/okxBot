@@ -22,7 +22,10 @@ train:
 warm_start:
   inst_ids:
     - "BTC-USDT-SWAP"
-  bar: "1m"
+  # Single-bar by design — see WarmStartConfig.bar in rl_service/config.py for why interleaving
+  # timeframes in one replay sequence would make the reward signal inconsistent across steps.
+  # 15m: the middle of the deployed agent's 5m/15m/1H decision timeframes.
+  bar: "15m"
   total_timesteps: 50000
   model_out: "models/ppo_global.zip"
   initial_equity_usd: 10.0 # CLAUDE.md §15.6: matches the real per-token paper budget

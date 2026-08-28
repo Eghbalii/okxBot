@@ -13,33 +13,74 @@ trading:
   td_mode: "cross"        # "cross" or "isolated"
   pos_mode: "net"         # "net" or "long_short" (hedge mode)
   min_order_usd: 10       # skip rebalancing orders smaller than this
+  # CLAUDE.md §15.6: the paper -> demo -> real progression. cmd/trader REFUSES to start against
+  # real (non-demo) credentials unless this is explicitly true — going live should require saying
+  # so, not just forgetting to set OKX_SIMULATED_TRADING. Trading mode itself is derived from that
+  # env var (simulated => demo, otherwise real), so mode can never disagree with the keys in use.
+  allow_real_money: false
 
 # The always-on data collector (cmd/ingestor): a broad, stable set of timeframes it publishes to
 # Redis 24/7, independent of what any given paper-trading/strategy test run actually evaluates.
+# CASING IS NOT COSMETIC: OKX's channel names are case-sensitive (capital H/D, lowercase m), and
+# the ingestor subscribes to "candle"+bar literally — "1h" would subscribe to a channel that pushes
+# nothing, so that timeframe silently produces no candles while the pipeline looks healthy.
+# config.ValidateBarNames rejects a mis-cased bar at startup rather than letting that happen.
 ingestion:
-  bars:                    # OKX channel names, note casing (lowercase m, capital H/D)
-    - "1m"
-    - "3m"
+  bars:
     - "5m"
+    - "15m"
     - "1H"
+    # Collected for higher-timeframe CONTEXT only — a strategy assigned to 5m can consult these via
+    # strategy.MultiTimeframeStrategy for trend confirmation (CLAUDE.md §9). Nothing decides on them.
     - "4H"
     - "1D"
 
 paper_trading:
   notional_usd: 100
   max_open_orders: 3
-  # The subset of ingestion.bars this run actually maintains candle windows for and evaluates
-  # strategies against — change this freely per test run without touching the ingestor. Must be a
-  # subset of ingestion.bars above (validated at startup).
+  # The timeframes strategies actually DECIDE on — the RL model's training cadence (CLAUDE.md §9).
+  # Must be a subset of ingestion.bars above (validated at startup: a bar the ingestor isn't
+  # publishing has no Kafka topic to consume from).
+  # A strategy assigned here may still read any bar in ingestion.bars above for context, so adding
+  # a longer timeframe for confirmation does not require adding it here.
   bars:
-    - "1m"
+    - "5m"
+    - "15m"
+    - "1H"
   candle_limit: 100
-  # CLAUDE.md §15.6: fixed per-token paper-mode sub-budget for Phase A (not RL-allocated yet).
-  token_budget_usd: 10
-  # CLAUDE.md §15.4: enables the RL-driven in-trade SL/TP adjustment pass (calls rl_service's
-  # /predict at candle close for each open baseline order, forking a linked copy if it proposes a
-  # nonzero adjustment). Off by default — requires rl_service reachable at rl_service.url.
+  # Which timeframe's signals/price-context feed a TICK-driven RL SL/TP-adjust decision
+  # (CLAUDE.md §15.9) — a tick belongs to no single bar, so it's chosen rather than inferred.
+  # Empty defaults to the shortest bar above, the freshest read of what price is doing right now.
+  # Must be one of paper_trading.bars.
+  rl_decision_bar: "5m"
+  # CLAUDE.md §15.4: enables the RL-driven in-trade SL/TP adjustment pass — calls rl_service's
+  # /predict on the live tick stream (throttled to a couple of seconds, per §15.9's freshness fix)
+  # for each open baseline order, forking a linked copy if it proposes a nonzero adjustment. Off by
+  # default — requires rl_service reachable at rl_service.url.
   rl_sltp_adjust: false
+  # CLAUDE.md §15.4: lets the RL agent size each new order (notional + leverage from its
+  # target_exposure/leverage_frac) instead of opening every order at notional_usd and 1x. Off by
+  # default, and independent of rl_sltp_adjust above. Worth knowing: while this is off, the
+  # paper_orders log records no leverage or exposure variance at all, so §15.8's continued-live-
+  # learning phase has no sizing signal to learn from. Leverage is capped by risk.max_leverage.
+  rl_sizing: false
+
+# CLAUDE.md §15.6 (revised 2026-08-28): ONE shared capital pool every token trades against,
+# replacing the earlier fixed per-token sub-budgets. How much of it goes into any single position is
+# the RL agent's decision (target_exposure), bounded by the two caps below rather than by splitting
+# the account into per-token buckets up front. Applies to all three modes, hence the top-level
+# section rather than nesting under paper_trading.
+account:
+  # Starting balance, and what a drained paper/demo account resets back to. Real mode never
+  # auto-resets — running out there is a stop condition for a human (§15.7).
+  initial_usd: 100
+  # Hard Go-side caps on the agent's sizing proposal, as FRACTIONS (0.25 = 25%), never percentages.
+  # The model is never the safety boundary (§5, §15.4): at 100x leverage a single uncapped position
+  # is an account-ending event, and the risk manager only guards the live path, not paper.
+  max_position_pct: 0.25
+  # The per-position cap alone would still allow four simultaneous 25% positions committing the
+  # whole account, so total open exposure is bounded independently.
+  max_total_exposure_pct: 0.60
 
 risk:
   # CLAUDE.md §15.4: RL agent's target leverage range is 10x-100x; min_liquidation_buffer_pct below

@@ -190,6 +190,12 @@ Three datastores, different jobs — this is not redundant, each is used for wha
     opened_at, closed_at, close_reason (`sl`|`tp`|`manual`), realized_pnl, features_json (the
     observation/indicator snapshot at entry, for training + the panel's order-detail view).
   - `strategies` — id, name, token(s) it's assigned to, config/version, enabled flag.
+  - `account_equity` — one row per mode (paper/demo/real): the shared balance every token trades
+    against, its configured starting point, and reset_count/last_reset_at (§15.6/§15.7). Replaced
+    the per-token `token_budgets` table in migration `000006`.
+  - `account_equity_history` — every balance change: post-change equity, signed delta, and reason
+    (`trade`|`reset`|`seed`), backing the panel's balance chart so an overnight drain-and-reset is
+    reviewable after the fact (§15.7).
   - `training_runs` — (planned) started_at, finished_at, status, timesteps, model_artifact_path.
 
 Implemented behind `port.Repository` (§10, `internal/postgres`), so use-cases never depend on pgx
@@ -250,6 +256,34 @@ enabling/disabling live trading never affects the continuous paper-trading/data-
   exchange-confirmed candles per timeframe, not self-aggregated from 1m. Live-verified against
   real OKX data across `["1m","15m","1H"]` — see git history for the dry-run details, including a
   concurrent-map-write crash found and fixed during that run.
+- **Decision timeframes vs. context timeframes (decided 2026-08-28).** These are deliberately
+  separate settings, because they answer different questions:
+  - `ingestion.bars` — every timeframe collected. Now `5m/15m/1H` (the decision set) **plus
+    `4H`/`1D` for context only**.
+  - `paper_trading.bars` — the timeframes strategies actually *decide* on, and therefore the RL
+    model's training cadence: **`5m`, `15m`, `1H`**. Narrowing to a single "best" timeframe is a
+    later call to make from real data, not up front.
+  - A strategy assigned to 5m may still *read* 1H/4H/1D for trend confirmation — normal
+    discretionary practice, and a strategy restricted to one window structurally cannot express it.
+    Implemented as the **optional** `strategy.MultiTimeframeStrategy` interface (`EvaluateView(
+    MarketView)`) rather than a change to `Strategy.Evaluate`'s signature, so all 14 built-ins keep
+    working untouched and only strategies that want higher-timeframe context opt in.
+    `strategy.EvaluateWith` dispatches to whichever the strategy implements, so engine call sites
+    don't change when a strategy gains the capability. `MarketView.Higher(bar, minLen)` returns
+    `ok=false` when a bar isn't collected or hasn't filled yet — that's the normal warm-up case, to
+    be degraded through, never an error.
+  - `PaperTrader.marketView` snapshots every maintained bar under one lock, so a multi-timeframe
+    strategy sees bars consistent with each other and no lock is held across `Evaluate`.
+  - **`cmd/strategy-optimizer` deliberately stays single-timeframe** (`Evaluate`, not
+    `EvaluateWith`): a tuning run evaluates one kind on one bar (§16.3) and only maintains that
+    bar's window. Handing a multi-timeframe strategy a view containing just its own bar would score
+    it as a different strategy than the one production runs. Optimizing those needs the runner to
+    maintain the extra bars first.
+- **OKX bar-name casing is validated at startup.** OKX's channel names are case-sensitive
+  (`candle1H`, not `candle1h`), and the ingestor subscribes to `"candle"+bar` literally — a
+  mis-cased bar subscribes to a channel that pushes nothing, so that timeframe silently produces no
+  candles while the pipeline looks perfectly healthy. `config.validateBarNames` rejects it at
+  startup and names the correct casing, turning a silent data gap into an immediate failure.
 
 ## 10. Clean architecture for go-engine
 
@@ -697,6 +731,79 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       (`tests/test_replay_env.py`) verify shapes, the token-identity one-hot actually differs per
       token, multi-token sequencing, and a real PPO training run against the env completes and
       produces a loadable, predictable model.
+- [x] **Widened the action space to the full §15.4 action (2026-08-28)** — until this landed, both
+      envs' `action_space` was still the original `Box(2,)` `[target_exposure, leverage_frac]`, so
+      `/predict` returned **hardcoded** neutral values for `strategy_weights` (uniform) and
+      `sl_adjust_pct`/`tp_adjust_pct` (always 0.0) no matter what the model said. That made the
+      whole shadow-fork A/B mechanic (§15.4) dead code: `adjustOpenOrdersWithRL` skips on a zero
+      adjustment, so a trained model could never fork anything and the comparison page would have
+      stayed empty with no error anywhere. Now: `ACTION_DIM = 4 + MAX_STRATEGY_SLOTS` (12), decoded
+      by one shared `obs.py:decode_action` used by both `/predict` and `ReplayEnv`; a model with a
+      mismatched action width is refused with a 503 (and `/health` gained `action_compatible`)
+      instead of silently serving stubs. `ACTION_SCHEMA_VERSION`/`domain.ActionSchemaVersion` track
+      the action layout separately from the observation's `schema_version`, since a too-narrow
+      action space is a different failure from a mis-shaped observation. `ReplayEnv` now also
+      tracks simulated SL/TP, closes on a bar high/low touch, applies Go's tighten-only ratchet, and
+      charges the §15.5 churn penalty — without those, the new adjustment outputs would have had no
+      gradient signal at all. Verified end-to-end against a real trained model: `/predict` returns
+      model-derived nonzero `sl_adjust_pct`/`tp_adjust_pct` and differentiated `strategy_weights`;
+      an old 2-dim model gets the 503. 8 new decode tests + 4 new replay-env tests (19 Python tests
+      total), all 85 Go tests still pass.
+- [x] RL-driven order sizing at open (`usecase.rlSizing`, `paper_trading.rl_sizing`, off by
+      default) — previously every paper order was opened at a hardcoded 1x leverage and the fixed
+      `notional_usd`, so the `paper_orders` log contained zero leverage/exposure variance for the
+      continued-live-learning phase below to learn sizing from. Magnitude-only by design: direction
+      stays with the strategy layer (§9/§16.1). `RLSLTPAdjust` is now an explicit `PaperTrader`
+      field rather than being implied by `Model != nil`, so the two RL passes stay independent as
+      documented.
+- [x] Fixed the live/demo path's train-serve skew (`usecase.Trader`, `cmd/trader`): its observation
+      sent no `ActiveTokens` at all (an all-zero token-identity one-hot — a token the global model
+      has never seen) and reported **total account equity** as `TokenEquityUSD` where every
+      paper-trading observation reports that token's own sub-budget. Both now come from
+      `Trading.InstIDs`/`PaperTrading.TokenBudgetUSD`, the same source the paper-trader uses, with a
+      total-equity fallback when no per-token budget is configured. No practical effect while the
+      model is a no-op, which is exactly why it was worth fixing before the demo run rather than
+      after (§15.6, and the open demo-trading item in Phase 2).
+- [x] **Shared $100 account replacing per-token sub-budgets (2026-08-28, §15.6's revision)** — the
+      RL agent now decides what fraction of real account equity each position uses, bounded by
+      `account.max_position_pct` (25%) and `account.max_total_exposure_pct` (60%) rather than by
+      pre-split per-token buckets. Migration `000006` replaces `token_budgets` with `account_equity`
+      (one row per mode) + `account_equity_history`; observation schema bumped to **v4**
+      (`AccountEquityUSD`/`AccountInitialUSD`/`OpenExposureUSD` replace the token-budget fields, fed
+      to the model as ratios). `ReplayEnv` sizes against the shared balance under the same caps and
+      **carries the balance across token boundaries** — it used to reset equity per token, which
+      under a shared account would have taught the agent that losses are wiped clean at each
+      boundary. `token_budgets` used `DOUBLE PRECISION` against §7's NUMERIC rule; the new tables
+      don't repeat that. Verified against a real TimescaleDB (migration applies, drain→reset,
+      real-mode carve-out, history ordering, exact NUMERIC round-trip of 100.07), and the endpoints
+      verified through the real router.
+- [x] Equity timeline for all three modes (explicit requirement: "I want to see it happen when I'm
+      not online") — every balance change writes an `account_equity_history` row with its reason
+      (`trade`/`reset`/`seed`), written in the **same transaction** as the balance update so the
+      chart can never be missing the drop that drained the account. `GET /api/account` +
+      `GET /api/account/history`; `cmd/trader` records demo/real by observing the exchange's
+      reported equity each poll, best-effort so a database problem can't interrupt live trading.
+      **Panel chart still to build** — the backend data is in place, the frontend view isn't (the
+      panel is the one part explicitly out of scope for now).
+- [x] **Decision timeframes fixed at 5m/15m/1H, with higher-timeframe context available
+      (2026-08-28)** — `ingestion.bars` collects `5m/15m/1H` plus `4H`/`1D` for context;
+      `paper_trading.bars` (the decision/training cadence) is the three. Added the optional
+      `strategy.MultiTimeframeStrategy` interface + `MarketView`/`EvaluateWith` so a strategy
+      assigned to 5m can consult 1H/4H for trend confirmation — an optional capability interface
+      rather than a signature change, so all 14 built-ins are untouched. `PaperTrader.marketView`
+      snapshots every bar under one lock. `cmd/strategy-optimizer` deliberately keeps the
+      single-timeframe path (it only maintains one bar; see §9). Replaced the tick-path's
+      `Bars[0]` decision-context selection — array order that would silently change meaning if the
+      config list were reordered — with `paper_trading.rl_decision_bar`, defaulting to the
+      *shortest* configured bar (freshest read for an in-trade adjustment). Added OKX bar-name
+      casing validation at startup: `1h` instead of `1H` used to subscribe to a channel that pushes
+      nothing, producing a silent data gap on a pipeline that looks healthy. Warm-start stays
+      single-bar by design (now `15m`, was `1m`) — interleaving timeframes in one replay sequence
+      makes "one step" mean different elapsed times, so the reward signal would be inconsistent
+      across steps. 12 new tests.
+- [x] Paper → demo → real progression guardrails (§15.6): mode derived from `okx.simulated` so it
+      can never disagree with the credentials in use, plus `trading.allow_real_money` (default
+      false) which `cmd/trader` refuses to start without against non-demo keys.
 - [ ] Live/continued-training mode (the second half of §15.8 — consuming real paper-trading
       outcomes as they accumulate, not just the warm-start replay) — not yet built; needs enough
       live paper-trading history to be meaningful, which is itself gated on running the Phase A
@@ -869,13 +976,18 @@ connected to live OKX public WS — not a synthetic test):
 ### 15.2 Phased rollout (start small, expand only with evidence)
 
 - **Phase A (start here):** 2 tokens (BTC-USDT-SWAP, XAU or its OKX equivalent instrument — verify
-  the exact `instId` exists on OKX SWAP before wiring it in), ≤5 of the 12 strategies (pick the
+  the exact `instId` exists on OKX SWAP before wiring it in), ≤5 of the 14 registered strategies
+  (`strategy.Factories`) (pick the
   ones with the cleanest/most orthogonal signals — e.g. avoid shipping two near-duplicate
-  moving-average-cross variants both in the initial 5), all 3 timeframes (5m, 15m, 1h) folded into
+  moving-average-cross variants both in the initial 5), the 3 decision timeframes
+  (**`5m`, `15m`, `1H`** — OKX casing) folded into
   the one global agent's observation, token identity as an explicit input field (one-hot over
   active tokens is enough at this scale — a learned embedding is unnecessary complexity for 2-10
-  tokens). One model: `models/ppo_global.zip`.
-- **Phase B:** expand token count toward the full ~10-token roster and/or the full 12-strategy
+  tokens). One model: `models/ppo_global.zip`. Strategies may additionally *read* `4H`/`1D` for
+  context without those becoming decision timeframes (§9). Narrowing to a single best-performing
+  timeframe is an explicit **later** decision, to be made from real per-timeframe results rather
+  than guessed now.
+- **Phase B:** expand token count toward the full ~10-token roster and/or the full 14-strategy
   roster, gated on the global agent showing real learning signal (reward trending up **per token**,
   not just in aggregate — §15.5) before adding more tokens on top of it.
 - Watch specifically for the failure mode described in §15.1: aggregate reward improving while one
@@ -911,10 +1023,11 @@ schema on both sides must stay in sync, same as today):
   among several**, not the sole gate on what the agent can see or act on — the agent must be able
   to weigh raw price action against what a strategy is saying, including disagreeing with every
   strategy, which requires the raw-price-context field above to actually exist.
-- **Account/position tail**: current exposure, current leverage, unrealized PnL %, equity ratio for
-  *this token's* allocated sub-budget (§15.6) — not total account equity, since per-token reward
-  attribution (§15.5) requires the agent to see the capital constraint it's actually operating
-  under for that token, even though one policy serves all tokens.
+- **Account/position tail**: current exposure, current leverage, unrealized PnL %, plus the shared
+  account's equity ratio (balance ÷ starting balance) and its already-committed exposure ratio
+  (§15.6, revised 2026-08-28 — this replaced the earlier per-token sub-budget framing). Fed as
+  ratios rather than raw dollars so the policy doesn't go out-of-distribution when the account size
+  is reconfigured. Per-token reward attribution (§15.5) is unaffected by capital being pooled.
 - **Recent-performance-of-this-token tail** (needed for §15.7's "give it another chance" behavior
   to be learnable rather than hardcoded): a short rolling window of this token's own recent
   realized trade outcomes (e.g. last N paper_orders' PnL, win/loss) and time-since-last-loss — lets
@@ -937,24 +1050,57 @@ land the version bump together with the field changes, not separately).
 ### 15.4 Action space (per-request output, one shared policy)
 
 Today's `Action{TargetExposure, LeverageFrac, Confidence}` (§2) becomes, per token:
-1. **`strategy_weights`**: one continuous value per assigned strategy (softmax'd or clamped to
-   [0,1] and normalized) — how much the agent trusts each strategy's current signal *right now*,
-   combined with each strategy's `Confidence` to produce a single effective directional signal.
-   This is what "combine the signal of multiple strategies" (per your original ask) resolves to
-   concretely: a learned weighting, not a fixed voting rule.
+
+**Implemented layout (2026-08-28)** — the policy emits one fixed-width vector, `ACTION_DIM = 4 +
+MAX_STRATEGY_SLOTS` (12 today), decoded by the single shared `rl_service/obs.py:decode_action`
+that both `/predict` and the replay env go through so the two can never drift:
+`[target_exposure, leverage_frac, sl_adjust_pct, tp_adjust_pct, w_0 … w_{MAX_STRATEGY_SLOTS-1}]`.
+PPO needs a fixed action shape but the number of assigned strategies varies per request, so the
+weight slots are read **positionally** against the request's strategy signals (assignment order, as
+`buildObservation` appends them) and only slots backed by a real signal are returned. Raising
+`MAX_STRATEGY_SLOTS` (mirrored as `domain.MaxStrategySlots`) changes the action width and
+invalidates existing models — bump `ACTION_SCHEMA_VERSION`/`domain.ActionSchemaVersion` with it.
+`sl_adjust_pct`/`tp_adjust_pct` are emitted in `[-1, 1]` and scaled by `MAX_SLTP_ADJUST_PCT` (0.02,
+mirroring `usecase.MaxSLTPAdjustPct`) so the policy's output range maps onto exactly the bounded
+adjustment Go's ratchet accepts, rather than spending most of its range on values Go clips away.
+
+A model whose action width doesn't match is refused with a **503** (and `/health` reports
+`action_compatible: false`) rather than served — before this landed, `/predict` returned hardcoded
+neutral values for `strategy_weights`/`sl_adjust_pct`/`tp_adjust_pct`, which looked exactly like a
+working model that never wanted to adjust anything, and silently made the shadow-fork mechanic
+below dead code.
+
+1. **`strategy_weights`**: one continuous value per assigned strategy (clamped to [0,1] and
+   normalized to sum to 1 across the strategies present in the request) — how much the agent trusts
+   each strategy's current signal *right now*, combined with each strategy's `Confidence` to produce
+   a single effective directional signal. This is what "combine the signal of multiple strategies"
+   (per your original ask) resolves to concretely: a learned weighting, not a fixed voting rule. An
+   all-zero output falls back to uniform, since a dict of zeros is indistinguishable downstream from
+   a bug.
 2. **`target_exposure`** (unchanged, [-1, 1]): resulting position as a fraction of *this token's*
    max allowed notional, sign = side.
-3. **`leverage_frac`** (unchanged, [0, 1]): mapped to `[1x, MAX_LEVERAGE]` — note your target range
-   is 10x-100x, materially higher than the current `EnvConfig.max_leverage` default of 5.0 and
-   `config.example.yaml`'s `risk.max_leverage: 5`; both must be raised together for Phase A,
-   understanding that §5's hard risk caps (independent of RL, Go-side, non-overridable) are what
-   actually bound worst-case loss — the RL agent proposing up to 100x is safe only because those
-   caps clamp it, never trust the agent's own leverage choice as the safety boundary.
+2b. **Direction stays with the strategy layer.** `target_exposure`'s *magnitude* sizes the order;
+   its sign is not used to flip an order's side out from under the strategy that generated the
+   signal (§9/§16.1: strategies decide *when* there's a tradeable signal, the agent decides *how
+   much*). A model that disagrees with a signal expresses that by sizing toward zero.
+   `usecase.rlSizing` implements this, gated behind `paper_trading.rl_sizing` (off by default,
+   independent of `rl_sltp_adjust`); while it's off, every paper order is opened at the fixed
+   `notional_usd` and 1x, so the `paper_orders` log carries **no leverage or exposure variance** —
+   which is precisely the training signal §15.8's continued-live-learning phase needs in order to
+   learn sizing at all. Turn it on once a model with the current action schema is loaded.
+3. **`leverage_frac`** (unchanged, [0, 1]): mapped to `[1x, MAX_LEVERAGE]` — your target range is
+   10x-100x. `EnvConfig.max_leverage`, `okx_futures_env.py`'s own default, and
+   `config.example.yaml`'s `risk.max_leverage` are all 100 as of this revision (they were 5 when
+   this section was first written). §5's hard risk caps (independent of RL, Go-side,
+   non-overridable) are what actually bound worst-case loss — the RL agent proposing up to 100x is
+   safe only because those caps clamp it, never trust the agent's own leverage choice as the safety
+   boundary.
 4. **`sl_adjust_pct`, `tp_adjust_pct`** (new, continuous, both allowed negative/positive within a
-   clamped range e.g. ±2% per decision step): in-trade adjustments to the *open* position's SL/TP,
-   evaluated on the same cadence as `monitorOpenOrders` (every tick) or throttled to e.g. once per
-   candle close to avoid overreacting to noise — start with candle-close cadence in Phase A, tick
-   cadence is a possible later tightening once the behavior is validated. This is what "trail SL
+   clamped range of ±2% per decision step): in-trade adjustments to the *open* position's SL/TP.
+   Cadence: this section originally proposed starting at candle close and tightening to tick
+   cadence later; §15.9's freshness audit found candle-close cadence let the model reason about a
+   price up to a full bar stale, so it now runs from the **tick stream**, throttled to
+   `RLAdjustInterval` (2s). This is what "trail SL
    into profit when safe" (per your ask) resolves to: not a hardcoded trailing-stop rule, but a
    learned adjustment the agent proposes and the reward function (§15.5) judges after the fact via
    whether it improved or hurt realized outcomes — exactly as you asked ("it should be screened by
@@ -980,8 +1126,9 @@ Today's `Action{TargetExposure, LeverageFrac, Confidence}` (§2) becomes, per to
      folded into training as evidence for whether adjusting helped — rather than the adjustment
      silently overwriting ground truth about what the un-adjusted order would have done.
      `port.Repository.ForkPaperOrderWithSLTP` implements the clone; `usecase.PaperTrader.
-     adjustOpenOrdersWithRL` (called at candle-close cadence, gated on `PaperTrading.RLSLTPAdjust`)
-     is the call site. A fork is **tracking-only**: it is explicitly excluded from token
+     adjustOpenOrdersWithRL` (called from `handleTick` on the live tick stream, throttled to
+     `RLAdjustInterval`, gated on `PaperTrading.RLSLTPAdjust`) is the call site. A fork is
+     **tracking-only**: it is explicitly excluded from token
      budget/reward accounting (§15.6/§15.7) — only its baseline parent's realized PnL counts
      toward the token's real running budget, so one signal never draws down the budget twice.
 
@@ -989,9 +1136,16 @@ Today's `Action{TargetExposure, LeverageFrac, Confidence}` (§2) becomes, per to
 
 Extends the existing `okx_futures_env.py` shaping (realized PnL − fee/funding − drawdown penalty −
 liquidation-proximity penalty, §2) with:
-- A small penalty on `sl_adjust_pct`/`tp_adjust_pct` churn (e.g. proportional to the number of
-  adjustments per trade) so the agent doesn't learn to twitch the SL every tick for free — every
-  adjustment should earn its keep in realized outcome, not be free to try.
+- A small penalty on `sl_adjust_pct`/`tp_adjust_pct` churn so the agent doesn't learn to twitch the
+  SL every tick for free — every adjustment should earn its keep in realized outcome, not be free
+  to try. **Implemented** in `replay_env.py` as `SLTP_CHURN_PENALTY` (0.002), charged against the
+  magnitude of each step's proposed adjustment. Scaled against the raw `[-1, 1]` outputs rather than
+  the post-`MAX_SLTP_ADJUST_PCT` fractions, so the penalty doesn't quietly shrink if that bound is
+  widened later. For the adjustment to have any learnable consequence at all, the replay env also
+  tracks simulated SL/TP prices per position and closes on a **bar high/low touch** (not just the
+  close — the same intra-bar-wick correctness reason `PaperTrader` checks SL/TP on ticks, §14), and
+  mirrors Go's `RatchetSLTP` tighten-only clamp so the policy only sees reward consequences for
+  adjustments production would actually accept.
 - The per-step/per-trade reward the global agent actually trains on is still computed **per
   token** (that token's own realized PnL/equity, not a blended cross-token number) — this doesn't
   change under the global-agent design (§15.1); pooling happens at the *training data* level (all
@@ -1007,38 +1161,109 @@ liquidation-proximity penalty, §2) with:
 
 ### 15.6 Capital allocation across tokens
 
-**Fixed, not learned, in Phase A**: config-level per-token notional (your stated $10/token against
-a <$50 total budget), not a decision the RL agent makes. Rejected letting even the (now single,
-shared) agent dynamically reallocate capital across tokens for Phase A specifically because it
-would make the per-token reward signal (§15.5) depend on a capital-allocation decision made from
-the same pooled policy update — moving capital away from a temporarily-losing-but-still-learning
-token would starve it of the very trades it needs to keep contributing to the shared policy's
-training data, compounding rather than isolating a bad early streak. This is an explicit "later"
-item (add a §14 roadmap entry only once there's a real per-token track record to allocate against),
-not a "we'll get to it eventually, unscoped."
+**Revised 2026-08-28 — one shared account the agent sizes against, replacing fixed per-token
+sub-budgets.** The original decision is kept below rather than deleted, since the concern that
+motivated it is real and still constrains the design.
 
-### 15.7 Handling a token's budget going to zero/negative ("give it another chance")
+**Current design**: one account (`account.initial_usd`, default **$100**) that every token trades
+against. The RL agent's `target_exposure` decides what fraction of *current account equity* goes
+into each position — this is the "imagine we have $100 and the model decides how much to use"
+requirement, and it's what makes `target_exposure` a real capital decision rather than a multiplier
+on a config constant. Sizing is implemented in `usecase.rlSizing`, gated behind
+`paper_trading.rl_sizing`.
 
-Per your explicit ask: a token whose $10 sub-budget is drawn down to zero (or below, if fees push
-it negative) must not be permanently benched — it should get reset and get another shot, since a
-losing streak early in training is expected/noisy, not necessarily evidence the token/strategy mix
-is bad. Concretely:
-- Track equity **per token**, not just per paper order (a new small piece of state — likely a
-  `token_budgets` table or a computed running value from that token's `paper_orders`, TBD at
-  implementation time) so "this token is at zero" is a fact the system can act on.
-  - The recent-performance tail in the observation (§15.3) is what lets the *agent itself* learn to
-    size down approaching zero, rather than needing a hardcoded halt.
+Two **hard Go-side caps** bound whatever the model proposes — the same "never trust the model as
+the safety boundary" pattern as §15.4's ratchet and §5's risk manager:
+- `account.max_position_pct` (default 0.25) — no single position exceeds this fraction of equity.
+  At the 100x leverage ceiling (§15.4) an uncapped position is an account-ending event, and §5's
+  risk manager only guards the *live* path, not paper.
+- `account.max_total_exposure_pct` (default 0.60) — the summed notional of all open baseline
+  positions across every token. The per-position cap alone would still permit four simultaneous
+  25% positions committing the whole account. A new position is trimmed to the remaining headroom,
+  or declined outright when there is none. Shadow forks (§15.4) are excluded from this sum — they
+  track their baseline parent rather than committing separate capital.
+
+The observation carries `AccountEquityUSD`/`AccountInitialUSD`/`OpenExposureUSD` (schema v4), fed
+to the model as **ratios rather than raw dollars** (`rl_service/obs.py:observation_tail`): the
+decision is scale-free, and a policy trained on raw balances would go out-of-distribution the
+moment the account size is reconfigured. `ReplayEnv` applies the same caps and the same
+equity-relative sizing, so the policy never learns to request sizes production would clamp away.
+
+**Mode progression: paper → demo → real** (decided 2026-08-28). Training starts in **paper** mode
+and stays there until there's a genuinely good win rate to point at; then optionally OKX **demo**
+(real order placement, sandboxed — `x-simulated-trading: 1`, §4) as a dress rehearsal that exercises
+the actual execution path; then **real** money. Each mode keeps its own `account_equity` row and
+equity timeline (§15.7), so switching doesn't blend the histories and the paper track record stays
+readable after moving on. Two guardrails make the progression hard to take by accident:
+- `cmd/trader`'s mode is **derived** from `okx.simulated`, never configured separately — a
+  standalone `mode:` setting could disagree with the credentials in use, which would record real
+  losses against the demo account's books *and* make them eligible for the paper/demo auto-reset.
+  Tying them together makes that combination unrepresentable.
+- `trading.allow_real_money` must be explicitly `true` before `cmd/trader` will start against
+  non-demo credentials; it refuses and exits otherwise. Reaching real trading by merely *forgetting*
+  to set `OKX_SIMULATED_TRADING` would make an unset env var the only thing between a sandbox and
+  real capital.
+
+Making mode (and the other config above) switchable from the panel is the intended end state, but
+the panel is deliberately behind the backend for now — the settings are config-driven until the
+frontend work happens, and `allow_real_money` should stay a config/deploy-level decision rather than
+a button, even once the rest becomes panel-editable.
+
+**Why the original per-token design was replaced**: the concern below — that a *learned*
+reallocation decision could starve a temporarily-losing token of the trades it needs to keep
+contributing training data — is about the agent moving capital *between* tokens as a strategic
+choice. That is still not built and still not wanted. What changed is the recognition that fixed
+$10 buckets don't avoid that problem so much as sidestep the actual product requirement: a real
+account is one pool, and "how much do I commit here" is the decision worth learning. The starvation
+risk is now bounded structurally by the caps above rather than by pre-splitting the account, and
+per-token reward attribution (§15.5) is unaffected — that was always independent of whether capital
+is pooled.
+
+**Superseded (kept for the reasoning)** — *Fixed, not learned, in Phase A*: config-level per-token
+notional ($10/token against a <$50 total budget), not a decision the RL agent makes. Rejected
+letting even the (now single, shared) agent dynamically reallocate capital across tokens for Phase A
+specifically because it would make the per-token reward signal (§15.5) depend on a
+capital-allocation decision made from the same pooled policy update — moving capital away from a
+temporarily-losing-but-still-learning token would starve it of the very trades it needs to keep
+contributing to the shared policy's training data, compounding rather than isolating a bad early
+streak.
+
+### 15.7 Handling the account going to zero/negative ("give it another chance")
+
+Per the original ask, now applied at the **account** level rather than per token (§15.6's
+revision): a drained balance must not permanently bench the bot — it gets reset and another shot,
+since a losing streak early in training is expected noise, not necessarily evidence the
+strategy/token mix is bad. Concretely:
+- Track equity as its own durable state (`account_equity`, migration `000006`, one row per mode),
+  not recomputed by summing `paper_orders` on every check, so "the account is at zero" is a fact
+  the system can act on directly.
+  - The recent-performance tail in the observation (§15.3) plus `AccountEquityUSD` (§15.6) is what
+    lets the *agent itself* learn to size down approaching zero, rather than needing a hardcoded
+    halt.
 - **Reset condition** (a hard Go-side rule, not RL-decided — this is a bookkeeping/risk-adjacent
   action, same "don't trust the model to have learned this" reasoning as §15.4's ratchet
-  constraint): when a token's running budget hits zero/negative, top it back up to the configured
-  per-token notional and record the reset (so training-run analysis can see how often this
-  happens, and it doesn't look like unlimited free money if it resets constantly with no
-  learning — a token resetting every day is itself a signal something's wrong with that
-  token/strategy mix, worth surfacing on the panel eventually, not just silently papering over).
-- This is paper/demo-mode behavior. Real-money trading (§14, not yet wired) must NOT auto-reset a
-  drained budget the same way — that's real capital, and running out is a stop condition requiring
-  a human decision, not an automatic top-up. Keep this distinction explicit whenever real-mode
-  wiring happens; don't let the paper-mode reset logic leak into the real-mode path by accident.
+  constraint): when the running balance hits zero/negative, top it back up to
+  `account.initial_usd` and record the reset. `reset_count` is the signal worth watching — an
+  account resetting daily is itself evidence something is wrong, and surfacing that is the whole
+  reason it's counted rather than silently papering over it.
+- **Equity timeline** (explicit product requirement, 2026-08-28 — "I want to see it happen when I'm
+  not online"): every balance change writes a durable `account_equity_history` row carrying the
+  post-change balance, the signed delta, and *why* (`trade` / `reset` / `seed`), for **all three
+  modes**. A drain-and-reset that happens overnight is therefore reviewable afterward in the
+  panel's chart instead of existing only as a log line nobody was watching. The balance update and
+  its history row are written in **one transaction** — a chart missing the very drop that drained
+  the account would be actively misleading, which is exactly what this exists to prevent. Served by
+  `GET /api/account` and `GET /api/account/history?mode=&since=&limit=`; `cmd/trader` records the
+  demo/real timeline by observing the exchange's reported equity each poll (best-effort — a
+  database problem must never interrupt a live trading loop).
+- This is paper/demo-mode behavior. Real-money trading must NOT auto-reset a drained balance — that's
+  real capital, and running out is a stop condition requiring a human decision, not an automatic
+  top-up. **Now enforced in code, not just documented**: `Repository.ApplyRealizedPnL` skips the
+  reset entirely when `mode == "real"`, leaving the balance at/below zero and reporting
+  `reset=false`, so the paper-mode reset logic cannot leak into the real path by accident. Covered
+  by a test asserting a real account drained to -50 stays at -50. `cmd/trader` picks its mode from
+  `okx.simulated` (demo when simulated, real otherwise), so the carve-out follows the credentials
+  in use rather than a separately-configured flag that could disagree with them.
 
 ### 15.8 Training loop shape: warm-start replay + continued live learning
 
@@ -1140,7 +1365,8 @@ inputs into a new kind of signal).
 
 **Engineering principle driving this split**: never duplicate domain logic across languages if it
 can be avoided; only reach across language boundaries for a genuinely generic, off-the-shelf tool.
-The 12 built-in strategies' logic is this project's actual domain knowledge and lives in
+The built-in strategies' logic (14 kinds registered in `strategy.Factories` today) is this
+project's actual domain knowledge and lives in
 `internal/strategy/*.go` — reimplementing it in Python (the same trap warm-start's design
 deliberately avoided, §15.8) would create two copies that drift the moment one is edited and the
 other is forgotten. Bayesian optimization itself (which candidate parameter values to try next,
@@ -1213,7 +1439,7 @@ replacement for the optimizer, not a replacement for the RL agent) that directly
 single strategy's confidence calculation is a self-contained, low-risk place to try it, distinct
 from the larger (and explicitly deferred) question of using fuzzy logic to reconcile heterogeneous
 raw indicators as a preprocessing layer ahead of the RL agent (§16.1's Neuro-Fuzzy note). Implement
-as a new `strategy.Strategy` kind (e.g. `rsi_sma_fuzzy`) alongside the existing 12, not a
+as a new `strategy.Strategy` kind (e.g. `rsi_sma_fuzzy`) alongside the existing kinds, not a
 modification to `rsi_sma` itself — origins must stay locked and comparable (§11.3).
 
 ### 16.6 Open implementation questions (resolve at implementation time, not here)

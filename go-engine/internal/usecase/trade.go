@@ -29,6 +29,25 @@ type Trader struct {
 	PosMode      string // "net" or "long_short" (hedge mode)
 	MinOrderUSD  decimal.Decimal
 	Logger       *slog.Logger
+
+	// ActiveTokens is the ordered roster the observation's token-identity one-hot is built against
+	// (CLAUDE.md §15.1/§15.3) — it must be the same roster, in the same order, that the loaded
+	// global model was trained with, since order defines each slot's index. Leaving it empty sends
+	// an all-zero one-hot, which is a token the model has never seen.
+	ActiveTokens []string
+
+	// Mode is which account this trader operates against: "demo" or "real" (CLAUDE.md §15.6).
+	// It selects which account_equity row the equity timeline is recorded under, and — critically —
+	// "real" is the mode the repository refuses to auto-reset when drained (§15.7).
+	Mode string
+	// AccountInitialUSD is the configured starting balance, reported to the model alongside live
+	// equity so it can see drawdown from the starting point the same way the paper path does.
+	AccountInitialUSD decimal.Decimal
+	// Repo records the equity timeline for this mode (CLAUDE.md §15.7's requirement that a drain be
+	// visible after the fact, in every mode). Optional: nil means no timeline is recorded and the
+	// observation reports the exchange's equity directly — the trading loop itself never depends on
+	// it, so a database outage can't stop live trading.
+	Repo port.Repository
 }
 
 // Run executes the trading loop until ctx is cancelled.
@@ -90,18 +109,28 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 	lever := pos.Lever
 	uplRatio := pos.UplRatio
 
-	obs := domain.Observation{
-		SchemaVersion:    domain.ObservationSchemaVersion,
-		InstID:           t.InstID,
-		LastPrice:        mid,
-		Position:         posSize,
-		CurrentLeverage:  lever,
-		UnrealizedPnLPct: uplRatio,
-		// TODO(CLAUDE.md §15): cmd/trader is not yet part of the per-token paper-trading/RL loop
-		// (§14, live wiring still open) — TokenEquityUSD is set to total account equity as a
-		// placeholder until this loop is repointed at per-token budgets like the paper-trader path.
-		TokenEquityUSD: equity,
+	// The exchange's own reported equity is ground truth for demo/real — unlike paper mode, where
+	// the balance is bookkeeping the engine owns, here the account really exists. It's reported as
+	// AccountEquityUSD so the observation is shaped exactly like every paper-mode observation the
+	// model trained on (CLAUDE.md §15.6).
+	initial := t.AccountInitialUSD
+	if !initial.IsPositive() {
+		initial = equity
 	}
+
+	obs := domain.Observation{
+		SchemaVersion:     domain.ObservationSchemaVersion,
+		InstID:            t.InstID,
+		ActiveTokens:      t.ActiveTokens,
+		LastPrice:         mid,
+		Position:          posSize,
+		CurrentLeverage:   lever,
+		UnrealizedPnLPct:  uplRatio,
+		AccountEquityUSD:  equity,
+		AccountInitialUSD: initial,
+	}
+
+	t.recordEquity(ctx, equity, initial, logger)
 
 	action, err := t.Model.Predict(ctx, obs)
 	if err != nil {
@@ -117,6 +146,39 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 // execute translates the RL agent's action into a leverage change and/or order, after running it
 // through the risk manager. It is the only place live orders are placed, so every path that could
 // touch real money goes through risk.Manager.Approve first.
+// recordEquity keeps this mode's equity timeline in step with what the exchange reports, so the
+// panel can chart demo/real balance over time the same way it charts paper (CLAUDE.md §15.7's
+// requirement that a drain be reviewable after the fact, in every mode).
+//
+// Unlike paper mode, the balance here isn't ours to compute — the exchange owns it. So rather than
+// applying a PnL delta, this observes the reported equity and records the difference from what was
+// last stored. A reset is never triggered from this path: for "real" the repository refuses to
+// auto-reset by design, and for "demo" the exchange's own balance is authoritative, so topping up a
+// local row would just desynchronize it from reality.
+//
+// Entirely best-effort: every failure is logged and swallowed, because a database problem must
+// never interrupt a live trading loop.
+func (t *Trader) recordEquity(ctx context.Context, equity, initial decimal.Decimal, logger *slog.Logger) {
+	if t.Repo == nil || t.Mode == "" {
+		return
+	}
+
+	acct, err := t.Repo.GetAccountEquity(ctx, t.Mode, initial)
+	if err != nil {
+		logger.Warn("equity timeline: read failed", "mode", t.Mode, "error", err)
+		return
+	}
+
+	delta := equity.Sub(acct.EquityUSD)
+	if delta.IsZero() {
+		return // nothing moved since the last poll; don't spam the timeline with flat points
+	}
+
+	if _, _, err := t.Repo.ApplyRealizedPnL(ctx, t.Mode, delta, nil, t.InstID); err != nil {
+		logger.Warn("equity timeline: write failed", "mode", t.Mode, "error", err)
+	}
+}
+
 func (t *Trader) execute(
 	logger *slog.Logger,
 	mid decimal.Decimal,

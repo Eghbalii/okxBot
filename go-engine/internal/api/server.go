@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
@@ -22,6 +24,11 @@ type Server struct {
 	ProcessMgr string
 	Units      []string
 	Logger     *slog.Logger
+
+	// AccountInitialUSD seeds a mode's account row on first read, matching what the trading
+	// services are configured with (CLAUDE.md §15.6) — cmd/api must not invent a different starting
+	// balance than the engine actually trades against.
+	AccountInitialUSD decimal.Decimal
 
 	// hub fans out real-time paper-order open/close events to connected panel WebSocket clients
 	// (CLAUDE.md §11.4). Lazily initialized by Routes/Hub so callers never need to construct it
@@ -76,6 +83,12 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("DELETE /api/assignments/{id}", s.handleDeleteAssignment)
 
 	mux.HandleFunc("GET /api/positions", s.handleListPositions)
+
+	// CLAUDE.md §15.6/§15.7: the shared account's current balance and its timeline, backing the
+	// panel's balance chart — the point of which is that a drain-and-reset that happened overnight
+	// is reviewable after the fact, not only visible in logs nobody was watching.
+	mux.HandleFunc("GET /api/account", s.handleGetAccount)
+	mux.HandleFunc("GET /api/account/history", s.handleAccountHistory)
 
 	mux.HandleFunc("GET /api/sltp-adjustments/stats", s.handleSLTPAdjustmentStats)
 	mux.HandleFunc("GET /api/sltp-adjustments/pairs", s.handleListSLTPAdjustmentPairs)

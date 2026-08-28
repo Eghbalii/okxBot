@@ -121,17 +121,35 @@ type SLTPAdjustmentPair struct {
 	RLAdjustedOrder PaperOrder
 }
 
-// TokenBudget is a token's running paper/demo-mode sub-budget (CLAUDE.md §15.6/§15.7) — tracked
-// separately from summing paper_orders on every check so "this token is at zero" is a fact the
-// system can act on directly, and so reset events (ResetCount/LastResetAt) are visible for
-// training-run analysis rather than looking like unlimited free money.
-type TokenBudget struct {
-	InstID      string
-	BudgetUSD   decimal.Decimal // configured per-token notional a reset tops back up to
+// AccountEquity is one trading mode's shared running balance (CLAUDE.md §15.6, revised
+// 2026-08-28). This replaced the per-token sub-budgets: every token trades against ONE pool, and
+// how much of it goes into any single position is the RL agent's decision (bounded by Go-side
+// caps), not a config constant split evenly across tokens up front.
+//
+// Tracked as its own row rather than summed from paper_orders on every check so "the account is at
+// zero" is a fact the system can act on directly, and so reset events (ResetCount/LastResetAt) stay
+// visible for training-run analysis rather than looking like unlimited free money.
+type AccountEquity struct {
+	Mode        string          // "paper", "demo", or "real"
+	InitialUSD  decimal.Decimal // configured starting balance a reset returns to
 	EquityUSD   decimal.Decimal // current running balance
 	ResetCount  int
 	LastResetAt *time.Time
 	UpdatedAt   time.Time
+}
+
+// EquityPoint is one entry in a mode's balance timeline (CLAUDE.md §15.7). Every balance change
+// writes one, so a drain-and-reset that happens overnight is visible in the panel's chart
+// afterward instead of only in logs nobody was watching at the time.
+type EquityPoint struct {
+	ID        int64
+	Mode      string
+	EquityUSD decimal.Decimal // balance AFTER this change
+	DeltaUSD  decimal.Decimal // signed: realized PnL for a trade, top-up amount for a reset
+	Reason    string          // "trade", "reset", or "seed"
+	OrderID   *int64
+	InstID    string
+	CreatedAt time.Time
 }
 
 // ParamChange is one recorded strategy parameter-change event (CLAUDE.md §16): either
@@ -196,14 +214,19 @@ type Repository interface {
 	// (CLAUDE.md §11.4), filtered/sorted per f.
 	ListPositions(ctx context.Context, f PositionFilter) ([]PaperOrder, error)
 
-	// GetTokenBudget returns inst_id's current budget row, creating it (seeded at initialBudgetUSD,
-	// EquityUSD=initialBudgetUSD) if it doesn't exist yet — CLAUDE.md §15.7.
-	GetTokenBudget(ctx context.Context, instID string, initialBudgetUSD decimal.Decimal) (TokenBudget, error)
-	// ApplyTokenPnL adds pnl (signed) to inst_id's running equity. If the resulting equity is
-	// <= 0, it is reset back to its configured BudgetUSD and ResetCount/LastResetAt are recorded
-	// (CLAUDE.md §15.7's "give it another chance" — paper/demo mode only, never called from a
-	// real-money path). Returns the updated row and whether a reset occurred.
-	ApplyTokenPnL(ctx context.Context, instID string, pnl decimal.Decimal) (TokenBudget, bool, error)
+	// GetAccountEquity returns mode's current balance row, creating it (seeded at initialUSD, with
+	// a reason="seed" history point) if it doesn't exist yet — CLAUDE.md §15.6.
+	GetAccountEquity(ctx context.Context, mode string, initialUSD decimal.Decimal) (AccountEquity, error)
+	// ApplyRealizedPnL adds pnl (signed) to mode's running balance and records an EquityPoint for
+	// it. If the resulting equity is <= 0 AND mode is not "real", it is reset back to InitialUSD,
+	// ResetCount/LastResetAt are recorded, and a second reason="reset" point is written
+	// (CLAUDE.md §15.7's "give it another chance"). Real mode NEVER auto-resets — a drained real
+	// account is a stop condition requiring a human decision, so it is left at/below zero and
+	// reported as drained instead. Returns the updated row and whether a reset occurred.
+	ApplyRealizedPnL(ctx context.Context, mode string, pnl decimal.Decimal, orderID *int64, instID string) (AccountEquity, bool, error)
+	// ListEquityHistory returns mode's balance timeline for the panel's chart (CLAUDE.md §15.7),
+	// oldest-first for direct plotting. A zero since means no lower bound; limit<=0 means no cap.
+	ListEquityHistory(ctx context.Context, mode string, since time.Time, limit int) ([]EquityPoint, error)
 
 	// SLTPAdjustmentStats aggregates CLOSED baseline vs. rl_adjusted trades into one VariantStats
 	// per variant (CLAUDE.md §15.4's A/B comparison) — instID/since filter the underlying
