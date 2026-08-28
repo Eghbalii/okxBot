@@ -823,11 +823,30 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       service never calls, so `train()` raised on its first metric write and the error handler
       swallowed it — the service would have looked healthy while never learning anything. 9 new
       tests (45 Python total), verified end to end through the real API with learning enabled.
-- [ ] Signal-lifecycle controller in Go (§15.10/§15.11) — the categories, PnL-threshold update
-      cadence, terminal `closed_*` emission and early-close handling are designed and the schema
-      carries them, but `PaperTrader` does not yet drive the state machine: it still sends
-      `CategoryUpdate` as a default and never emits terminal calls, so nothing reaches the learner
-      above in production yet.
+
+**NEXT UP — start here in a new session.** Ordered; the first two gate everything else:
+
+- [ ] **(1) Reward penalties in `ReplayEnv` — full spec in §15.13.** Small, and deliberately first:
+      the reward currently has no drawdown or liquidation-proximity term, so with 100x leverage
+      available it actively teaches over-leveraging while §15.6's caps hold that back with a hard
+      limit. Any training done before this has to be unlearned afterward.
+- [ ] **(2) Signal-lifecycle controller in Go — full spec in §15.12.** The blocker for everything
+      in §15: the schema carries categories and `rl_service/learner.py` waits for terminal calls,
+      but `PaperTrader` still sends `CategoryUpdate` as a hardcoded default and never emits
+      `closed_*`, so **no reward reaches the model in production today**. Includes the
+      PnL-threshold update cadence, early close, signal carry-forward, and the SL/TP clamps.
+- [ ] **(3) Strategy audit for `entry_px`/`sl_px`/`tp_px`** (already listed below) — everything
+      currently falls back to percentage-derived levels, which works but wastes the price-level
+      design and leaves the model reasoning about levels no strategy actually chose.
+- [ ] **(4) Then it can genuinely run**: warm-start against real candle history, enable
+      `paper_trading.rl_sizing` + `rl_sltp_adjust` + `serve.learning_enabled` in paper mode, and let
+      it accumulate. Nothing before (2) produces a single reward, so this order is not negotiable.
+
+Deferred, in rough priority: per-token reward breakdown in training logs (§15.5 — the detection
+mechanism for "good on average, bad for one token", needed before expanding past 2 tokens); the
+panel's equity chart (backend done, frontend not); `rl_service/metrics.py` (§11.2); and the OKX
+demo-trading dry run, which is the one Phase 2 item that can only be done on the server.
+
 - [x] Audit MidPrice's live-tick freshness across the SL/TP-adjust and open-order-decision paths
       (explicit user requirement, 2026-08-27) — **found genuinely stale, not just re-verified**:
       `adjustOpenOrdersWithRL` was only ever called from `handleCandle` with `c.Close` (the
@@ -913,7 +932,10 @@ reasoning is still relevant if per-token agents are revisited later at higher to
 Revisit only with an explicit reason (new hardware, materially more paper-trading data, or
 evidence a design assumption below was wrong).
 
-### 15.1 Core decision: one single global PPO agent, not one per token
+### 15.1 Core decision: one single global agent, not one per token
+
+(The algorithm was PPO when this was written; §15.11 changed it to SAC. The one-global-agent
+decision below is unaffected by that — it is about pooling experience, not about the algorithm.)
 
 Explicit product decision, superseding the original "one PPO per token" framing from earlier the
 same day: **one shared policy, trained on the pooled experience of every active token, with token
@@ -1490,6 +1512,87 @@ flips its side.
 **Go-side clamps, config-driven** (the §15.4 ratchet pattern — the model is never the safety
 boundary): min/max SL distance, a minimum TP:SL ratio, and size/leverage ceilings. Early in
 training the policy is effectively random, and one absurd SL would otherwise destroy a position.
+
+### 15.12 Implementation spec: the signal-lifecycle controller (NOT YET BUILT)
+
+§15.10/§15.11 settled *what* the lifecycle is; this is *how* to build it, written down because
+nothing reaches the learner without it. Today `PaperTrader` sends `Category = CategoryUpdate` as a
+hardcoded default and never emits a terminal call, so the continuous-learning path built in
+`rl_service/learner.py` receives no rewards at all in production. **This is the blocker for
+everything else in §15.**
+
+**Where it lives**: an extension of `usecase.PaperTrader`, not a new service. It already tracks open
+positions per token, consumes ticks and candles, and calls the model — what is missing is the state
+machine around those calls.
+
+**Category selection** (replaces the hardcoded default in `buildObservation`):
+
+| Condition | Category | Then |
+|---|---|---|
+| strategy fires, no open baseline position for this token | `buy`/`sell` from the signal's side | model returns `open`/`skip`; on `open`, apply its `SizePct`/`LeverageFrac`/`SLPx`/`TPPx` |
+| strategy fires, position already open | `update` | model returns `none`/`update`/`close` |
+| PnL moved ≥ threshold since last update, position open | `update`, `Signal = nil` | same |
+| time ceiling elapsed, position open | `update`, `Signal = nil` | same |
+| order closes (SL/TP touch, or model `close`) | `closed_sl`/`closed_tp`/`closed_early` | fire-and-forget; the response is discarded |
+
+`Signal = nil` on a price-driven update is deliberate: `signal_block`'s `present` flag is what tells
+the model no strategy spoke, and inventing a stale signal there would be a lie it learns from.
+
+**Update cadence** (§15.11's decision, still unimplemented). Fire an `update` when **any** holds:
+- unrealized PnL moved ≥ `paper_trading.rl_update_pnl_threshold_pct` (default ~1%) since the last
+  update for that order — self-adapting: near-silent in a range, dense during a real move, and far
+  better for credit assignment than thousands of near-identical steps;
+- `paper_trading.rl_update_max_interval` elapsed (default ~15m) — a position grinding sideways must
+  still be observed, since funding accrues and setups decay, and "time passed" is itself information;
+- a strategy fires — never filtered; a real opinion always reaches the model immediately.
+
+Per-order state (last-update PnL and timestamp) belongs in memory on `PaperTrader`, guarded like
+`candlesMu`. Losing it on restart is harmless: the next tick simply triggers one update.
+
+**Terminal calls are the reward delivery path.** On every close in `monitorOpenOrders`, build an
+observation with the terminal category and `PositionState.RealizedPnLUSD` set, and POST it. Do NOT
+zero entry/SL/TP — the outcome has to stay attached to the decision that produced it (§15.10).
+Best-effort: a failed terminal call must never block closing the order, but it does mean that
+decision is never scored, so log it at warn.
+
+**Early close** (`action == "close"`) is new capability with no code yet. Per the 2026-08-28
+decision: allow it, close at market, and record `close_reason = 'rl_early'` so early-closed trades
+stay comparable against ones that ran to SL/TP — the same evidence-gathering logic as the shadow
+forks. `closeReason` and the `paper_orders` CHECK constraint both need the new value.
+
+**Signal carry-forward**: a higher-timeframe signal stays meaningful between its candles, so the
+last signal per (inst_id, bar) is retained and re-sent on `update` calls rather than vanishing.
+Note §15.11 dropped the signal's `age_seconds` field, so staleness currently reaches the model only
+through `PositionState.AgeSeconds` — if carry-forward proves to need explicit staleness, that is a
+schema change, not a controller change.
+
+**Forks generate their own updates** (§15.4): they are open positions too. Bound fork-of-a-fork or
+it grows without limit — simplest rule is to skip the adjust pass for orders whose `Variant` is
+already `rl_adjusted`.
+
+**Go-side clamps to add before any of this is trusted** (§15.11, the `RatchetSLTP` pattern — the
+model is never the safety boundary): minimum and maximum SL distance, a minimum TP:SL ratio, and
+the existing size/leverage ceilings. Early in training the policy is effectively random, and one
+absurd stop would otherwise destroy a position. These belong in config, not hardcoded.
+
+### 15.13 Reward penalties still missing from ReplayEnv (NOT YET BUILT)
+
+`ReplayEnv.step` currently computes `reward = (realized_pnl - fee_cost) / initial_equity` minus the
+SL/TP churn penalty, and **nothing else**. The drawdown and liquidation-proximity penalties that
+§15.5 and §2 describe exist only in the legacy `okx_futures_env.py`
+(`reward -= 0.5 * drawdown_pct`, `reward -= 0.3 * liq_penalty`), which is off by default and not
+what anything trains against.
+
+Why this matters more than it looks: with leverage up to 100x available, maximum expected PnL comes
+from maximum position size. A PnL-only reward therefore actively teaches the agent to over-leverage,
+and §15.6's 25%/60% caps currently hold that back with a hard limit while the reward keeps pointing
+the wrong way. Fighting your own objective function with a clamp is not a stable place to be.
+
+**Do this BEFORE any serious training run**, not after: early learning against the wrong objective
+has to be unlearned later, and at this project's data volumes that is expensive. Port both terms
+into `ReplayEnv`, tracking `peak_equity` for the drawdown term (it is not tracked there today), and
+add tests asserting that an identical trade at higher leverage earns strictly less reward — the
+property that makes the reward, not just the clamp, discourage over-leveraging.
 
 ### 15.9 Implementation phasing (tracked in §14 going forward)
 
