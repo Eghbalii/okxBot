@@ -36,6 +36,16 @@ func newFakeRepository() *fakeRepository {
 func (r *fakeRepository) SaveCandle(ctx context.Context, c port.Candle) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Upsert on (inst_id, bar, ts), mirroring the real Postgres implementation's ON CONFLICT.
+	// A plain append would let a test see duplicate rows that production cannot produce — and
+	// would make the backfill's idempotency (which is what allows an interrupted run to simply be
+	// re-run) untestable against this fake.
+	for i, existing := range r.candles {
+		if existing.InstID == c.InstID && existing.Bar == c.Bar && existing.Timestamp.Equal(c.Timestamp) {
+			r.candles[i] = c
+			return nil
+		}
+	}
 	r.candles = append(r.candles, c)
 	return nil
 }

@@ -88,7 +88,7 @@ okxBot/
 │   ├── cmd/
 │   │   ├── ingestor/          # connects OKX public WS, publishes ticks/candles to Redis
 │   │   ├── trader/            # main trading loop: reads state, calls RL service, executes orders
-│   │   ├── paper-trader/      # forward-test engine, §8
+│   │   ├── paper-trader/      # forward-test engine, §8; -backfill loads candle history, §17
 │   │   └── api/               # dashboard/reporting HTTP API, §11
 │   ├── internal/
 │   │   ├── domain/            # core entities: Candle, Ticker, Position, Balance, Order,
@@ -863,10 +863,16 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       §16.8. 7 of 14 now emit the structural levels they were computing and discarding; the other 7
       legitimately have none. Turned up four pre-existing bugs, including `pmax` being unable to
       emit a signal at all and EMA's precision growing without bound.
-- [ ] **(4) Then it can genuinely run**: warm-start against real candle history, enable
-      `paper_trading.rl_sizing` + `rl_sltp_adjust` + `serve.learning_enabled` in paper mode, and let
-      it accumulate. The reward now flows end to end and the objective no longer rewards
-      over-leveraging, so what it learns from here is worth keeping.
+- [x] **(3b) Candle backfill (2026-08-28, §17)** — warm-start rolls out against real candle
+      history from Postgres, and a fresh database has none. Waiting days for the live ingestor to
+      accumulate it was never necessary: OKX serves it directly. `cmd/paper-trader -backfill` and
+      `POST /api/candles/backfill`, paced and idempotent. This turned step (4) from a multi-day
+      wait into a ~90 second job.
+- [ ] **(4) Then it can genuinely run**: warm-start against the backfilled history, enable
+      `serve.learning_enabled` -> `paper_trading.rl_sizing` -> `rl_sltp_adjust` in paper mode (in
+      that order, so a bad reward curve is attributable), leaving `rl_early_close` off. The reward
+      now flows end to end and the objective no longer rewards over-leveraging, so what it learns
+      from here is worth keeping.
 
 Deferred, in rough priority: per-token reward breakdown in training logs (§15.5 — the detection
 mechanism for "good on average, bad for one token", needed before expanding past 2 tokens); the
@@ -1979,3 +1985,53 @@ invisible while only percentages were emitted:
 
 15 new tests (185 Go total). The `pmax`, EMA, and state-isolation fixes are mutation-checked:
 reverting each one fails the test written for it.
+
+## 17. Candle backfill (implemented 2026-08-28)
+
+Warm-start training (§15.8) rolls out against real candle history read from Postgres's `candles`
+hypertable, and a fresh database has none. The original plan was to run the live ingestor for
+several days to accumulate it — unnecessary, since OKX serves that history directly. This turned
+the first warm-start from a multi-day wait into a ~90 second job.
+
+- **`GET /api/v5/market/history-candles`**, not the `/market/candles` the ingestor already used.
+  The latter only serves the most recent window (a few hundred bars) and cannot page backwards, so
+  it can seed a live candle window but cannot build history. `rest.Client.GetHistoryCandles` pages
+  backwards from a cursor; note OKX's parameter is confusingly named `after` (meaning "older than",
+  from the cursor's perspective), so the Go signature says `before` instead.
+- **`usecase.Backfill`** owns the orchestration. It depends on a new narrow
+  `port.HistoryCandleFetcher` rather than the full `ExchangeClient` — a data-loading job must not
+  be able to place an order, and the type system should enforce that rather than the implementation
+  being careful.
+- **Sized in CANDLES per timeframe, not days** (a deliberate revision of the day-based depth this
+  was first specified with). `ReplayEnv` advances one candle per training step, so candle count is
+  what training consumes: "30 days" is ~30 rows on a 1D bar and ~8,600 on 5m. A day-based depth
+  starves exactly the timeframes that need the most history — at ~96 15m candles per token, a
+  50,000-timestep warm-start would loop one day of price action ~260 times, which is memorization,
+  not initialization. `DefaultTargetCandles` is 1,500: ~5 days of 5m, ~15 days of 15m, ~2 months of
+  1H, ~4 years of 1D.
+- **Paced and idempotent.** `DefaultPageDelay` (150ms) stays well inside OKX's rate limit rather
+  than racing it — the backfill shares an IP with the live trading path, so being throttled here
+  would also throttle order placement. `SaveCandle` already upserts on `(inst_id, bar, ts)`, so an
+  interrupted run is resumed by simply issuing it again.
+- **Partial failure is expected, not fatal.** One delisted instrument or one timeframe with less
+  history than requested reports its error in its own `BackfillResult` while every other pair
+  completes. A stall guard exits if the cursor stops advancing, so a misbehaving endpoint can't
+  produce an infinite request loop against a rate-limited API.
+- **Two triggers**: `cmd/paper-trader -backfill [-backfill-candles N]` (runs and exits without
+  starting the trading loop) and `POST /api/candles/backfill` on `cmd/api` (empty body = the
+  configured instruments and bars). The flag lives on `cmd/paper-trader` rather than in a new
+  binary because that process already has the exchange client, repository, and instrument/bar
+  config wired up. The endpoint runs synchronously: it is paced and can take minutes, but a
+  fire-and-forget job would need its own status endpoint and progress store to answer the only
+  question anyone asks afterward ("did it work?").
+
+**Live-verified against real OKX and a real TimescaleDB**, not just unit-tested: 9,000 candles
+across 2 instruments × 3 timeframes in ~90s; re-running the full backfill left the row count
+unchanged at exactly 1,800 (idempotency against real Postgres, not just the fake); 0 of 1,800 rows
+had incoherent OHLC; a nonexistent instrument returned HTTP 200 with its error scoped to its own
+result. Coverage matched the projection — 1H reached ~2 months back, 1D ~3 months at 100 candles.
+
+**A test fake was fixed rather than the test weakened**: `fakeRepository.SaveCandle` appended where
+the real Postgres implementation upserts, so the idempotency test failed against a fake that could
+not model the behavior being asserted. A fake that diverges from its real counterpart quietly
+weakens every test that uses it, so the fake now upserts on the same key.

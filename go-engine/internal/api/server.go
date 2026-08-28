@@ -14,6 +14,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )
 
 // Server holds the dependencies cmd/api's handlers need.
@@ -29,6 +30,17 @@ type Server struct {
 	// services are configured with (CLAUDE.md §15.6) — cmd/api must not invent a different starting
 	// balance than the engine actually trades against.
 	AccountInitialUSD decimal.Decimal
+
+	// Backfill loads historical candles on demand (CLAUDE.md §15.8), so warm-start training has
+	// real market history without waiting days for the live ingestor to accumulate it. Nil when
+	// cmd/api runs without exchange credentials — the panel backend is otherwise read-only, so
+	// having no exchange client is a valid configuration, and the endpoint reports that rather
+	// than failing.
+	Backfill *usecase.Backfill
+	// BackfillInstIDs/BackfillBars are the defaults used when a backfill request omits them,
+	// mirroring what the trading services are configured to run.
+	BackfillInstIDs []string
+	BackfillBars    []string
 
 	// hub fans out real-time paper-order open/close events to connected panel WebSocket clients
 	// (CLAUDE.md §11.4). Lazily initialized by Routes/Hub so callers never need to construct it
@@ -96,6 +108,7 @@ func (s *Server) Routes() http.Handler {
 	// CLAUDE.md §16 point 6: backs the Strategies page's price-line + parameter-change-marker
 	// chart — candles for the price line, param-changes for the vertical markers.
 	mux.HandleFunc("GET /api/candles", s.handleListCandles)
+	mux.HandleFunc("POST /api/candles/backfill", s.handleBackfillCandles)
 	mux.HandleFunc("GET /api/strategies/{id}/param-changes", s.handleListParamChanges)
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {

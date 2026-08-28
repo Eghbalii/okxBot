@@ -16,8 +16,10 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/api"
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )
 
 func main() {
@@ -60,6 +62,18 @@ func main() {
 		// both read through GetAccountEquity, so a different value here would seed a balance the
 		// engine never actually traded against.
 		AccountInitialUSD: cfg.Account.InitialUSD,
+
+		// Candle backfill (CLAUDE.md §15.8) needs only read access to market data, so it takes the
+		// narrow HistoryCandleFetcher port rather than the full ExchangeClient — cmd/api must not
+		// be able to place an order. Public market endpoints need no credentials, so this works
+		// even where OKX keys aren't configured.
+		Backfill: &usecase.Backfill{
+			Exchange: rest.New(cfg.OKX.RESTBaseURL, cfg.OKX.APIKey, cfg.OKX.APISecret, cfg.OKX.APIPassphrase, cfg.OKX.Simulated),
+			Repo:     repo,
+			Logger:   logger,
+		},
+		BackfillInstIDs: cfg.Trading.InstIDs,
+		BackfillBars:    cfg.PaperTrading.Bars,
 	}
 	routes := srv.Routes() // must be called before Hub() usage below so the same *wsHub backs both
 
