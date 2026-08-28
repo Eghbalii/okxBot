@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 import os
 
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 
@@ -101,17 +101,40 @@ def main() -> None:
         total_timesteps = cfg.train.total_timesteps
         model_out = cfg.train.model_out
 
-    model = PPO(
-        "MlpPolicy",
-        vec_env,
-        verbose=1,
-        tensorboard_log="data/tensorboard",
-    )
+    if args.warm_start:
+        # SAC, not PPO (CLAUDE.md §15.11): the deployed model has to keep learning from live
+        # outcomes, and PPO's on-policy batches cannot be filled at this project's trade volume.
+        # Warm-start therefore has to produce an artifact the serving path can continue training.
+        model = SAC(
+            "MlpPolicy",
+            vec_env,
+            buffer_size=cfg.serve.buffer_size,
+            verbose=1,
+            tensorboard_log="data/tensorboard",
+        )
+    else:
+        # The legacy historical-CSV sanity-check path (CLAUDE.md §2) stays on PPO — it exists to
+        # validate env/reward changes quickly, never to produce a deployed model.
+        model = PPO(
+            "MlpPolicy",
+            vec_env,
+            verbose=1,
+            tensorboard_log="data/tensorboard",
+        )
+
     model.learn(total_timesteps=total_timesteps)
 
-    os.makedirs(os.path.dirname(model_out), exist_ok=True)
+    os.makedirs(os.path.dirname(model_out) or ".", exist_ok=True)
     model.save(model_out)
     print(f"Saved trained model to {model_out}")
+
+    if args.warm_start:
+        # Save the buffer too, so the serving path resumes with the warm-start experience rather
+        # than an empty buffer (CLAUDE.md §15.11) — weights alone would discard it.
+        buffer_out = cfg.serve.buffer_path
+        os.makedirs(os.path.dirname(buffer_out) or ".", exist_ok=True)
+        model.save_replay_buffer(buffer_out)
+        print(f"Saved replay buffer to {buffer_out}")
 
 
 if __name__ == "__main__":

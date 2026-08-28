@@ -809,10 +809,25 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       necessarily produces them. Each one either gets updated to emit all three, or is removed from
       the roster — a strategy that leaves them empty gives the model nothing to reason about and
       silently degrades the signal block to zeros.
-- [ ] Live/continued-training mode (the second half of §15.8 — consuming real paper-trading
-      outcomes as they accumulate, not just the warm-start replay) — not yet built; needs enough
-      live paper-trading history to be meaningful, which is itself gated on running the Phase A
-      no-op loop against a live OKX feed first (§15.9, still open).
+- [x] **Continuous learning on SAC (§15.11)** — `rl-service` now keeps learning from live outcomes
+      instead of serving frozen weights between periodic retrains, which PPO structurally could not
+      do at this trade volume. `rl_service/learner.py` holds each decision as *pending* keyed by
+      order id and pairs it with the realized PnL that arrives on the terminal (`closed_*`) call
+      hours later — a decision cannot be scored when it is made, so pairing by id rather than by
+      arrival order is what keeps a winning trade's reward from training a losing trade's decision.
+      Reward is PnL normalized by account size, for the same reason the observation feeds ratios.
+      Snapshots write weights AND replay buffer together (config `snapshot_every`), and startup
+      restores both — weights alone would come back having forgotten every experience collected.
+      `learning_enabled` is off by default and must stay off for real money.
+      Caught a silent-failure bug while testing: SB3 sets up its logger inside `learn()`, which this
+      service never calls, so `train()` raised on its first metric write and the error handler
+      swallowed it — the service would have looked healthy while never learning anything. 9 new
+      tests (45 Python total), verified end to end through the real API with learning enabled.
+- [ ] Signal-lifecycle controller in Go (§15.10/§15.11) — the categories, PnL-threshold update
+      cadence, terminal `closed_*` emission and early-close handling are designed and the schema
+      carries them, but `PaperTrader` does not yet drive the state machine: it still sends
+      `CategoryUpdate` as a default and never emits terminal calls, so nothing reaches the learner
+      above in production yet.
 - [x] Audit MidPrice's live-tick freshness across the SL/TP-adjust and open-order-decision paths
       (explicit user requirement, 2026-08-27) — **found genuinely stale, not just re-verified**:
       `adjustOpenOrdersWithRL` was only ever called from `handleCandle` with `c.Close` (the

@@ -50,7 +50,7 @@ class WarmStartConfig:
     # slow enough that the price action resembles the higher bars too.
     bar: str = "15m"
     total_timesteps: int = 50_000
-    model_out: str = "models/ppo_global.zip"
+    model_out: str = "models/sac_global.zip"
     # CLAUDE.md §15.6 (revised 2026-08-28): ONE shared account across every pooled token, matching
     # go-engine's account.initial_usd — not a per-token sub-budget.
     initial_equity_usd: float = 100.0
@@ -65,9 +65,30 @@ class ServeConfig:
     # The global agent's artifact (CLAUDE.md §15.1), matching warm_start.model_out — NOT the legacy
     # okx_futures_env sanity-check env's output. A default pointing at the legacy path meant a
     # deployment without an explicit config.yaml would look for a file --warm-start never writes.
-    model_path: str = "models/ppo_global.zip"
+    model_path: str = "models/sac_global.zip"
     host: str = "0.0.0.0"
     port: int = 8000
+
+    # --- continuous learning (CLAUDE.md §15.11) ---
+    # OFF by default. When enabled the service keeps learning from live outcomes instead of serving
+    # frozen weights: terminal (closed_*) calls deliver realized PnL as reward and trigger a
+    # gradient step. Freeze this for real money — a bad update would otherwise reach live trading
+    # with no review gate, which is exactly what the paper -> demo -> real progression guards.
+    learning_enabled: bool = False
+    # Replay buffer capacity. 100k is far more than this project can fill (tens of trades/day), and
+    # SB3's 1M default would reserve ~788 MB for capacity that will never be used.
+    buffer_size: int = 100_000
+    # No gradient steps until the buffer holds at least this many experiences — updating from a
+    # nearly-empty buffer just overfits the first few trades.
+    learning_starts: int = 100
+    # Gradient steps per closed trade. Off-policy means each experience is reused many times, so
+    # this can be >1 even though experiences arrive slowly.
+    gradient_steps: int = 4
+    # Snapshot cadence, in closed trades. A snapshot writes BOTH weights and the replay buffer:
+    # weights alone would silently discard every collected experience on restart.
+    snapshot_every: int = 25
+    # Where the replay buffer is snapshotted. Sits beside model_path by default.
+    buffer_path: str = "models/sac_global_buffer.pkl"
 
 
 @dataclass

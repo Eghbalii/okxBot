@@ -27,10 +27,20 @@ warm_start:
   # 15m: the middle of the deployed agent's 5m/15m/1H decision timeframes.
   bar: "15m"
   total_timesteps: 50000
-  model_out: "models/ppo_global.zip"
+  model_out: "models/sac_global.zip"
   initial_equity_usd: 10.0 # CLAUDE.md §15.6: matches the real per-token paper budget
 
 serve:
-  model_path: "models/ppo_global.zip"
+  model_path: "models/sac_global.zip"
+  # CLAUDE.md §15.11: keep learning from live outcomes instead of serving frozen weights. Terminal
+  # (closed_*) calls deliver realized PnL as reward and trigger a gradient step.
+  # OFF by default, and it MUST stay off for real money — a bad update would otherwise reach live
+  # trading with no review gate. Turn it on for paper mode, where fast iteration is the point.
+  learning_enabled: false
+  buffer_size: 100000        # ~79 MB at this observation width; SB3's 1M default is Atari-sized
+  learning_starts: 100       # no gradient steps until the buffer has this much to learn from
+  gradient_steps: 4          # per closed trade; off-policy reuses each experience many times
+  snapshot_every: 25         # closed trades between snapshots (weights AND buffer, never just one)
+  buffer_path: "models/sac_global_buffer.pkl"
   host: "0.0.0.0"
   port: 8000

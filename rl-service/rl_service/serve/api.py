@@ -9,21 +9,33 @@ schema and vectorization logic live in rl_service/obs.py, shared with the warm-s
 in sync with `domain.Observation` / `domain.Action` on the Go side
 (go-engine/internal/domain/rl.go) — including OBSERVATION_SCHEMA_VERSION vs
 domain.ObservationSchemaVersion.
+
+**One endpoint, always /predict** (CLAUDE.md §15.11). Terminal (`closed_*`) calls also come here:
+they return an action the caller discards, and their realized PnL becomes the reward that trains
+every decision that preceded them. There is no separate training route and no queue — one request,
+one response.
+
+The algorithm is **SAC**, not PPO (§15.11): PPO is on-policy and can only learn from a fresh batch
+of its own current policy's actions, which at tens of trades/day takes weeks to fill. SAC's replay
+buffer learns from a trickle, which is what makes continuous learning possible here at all.
 """
 from __future__ import annotations
 
 import logging
 import os
+from typing import Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
-from stable_baselines3 import PPO
+from stable_baselines3 import SAC
 
 from rl_service.config import load_config
+from rl_service.learner import Learner, reward_from_outcome
 from rl_service.obs import (
     ACTION_DIM,
     ACTION_SCHEMA_VERSION,
     OBSERVATION_SCHEMA_VERSION,
+    TERMINAL_CATEGORIES,
     Action,
     Observation,
     decode_action,
@@ -40,21 +52,65 @@ _cfg = load_config(os.environ.get("CONFIG_PATH"))
 # Single global policy (CLAUDE.md §15.1) — every token's /predict call is answered by this one
 # model; token identity reaches the model only through the observation vector's one-hot, not
 # through model selection. None until a trained model exists at _cfg.serve.model_path.
-_model: PPO | None = None
+_model: Optional[SAC] = None
+
+# Present only when continuous learning is enabled (CLAUDE.md §15.11). None means the service serves
+# frozen weights, which is the required posture for real money.
+_learner: Optional[Learner] = None
 
 
 @app.on_event("startup")
 def _load_model() -> None:
-    global _model
-    if os.path.exists(_cfg.serve.model_path):
-        _model = PPO.load(_cfg.serve.model_path)
-        logger.info("Loaded global RL model from %s", _cfg.serve.model_path)
-    else:
+    global _model, _learner
+
+    if not os.path.exists(_cfg.serve.model_path):
         logger.warning(
             "No trained model found at %s; /predict will return a flat (no-op) action until a "
             "model is trained and placed there.",
             _cfg.serve.model_path,
         )
+        return
+
+    _model = SAC.load(_cfg.serve.model_path)
+    logger.info("Loaded global RL model from %s", _cfg.serve.model_path)
+
+    if not _cfg.serve.learning_enabled:
+        logger.info("Continuous learning disabled; serving frozen weights.")
+        return
+
+    # A model loaded for inference has no replay buffer — SB3 drops it on save unless it is written
+    # separately. Restoring it is what makes learning resume rather than restart: without it the
+    # service would come back having forgotten every experience it ever collected.
+    _model.replay_buffer_class = None
+    if os.path.exists(_cfg.serve.buffer_path):
+        try:
+            _model.load_replay_buffer(_cfg.serve.buffer_path)
+            logger.info(
+                "Restored replay buffer from %s (%d experiences)",
+                _cfg.serve.buffer_path, _model.replay_buffer.size(),
+            )
+        except Exception:
+            logger.exception("Could not restore replay buffer; starting with an empty one")
+
+    _learner = Learner(
+        _model,
+        learning_starts=_cfg.serve.learning_starts,
+        gradient_steps=_cfg.serve.gradient_steps,
+        snapshot_every=_cfg.serve.snapshot_every,
+        model_path=_cfg.serve.model_path,
+        buffer_path=_cfg.serve.buffer_path,
+    )
+    logger.info("Continuous learning ENABLED (CLAUDE.md §15.11) — freeze this for real money.")
+
+
+@app.on_event("shutdown")
+def _snapshot_on_shutdown() -> None:
+    """A clean shutdown must not throw away experience collected since the last snapshot."""
+    if _learner is not None:
+        try:
+            _learner.snapshot()
+        except Exception:
+            logger.exception("shutdown snapshot failed")
 
 
 @app.get("/health")
@@ -63,12 +119,17 @@ def health():
     # current action schema" — CLAUDE.md §11.2 makes the same point about model_loaded, and the
     # panel needs to tell these apart for the same reason: they mean very different things.
     action_compatible = _model is not None and _model.action_space.shape[0] == ACTION_DIM
-    return {
+    body = {
         "status": "ok",
         "model_loaded": _model is not None,
         "action_schema_version": ACTION_SCHEMA_VERSION,
+        "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
         "action_compatible": action_compatible,
+        "learning_enabled": _learner is not None,
     }
+    if _learner is not None:
+        body["learning"] = _learner.stats()
+    return body
 
 
 @app.post("/predict", response_model=Action)
@@ -91,10 +152,8 @@ def predict(obs: Observation) -> Action:
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
-    # A model trained against the old Box(2,) action space cannot answer the full CLAUDE.md §15.4
-    # action — refuse rather than silently returning zeros for sl/tp_adjust and uniform strategy
-    # weights, which would look like a working model proposing no adjustments (exactly the failure
-    # this endpoint used to have with its hardcoded defaults).
+    # A model trained against an older, narrower action space cannot answer the current one —
+    # refuse rather than silently serving values that would look like real decisions.
     action_dim = _model.action_space.shape[0]
     if action_dim != ACTION_DIM:
         raise HTTPException(
@@ -107,4 +166,33 @@ def predict(obs: Observation) -> Action:
         )
 
     raw, _ = _model.predict(obs_vec, deterministic=True)
-    return decode_action(np.asarray(raw).reshape(-1), obs)
+    raw = np.asarray(raw).reshape(-1)
+
+    if _learner is not None:
+        _learn(obs, obs_vec, raw)
+
+    return decode_action(raw, obs)
+
+
+def _learn(obs: Observation, obs_vec: np.ndarray, raw: np.ndarray) -> None:
+    """Feeds this call into the learning loop (CLAUDE.md §15.11).
+
+    A terminal call CLOSES the loop: it carries the realized PnL that scores the decision recorded
+    when the position was opened. Every other call OPENS one, holding the decision until its
+    outcome arrives — which may be hours later, and is why decisions are keyed by order id rather
+    than assumed to resolve in order.
+    """
+    assert _learner is not None
+
+    if obs.category in TERMINAL_CATEGORIES:
+        reward = reward_from_outcome(
+            obs.position_state.realized_pnl_usd, obs.account_initial_usd or obs.account_equity_usd
+        )
+        matched = _learner.complete(obs.order_id, reward, obs_vec.reshape(-1))
+        if not matched:
+            # Expected after a restart, or for trades opened before learning was enabled — the
+            # decision that produced them was never recorded, so there is nothing to score.
+            logger.debug("terminal call for unknown order %s; nothing to score", obs.order_id)
+        return
+
+    _learner.record(obs.order_id, obs_vec.reshape(-1), raw)
