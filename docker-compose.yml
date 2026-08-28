@@ -189,6 +189,24 @@ services:
     depends_on:
       - api
 
+  # Host-level CPU/RAM/disk (the panel's "resources" tab, CLAUDE.md §11.1, currently only embeds
+  # a Grafana link — this is what that dashboard actually has to show). Prometheus's own
+  # process_* metrics (used elsewhere on the dashboard) are per-service, not host-wide; node-
+  # exporter is the standard way to get the underlying VM's numbers into Prometheus at all.
+  node-exporter:
+    image: prom/node-exporter:latest
+    command:
+      - "--path.rootfs=/host"
+      # Excludes noisy/irrelevant pseudo-filesystems (overlay layers, tmpfs, container mounts)
+      # from the disk-usage metrics so "free disk space" reads as the host's real root volume,
+      # not dozens of Docker-internal mounts.
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    ports:
+      - "9100:9100"
+
   prometheus:
     image: prom/prometheus:latest
     volumes:
@@ -199,6 +217,7 @@ services:
     depends_on:
       - ingestor
       - paper-trader
+      - node-exporter
 
   # Single-node log aggregation (CLAUDE.md §11.2/§11.6 revised): Loki indexes only labels
   # (service, level), not full text, which is what keeps this lightweight next to
