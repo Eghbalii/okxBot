@@ -804,6 +804,11 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
 - [x] Paper → demo → real progression guardrails (§15.6): mode derived from `okx.simulated` so it
       can never disagree with the credentials in use, plus `trading.allow_real_money` (default
       false) which `cmd/trader` refuses to start without against non-demo keys.
+- [ ] **Audit all 14 strategies for entry_px / sl_px / tp_px** (§15.11): the observation now carries
+      a strategy's proposed entry price and SL/TP *levels*, but not every built-in strategy
+      necessarily produces them. Each one either gets updated to emit all three, or is removed from
+      the roster — a strategy that leaves them empty gives the model nothing to reason about and
+      silently degrades the signal block to zeros.
 - [ ] Live/continued-training mode (the second half of §15.8 — consuming real paper-trading
       outcomes as they accumulate, not just the warm-start replay) — not yet built; needs enough
       live paper-trading history to be meaningful, which is itself gated on running the Phase A
@@ -1377,6 +1382,99 @@ unused legacy `okx_futures_env.py`. With 100x leverage available, PnL-only rewar
 maximum position size; §15.6's caps currently bound that with a hard limit rather than the reward
 discouraging it. Porting those penalties into `ReplayEnv` is required before any leverage freedom
 is trusted.
+
+### 15.11 SAC + continuous learning, and the final observation/action shape (decided 2026-08-28)
+
+Revises §2's PPO choice and §15.10's field list, after working through what "the model decides how
+much to risk" actually requires. §15.10's lifecycle (categories, close-event-as-reward, one signal
+per call) is unchanged — this settles the algorithm and the exact fields.
+
+**PPO → SAC.** §2 chose PPO for stability and noted SAC as a later A/B candidate. The requirement
+that forced the change: **the model must keep learning in production, not serve frozen weights
+between periodic retrains.** PPO is on-policy — it learns only from actions its *current* policy
+just took, collects a batch (~2048 steps), updates, and discards it. At tens of trades/day that
+batch takes weeks to fill, so PPO structurally cannot learn continuously here.
+
+SAC is off-policy: a **replay buffer** keeps every experience and reuses it, so it learns from a
+trickle rather than a batch and can update after each closed trade. Measured on this project's
+actual dimensions (94-in/7-out): ~462k params, **1.88 MB** per weights snapshot, and **~79 MB** RAM
+for a 100k-entry buffer (SB3's 1M default is sized for Atari and would waste ~788 MB for capacity
+this project will never fill). Fits the 4 GB VPS with room to spare.
+
+- **Freezing stays available**: a SAC model saves and loads exactly like PPO, so `learning_enabled`
+  simply turns updates off. This maps onto §15.6's paper → demo → real progression — learn
+  continuously in paper, freeze a reviewed snapshot before real capital is involved.
+- **Snapshots must include the replay buffer**, not just weights: a restart would otherwise discard
+  every experience collected. Weights and buffer are saved separately by SB3.
+- **The service becomes stateful.** Today `rl-service` loads a file and answers; a restart loses
+  nothing. With continuous learning the buffer and updated weights live in memory, which is a new
+  operational requirement.
+- **One endpoint, always `/predict`.** Terminal (`closed_*`) calls return an action the caller
+  discards — the service uses them to compute reward and update. There is no separate `/train`
+  route, and no queue: one request, one response, ~1 ms.
+- **Honest limit**: switching algorithms does not fix data scarcity. RL typically wants hundreds of
+  thousands of experiences; this produces tens of trades/day. SAC is markedly more sample-efficient
+  than PPO, but expect slow learning regardless. §15.4's shadow forks help by yielding two outcomes
+  per signal plus a clean baseline-vs-adjusted difference.
+
+**Observation (v6).** Revised from §15.10 after review — several fields were carrying no weight:
+- **Signal**: `present`, `side`, `confidence`, **`entry_px`**, **`sl_px`**, **`tp_px`**,
+  `win_rate`, `log(trade_count)`, plus `kind` and `bar` one-hots.
+  - SL/TP are **prices, not percentages**. A strategy derives a level from chart structure (below a
+    swing low, at a fair-value gap); expressing it as a percentage discards exactly the structural
+    information that made it a level. Same for the model's own SL/TP output.
+  - `entry_px` is new — strategies propose where to enter, which nothing carried before.
+  - `win_rate`/`trade_count` are kept deliberately: they are what replaced the `strategy_weights`
+    output, and the only way one shared policy can learn that a strategy works on one token and
+    not another. Trade count is log-compressed because 100% of 2 trades and 60% of 200 are very
+    different evidence.
+- **Position** (merged; §15.10 had this split across two overlapping blocks): `position_open`,
+  `side`, `leverage`, `size_ratio`, `is_fork`, `age_seconds`, `unrealized_pnl_pct`,
+  **`pnl_max`/`pnl_min`**, `dist_to_sl`, `dist_to_tp`. Entry/SL/TP are not repeated here — they
+  are already in the signal.
+  - `age_seconds` distinguishes "+30% in 10 minutes" from "−5% after 4 hours", which current PnL
+    alone cannot.
+  - **`pnl_max`/`pnl_min`** (`pnl_min` is negative-ranged) record how far a position travelled in
+    each direction, not just where it sits now. A trade that reached 90% of its target and gave it
+    all back is a completely different lesson from one that drifted sideways, and without this the
+    model cannot tell them apart. Genuinely strong training signal for the SL/TP-adjust decision.
+- **Per timeframe**: the **live forming candle's OHLC** plus `ema_5/10/20`, `volatility_5/10/20`,
+  `volume_ratio_20`, `rsi_14`, the recent-returns window and distance to swing high/low.
+  - OKX pushes the forming candle on the same WS channel (`confirm=0`), so live OHLC needs no extra
+    REST call and no rate-limit exposure. On a 1H bar the last *closed* candle can be 59 minutes
+    stale, which is exactly the freshness problem §15.9's audit found on the SL/TP path.
+  - `ret_1`/`log_ret_1` dropped (redundant with the returns window); `sma_*` → `ema_*`; `vol_*`
+    renamed to `volatility_*` and `volume_ratio_20` — both were called `vol`, which read as one
+    concept when they are two (return dispersion vs. traded volume).
+- **Dropped**: `market_context` (confluence summary — low value once each call carries one signal),
+  `recent_trades` (20 of 94 inputs for a weak signal), and the signal's own `age_seconds`.
+
+**One-hot vocabularies are over-provisioned so the roster can grow without retraining**: 24 strategy
+kinds (14 used), **16 timeframes** (3 used), 16 tokens (2 used). Spare slots cost a few zeros;
+crossing a ceiling costs a retrain. **Appending is safe, reordering is not** — inserting in the
+middle silently reassigns every later slot's meaning for an already-trained model.
+
+**Action (v4).** One `action` field, five values, named to match the input categories so the same
+word means the same thing on both sides (`adjust` was renamed `update` for this reason):
+
+| Valid on | `action` | Meaning |
+|---|---|---|
+| `buy`/`sell` | `open` / `skip` | take the trade, or decline it |
+| `update` | `none` / `update` / `close` | leave it, move SL/TP, or close now |
+| `closed_*` | — | ignored; the call exists to deliver reward |
+
+Plus `sl_px`, `tp_px` (**prices**, set by the model, not just adjusted), `size_pct`,
+`leverage_frac`, and `order_id` echoed back so the controller can pair a response to its position.
+The model always emits every value; the controller accepts only those meaningful for the category.
+
+**Direction and entry price stay with the strategy** (§16.1): strategies answer *where and which
+way*, the model answers *how much risk*. The model shapes the trade — stops, targets, size,
+leverage — based on regime (and later news/on-chain), and may `skip` a signal entirely, but never
+flips its side.
+
+**Go-side clamps, config-driven** (the §15.4 ratchet pattern — the model is never the safety
+boundary): min/max SL distance, a minimum TP:SL ratio, and size/leverage ceilings. Early in
+training the policy is effectively random, and one absurd SL would otherwise destroy a position.
 
 ### 15.9 Implementation phasing (tracked in §14 going forward)
 
