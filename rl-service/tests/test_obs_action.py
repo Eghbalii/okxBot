@@ -206,3 +206,40 @@ def test_categories_and_order_actions_are_stable_vocabularies():
     # model, so these lists are effectively part of the schema version.
     assert SIGNAL_CATEGORIES[:3] == ["buy", "sell", "update"]
     assert ORDER_ACTIONS == ["none", "adjust", "close"]
+
+
+def test_null_lists_from_go_are_accepted():
+    """Go marshals a nil slice as JSON `null`, not `[]`.
+
+    An observation with no recent trades — every one on a fresh install — would otherwise fail
+    validation and surface to the caller as a schema mismatch. Same null-vs-[] class of bug
+    CLAUDE.md §14 records hitting on the panel side.
+    """
+    raw = (
+        '{"schema_version": 5, "inst_id": "BTC-USDT-SWAP", "active_tokens": ["BTC-USDT-SWAP"],'
+        ' "last_price": "100.5", "timeframes": null, "recent_trades": null, "features": null,'
+        ' "category": "update"}'
+    )
+    obs = Observation.model_validate_json(raw)
+    assert obs.timeframes == []
+    assert obs.recent_trades == []
+    assert obs.features == []
+    # And it must still vectorize rather than blowing up downstream.
+    assert len(observation_tail(obs)) > 0
+
+
+def test_decimal_strings_from_go_are_coerced():
+    """decimal.Decimal marshals as a JSON string; every numeric field must accept that form."""
+    raw = (
+        '{"schema_version": 5, "inst_id": "BTC-USDT-SWAP", "active_tokens": ["BTC-USDT-SWAP"],'
+        ' "last_price": "100.5", "category": "buy",'
+        ' "signal": {"strategy_id": 1, "side": "buy", "confidence": "0.8", "sl_pct": "0.01",'
+        '            "tp_pct": "0.02", "kind": "rsi_sma", "bar": "5m", "win_rate": "0.62",'
+        '            "trade_count": 40, "age_seconds": 120},'
+        ' "position_state": {"position_open": true, "entry_px": "98", "sl_px": "95"},'
+        ' "account_equity_usd": "100"}'
+    )
+    obs = Observation.model_validate_json(raw)
+    assert obs.signal is not None and obs.signal.confidence == 0.8
+    assert obs.position_state.entry_px == 98.0
+    assert obs.last_price == 100.5

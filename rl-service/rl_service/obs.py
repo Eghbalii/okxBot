@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # v3: switched to a single global agent (CLAUDE.md §15.1) — added active_tokens (token-identity
 # one-hot) and price_context (raw price series + positional/distance features) per timeframe block,
@@ -195,6 +195,16 @@ class PositionState(BaseModel):
 
 
 class Observation(BaseModel):
+    # Go marshals a nil slice as JSON `null`, not `[]`, and Pydantic rejects null for a list field.
+    # An observation with no recent trades (every one on a fresh install) would otherwise be a 422
+    # from the caller's perspective and look like a schema mismatch. Coercing null -> [] here fixes
+    # it for every list field at once, rather than requiring each Go call site to remember to
+    # allocate empty slices. Same null-vs-[] class of bug CLAUDE.md §14 records hitting on the panel.
+    @field_validator("timeframes", "recent_trades", "features", mode="before")
+    @classmethod
+    def _null_to_empty(cls, v):
+        return [] if v is None else v
+
     schema_version: int = OBSERVATION_SCHEMA_VERSION
     inst_id: str
     # Ordered roster the token-identity one-hot is built against — must match what the loaded

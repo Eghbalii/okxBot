@@ -591,7 +591,7 @@ func TestAdjustOpenOrdersWithRL_ForksOnNonZeroAdjustment(t *testing.T) {
 	pt.candles = map[string][]domain.Candle{"1m": {
 		{Close: dec("100")}, {Close: dec("101")}, {Close: dec("102")}, {Close: dec("105")},
 	}, "15m": nil}
-	model := &fakeModelClientRL{action: domain.Action{SLAdjustPct: dec("0.02"), TPAdjustPct: dec("0.02")}}
+	model := &fakeModelClientRL{action: domain.Action{OrderAction: domain.OrderActionAdjust, SLAdjustPct: dec("0.02"), TPAdjustPct: dec("0.02")}}
 	pt.Model = model
 
 	sl, tp := dec("95"), dec("110")
@@ -669,7 +669,7 @@ func TestAdjustOpenOrdersWithRL_SkipsWhenNoBaselineOrders(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
 	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
-	model := &fakeModelClientRL{action: domain.Action{SLAdjustPct: dec("0.02")}}
+	model := &fakeModelClientRL{action: domain.Action{OrderAction: domain.OrderActionAdjust, SLAdjustPct: dec("0.02")}}
 	pt.Model = model
 
 	pt.adjustOpenOrdersWithRL(context.Background(), "1m", dec("100"), testLogger())
@@ -1245,5 +1245,105 @@ func TestMarketView_IsASnapshot(t *testing.T) {
 
 	if len(v.Bars["5m"]) != 1 {
 		t.Errorf("snapshot must not see later appends, got %d candles", len(v.Bars["5m"]))
+	}
+}
+
+// TestAdjustOpenOrdersWithRL_RequiresAdjustOrderAction covers the §15.10 order-action head: the
+// model has to actually ask to adjust. Without this gate a model meaning "leave it alone" would
+// still fork whenever its adjust outputs happened to be nonzero, which for a continuous output is
+// essentially always.
+func TestAdjustOpenOrdersWithRL_RequiresAdjustOrderAction(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
+	// Nonzero adjustments, but the model is saying "none" — no fork may be created.
+	pt.Model = &fakeModelClientRL{action: domain.Action{
+		OrderAction: domain.OrderActionNone, SLAdjustPct: dec("0.02"), TPAdjustPct: dec("0.02"),
+	}}
+
+	sl := dec("95")
+	if _, err := repo.OpenPaperOrder(ctx, port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, Size: dec("100"), Leverage: dec("1"),
+	}); err != nil {
+		t.Fatalf("open baseline order: %v", err)
+	}
+
+	pt.adjustOpenOrdersWithRL(ctx, "1m", dec("103"), testLogger())
+
+	open, _ := repo.ListOpenPaperOrders(ctx, "BTC-USDT-SWAP")
+	if len(open) != 1 {
+		t.Errorf("expected no fork when order_action is 'none', got %d open orders", len(open))
+	}
+}
+
+// The observation must carry which strategy produced a signal and on which timeframe (§15.10) —
+// one shared policy has no other way to tell strategies apart.
+func TestBuildObservation_SignalsCarryKindAndBar(t *testing.T) {
+	repo := newFakeRepository()
+	buy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+	pt := newTestPaperTrader(repo, []StrategyAssignment{
+		{Bar: "1m", Strategy: buy, StrategyID: 7, Kind: "rsi_sma"},
+	})
+	pt.candles["1m"] = []domain.Candle{{Close: dec("100")}, {Close: dec("101")}}
+
+	obs := pt.buildObservation(context.Background(), "1m", dec("101"), testLogger())
+
+	if len(obs.Timeframes) != 1 || len(obs.Timeframes[0].StrategySignals) != 1 {
+		t.Fatalf("expected one signal, got %+v", obs.Timeframes)
+	}
+	sig := obs.Timeframes[0].StrategySignals[0]
+	if sig.Kind != "rsi_sma" {
+		t.Errorf("want kind rsi_sma, got %q", sig.Kind)
+	}
+	if sig.Bar != "1m" {
+		t.Errorf("want bar 1m, got %q", sig.Bar)
+	}
+	if obs.SchemaVersion != domain.ObservationSchemaVersion {
+		t.Errorf("want schema v%d, got v%d", domain.ObservationSchemaVersion, obs.SchemaVersion)
+	}
+}
+
+func TestMarketContextFrom_CountsSidesAndAveragesConfidence(t *testing.T) {
+	mc := marketContextFrom([]domain.StrategySignal{
+		{Side: "buy", Confidence: dec("0.8")},
+		{Side: "buy", Confidence: dec("0.6")},
+		{Side: "sell", Confidence: dec("0.4")},
+		{Side: "", Confidence: dec("0.9")}, // a hold is not an opinion; must not dilute the mean
+	})
+
+	if mc.OthersLong != 2 || mc.OthersShort != 1 {
+		t.Errorf("want 2 long / 1 short, got %d / %d", mc.OthersLong, mc.OthersShort)
+	}
+	if !mc.MeanConfidence.Equal(dec("0.6")) { // (0.8+0.6+0.4)/3, the hold excluded
+		t.Errorf("want mean confidence 0.6 over the three real opinions, got %s", mc.MeanConfidence)
+	}
+}
+
+func TestMarketContextFrom_EmptyIsZeroNotDivideByZero(t *testing.T) {
+	mc := marketContextFrom(nil)
+	if mc.OthersLong != 0 || mc.OthersShort != 0 || !mc.MeanConfidence.IsZero() {
+		t.Errorf("want a zero context for no signals, got %+v", mc)
+	}
+}
+
+// A fork must be identifiable in the observation: fork outcomes are compared against their baseline
+// parent (§15.4), so the model needs to know which it is reasoning about.
+func TestPositionStateOf_MarksForks(t *testing.T) {
+	sl, tp := dec("95"), dec("110")
+	base := port.PaperOrder{EntryPx: dec("100"), SLPx: &sl, TPPx: &tp, Size: dec("25"), Leverage: dec("10"), Variant: "baseline"}
+	fork := base
+	fork.Variant = "rl_adjusted"
+
+	if positionStateOf(base).IsFork {
+		t.Error("baseline must not be marked as a fork")
+	}
+	if !positionStateOf(fork).IsFork {
+		t.Error("rl_adjusted variant must be marked as a fork")
+	}
+
+	ps := positionStateOf(base)
+	if !ps.PositionOpen || !ps.EntryPx.Equal(dec("100")) || !ps.SLPx.Equal(dec("95")) || !ps.TPPx.Equal(dec("110")) {
+		t.Errorf("position state did not carry the order's own levels: %+v", ps)
 	}
 }

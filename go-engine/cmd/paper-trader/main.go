@@ -218,7 +218,7 @@ func loadStrategyAssignments(ctx context.Context, repo *postgres.Repository, ins
 		if err != nil {
 			return nil, fmt.Errorf("build strategy %d (kind %q) for assignment %d: %w", a.StrategyID, cfg.Kind, a.ID, err)
 		}
-		out = append(out, usecase.StrategyAssignment{Bar: a.Bar, Strategy: s, StrategyID: a.StrategyID})
+		out = append(out, usecase.StrategyAssignment{Bar: a.Bar, Strategy: s, StrategyID: a.StrategyID, Kind: cfg.Kind})
 	}
 	return out, nil
 }

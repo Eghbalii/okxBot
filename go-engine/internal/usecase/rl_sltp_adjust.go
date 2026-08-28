@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/shopspring/decimal"
 
@@ -56,10 +57,18 @@ func (e *PaperTrader) adjustOpenOrdersWithRL(ctx context.Context, bar string, pr
 		obs.UnrealizedPnLPct = unrealizedPnLPct(o, price)
 		obs.DistToSLPct = distPct(o.SLPx, price)
 		obs.DistToTPPct = distPct(o.TPPx, price)
+		obs.OrderID = o.ID
+		obs.PositionState = positionStateOf(o)
 
 		action, err := e.Model.Predict(ctx, obs)
 		if err != nil {
 			logger.Warn("rl sl/tp adjust: predict failed", "instId", e.InstID, "orderId", o.ID, "error", err)
+			continue
+		}
+		// The order-action head decides whether to touch this position at all (CLAUDE.md §15.10).
+		// Adjust magnitudes are only consulted once it has actually asked to adjust — otherwise a
+		// model that means "leave it alone" would still fork on incidental nonzero outputs.
+		if action.OrderAction != domain.OrderActionAdjust {
 			continue
 		}
 		if action.SLAdjustPct.IsZero() && action.TPAdjustPct.IsZero() {
@@ -219,6 +228,8 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 			Confidence: sig.Confidence,
 			SLPct:      sig.SLPct,
 			TPPct:      sig.TPPct,
+			Kind:       a.Kind,
+			Bar:        a.Bar,
 		})
 	}
 
@@ -230,6 +241,11 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 		Timeframes:        []domain.TimeframeBlock{tb},
 		AccountInitialUSD: e.AccountInitialUSD,
 		RecentTrades:      e.recentBaselineTrades(ctx, logger),
+		// The lifecycle category and per-call Signal are set by the caller, which knows which
+		// decision it is asking for (CLAUDE.md §15.10). CategoryUpdate is the safe default: it is
+		// what a price-driven call is, and it never claims a strategy spoke when none did.
+		Category:      domain.CategoryUpdate,
+		MarketContext: marketContextFrom(tb.StrategySignals),
 	}
 
 	if acct, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), e.AccountInitialUSD); err == nil {
@@ -240,6 +256,60 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 	obs.OpenExposureUSD = e.openExposure(ctx, logger)
 
 	return obs
+}
+
+// positionStateOf describes an open order for the observation (CLAUDE.md §15.10). Prices are sent
+// as-is; rl_service converts them to fractions of the live price at vectorization time, so one
+// shared policy generalizes across instruments at wildly different price scales.
+func positionStateOf(o port.PaperOrder) domain.PositionState {
+	ps := domain.PositionState{
+		PositionOpen: true,
+		EntryPx:      o.EntryPx,
+		SizeUSD:      o.Size,
+		Leverage:     o.Leverage,
+		IsFork:       o.Variant == "rl_adjusted",
+	}
+	if o.SLPx != nil {
+		ps.SLPx = *o.SLPx
+	}
+	if o.TPPx != nil {
+		ps.TPPx = *o.TPPx
+	}
+	if !o.OpenedAt.IsZero() {
+		ps.AgeSeconds = int64(time.Since(o.OpenedAt).Seconds())
+	}
+	return ps
+}
+
+// marketContextFrom summarizes a set of live signals into the fixed-width confluence block
+// (CLAUDE.md §15.10). One signal per /predict call means the model can't otherwise see two
+// strategies agreeing within one decision — this restores that without naming them individually,
+// so the block's width never depends on how many strategies are registered.
+//
+// Callers pass the signals OTHER than the one the call is about; passing the full set (as the
+// price-driven update path does, where no single signal is the subject) is also correct.
+func marketContextFrom(signals []domain.StrategySignal) domain.MarketContext {
+	mc := domain.MarketContext{}
+	var confidenceSum decimal.Decimal
+	var counted int
+
+	for _, s := range signals {
+		switch s.Side {
+		case "buy":
+			mc.OthersLong++
+		case "sell":
+			mc.OthersShort++
+		default:
+			continue // a hold isn't an opinion; counting it would dilute mean confidence
+		}
+		confidenceSum = confidenceSum.Add(s.Confidence)
+		counted++
+	}
+
+	if counted > 0 {
+		mc.MeanConfidence = confidenceSum.Div(decimal.NewFromInt(int64(counted)))
+	}
+	return mc
 }
 
 // openExposure sums the notional of every open baseline position across ALL tokens (CLAUDE.md

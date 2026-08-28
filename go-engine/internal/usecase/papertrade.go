@@ -28,6 +28,11 @@ type StrategyAssignment struct {
 	Bar        string
 	Strategy   strategy.Strategy
 	StrategyID int64
+	// Kind is the strategy.Factories registry name this assignment was built from. It travels with
+	// every signal to the RL model (CLAUDE.md §15.10) as the stable identity one shared policy uses
+	// to tell strategies apart — StrategyID can't serve that purpose, since it differs per
+	// deployment and per cloned sub-strategy, while a kind means the same thing everywhere.
+	Kind string
 }
 
 // PaperTrader implements the Paper Trading Engine (CLAUDE.md §8): it evaluates strategies
