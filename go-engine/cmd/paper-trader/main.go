@@ -79,7 +79,7 @@ func main() {
 		logger.Error("failed to seed origin strategies", "error", err)
 		os.Exit(1)
 	}
-	if err := ensureDefaultAssignment(ctx, repo, cfg.Trading.InstIDs); err != nil {
+	if err := ensureDefaultAssignment(ctx, repo, cfg.Trading.InstIDs, cfg.PaperTrading.Bars); err != nil {
 		logger.Error("failed to ensure default strategy assignment", "error", err)
 		os.Exit(1)
 	}
@@ -194,7 +194,7 @@ func envOr(key, fallback string) string {
 // configured instrument, matching the previous hardcoded behavior, so a fresh install still
 // trades out of the box. Once the panel (CLAUDE.md §11) is used to manage assignments, this is a
 // no-op for any instrument that already has one.
-func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, instIDs []string) error {
+func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, instIDs []string, paperTradingBars []string) error {
 	origins, err := repo.ListStrategies(ctx, "", false)
 	if err != nil {
 		return err
@@ -210,6 +210,14 @@ func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, ins
 		return fmt.Errorf("default origin strategy %q not found after seeding", "rsi_sma")
 	}
 
+	// The default assignment must land on a bar PaperTrader actually evaluates
+	// (paper_trading.bars) — a hardcoded "1m" here silently never fires if 1m isn't configured,
+	// since the assignment exists but its candle window never gets populated/evaluated.
+	if len(paperTradingBars) == 0 {
+		return fmt.Errorf("paper_trading.bars is empty; cannot pick a default assignment bar")
+	}
+	defaultBar := paperTradingBars[0]
+
 	for _, instID := range instIDs {
 		assignments, err := repo.ListAssignments(ctx, instID, false)
 		if err != nil {
@@ -221,7 +229,7 @@ func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, ins
 		if _, err := repo.CreateAssignment(ctx, port.StrategyAssignment{
 			StrategyID: defaultOriginID,
 			InstID:     instID,
-			Bar:        "1m",
+			Bar:        defaultBar,
 			Enabled:    true,
 		}); err != nil {
 			return err
