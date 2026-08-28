@@ -8,7 +8,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "refresh": "30s",
   "time": {
     "from": "now-6h",
@@ -38,12 +38,19 @@
         "x": 0,
         "y": 1
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100)",
           "legendFormat": "CPU %",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -86,17 +93,28 @@
         "x": 8,
         "y": 1
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes",
           "legendFormat": "used",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         },
         {
           "expr": "node_memory_MemTotal_bytes",
           "legendFormat": "total",
-          "refId": "B"
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -120,12 +138,19 @@
         "x": 16,
         "y": 1
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "node_filesystem_avail_bytes{mountpoint=\"/\"}",
           "legendFormat": "free",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -185,12 +210,19 @@
         "x": 0,
         "y": 8
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "okxbot_ws_connected",
           "legendFormat": "{{channel}}",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -248,12 +280,19 @@
         "x": 6,
         "y": 8
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "rate(okxbot_ws_reconnects_total[5m])",
           "legendFormat": "{{channel}}",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -277,12 +316,19 @@
         "x": 12,
         "y": 8
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "rate(okxbot_ingestor_events_total[5m])",
           "legendFormat": "{{inst_id}} — {{kind}}",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -317,12 +363,19 @@
         "x": 0,
         "y": 14
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "sum(okxbot_paper_orders_open)",
           "legendFormat": "open",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "options": {
@@ -344,12 +397,19 @@
         "x": 4,
         "y": 14
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "okxbot_paper_orders_open",
           "legendFormat": "{{inst_id}}",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -376,12 +436,19 @@
         "x": 12,
         "y": 14
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "sum by (side) (increase(okxbot_strategy_signals_total[1h]))",
           "legendFormat": "{{side}}",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -408,17 +475,28 @@
         "x": 0,
         "y": 22
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "sum(increase(okxbot_paper_orders_opened_total[1h]))",
           "legendFormat": "opened",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         },
         {
           "expr": "sum by (reason) (increase(okxbot_paper_orders_closed_total[1h]))",
           "legendFormat": "closed — {{reason}}",
-          "refId": "B"
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -442,12 +520,19 @@
         "x": 12,
         "y": 22
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "okxbot_paper_orders_realized_pnl_usd_total",
           "legendFormat": "{{inst_id}}",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -482,12 +567,19 @@
         "x": 0,
         "y": 31
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "go_goroutines",
           "legendFormat": "{{job}}",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -510,12 +602,19 @@
         "x": 8,
         "y": 31
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "process_resident_memory_bytes",
           "legendFormat": "{{job}}",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -538,17 +637,28 @@
         "x": 16,
         "y": 31
       },
-      "datasource": "Prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "okxbot-prometheus"
+      },
       "targets": [
         {
           "expr": "go_gc_duration_seconds{quantile=\"0.5\"}",
           "legendFormat": "{{job}} p50",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         },
         {
           "expr": "go_gc_duration_seconds{quantile=\"1\"}",
           "legendFormat": "{{job}} p99",
-          "refId": "B"
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "okxbot-prometheus"
+          }
         }
       ],
       "fieldConfig": {
@@ -584,11 +694,18 @@
         "x": 0,
         "y": 38
       },
-      "datasource": "Loki",
+      "datasource": {
+        "type": "loki",
+        "uid": "okxbot-loki"
+      },
       "targets": [
         {
           "expr": "{level=\"ERROR\"}",
-          "refId": "A"
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "okxbot-loki"
+          }
         }
       ],
       "options": {

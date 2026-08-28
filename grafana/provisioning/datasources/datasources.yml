@@ -3,7 +3,12 @@
 apiVersion: 1
 
 datasources:
+  # Fixed uids (not left to Grafana's auto-generated default) so dashboard JSON files
+  # (grafana/provisioning/dashboards/) can reference these datasources by a stable id that
+  # survives a fresh `docker compose up` — an auto-generated uid differs per instance, which
+  # would silently break every panel's datasource reference on a new deploy.
   - name: Prometheus
+    uid: okxbot-prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090
@@ -11,6 +16,7 @@ datasources:
     editable: true
 
   - name: Loki
+    uid: okxbot-loki
     type: loki
     access: proxy
     url: http://loki:3100
