@@ -1,0 +1,14 @@
+# Auto-provisions every dashboard JSON in this directory on Grafana startup, same pattern as
+# datasources.yml (CLAUDE.md §11.6) — no manual import step after a fresh `docker compose up`.
+apiVersion: 1
+
+providers:
+  - name: okxbot
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

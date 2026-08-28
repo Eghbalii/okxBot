@@ -9,3 +9,7 @@ scrape_configs:
   - job_name: okxbot-paper-trader
     static_configs:
       - targets: ["paper-trader:9102"]
+
+  - job_name: okxbot-strategy-optimizer
+    static_configs:
+      - targets: ["strategy-optimizer:9103"]
