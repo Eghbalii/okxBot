@@ -13,6 +13,18 @@ import (
 	"time"
 )
 
+// maxConcurrentRequests bounds how many OKX REST calls this Client has in flight at once. One
+// Client is shared across every PaperTrader engine (one per configured instrument, CLAUDE.md
+// §15.2 Phase B) — at 10 instruments, startup candle-seeding fires ~30 requests within
+// milliseconds of each other. Live-verified: a burst around 4+ truly concurrent requests to
+// /market/candles reliably produces exactly one failure reported as "instrument doesn't exist"
+// (code 51001) on an unpredictable instrument each run, at the same latency as a real successful
+// call — i.e. a genuine round trip to OKX, not a client-side bug. Sequential requests (including
+// over a reused connection) and small concurrent bursts via curl never reproduced it, so the
+// limiter is set conservatively below where that started happening rather than at some derived
+// "safe" number — OKX's exact limiting behavior on this endpoint isn't otherwise documented.
+const maxConcurrentRequests = 3
+
 // Client is a signed OKX v5 REST API client.
 type Client struct {
 	BaseURL    string
@@ -22,17 +34,10 @@ type Client struct {
 	Simulated  bool
 
 	httpClient *http.Client
+	sem        chan struct{}
 }
 
 // New creates an OKX REST client. baseURL is typically "https://www.okx.com".
-//
-// One Client is shared across every PaperTrader engine (one per configured instrument,
-// CLAUDE.md §15.2 Phase B), so at 10 instruments its Transport routinely serves 10+ concurrent
-// requests to the same host during startup candle-seeding. http.DefaultTransport's
-// MaxIdleConnsPerHost is 2 — well under that concurrency — which forces most of those requests
-// onto freshly-dialed, non-reused connections instead of the pool. Sized here rather than left at
-// the default to avoid connection churn/contention under that load being a confound the next time
-// a transient okx.com error needs diagnosing.
 func New(baseURL, apiKey, apiSecret, passphrase string, simulated bool) *Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConnsPerHost = 20
@@ -43,6 +48,7 @@ func New(baseURL, apiKey, apiSecret, passphrase string, simulated bool) *Client 
 		Passphrase: passphrase,
 		Simulated:  simulated,
 		httpClient: &http.Client{Timeout: 10 * time.Second, Transport: transport},
+		sem:        make(chan struct{}, maxConcurrentRequests),
 	}
 }
 
@@ -53,8 +59,12 @@ type envelope struct {
 	Data json.RawMessage `json:"data"`
 }
 
-// do performs a signed request and decodes the "data" field of the response into out.
+// do performs a signed request and decodes the "data" field of the response into out. Blocks
+// until fewer than maxConcurrentRequests calls are already in flight on this Client.
 func (c *Client) do(method, path string, body any, out any) error {
+	c.sem <- struct{}{}
+	defer func() { <-c.sem }()
+
 	var bodyBytes []byte
 	if body != nil {
 		b, err := json.Marshal(body)
