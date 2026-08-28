@@ -25,8 +25,10 @@ from rl_service.data.features import FEATURE_COLUMNS, add_features
 from rl_service.data.postgres import CandleRow, PaperOrderRow, connect, fetch_candles, fetch_paper_orders
 from rl_service.obs import (
     ACTION_DIM,
-    MAX_SLTP_ADJUST_PCT,
+    ACTIONS,
+    MAX_SLTP_OFFSET_PCT,
     Observation,
+    PositionState,
     PriceContext,
     StrategySignal,
     TimeframeBlock,
@@ -40,7 +42,7 @@ PRICE_CONTEXT_WINDOW = 10
 # Penalty weight on SL/TP adjustment churn (CLAUDE.md §15.5) — every proposed adjustment costs a
 # little reward, so the agent only moves a stop when the resulting outcome pays for it rather than
 # twitching it every step for free. Scaled against the normalized [-1, 1] raw outputs, not the
-# post-MAX_SLTP_ADJUST_PCT fractions, so the penalty doesn't shrink if that bound is widened later.
+# post-MAX_SLTP_OFFSET_PCT fractions, so the penalty doesn't shrink if that bound is widened later.
 SLTP_CHURN_PENALTY = 0.002
 
 # Fallback SL/TP distances for a simulated position opened at a bar with no logged strategy signal
@@ -48,6 +50,13 @@ SLTP_CHURN_PENALTY = 0.002
 # give the SL/TP-adjust action something real to ratchet against.
 DEFAULT_SL_PCT = 0.02
 DEFAULT_TP_PCT = 0.04
+
+# Bar duration in seconds, for reporting position age in real elapsed time rather than step count.
+_BAR_SECONDS = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1H": 3600, "2H": 7200, "4H": 14400, "6H": 21600, "12H": 43200,
+    "1D": 86400, "1W": 604800,
+}
 
 
 @dataclass
@@ -94,8 +103,9 @@ def _extract_logged_signals(order: PaperOrderRow) -> tuple[str, StrategySignal] 
         strategy_id=s.get("strategy_id", 0),
         side=s.get("side", ""),
         confidence=float(s.get("confidence", 0) or 0),
-        sl_pct=float(s.get("sl_pct", 0) or 0),
-        tp_pct=float(s.get("tp_pct", 0) or 0),
+        sl_px=float(s.get("sl_px", 0) or 0),
+        tp_px=float(s.get("tp_px", 0) or 0),
+        entry_px=float(s.get("entry_px", 0) or 0),
     )
 
 
@@ -116,9 +126,20 @@ def load_token_series(conn, inst_id: str, bars: list[str]) -> _TokenSeries:
     return series
 
 
-def _price_context(closes: list[float]) -> PriceContext:
+def _price_context(closes: list[float], row: dict) -> PriceContext:
+    """Recent price action plus this bar's OHLC (CLAUDE.md §15.11).
+
+    In production `row` is the live forming candle; here it is the historical bar being replayed,
+    which is the closest equivalent the replay has.
+    """
+    ohlc = dict(
+        open=float(row.get("open", 0.0) or 0.0),
+        high=float(row.get("high", 0.0) or 0.0),
+        low=float(row.get("low", 0.0) or 0.0),
+        close=float(row.get("close", 0.0) or 0.0),
+    )
     if len(closes) < 2:
-        return PriceContext()
+        return PriceContext(**ohlc)
     window = closes[-(PRICE_CONTEXT_WINDOW + 1) :]
     pct_changes = [
         (window[i] - window[i - 1]) / window[i - 1] for i in range(1, len(window)) if window[i - 1] != 0
@@ -127,7 +148,8 @@ def _price_context(closes: list[float]) -> PriceContext:
     last = closes[-1]
     dist_high = (max(swing) - last) / last if last else 0.0
     dist_low = (min(swing) - last) / last if last else 0.0
-    return PriceContext(close_pct_changes=pct_changes, dist_to_swing_high_pct=dist_high, dist_to_swing_low_pct=dist_low)
+    return PriceContext(close_pct_changes=pct_changes, dist_to_swing_high_pct=dist_high,
+                        dist_to_swing_low_pct=dist_low, **ohlc)
 
 
 class ReplayEnv(gym.Env):
@@ -166,6 +188,9 @@ class ReplayEnv(gym.Env):
         self.initial_equity_usd = initial_equity_usd
         self.max_position_pct = max_position_pct
         self.max_total_exposure_pct = max_total_exposure_pct
+        # One step advances one bar, so position age in seconds is step count times the bar's own
+        # duration — the model sees real elapsed time, matching what production reports.
+        self._bar_seconds = _BAR_SECONDS.get(bar, 300)
 
         self._reset_state()
 
@@ -190,8 +215,13 @@ class ReplayEnv(gym.Env):
         self.position_notional = 0.0
         self.leverage = 1.0
         self.entry_price = None
-        self.sl_price: float | None = None
-        self.tp_price: float | None = None
+        self.sl_price = None
+        self.tp_price = None
+        # Peak and trough PnL reached while this position has been open (CLAUDE.md §15.11), reset
+        # with the position. pnl_min is negative-ranged.
+        self.pnl_max_pct = 0.0
+        self.pnl_min_pct = 0.0
+        self._position_age_steps = 0
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -206,30 +236,57 @@ class ReplayEnv(gym.Env):
         row = rows[min(step_idx, len(rows) - 1)]
         closes = [r["close"] for r in rows[: step_idx + 1]]
 
+        price = float(row["close"])
         sigs = series.logged_signals.get((self.bar, int(row["ts"].timestamp() * 1000)), [])
         tb = TimeframeBlock(
             bar=self.bar,
             strategy_signals=sigs,
             features=[float(row.get(c, 0.0) or 0.0) for c in FEATURE_COLUMNS],
-            price_context=_price_context(closes),
+            price_context=_price_context(closes, row),
         )
-        price = float(row["close"])
-        # dist_to_sl/tp must be populated here for the same reason go-engine's adjustOpenOrdersWithRL
-        # sets them per-order (CLAUDE.md §15.3): they're the direct input to the sl/tp_adjust
-        # decision, so a model trained with them pinned at zero would never learn to use them.
+
+        # The env must build the SAME shape the live path does (CLAUDE.md §15.11), or a model
+        # trained here misaligns when served: one signal per call, its category, and the position
+        # block. A bar with a logged signal and no open position is an open decision; anything with
+        # a position open is an update; a quiet bar carries no signal at all.
+        signal = sigs[0] if sigs else None
+        if self.position_notional != 0:
+            category = "update"
+        elif signal is not None:
+            category = "sell" if signal.side == "sell" else "buy"
+        else:
+            category = "update"
+
         return Observation(
             inst_id=series.inst_id,
             active_tokens=self.active_tokens,
             last_price=price,
             timeframes=[tb],
-            position=1.0 if self.position_notional > 0 else (-1.0 if self.position_notional < 0 else 0.0),
-            current_leverage=self.leverage,
-            unrealized_pnl_pct=self._unrealized_pnl_pct(price),
-            dist_to_sl_pct=(self.sl_price - price) / price if self.sl_price and price else 0.0,
-            dist_to_tp_pct=(self.tp_price - price) / price if self.tp_price and price else 0.0,
+            category=category,
+            signal=signal,
+            position_state=self._position_state(price),
             account_equity_usd=self.equity,
             account_initial_usd=self.initial_equity_usd,
             open_exposure_usd=abs(self.position_notional),
+        )
+
+    def _position_state(self, price: float) -> PositionState:
+        """The open position block (CLAUDE.md §15.11), including how far it has travelled in each
+        direction — a trade that reached 90% of target and gave it back is a different lesson from
+        one that drifted sideways to the same current PnL."""
+        if self.position_notional == 0 or self.entry_price is None:
+            return PositionState()
+        return PositionState(
+            position_open=1.0,
+            side=1.0 if self.position_notional > 0 else -1.0,
+            size_usd=abs(self.position_notional),
+            leverage=self.leverage,
+            age_seconds=float(self._position_age_steps * self._bar_seconds),
+            unrealized_pnl_pct=self._unrealized_pnl_pct(price),
+            pnl_max_pct=self.pnl_max_pct,
+            pnl_min_pct=self.pnl_min_pct,
+            dist_to_sl_pct=(self.sl_price - price) / price if self.sl_price and price else 0.0,
+            dist_to_tp_pct=(self.tp_price - price) / price if self.tp_price and price else 0.0,
         )
 
     def _unrealized_pnl_pct(self, price: float) -> float:
@@ -257,11 +314,14 @@ class ReplayEnv(gym.Env):
         price = float(row["close"])
         bar_high, bar_low = float(row["high"]), float(row["low"])
 
+        # Same layout decode_action uses (CLAUDE.md §15.11): SL/TP as offsets that become levels,
+        # then size and leverage, then the lifecycle action head.
         vec = np.asarray(action, dtype=np.float32).reshape(-1)
-        target_exposure = float(np.clip(vec[0], -1.0, 1.0))
-        leverage_frac = float(np.clip(vec[1], 0.0, 1.0))
-        sl_adjust_pct = float(np.clip(vec[2], -1.0, 1.0))
-        tp_adjust_pct = float(np.clip(vec[3], -1.0, 1.0))
+        sl_offset = float(np.clip(vec[0], -1.0, 1.0)) * MAX_SLTP_OFFSET_PCT
+        tp_offset = float(np.clip(vec[1], -1.0, 1.0)) * MAX_SLTP_OFFSET_PCT
+        size_pct = float(np.clip(vec[2], 0.0, 1.0))
+        leverage_frac = float(np.clip(vec[3], 0.0, 1.0))
+        chosen = ACTIONS[int(np.argmax(vec[4 : 4 + len(ACTIONS)]))]
         next_leverage = 1.0 + leverage_frac * (self.max_leverage - 1.0)
         # Size against the SHARED ACCOUNT BALANCE, under the same caps go-engine's rlSizing applies
         # (CLAUDE.md §15.6) — so the policy learns what a position of a given size actually costs
@@ -270,7 +330,14 @@ class ReplayEnv(gym.Env):
         # it can read at decision time, which is likewise the last settled balance.
         equity = max(self.equity, 0.0)
         cap = equity * min(self.max_position_pct, self.max_total_exposure_pct)
-        target_notional = float(np.clip(target_exposure * equity, -cap, cap))
+        # `open` commits capital, `close` flattens, anything else leaves exposure where it is —
+        # mirroring how the controller reads the action head in production.
+        if chosen == "open":
+            target_notional = float(np.clip(size_pct * equity, 0.0, cap))
+        elif chosen == "close":
+            target_notional = 0.0
+        else:
+            target_notional = self.position_notional
 
         realized_pnl = 0.0
         exit_price = price
@@ -307,23 +374,42 @@ class ReplayEnv(gym.Env):
         was_flat = self.position_notional == 0
         self.position_notional = target_notional
         self.leverage = next_leverage
-        self.entry_price = price if target_notional != 0 else None
 
         if target_notional == 0:
+            self.entry_price = None
             self.sl_price = self.tp_price = None
-        elif was_flat or self.sl_price is None:
-            # Opening (or re-opening) a position seeds SL/TP from the strategy signal's own
-            # suggested distances where one was logged, falling back to a default band — this is the
-            # order the RL agent then gets to ratchet, matching live's "strategy proposes, RL
-            # adjusts" split (CLAUDE.md §15.4).
-            self._seed_sltp(series, row, price, target_notional)
+            self.pnl_max_pct = self.pnl_min_pct = 0.0
+            self._position_age_steps = 0
         else:
-            self._apply_sltp_adjust(price, target_notional, sl_adjust_pct, tp_adjust_pct)
+            # Only a NEWLY opened position takes this bar's price as its entry. Re-stamping the
+            # entry on every step of a held position would silently erase the trade's own basis and
+            # make unrealized PnL read as ~0 forever.
+            if was_flat or self.entry_price is None:
+                self.entry_price = price
+                self.pnl_max_pct = self.pnl_min_pct = 0.0
+                self._position_age_steps = 0
+            else:
+                self._position_age_steps += 1
+            # Track how far the position has travelled in each direction (CLAUDE.md §15.11) — the
+            # model needs to see that a trade reached 90% of its target and gave it back, which
+            # current PnL alone cannot express.
+            upl = self._unrealized_pnl_pct(price)
+            self.pnl_max_pct = max(self.pnl_max_pct, upl)
+            self.pnl_min_pct = min(self.pnl_min_pct, upl)
+
+            if chosen in ("open", "update"):
+                # The model SETS the levels now rather than nudging them (CLAUDE.md §15.11): on
+                # `open` it places the initial stop/target, on `update` it moves them. Go clamps the
+                # result either way, so the env clamps too — a policy trained without the clamp
+                # would spend its output range on levels production silently rejects.
+                self._set_sltp(price, target_notional, sl_offset, tp_offset)
 
         reward = (realized_pnl - fee_cost) / self.initial_equity_usd if self.initial_equity_usd else 0.0
-        # CLAUDE.md §15.5: charge for adjustment churn so every SL/TP move has to earn its keep in
-        # realized outcome rather than being free to try.
-        reward -= SLTP_CHURN_PENALTY * (abs(sl_adjust_pct) + abs(tp_adjust_pct))
+        # CLAUDE.md §15.5: charge for churn so every SL/TP move has to earn its keep in realized
+        # outcome rather than being free to try. Only an actual `update` is churn — placing the
+        # initial levels on `open` is not.
+        if chosen == "update":
+            reward -= SLTP_CHURN_PENALTY * (abs(sl_offset) + abs(tp_offset)) / MAX_SLTP_OFFSET_PCT
 
         self._step_idx += 1
         exhausted_token = self._step_idx >= len(rows) - 1
@@ -339,47 +425,28 @@ class ReplayEnv(gym.Env):
         info = {"equity": self.equity, "inst_id": series.inst_id, "leverage": self.leverage}
         return obs_vec, float(reward), terminated, truncated, info
 
-    def _seed_sltp(self, series: _TokenSeries, row: dict, price: float, notional: float) -> None:
-        """Sets the initial SL/TP for a newly opened position from the strategy signal logged at
-        this bar, if any, else DEFAULT_SL_PCT/DEFAULT_TP_PCT."""
-        sl_pct, tp_pct = DEFAULT_SL_PCT, DEFAULT_TP_PCT
-        sigs = series.logged_signals.get((self.bar, int(row["ts"].timestamp() * 1000)), [])
-        for s in sigs:
-            if s.sl_pct > 0:
-                sl_pct = s.sl_pct
-            if s.tp_pct > 0:
-                tp_pct = s.tp_pct
-            break
+    def _set_sltp(self, price: float, notional: float, sl_offset: float, tp_offset: float) -> None:
+        """Applies the policy's chosen SL/TP levels, clamped the way Go clamps them (§15.11).
 
-        direction = 1.0 if notional > 0 else -1.0
-        self.sl_price = price * (1.0 - direction * sl_pct)
-        self.tp_price = price * (1.0 + direction * tp_pct)
-
-    def _apply_sltp_adjust(self, price: float, notional: float, sl_adjust_pct: float, tp_adjust_pct: float) -> None:
-        """Applies the policy's SL/TP adjustment under the same ratchet rule Go enforces
-        (usecase.RatchetSLTP, CLAUDE.md §15.4): an adjustment may only tighten — move SL toward the
-        current price (locking in profit / cutting risk) and TP toward it (easier to reach) — never
-        widen or walk back a prior tightening.
-
-        Mirroring the clamp here matters for training, not safety: Go re-applies its own clamp
-        regardless, so a policy trained against an unclamped env would spend much of its output
-        range proposing adjustments production silently discards, and never see the reward
-        consequence of the ones that actually land.
+        The offsets are fractions of the live price. A stop must sit on the losing side of price and
+        a target on the winning side — a level on the wrong side would close the position the
+        instant it was set, so those are rejected and the previous level (or the default band) is
+        kept instead.
         """
         direction = 1.0 if notional > 0 else -1.0
 
-        if self.sl_price is not None:
-            candidate = self.sl_price * (1.0 + sl_adjust_pct * MAX_SLTP_ADJUST_PCT)
-            # Tightening moves SL up for a long, down for a short — and never past the live price,
-            # which would close the position instantly.
-            if direction * (candidate - self.sl_price) > 0 and direction * (price - candidate) > 0:
-                self.sl_price = candidate
+        sl_candidate = price * (1.0 + sl_offset)
+        if direction * (price - sl_candidate) > 0:
+            self.sl_price = sl_candidate
+        elif self.sl_price is None:
+            self.sl_price = price * (1.0 - direction * DEFAULT_SL_PCT)
 
-        if self.tp_price is not None:
-            candidate = self.tp_price * (1.0 + tp_adjust_pct * MAX_SLTP_ADJUST_PCT)
-            # Tightening pulls TP toward price: down for a long, up for a short, never across it.
-            if direction * (candidate - self.tp_price) < 0 and direction * (candidate - price) > 0:
-                self.tp_price = candidate
+        tp_candidate = price * (1.0 + tp_offset)
+        if direction * (tp_candidate - price) > 0:
+            self.tp_price = tp_candidate
+        elif self.tp_price is None:
+            self.tp_price = price * (1.0 + direction * DEFAULT_TP_PCT)
+
 
     def _carry_account_to_next_token(self):
         """Flattens the simulated position when the rollout moves to the next token, but CARRIES
@@ -394,6 +461,9 @@ class ReplayEnv(gym.Env):
         self.entry_price = None
         self.sl_price = None
         self.tp_price = None
+        self.pnl_max_pct = 0.0
+        self.pnl_min_pct = 0.0
+        self._position_age_steps = 0
 
 
 def build_replay_env(

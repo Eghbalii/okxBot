@@ -9,12 +9,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import numpy as np
+import pytest
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 
 from rl_service.data.postgres import CandleRow
 from rl_service.env.replay_env import DEFAULT_SL_PCT, ReplayEnv, _TokenSeries, _rows_to_feature_dicts
-from rl_service.obs import ACTION_DIM, Observation, observation_tail
+from rl_service.obs import ACTION_DIM, ACTIONS, MAX_SLTP_OFFSET_PCT, Observation, observation_tail
 
 
 def _make_candles(n, start_price=100.0, inst_id="BTC-USDT-SWAP", bar="1m", seed=0):
@@ -128,27 +129,8 @@ def _env_with_open_long(price=100.0):
     return env
 
 
-def test_sltp_adjust_only_tightens_never_widens():
-    # Mirrors the Go-side RatchetSLTP constraint (CLAUDE.md §15.4): a proposal that would move a
-    # long's stop DOWN (widening risk) must be rejected outright, not applied.
-    env = _env_with_open_long()
-    original_sl = env.sl_price
-
-    env._apply_sltp_adjust(price=100.0, notional=100.0, sl_adjust_pct=-1.0, tp_adjust_pct=0.0)
-    assert env.sl_price == original_sl, "widening the stop must be rejected"
-
-    env._apply_sltp_adjust(price=100.0, notional=100.0, sl_adjust_pct=1.0, tp_adjust_pct=0.0)
-    assert env.sl_price > original_sl, "tightening the stop toward price must be applied"
 
 
-def test_sltp_adjust_never_moves_stop_past_current_price():
-    # A stop moved across the live price would close the position instantly — the clamp must refuse
-    # it however large the proposal is.
-    env = _env_with_open_long()
-    env.sl_price = 99.9  # already just below price
-    for _ in range(50):
-        env._apply_sltp_adjust(price=100.0, notional=100.0, sl_adjust_pct=1.0, tp_adjust_pct=0.0)
-    assert env.sl_price < 100.0
 
 
 def test_stop_touch_closes_position_at_stop_price():
@@ -234,3 +216,65 @@ def test_observation_tail_uses_account_ratios_not_raw_dollars():
 
     # Same ratios at 100x the scale => identical model input.
     assert np.allclose(observation_tail(small), observation_tail(large))
+
+
+def test_model_sets_sl_and_tp_levels_directly():
+    """CLAUDE.md §15.11: the model SETS the levels rather than nudging existing ones.
+
+    Its raw output is a distance, which becomes a price against the live bar — a network output has
+    no way to know whether an instrument trades at 0.15 or 65000.
+    """
+    env = _env_with_open_long()
+    price = 100.0
+
+    env._set_sltp(price, notional=100.0, sl_offset=-0.03, tp_offset=0.05)
+
+    assert env.sl_price == pytest.approx(97.0), "SL must land at the chosen distance below price"
+    assert env.tp_price == pytest.approx(105.0), "TP must land at the chosen distance above price"
+
+
+def test_sltp_on_the_wrong_side_of_price_is_rejected():
+    """A stop above price (for a long) would close the position the instant it was set, so the env
+    clamps it the same way Go does rather than letting the policy learn from an impossible level."""
+    env = _env_with_open_long()
+    original_sl, original_tp = env.sl_price, env.tp_price
+
+    # Long: a positive SL offset puts the stop ABOVE price, a negative TP offset puts it below.
+    env._set_sltp(100.0, notional=100.0, sl_offset=+0.03, tp_offset=-0.05)
+
+    assert env.sl_price == original_sl, "a stop on the winning side must be rejected"
+    assert env.tp_price == original_tp, "a target on the losing side must be rejected"
+
+
+def test_pnl_max_and_min_track_the_position_trajectory():
+    """A trade that ran to +8% and came back to +1% must be distinguishable from one that only ever
+    drifted to +1% (CLAUDE.md §15.11) — current PnL alone cannot express that difference."""
+    env = _env_with_open_long(price=100.0)
+    env.pnl_max_pct = env.pnl_min_pct = 0.0
+
+    for upl in (0.03, 0.08, 0.01, -0.02):
+        env.pnl_max_pct = max(env.pnl_max_pct, upl)
+        env.pnl_min_pct = min(env.pnl_min_pct, upl)
+
+    assert env.pnl_max_pct == pytest.approx(0.08)
+    assert env.pnl_min_pct == pytest.approx(-0.02)
+
+
+def test_entry_price_is_not_restamped_while_a_position_is_held():
+    """Re-stamping entry on every step would erase the trade's basis and pin unrealized PnL at ~0."""
+    series = _two_token_series()
+    env = ReplayEnv(series, bar="1m", active_tokens=["BTC-USDT-SWAP", "XAU-USD-SWAP"], initial_equity_usd=1000.0)
+    env.reset()
+
+    open_action = np.zeros(ACTION_DIM, dtype=np.float32)
+    open_action[2] = 0.2  # size_pct
+    open_action[4 + ACTIONS.index("open")] = 1.0
+    env.step(open_action)
+    entry_after_open = env.entry_price
+    assert entry_after_open is not None
+
+    hold = np.zeros(ACTION_DIM, dtype=np.float32)
+    hold[4 + ACTIONS.index("none")] = 1.0
+    env.step(hold)
+
+    assert env.entry_price == entry_after_open, "entry must survive a hold step"
