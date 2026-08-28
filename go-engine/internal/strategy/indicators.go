@@ -55,6 +55,11 @@ func RSI(candles []Candle, period int) (decimal.Decimal, error) {
 // candle from index period-1 onward (index period-2 and earlier are the zero value). Unlike SMA/
 // RSI/ATR, callers that need EMA's recursive history (crossovers, chained EMAs like DEMA) want the
 // whole series, not just the latest value.
+// emaScale bounds EMA's recursive accumulator — see the rounding note in EMASeries. 12 decimal
+// places is well past the precision of any instrument this bot trades while keeping the value from
+// growing a fixed number of digits per candle forever.
+const emaScale = 12
+
 func EMASeries(candles []Candle, period int) ([]decimal.Decimal, error) {
 	if len(candles) < period {
 		return nil, errNeedMore(period, len(candles))
@@ -70,7 +75,17 @@ func EMASeries(candles []Candle, period int) ([]decimal.Decimal, error) {
 	out[period-1] = sum.Div(decimal.NewFromInt(int64(period)))
 
 	for i := period; i < len(candles); i++ {
-		out[i] = candles[i].Close.Mul(alpha).Add(out[i-1].Mul(oneMinusAlpha))
+		// Round each step. alpha is a repeating decimal for most periods (2/11 at period 10), and
+		// decimal.Decimal is arbitrary-precision, so multiplying the running value by
+		// oneMinusAlpha on every bar compounds ~16 new digits per candle with nothing to truncate
+		// it: measured 498 digits at 40 candles, 4,659 at 300, growing without bound for as long as
+		// the window does. Those values reach NUMERIC columns and every model observation, so this
+		// is not merely untidy.
+		//
+		// emaScale is far beyond the significance of any real price while keeping the value
+		// bounded; rounding the accumulator (not just the result) is what stops the growth, since
+		// the previous value is what feeds the next multiplication.
+		out[i] = candles[i].Close.Mul(alpha).Add(out[i-1].Mul(oneMinusAlpha)).Round(emaScale)
 	}
 	return out, nil
 }
