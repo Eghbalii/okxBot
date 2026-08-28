@@ -305,25 +305,6 @@ func (r *fakeRepository) ListParamChanges(ctx context.Context, instID string, si
 	return out, nil
 }
 
-// fakeExchangeForCandles only needs to satisfy GetCandles for the seed call in Run — not used by
-// these tests, which call handleTick/evaluateStrategies directly, but kept for completeness.
-type fakeExchangeForCandles struct{ candles []domain.Candle }
-
-func (f *fakeExchangeForCandles) GetTicker(instID string) (domain.Ticker, error) {
-	return domain.Ticker{}, nil
-}
-func (f *fakeExchangeForCandles) GetPositions(instType string) ([]domain.Position, error) {
-	return nil, nil
-}
-func (f *fakeExchangeForCandles) GetBalance(ccy string) ([]domain.Balance, error) { return nil, nil }
-func (f *fakeExchangeForCandles) GetCandles(instID, bar string, limit int) ([]domain.Candle, error) {
-	return f.candles, nil
-}
-func (f *fakeExchangeForCandles) PlaceOrder(req domain.OrderRequest) (*domain.OrderResult, error) {
-	return nil, nil
-}
-func (f *fakeExchangeForCandles) SetLeverage(req domain.LeverageChange) error { return nil }
-
 // noopConsumer satisfies port.MarketDataConsumer without ever invoking the handler — sufficient
 // for tests that drive PaperTrader through its handler methods directly.
 type noopConsumer struct{}
@@ -339,7 +320,6 @@ func newTestPaperTrader(repo port.Repository, strategies []StrategyAssignment) *
 		Bars:         []string{"1m", "15m"},
 		CandleWindow: 100,
 		Strategies:   strategies,
-		Exchange:     &fakeExchangeForCandles{},
 		TickConsumer: noopConsumer{},
 		CandleConsumers: map[string]port.MarketDataConsumer{
 			"1m":  noopConsumer{},

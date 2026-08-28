@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	mathrand "math/rand"
 	"strconv"
 	"sync"
 	"time"
@@ -52,7 +51,6 @@ type PaperTrader struct {
 	Bars            []string // candle timeframes to maintain windows for, e.g. ["1m", "15m", "1h"]
 	CandleWindow    int      // how many recent candles to keep in memory per timeframe
 	Strategies      []StrategyAssignment
-	Exchange        port.ExchangeClient // used once per bar at startup to seed each candle window
 	TickConsumer    port.MarketDataConsumer
 	CandleConsumers map[string]port.MarketDataConsumer // keyed by bar
 	Repo            port.Repository
@@ -264,17 +262,21 @@ type candleEvent struct {
 	Candle []string `json:"candle"`
 }
 
-// Run seeds each timeframe's initial candle window via the exchange port, then consumes
-// ticks/candles from the event bus until ctx is cancelled.
+// Run consumes ticks/candles from the event bus until ctx is cancelled. Candle windows start
+// empty and fill in from the live feed as bars close — no REST candle-seeding at startup
+// (removed 2026-08-29: it was a real crash source at Phase B's 10-instrument scale, tripping an
+// undiagnosed OKX-side failure on concurrent /market/candles calls, and the depth it bought
+// (CLAUDE.md §14's original candle_limit=100 window) isn't needed now that the shortest strategy
+// timeframe (5m) fills a useful window within the first few live bars anyway).
 func (e *PaperTrader) Run(ctx context.Context) error {
 	logger := e.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	if err := e.seedCandles(); err != nil {
-		return fmt.Errorf("seed initial candle windows: %w", err)
-	}
+	e.candlesMu.Lock()
+	e.candles = make(map[string][]domain.Candle, len(e.Bars))
+	e.candlesMu.Unlock()
 
 	errCh := make(chan error, 1+len(e.CandleConsumers))
 	go func() {
@@ -297,54 +299,6 @@ func (e *PaperTrader) Run(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	}
-}
-
-// seedCandleRetries/seedCandleRetryDelay: starting several PaperTrader engines at once (one per
-// configured instrument, CLAUDE.md §15.2 Phase B's 10-token roster) fires that many instruments'
-// worth of REST calls to OKX within milliseconds of each other — observed in practice to trip a
-// rate limit that OKX reports as instrument-not-found (code 51001) rather than the standard
-// too-many-requests code, on an unpredictable instrument each time. A short retry absorbs this
-// without needing to diagnose OKX's exact limiting behavior; it's the same "transient startup
-// blip, log and continue" posture as the Kafka topic-creation race (CLAUDE.md §12).
-const (
-	seedCandleRetries    = 3
-	seedCandleRetryDelay = 2 * time.Second
-)
-
-func (e *PaperTrader) seedCandles() error {
-	candles := make(map[string][]domain.Candle, len(e.Bars))
-	for _, bar := range e.Bars {
-		var raw []domain.Candle
-		var err error
-		for attempt := 0; attempt <= seedCandleRetries; attempt++ {
-			raw, err = e.Exchange.GetCandles(e.InstID, bar, e.CandleWindow)
-			if err == nil {
-				break
-			}
-			if attempt < seedCandleRetries {
-				// Jittered rather than a fixed delay: several instruments' engines retry at
-				// roughly the same time (they all failed together), and a fixed delay would
-				// just have them collide again on the retry.
-				jitter := time.Duration(mathrand.Int63n(int64(seedCandleRetryDelay)))
-				time.Sleep(seedCandleRetryDelay/2 + jitter)
-			}
-		}
-		if err != nil {
-			return fmt.Errorf("seed candle window for bar %s: %w", bar, err)
-		}
-		// Exchange returns newest-first; strategies expect oldest-first.
-		out := make([]domain.Candle, len(raw))
-		for i, c := range raw {
-			out[len(raw)-1-i] = c
-		}
-		candles[bar] = out
-	}
-	// Run before this returns hasn't started the per-bar consumer goroutines yet, so no lock is
-	// strictly needed here, but take it anyway for consistency with every other candles access.
-	e.candlesMu.Lock()
-	e.candles = candles
-	e.candlesMu.Unlock()
-	return nil
 }
 
 func (e *PaperTrader) handleTick(ctx context.Context, data []byte, logger *slog.Logger) error {

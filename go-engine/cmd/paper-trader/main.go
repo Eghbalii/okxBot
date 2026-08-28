@@ -140,7 +140,6 @@ func main() {
 			Bars:            cfg.PaperTrading.Bars,
 			CandleWindow:    cfg.PaperTrading.CandleLimit,
 			Strategies:      strategies,
-			Exchange:        restClient,
 			TickConsumer:    tickDispatcher.ForInstrument(instID),
 			CandleConsumers: candleConsumers,
 			Repo:            repo,
