@@ -851,17 +851,19 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       `000008`), signal carry-forward, and the SL/TP placement clamps. Verified against a live
       `rl_service` with learning enabled — `completed_trades` and real SAC gradient steps, where
       the counter would previously have stayed at zero forever. 25 new tests.
-- [ ] **(2) Reward penalties in `ReplayEnv` — full spec in §15.13.** Now the first blocker: the
-      reward still has no drawdown or liquidation-proximity term, so with 100x leverage available it
-      actively teaches over-leveraging while §15.6's caps hold that back with a hard limit. Any
-      training done before this has to be unlearned afterward, so it comes before any serious run.
+- [x] **(2) Reward penalties in `ReplayEnv` — §15.13.** Done 2026-08-28. Drawdown (against a new
+      `peak_equity` high-water mark that survives token boundaries) and liquidation-proximity
+      (the term that makes leverage itself cost something) now both charge against reward, and are
+      reported in `info` so a falling curve can be attributed to risk vs. bad entries. Caught a
+      latent bug in the process: `step` re-stamped `self.leverage` every step, so a position opened
+      at 100x silently read as 1x while held. 10 new tests.
 - [ ] **(3) Strategy audit for `entry_px`/`sl_px`/`tp_px`** (already listed below) — everything
       currently falls back to percentage-derived levels, which works but wastes the price-level
       design and leaves the model reasoning about levels no strategy actually chose.
 - [ ] **(4) Then it can genuinely run**: warm-start against real candle history, enable
       `paper_trading.rl_sizing` + `rl_sltp_adjust` + `serve.learning_enabled` in paper mode, and let
-      it accumulate. The reward now flows end to end; (2) is what makes what it learns worth
-      keeping.
+      it accumulate. The reward now flows end to end and the objective no longer rewards
+      over-leveraging, so what it learns from here is worth keeping.
 
 Deferred, in rough priority: per-token reward breakdown in training logs (§15.5 — the detection
 mechanism for "good on average, bad for one token", needed before expanding past 2 tokens); the
@@ -1434,12 +1436,10 @@ signals, and fork-of-a-fork must be bounded or it grows without limit.
 **Live PnL is computed in Go** from entry price, live tick, and size (as `unrealizedPnLPct`
 already does) — not read from Redis, which holds only the optimizer's disposable trial state (§7).
 
-**Reward** (§15.5 unchanged in intent, but note): `ReplayEnv` currently rewards fee-adjusted PnL
-minus SL/TP churn, with **no drawdown or liquidation-proximity penalty** — those exist only in the
-unused legacy `okx_futures_env.py`. With 100x leverage available, PnL-only reward selects for
-maximum position size; §15.6's caps currently bound that with a hard limit rather than the reward
-discouraging it. Porting those penalties into `ReplayEnv` is required before any leverage freedom
-is trusted.
+**Reward** (§15.5 unchanged in intent): `ReplayEnv` rewards fee-adjusted PnL minus SL/TP churn,
+minus drawdown and liquidation-proximity penalties. Those last two landed in §15.13 — until then the
+reward was PnL-only, which with 100x leverage available selected for maximum position size while
+§15.6's caps bound it with a hard limit, i.e. the objective and the clamp disagreed. They now agree.
 
 ### 15.11 SAC + continuous learning, and the final observation/action shape (decided 2026-08-28)
 
@@ -1644,24 +1644,56 @@ regenerated CHECK constraint accepts `rl_early` and still rejects an invalid rea
 not-recreated constraint would have silently allowed any string), and that the down migration
 relabels existing `rl_early` rows rather than failing on them.
 
-### 15.13 Reward penalties still missing from ReplayEnv (NOT YET BUILT)
+### 15.13 Reward penalties in ReplayEnv (implemented 2026-08-28)
 
-`ReplayEnv.step` currently computes `reward = (realized_pnl - fee_cost) / initial_equity` minus the
-SL/TP churn penalty, and **nothing else**. The drawdown and liquidation-proximity penalties that
-§15.5 and §2 describe exist only in the legacy `okx_futures_env.py`
-(`reward -= 0.5 * drawdown_pct`, `reward -= 0.3 * liq_penalty`), which is off by default and not
-what anything trains against.
+`ReplayEnv.step` computed `reward = (realized_pnl - fee_cost) / initial_equity` minus the SL/TP
+churn penalty, and **nothing else**. The drawdown and liquidation-proximity penalties §15.5 and §2
+describe existed only in the legacy `okx_futures_env.py`, which is off by default and not what
+anything trains against.
 
-Why this matters more than it looks: with leverage up to 100x available, maximum expected PnL comes
-from maximum position size. A PnL-only reward therefore actively teaches the agent to over-leverage,
-and §15.6's 25%/60% caps currently hold that back with a hard limit while the reward keeps pointing
-the wrong way. Fighting your own objective function with a clamp is not a stable place to be.
+Why it mattered more than it looked: with leverage up to 100x, maximum expected PnL comes from
+maximum position size, so a PnL-only reward actively taught over-leveraging while §15.6's 25%/60%
+caps held that back with a hard clamp — the objective and the clamp pulling in opposite directions.
+Done before any serious training run, deliberately: early learning against the wrong objective has
+to be unlearned later, and at this project's data volumes that is expensive.
 
-**Do this BEFORE any serious training run**, not after: early learning against the wrong objective
-has to be unlearned later, and at this project's data volumes that is expensive. Port both terms
-into `ReplayEnv`, tracking `peak_equity` for the drawdown term (it is not tracked there today), and
-add tests asserting that an identical trade at higher leverage earns strictly less reward — the
-property that makes the reward, not just the clamp, discourage over-leveraging.
+- **Drawdown** (`DRAWDOWN_PENALTY_WEIGHT`, `_drawdown_pct`): charges for distance below the
+  account's high-water mark. This is what makes a round-trip cost something — reward is otherwise
+  computed per step from realized PnL, so running the account to 2x and giving it all back collects
+  the gains on the way up and pays the losses on the way down, netting to ~0 and reading as no worse
+  than never having traded. Measured: that round-trip now scores **−0.625** instead of ~0.
+  `peak_equity` is new state (it was not tracked at all) and is deliberately **not** reset at a
+  token boundary — with one shared account (§15.6), clearing the high-water mark on crossing to the
+  next instrument would teach the same "losses don't follow me" lesson the equity carry exists to
+  prevent.
+- **Liquidation proximity** (`LIQ_PENALTY_WEIGHT`, `_liquidation_penalty`): zero when flat or when
+  estimated distance to liquidation is ≥ `LIQ_BUFFER_FLOOR_PCT` (10%), ramping linearly to 1.0 as
+  that distance closes. This is the term that makes **leverage itself** expensive: the drawdown term
+  only charges for losses already taken, so without it the agent could hold maximum leverage
+  indefinitely at no cost right up until it blew up. Measured curve: free to ~10x, then −0.015 at
+  10x, −0.165 at 20x, −0.285/step at 100x. Strong enough to discourage, not an outright ban — a
+  genuinely good high-leverage trade can still pay for it, which is the intent.
+- Both terms are surfaced in `step`'s `info` dict. A reward falling because of risk and one falling
+  because of bad entries need completely different fixes, and an aggregate reward curve cannot tell
+  them apart.
+
+**Weights are a starting point, not tuned values.** `0.5`/`0.3` are carried over from the legacy env
+and were never validated against this env's reward scale (PnL normalized by account size). Revisit
+them against real training curves.
+
+**A real bug surfaced while testing this**, unrelated to the penalties but hidden by their absence:
+`step` assigned `self.leverage = next_leverage` on *every* step, so a position opened at 100x
+silently became 1x as soon as the policy stopped asking for leverage (a `none` action carries
+`leverage_frac=0`). The recorded leverage described the last action rather than the trade being
+held — which is why the liquidation penalty read 0 for a 100x position and the first version of the
+leverage test failed. Leverage is now stamped only when exposure is actually established, and reset
+to 1x when flat. Nothing before this could have noticed: no test read leverage on a held position,
+and no reward term depended on it.
+
+10 new tests (54 Python total), including the property §15.13 named outright — an identical trade at
+higher leverage earns strictly less reward — plus monotonicity across 1x→100x, and a training run
+that stays finite with the penalties active. Mutation-checked: removing the two penalty lines fails
+three of them.
 
 ### 15.9 Implementation phasing (tracked in §14 going forward)
 

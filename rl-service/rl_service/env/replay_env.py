@@ -45,6 +45,32 @@ PRICE_CONTEXT_WINDOW = 10
 # post-MAX_SLTP_OFFSET_PCT fractions, so the penalty doesn't shrink if that bound is widened later.
 SLTP_CHURN_PENALTY = 0.002
 
+# Risk-penalty weights (CLAUDE.md §15.13). Ported from the legacy okx_futures_env, which had them
+# from the start while this env — the one anything actually trains against — had neither.
+#
+# Why they matter more here than anywhere else: with leverage up to 100x, maximum expected PnL comes
+# from maximum position size, so a PnL-only reward actively TEACHES over-leveraging. §15.6's
+# 25%/60% caps then hold that back with a hard clamp, which means the objective and the clamp are
+# pulling in opposite directions — the policy keeps learning "bigger is better" and production keeps
+# saying no. Penalizing risk in the reward itself is what makes the two agree.
+#
+# The weights are a starting point carried over from the legacy env, NOT tuned values, and they were
+# never validated against this env's reward scale (PnL normalized by account size). Revisit them
+# against real training curves rather than treating them as settled.
+DRAWDOWN_PENALTY_WEIGHT = 0.5
+LIQ_PENALTY_WEIGHT = 0.3
+
+# Liquidation proximity is measured against this buffer: a position whose estimated distance to
+# liquidation is at or above LIQ_BUFFER_FLOOR_PCT of price costs nothing, and the penalty ramps
+# linearly to full weight as that distance closes to zero. 10% mirrors the legacy env's threshold.
+LIQ_BUFFER_FLOOR_PCT = 10.0
+
+# Maintenance-margin approximation for the liquidation-distance estimate, as a percent of notional.
+# Mirrors okx_futures_env's default and go-engine's own conservative approximation (CLAUDE.md §14's
+# note that the liquidation-buffer estimate ignores real maintenance-margin tiers) — a training-time
+# risk signal, never a substitute for OKX's real liquidation engine.
+LIQ_MAINTENANCE_MARGIN_PCT = 0.5
+
 # Fallback SL/TP distances for a simulated position opened at a bar with no logged strategy signal
 # to take them from — deliberately wide enough not to dominate outcomes, since their only job is to
 # give the SL/TP-adjust action something real to ratchet against.
@@ -212,6 +238,11 @@ class ReplayEnv(gym.Env):
         self._token_idx = 0
         self._step_idx = 0
         self.equity = self.initial_equity_usd
+        # High-water mark for the drawdown penalty (CLAUDE.md §15.13). Deliberately NOT reset at a
+        # token boundary — the account is one shared pool (§15.6), so a drawdown carries across
+        # tokens exactly as the balance does. Resetting it per token would let the agent wipe its
+        # own drawdown clean by simply moving to the next instrument.
+        self.peak_equity = self.initial_equity_usd
         self.position_notional = 0.0
         self.leverage = 1.0
         self.entry_price = None
@@ -373,13 +404,21 @@ class ReplayEnv(gym.Env):
         self.equity += realized_pnl - fee_cost
         was_flat = self.position_notional == 0
         self.position_notional = target_notional
-        self.leverage = next_leverage
+        # Leverage belongs to the POSITION, so it is only (re)stamped when exposure is actually
+        # established — not on every step. Applying next_leverage unconditionally meant a position
+        # opened at 100x silently became 1x as soon as the policy stopped asking for leverage, since
+        # a `none` action carries leverage_frac=0. The recorded leverage then described the last
+        # action rather than the trade being held, so the liquidation penalty (§15.13) read a risk
+        # the position was not actually running. A flat account resets to 1x below.
+        if target_notional != 0 and (was_flat or self.entry_price is None):
+            self.leverage = next_leverage
 
         if target_notional == 0:
             self.entry_price = None
             self.sl_price = self.tp_price = None
             self.pnl_max_pct = self.pnl_min_pct = 0.0
             self._position_age_steps = 0
+            self.leverage = 1.0
         else:
             # Only a NEWLY opened position takes this bar's price as its entry. Re-stamping the
             # entry on every step of a held position would silently erase the trade's own basis and
@@ -411,6 +450,15 @@ class ReplayEnv(gym.Env):
         if chosen == "update":
             reward -= SLTP_CHURN_PENALTY * (abs(sl_offset) + abs(tp_offset)) / MAX_SLTP_OFFSET_PCT
 
+        # CLAUDE.md §15.13's risk penalties. Without these the reward is pure PnL, which at up to
+        # 100x leverage means the highest-reward policy is the most over-leveraged one — the caps
+        # would be fighting the objective instead of agreeing with it.
+        self.peak_equity = max(self.peak_equity, self.equity)
+        drawdown_pct = self._drawdown_pct()
+        liq_penalty = self._liquidation_penalty()
+        reward -= DRAWDOWN_PENALTY_WEIGHT * drawdown_pct
+        reward -= LIQ_PENALTY_WEIGHT * liq_penalty
+
         self._step_idx += 1
         exhausted_token = self._step_idx >= len(rows) - 1
         if exhausted_token:
@@ -422,8 +470,52 @@ class ReplayEnv(gym.Env):
         truncated = self._token_idx >= len(self.token_series)
 
         obs_vec = self._current_obs_vec() if not (terminated or truncated) else np.zeros(self.obs_dim, dtype=np.float32)
-        info = {"equity": self.equity, "inst_id": series.inst_id, "leverage": self.leverage}
+        info = {
+            "equity": self.equity,
+            "inst_id": series.inst_id,
+            "leverage": self.leverage,
+            # Surfaced so a training run can attribute a falling reward to risk rather than to bad
+            # entries — the two call for completely different fixes, and an aggregate reward curve
+            # cannot tell them apart.
+            "drawdown_pct": drawdown_pct,
+            "liq_penalty": liq_penalty,
+        }
         return obs_vec, float(reward), terminated, truncated, info
+
+    def _drawdown_pct(self) -> float:
+        """Current drawdown from the account's high-water mark, as a fraction in [0, 1].
+
+        This is what makes a round-trip cost something. Reward is otherwise computed per step from
+        realized PnL, so a policy that runs the account to 2x and gives it all back collects the
+        gains on the way up and pays only the losses on the way down — netting to roughly zero, and
+        reading as no worse than never having traded. The drawdown term prices the give-back itself.
+        """
+        if self.peak_equity <= 0:
+            return 0.0
+        return max(0.0, (self.peak_equity - self.equity) / self.peak_equity)
+
+    def _liquidation_penalty(self) -> float:
+        """Penalty in [0, 1] for holding a position close to liquidation (CLAUDE.md §15.13).
+
+        Zero when flat, or when the estimated distance to liquidation is at or beyond
+        LIQ_BUFFER_FLOOR_PCT; ramps linearly to 1.0 as that distance closes to zero.
+
+        The estimate depends only on leverage, not on the current price: at Nx leverage the position
+        is wiped out by an adverse move of roughly 1/N of notional (less maintenance margin), which
+        is the honest reading of an isolated-margin liquidation and doesn't need the mark price to
+        state. This is deliberately the term that makes LEVERAGE itself expensive — the drawdown
+        term only charges for losses already taken, so without this the agent could hold maximum
+        leverage indefinitely at no cost right up until the moment it blew up.
+
+        Approximate by design (it ignores OKX's real maintenance-margin tiers), matching the same
+        conservative approximation go-engine's risk manager uses.
+        """
+        if self.position_notional == 0 or self.leverage <= 0:
+            return 0.0
+        buffer_pct = max(0.0, (1.0 / self.leverage - LIQ_MAINTENANCE_MARGIN_PCT / 100.0) * 100.0)
+        if buffer_pct >= LIQ_BUFFER_FLOOR_PCT:
+            return 0.0
+        return (LIQ_BUFFER_FLOOR_PCT - buffer_pct) / LIQ_BUFFER_FLOOR_PCT
 
     def _set_sltp(self, price: float, notional: float, sl_offset: float, tp_offset: float) -> None:
         """Applies the policy's chosen SL/TP levels, clamped the way Go clamps them (§15.11).
@@ -455,7 +547,11 @@ class ReplayEnv(gym.Env):
         This used to reset equity per token, mirroring the old per-token sub-budgets. With one
         shared account that would be wrong in a way that matters for training: the agent would learn
         that losses are wiped clean at each token boundary, i.e. that over-committing has no lasting
-        consequence — the exact behavior the shared-account design needs it to feel."""
+        consequence — the exact behavior the shared-account design needs it to feel.
+
+        peak_equity is likewise left alone, for the same reason: resetting the high-water mark here
+        would let the agent clear its own drawdown penalty (§15.13) just by crossing into the next
+        instrument, which is the same "losses don't follow me" lesson in a different disguise."""
         self.position_notional = 0.0
         self.leverage = 1.0
         self.entry_price = None

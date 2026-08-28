@@ -278,3 +278,154 @@ def test_entry_price_is_not_restamped_while_a_position_is_held():
     env.step(hold)
 
     assert env.entry_price == entry_after_open, "entry must survive a hold step"
+
+
+# --- CLAUDE.md §15.13: risk penalties -------------------------------------------------------
+#
+# The property these exist to enforce: with leverage up to 100x, a PnL-only reward means the
+# highest-reward policy is the most over-leveraged one, so §15.6's caps end up fighting the
+# objective instead of agreeing with it. These tests assert the reward itself now discourages
+# over-leveraging, not just the clamp.
+
+
+def _leveraged_step_reward(leverage: float, *, price_move: float = 0.0) -> float:
+    """Reward for one step holding an identical position at the given leverage.
+
+    Everything except leverage is held fixed: same entry, same notional, same bar, same action —
+    so any difference in reward is attributable to leverage alone.
+    """
+    series = _two_token_series()
+    env = ReplayEnv(series, bar="1m", active_tokens=["BTC-USDT-SWAP", "XAU-USD-SWAP"], initial_equity_usd=1000.0)
+    env.reset()
+
+    rows = env.token_series[0].bars["1m"]
+    price = float(rows[0]["close"])
+    env.position_notional = 100.0
+    env.entry_price = price * (1.0 - price_move)
+    env.leverage = leverage
+    env.sl_price = None
+    env.tp_price = None
+
+    action = np.zeros(ACTION_DIM, dtype=np.float32)
+    # "none": hold the position as-is, so the step measures the cost of HOLDING at this leverage
+    # rather than the cost of trading.
+    action[4 + ACTIONS.index("none")] = 1.0
+    _, reward, _, _, _ = env.step(action)
+    return reward
+
+
+def test_higher_leverage_earns_strictly_less_reward_for_an_identical_trade():
+    # The property §15.13 names outright. 1x sits well beyond the liquidation buffer and costs
+    # nothing; 100x is ~1% from liquidation and should be penalized heavily.
+    low = _leveraged_step_reward(1.0)
+    high = _leveraged_step_reward(100.0)
+    assert high < low, (
+        f"100x reward {high} should be strictly less than 1x reward {low} for the same trade — "
+        "without this the reward actively teaches over-leveraging"
+    )
+
+
+def test_liquidation_penalty_is_monotonic_in_leverage():
+    # Not just "high is worse than low": the penalty must increase steadily, or the agent can find
+    # a leverage sweet spot that is risky but cheap.
+    rewards = [_leveraged_step_reward(lev) for lev in (1.0, 5.0, 10.0, 20.0, 50.0, 100.0)]
+    for lower, higher in zip(rewards, rewards[1:]):
+        assert higher <= lower, f"reward must not increase with leverage: {rewards}"
+    assert rewards[-1] < rewards[0]
+
+
+def test_leverage_within_the_buffer_costs_nothing():
+    # The penalty ramps only once the estimated distance to liquidation falls below the buffer
+    # floor. Charging for safe leverage would suppress position sizing the caps already permit.
+    env = ReplayEnv(_two_token_series(), bar="1m", active_tokens=["BTC-USDT-SWAP"], initial_equity_usd=1000.0)
+    env.reset()
+    env.position_notional = 100.0
+    env.leverage = 5.0  # ~20% to liquidation, comfortably beyond the 10% floor
+    assert env._liquidation_penalty() == 0.0
+
+    env.leverage = 50.0  # ~2% to liquidation
+    assert env._liquidation_penalty() > 0.0
+
+
+def test_liquidation_penalty_is_zero_when_flat():
+    # No position means no liquidation risk, whatever leverage the last trade happened to use —
+    # otherwise a flat agent would keep paying for a position it already closed.
+    env = ReplayEnv(_two_token_series(), bar="1m", active_tokens=["BTC-USDT-SWAP"], initial_equity_usd=1000.0)
+    env.reset()
+    env.position_notional = 0.0
+    env.leverage = 100.0
+    assert env._liquidation_penalty() == 0.0
+
+
+def test_drawdown_penalty_charges_for_giving_back_gains():
+    # A round-trip must cost something. Per-step PnL alone nets a run-up-and-give-back to roughly
+    # zero, making it read as no worse than never having traded at all.
+    env = ReplayEnv(_two_token_series(), bar="1m", active_tokens=["BTC-USDT-SWAP"], initial_equity_usd=1000.0)
+    env.reset()
+
+    assert env._drawdown_pct() == 0.0, "a fresh account is at its own high-water mark"
+
+    env.peak_equity = 2000.0
+    env.equity = 1000.0
+    assert env._drawdown_pct() == pytest.approx(0.5)
+
+    # Recovering to the peak clears it; exceeding the peak does not go negative (a new high is not
+    # a bonus, it just resets the reference).
+    env.equity = 2000.0
+    assert env._drawdown_pct() == 0.0
+    env.equity = 3000.0
+    assert env._drawdown_pct() == 0.0
+
+
+def test_peak_equity_advances_and_produces_a_drawdown_penalty():
+    # End-to-end through step(): a profitable stretch raises the high-water mark, and a subsequent
+    # loss is then penalized against it rather than only against the starting balance.
+    env = ReplayEnv(_two_token_series(), bar="1m", active_tokens=["BTC-USDT-SWAP"], initial_equity_usd=1000.0)
+    env.reset()
+
+    env.equity = 2000.0
+    env.step(np.zeros(ACTION_DIM, dtype=np.float32))
+    assert env.peak_equity >= 2000.0, "peak_equity must advance with a rising balance"
+
+    env.equity = 1500.0
+    _, reward, _, _, info = env.step(np.zeros(ACTION_DIM, dtype=np.float32))
+    assert info["drawdown_pct"] > 0.0
+    assert reward < 0.0, "sitting 25% below the high-water mark must cost reward"
+
+
+def test_peak_equity_carries_across_token_boundaries():
+    # CLAUDE.md §15.6/§15.13: with one shared account, a drawdown must follow the agent into the
+    # next instrument. Resetting the high-water mark at the boundary would let it clear its own
+    # penalty just by moving on — the same "losses don't follow me" lesson the equity carry exists
+    # to prevent.
+    env = ReplayEnv(_two_token_series(), bar="1m", active_tokens=["BTC-USDT-SWAP", "XAU-USD-SWAP"], initial_equity_usd=1000.0)
+    env.reset()
+    env.peak_equity = 2000.0
+    env.equity = 1200.0
+
+    env._carry_account_to_next_token()
+
+    assert env.peak_equity == 2000.0, "the high-water mark must survive a token boundary"
+    assert env._drawdown_pct() > 0.0
+
+
+def test_penalties_are_reported_in_info():
+    # A falling reward caused by risk and one caused by bad entries call for completely different
+    # fixes, and an aggregate reward curve cannot tell them apart.
+    env = ReplayEnv(_two_token_series(), bar="1m", active_tokens=["BTC-USDT-SWAP"], initial_equity_usd=1000.0)
+    env.reset()
+    _, _, _, _, info = env.step(np.zeros(ACTION_DIM, dtype=np.float32))
+    assert "drawdown_pct" in info and "liq_penalty" in info
+
+
+def test_training_still_runs_with_penalties_active(tmp_path):
+    # The penalties must not destabilize training or produce NaN/inf rewards — a reward that blows
+    # up would take the policy with it.
+    series = _two_token_series()
+    env = Monitor(ReplayEnv(series, bar="1m", active_tokens=["BTC-USDT-SWAP", "XAU-USD-SWAP"], initial_equity_usd=1000.0))
+    model = PPO("MlpPolicy", env, n_steps=64, batch_size=32, n_epochs=1, verbose=0)
+    model.learn(total_timesteps=128)
+
+    obs, _ = env.reset()
+    action, _ = model.predict(obs, deterministic=True)
+    assert np.all(np.isfinite(action))
