@@ -1310,6 +1310,74 @@ used to answer every token's `/predict` calls (the request's `inst_id` selects w
 token-identity input to set, not which model to load — see §15.1 for why this is one shared policy
 rather than per-token model files).
 
+### 15.10 Event-driven signal lifecycle (decided 2026-08-28) — supersedes §15.3/§15.4's shapes
+
+**The bug that forced this redesign**: `strategy_signals` were built in Go, sent over the wire, and
+parsed by Pydantic — but `rl_service/obs.py:observation_features` never put them into the model's
+input vector. The model was being asked to emit `strategy_weights` over strategies whose opinions
+it could not see. `recent_trades` (§15.3) was dropped the same way. So the observation was carrying
+data the policy never received, and the strategy-weight output was noise by construction. §15.3's
+field list stands as intent; this section replaces how signals actually reach the model.
+
+**Core idea**: the model isn't polled with a generic world-snapshot — it's driven by a **signal
+lifecycle**, where the signal's *category* tells it which decision it is being asked to make. A Go
+**controller** (an extension of `PaperTrader`, not a new service) owns that lifecycle per token.
+
+**Categories** replace `buy`/`sell`/`hold` + a separate optimize action:
+
+| Category | When | Model decides |
+|---|---|---|
+| `buy` / `sell` | a strategy fires, no open position on this token | open or skip; size, leverage, SL/TP |
+| `update` | position open: another signal fires, or PnL moved past a threshold | adjust SL/TP, close early, or nothing |
+| `closed_tp` / `closed_sl` / `closed_early` | position closed | nothing — this event **is** the reward |
+
+`hold` disappears: a strategy with no opinion simply produces no signal. The close event carrying
+realized PnL is what makes this episodic RL rather than a polling loop with a bolted-on reward —
+the terminal signal trains every decision that preceded it.
+
+**On the close signal, do NOT zero entry/SL/TP/size.** The outcome has to stay attached to the
+decision that produced it, or the model cannot learn which SL placement caused which result.
+
+**One signal per call, deliberately** (revising §15.4's fixed `strategy_weights` slots): each
+strategy's signal is its own `/predict` call, carrying its own strategy identity, timeframe, and
+its own proposed SL/TP. This removes the fixed-slot ceiling entirely — the roster can grow to 20
+strategies or shrink to 8 with no action-space change and no retraining, which a slot-per-strategy
+design could never do. `strategy_weights` is **dropped**: with each strategy's live win-rate and
+trade-count fed as *input*, the model can learn to discount weak strategies without emitting a
+trust score, and strategy selection is better answered from realized win rate anyway.
+- Cost of this choice: the model cannot see two strategies agreeing *within one call*, so
+  confluence would be invisible. Mitigated by a small fixed-width **market-context block** in every
+  observation summarizing the other currently-live signals (how many long/short, mean confidence,
+  time since the most recent other signal) — no per-strategy identity, so it stays independent of
+  roster size.
+
+**Update cadence: PnL-delta triggered, not time-triggered.** A fixed interval sends updates when
+nothing has happened and misses fast moves. Instead an `update` fires when unrealized PnL has moved
+at least `rl_update_pnl_threshold_pct` (~1%) since the last one, **or** a time ceiling elapses
+(so a position grinding sideways is still observed — funding accrues and setups decay, and "time
+passed" is itself information), **or** a strategy fires (never filtered — a real opinion always
+reaches the model immediately). This self-adapts: near-silent in a range, dense during a move. It
+also keeps credit assignment tractable — order 10 meaningful steps per trade instead of thousands
+of near-identical ones.
+
+**Shadow forks become the training signal for optimization** (extending §15.4's A/B mechanic from
+an operator-facing comparison to a learning one): baseline runs its original SL/TP, the fork runs
+the adjustment, and **outcome(fork) − outcome(baseline)** is a directly-attributable reward for the
+adjustment decision specifically — not blended with entry quality the way whole-trade PnL is. This
+is what makes in-trade optimization learnable rather than a long-delayed credit-assignment slog.
+Consequence for the controller: forks are open positions too, so they generate their own `update`
+signals, and fork-of-a-fork must be bounded or it grows without limit.
+
+**Live PnL is computed in Go** from entry price, live tick, and size (as `unrealizedPnLPct`
+already does) — not read from Redis, which holds only the optimizer's disposable trial state (§7).
+
+**Reward** (§15.5 unchanged in intent, but note): `ReplayEnv` currently rewards fee-adjusted PnL
+minus SL/TP churn, with **no drawdown or liquidation-proximity penalty** — those exist only in the
+unused legacy `okx_futures_env.py`. With 100x leverage available, PnL-only reward selects for
+maximum position size; §15.6's caps currently bound that with a hard limit rather than the reward
+discouraging it. Porting those penalties into `ReplayEnv` is required before any leverage freedom
+is trusted.
+
 ### 15.9 Implementation phasing (tracked in §14 going forward)
 
 This section is design; §14's checklist is where actual implementation progress against it is
