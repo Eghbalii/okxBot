@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
@@ -111,7 +112,14 @@ func main() {
 	defer orderEventsPub.Close()
 
 	errCh := make(chan error, len(cfg.Trading.InstIDs)+1+len(candleDispatchers))
-	for _, instID := range cfg.Trading.InstIDs {
+	// Staggering each instrument's engine start (rather than launching every goroutine in the same
+	// instant) spreads out seedCandles()'s REST calls — with 10 instruments x 3 bars, an
+	// unstaggered start fires 30 requests within milliseconds and was observed tripping an OKX
+	// rate limit reported as instrument-not-found (code 51001) on a different, unpredictable
+	// instrument each run. 300ms keeps total startup delay well under a second even at Phase B's
+	// 10-token scale.
+	const engineStartStagger = 300 * time.Millisecond
+	for i, instID := range cfg.Trading.InstIDs {
 		// Strategy assignments are durable (strategy_assignments table, CLAUDE.md §11.3): loaded
 		// fresh from Postgres on every start, so a crash/restart resumes with exactly the same
 		// token/timeframe->strategy bindings the panel last configured, not whatever was hardcoded
@@ -163,7 +171,11 @@ func main() {
 			MaxTotalExposurePct: cfg.Account.MaxTotalExposurePct,
 			OrderEvents:         orderEventsPub,
 		}
-		go func() { errCh <- engine.Run(ctx) }()
+		delay := time.Duration(i) * engineStartStagger
+		go func() {
+			time.Sleep(delay)
+			errCh <- engine.Run(ctx)
+		}()
 	}
 
 	go func() { errCh <- tickDispatcher.Run(ctx) }()

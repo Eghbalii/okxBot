@@ -298,10 +298,32 @@ func (e *PaperTrader) Run(ctx context.Context) error {
 	}
 }
 
+// seedCandleRetries/seedCandleRetryDelay: starting several PaperTrader engines at once (one per
+// configured instrument, CLAUDE.md §15.2 Phase B's 10-token roster) fires that many instruments'
+// worth of REST calls to OKX within milliseconds of each other — observed in practice to trip a
+// rate limit that OKX reports as instrument-not-found (code 51001) rather than the standard
+// too-many-requests code, on an unpredictable instrument each time. A short retry absorbs this
+// without needing to diagnose OKX's exact limiting behavior; it's the same "transient startup
+// blip, log and continue" posture as the Kafka topic-creation race (CLAUDE.md §12).
+const (
+	seedCandleRetries    = 3
+	seedCandleRetryDelay = 2 * time.Second
+)
+
 func (e *PaperTrader) seedCandles() error {
 	candles := make(map[string][]domain.Candle, len(e.Bars))
 	for _, bar := range e.Bars {
-		raw, err := e.Exchange.GetCandles(e.InstID, bar, e.CandleWindow)
+		var raw []domain.Candle
+		var err error
+		for attempt := 0; attempt <= seedCandleRetries; attempt++ {
+			raw, err = e.Exchange.GetCandles(e.InstID, bar, e.CandleWindow)
+			if err == nil {
+				break
+			}
+			if attempt < seedCandleRetries {
+				time.Sleep(seedCandleRetryDelay)
+			}
+		}
 		if err != nil {
 			return fmt.Errorf("seed candle window for bar %s: %w", bar, err)
 		}
