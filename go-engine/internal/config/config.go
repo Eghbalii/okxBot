@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/shopspring/decimal"
 	"gopkg.in/yaml.v3"
@@ -91,6 +92,33 @@ type Config struct {
 		// has to be chosen. Empty defaults to the shortest bar in Bars — freshest read of what price
 		// is doing right now, which is what an in-trade adjustment reacts to. Must be one of Bars.
 		RLDecisionBar string `yaml:"rl_decision_bar"`
+
+		// RLUpdatePnLThresholdPct / RLUpdateMaxInterval drive the signal-lifecycle conductor's
+		// update cadence (CLAUDE.md §15.12): an `update` call fires once unrealized PnL has moved
+		// this far (as a fraction, 0.01 = 1%) since the last one, OR once this much time has
+		// elapsed, OR whenever a strategy fires. PnL-delta rather than a fixed interval is what
+		// makes the cadence self-adapting — near-silent while a position ranges, dense while it
+		// actually moves — and keeps credit assignment tractable at ~10 meaningful steps per trade
+		// instead of thousands of near-identical ones. Zero falls back to conductor's defaults.
+		RLUpdatePnLThresholdPct decimal.Decimal `yaml:"rl_update_pnl_threshold_pct"`
+		RLUpdateMaxInterval     time.Duration   `yaml:"rl_update_max_interval"`
+		// RLEarlyClose lets the model close a position before either level is touched (CLAUDE.md
+		// §15.12), recorded as close_reason='rl_early'. Off by default and independent of the other
+		// RL flags: it is the one lifecycle action that destroys the counterfactual — a position
+		// closed early can never show what it would have done — so it should only be enabled once
+		// the SL/TP-adjust behavior is trusted.
+		RLEarlyClose bool `yaml:"rl_early_close"`
+		// RLClamps bound where the model may PLACE stops and targets on an open (CLAUDE.md
+		// §15.11/§15.12). Distinct from the ratchet, which governs how levels may MOVE later and
+		// says nothing about the initial placement. Early in training the policy is effectively
+		// random: a stop 0.001% from entry stops out on noise, one 40% away turns a bounded loss
+		// into an account event, and a target nearer than the stop is negative-expectancy by
+		// construction. Zero disables the respective clamp.
+		RLClamps struct {
+			MinSLDistPct decimal.Decimal `yaml:"min_sl_dist_pct"`
+			MaxSLDistPct decimal.Decimal `yaml:"max_sl_dist_pct"`
+			MinTPSLRatio decimal.Decimal `yaml:"min_tp_sl_ratio"`
+		} `yaml:"rl_clamps"`
 	} `yaml:"paper_trading"`
 
 	// Account is the shared capital pool every token trades against (CLAUDE.md §15.6, revised

@@ -198,7 +198,7 @@ type Observation struct {
 	// close (renamed from MidPrice, which read as "bid/ask midpoint" and didn't reflect what's
 	// actually sent: OKX's tickers channel "last" trade price). CLAUDE.md's 2026-08-27 MidPrice
 	// freshness audit found the SL/TP-adjust caller was passing a candle-close price here instead
-	// of the live tick — see usecase/papertrade.go's tick-driven adjustOpenOrdersWithRL for the fix.
+	// of the live tick — see usecase/lifecycle.go's tick-driven runUpdates for the fix.
 	LastPrice  decimal.Decimal  `json:"last_price"`
 	Timeframes []TimeframeBlock `json:"timeframes"`
 

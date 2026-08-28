@@ -94,7 +94,9 @@ okxBot/
 │   │   ├── domain/            # core entities: Candle, Ticker, Position, Balance, Order,
 │   │   │                        LeverageChange, Observation, Action — no framework/IO deps, §10
 │   │   ├── usecase/           # application logic: Trader (live trading loop), PaperTrader
-│   │   │                        (forward-test loop) — depend only on domain + port interfaces
+│   │   │   │                    (forward-test loop) — depend only on domain + port interfaces
+│   │   │   └── conductor/     # SignalConductor: the RL signal lifecycle state machine — which
+│   │   │                        decision to ask the model for, at what cadence, §15.12. Pure, no IO
 │   │   ├── port/               # interfaces use-cases depend on: Repository, ExchangeClient,
 │   │   │                        ModelClient, MarketDataConsumer/Publisher
 │   │   ├── config/             # env/yaml config loading
@@ -824,23 +826,42 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       swallowed it — the service would have looked healthy while never learning anything. 9 new
       tests (45 Python total), verified end to end through the real API with learning enabled.
 
-**NEXT UP — start here in a new session.** Ordered; the first two gate everything else:
+- [x] **The Signal Conductor (§15.12, 2026-08-28)** — the piece that made every other §15 mechanism
+      actually reachable. `PaperTrader` had been sending `CategoryUpdate` as a hardcoded default and
+      never emitting a terminal call, so `rl_service/learner.py` — which holds each decision pending
+      by order id and pairs it with the realized PnL arriving hours later — received **zero rewards
+      in production**: the model was asked questions but never told how any answer turned out.
+      `internal/usecase/conductor` holds the pure state machine (category selection, PnL-delta
+      update cadence, signal carry-forward per (instId, bar), SL/TP placement clamps) and
+      `internal/usecase/lifecycle.go` the IO half. Every close now routes through one
+      `closeOrder`, so no path can complete a close while skipping the reward call; a manual close
+      deliberately emits nothing, since attributing an operator's action to the policy would train
+      on a decision it never made. Early close (`rl_early`, migration `000008`) is opt-in — it is
+      the one action that destroys the counterfactual. Also fixed a latent double-call: the open
+      path used to `Predict` twice for one decision (once for buy/sell, once for sizing), which
+      could size an order against one answer while taking its levels from another. 25 new tests
+      (161 Go total), plus end-to-end verification against a live learning-enabled `rl_service` and
+      the migration applied to a real TimescaleDB.
 
-- [ ] **(1) Reward penalties in `ReplayEnv` — full spec in §15.13.** Small, and deliberately first:
-      the reward currently has no drawdown or liquidation-proximity term, so with 100x leverage
-      available it actively teaches over-leveraging while §15.6's caps hold that back with a hard
-      limit. Any training done before this has to be unlearned afterward.
-- [ ] **(2) Signal-lifecycle controller in Go — full spec in §15.12.** The blocker for everything
-      in §15: the schema carries categories and `rl_service/learner.py` waits for terminal calls,
-      but `PaperTrader` still sends `CategoryUpdate` as a hardcoded default and never emits
-      `closed_*`, so **no reward reaches the model in production today**. Includes the
-      PnL-threshold update cadence, early close, signal carry-forward, and the SL/TP clamps.
+**NEXT UP — start here in a new session.** Ordered:
+
+- [x] **(1) Signal Conductor in Go — §15.12.** Done 2026-08-28. `internal/usecase/conductor` (pure
+      state machine) + `internal/usecase/lifecycle.go` (PaperTrader's IO half): category selection,
+      PnL-threshold update cadence, terminal reward calls, early close (`rl_early`, migration
+      `000008`), signal carry-forward, and the SL/TP placement clamps. Verified against a live
+      `rl_service` with learning enabled — `completed_trades` and real SAC gradient steps, where
+      the counter would previously have stayed at zero forever. 25 new tests.
+- [ ] **(2) Reward penalties in `ReplayEnv` — full spec in §15.13.** Now the first blocker: the
+      reward still has no drawdown or liquidation-proximity term, so with 100x leverage available it
+      actively teaches over-leveraging while §15.6's caps hold that back with a hard limit. Any
+      training done before this has to be unlearned afterward, so it comes before any serious run.
 - [ ] **(3) Strategy audit for `entry_px`/`sl_px`/`tp_px`** (already listed below) — everything
       currently falls back to percentage-derived levels, which works but wastes the price-level
       design and leaves the model reasoning about levels no strategy actually chose.
 - [ ] **(4) Then it can genuinely run**: warm-start against real candle history, enable
       `paper_trading.rl_sizing` + `rl_sltp_adjust` + `serve.learning_enabled` in paper mode, and let
-      it accumulate. Nothing before (2) produces a single reward, so this order is not negotiable.
+      it accumulate. The reward now flows end to end; (2) is what makes what it learns worth
+      keeping.
 
 Deferred, in rough priority: per-token reward breakdown in training logs (§15.5 — the detection
 mechanism for "good on average, bad for one token", needed before expanding past 2 tokens); the
@@ -1513,19 +1534,29 @@ flips its side.
 boundary): min/max SL distance, a minimum TP:SL ratio, and size/leverage ceilings. Early in
 training the policy is effectively random, and one absurd SL would otherwise destroy a position.
 
-### 15.12 Implementation spec: the signal-lifecycle controller (NOT YET BUILT)
+### 15.12 The Signal Conductor (implemented 2026-08-28)
 
-§15.10/§15.11 settled *what* the lifecycle is; this is *how* to build it, written down because
-nothing reaches the learner without it. Today `PaperTrader` sends `Category = CategoryUpdate` as a
-hardcoded default and never emits a terminal call, so the continuous-learning path built in
-`rl_service/learner.py` receives no rewards at all in production. **This is the blocker for
-everything else in §15.**
+§15.10/§15.11 settled *what* the lifecycle is; this section is *how* it is built. Before it,
+`PaperTrader` sent `Category = CategoryUpdate` as a hardcoded default and never emitted a terminal
+call, so the continuous-learning path in `rl_service/learner.py` received **no rewards at all** in
+production — the model could be asked questions but was never told how any answer turned out. This
+was the blocker for everything else in §15.
 
-**Where it lives**: an extension of `usecase.PaperTrader`, not a new service. It already tracks open
-positions per token, consumes ticks and candles, and calls the model — what is missing is the state
-machine around those calls.
+**Name**: `SignalConductor` (`internal/usecase/conductor`), deliberately not "controller". It does
+not decide direction — strategies do (§9/§16.1) — and it does not decide size — the model does. It
+decides *who plays when*: which lifecycle question to ask, at what cadence, and it guarantees the
+terminal call that carries the reward actually happens. Coordination without authorship.
 
-**Category selection** (replaces the hardcoded default in `buildObservation`):
+**Where it lives**: `internal/usecase/conductor` holds the pure state machine (category selection,
+update cadence, signal carry-forward, SL/TP clamps) with no IO at all; `usecase.PaperTrader` owns
+the repository and model calls and delegates the decisions to it (`internal/usecase/lifecycle.go`).
+The split keeps the cadence and category rules unit-testable without a database or a running
+rl-service, and keeps `papertrade.go` from absorbing another few hundred lines. `PaperTrader` builds
+its conductor lazily from its own `RL*` fields, so a struct-literal construction — every test and
+every `cmd/` wiring — needs no separate initialization step.
+
+**Category selection** (`conductor.OpenCategory`/`TerminalCategory`, replacing the hardcoded
+default in `buildObservation`, which now stands only as a fallback that claims nothing):
 
 | Condition | Category | Then |
 |---|---|---|
@@ -1538,7 +1569,8 @@ machine around those calls.
 `Signal = nil` on a price-driven update is deliberate: `signal_block`'s `present` flag is what tells
 the model no strategy spoke, and inventing a stale signal there would be a lie it learns from.
 
-**Update cadence** (§15.11's decision, still unimplemented). Fire an `update` when **any** holds:
+**Update cadence** (`Conductor.ShouldUpdate`, config `paper_trading.rl_update_*`). Fire an `update`
+when **any** holds:
 - unrealized PnL moved ≥ `paper_trading.rl_update_pnl_threshold_pct` (default ~1%) since the last
   update for that order — self-adapting: near-silent in a range, dense during a real move, and far
   better for credit assignment than thousands of near-identical steps;
@@ -1546,34 +1578,71 @@ the model no strategy spoke, and inventing a stale signal there would be a lie i
   still be observed, since funding accrues and setups decay, and "time passed" is itself information;
 - a strategy fires — never filtered; a real opinion always reaches the model immediately.
 
-Per-order state (last-update PnL and timestamp) belongs in memory on `PaperTrader`, guarded like
-`candlesMu`. Losing it on restart is harmless: the next tick simply triggers one update.
+Per-order state (last-update PnL and timestamp) lives in memory on the conductor, keyed by order id
+and dropped when the order closes so it cannot grow past the set of open positions. Losing it on
+restart is harmless: the next tick simply triggers one update, which is the correct behavior for a
+process that has just come back and does not know how the position moved while it was gone.
+`ShouldUpdate` claims the slot as it answers (it advances the baseline when it returns true), the
+same check-and-claim pattern as `shouldRunRLAdjust`, so concurrent ticks cannot double-fire.
 
-**Terminal calls are the reward delivery path.** On every close in `monitorOpenOrders`, build an
-observation with the terminal category and `PositionState.RealizedPnLUSD` set, and POST it. Do NOT
-zero entry/SL/TP — the outcome has to stay attached to the decision that produced it (§15.10).
-Best-effort: a failed terminal call must never block closing the order, but it does mean that
-decision is never scored, so log it at warn.
+**Terminal calls are the reward delivery path.** Every close now goes through one
+`PaperTrader.closeOrder` — SL touch, TP touch, and model-driven early close alike — so no caller
+can complete a close while skipping the terminal call. It builds an observation with the terminal
+category and `PositionState.RealizedPnLUSD` set and POSTs it. Entry/SL/TP are deliberately NOT
+zeroed: the outcome has to stay attached to the decision that produced it (§15.10). Ordering
+matters — the call happens *after* the order is durably closed, because a model or network problem
+must never leave a position open in the database that the price feed has already resolved. A manual
+or timeout close deliberately emits nothing: that is an operator's action, and reporting it would
+attribute a human decision to the policy. Best-effort otherwise, logged at warn, since a failure
+means that trade trains nothing.
 
-**Early close** (`action == "close"`) is new capability with no code yet. Per the 2026-08-28
-decision: allow it, close at market, and record `close_reason = 'rl_early'` so early-closed trades
-stay comparable against ones that ran to SL/TP — the same evidence-gathering logic as the shadow
-forks. `closeReason` and the `paper_orders` CHECK constraint both need the new value.
+**Early close** (`action == "close"`): implemented, gated behind `paper_trading.rl_early_close`,
+**off by default**. It closes at market and records `close_reason = 'rl_early'` (migration
+`000008`) so early-closed trades stay distinguishable from operator action *and* comparable against
+trades that ran to SL/TP — the same evidence-gathering logic as the shadow forks. It stays opt-in
+because it is the one lifecycle action that destroys the counterfactual: an early-closed trade can
+never show what it would have done.
 
-**Signal carry-forward**: a higher-timeframe signal stays meaningful between its candles, so the
-last signal per (inst_id, bar) is retained and re-sent on `update` calls rather than vanishing.
-Note §15.11 dropped the signal's `age_seconds` field, so staleness currently reaches the model only
-through `PositionState.AgeSeconds` — if carry-forward proves to need explicit staleness, that is a
-schema change, not a controller change.
+**Signal carry-forward**: the last signal per (inst_id, bar) is retained by the conductor and
+re-attached to price-driven `update` calls, since a higher-timeframe opinion stays meaningful
+between its candles and dropping it at candle close would hide it from every update in between.
+Retention is per (instId, bar) — a 1H signal must not leak onto a 5m decision, or one token's onto
+another's. Note §15.11 dropped the signal's `age_seconds`, so staleness reaches the model only
+through `PositionState.AgeSeconds`; if carry-forward proves to need explicit staleness, that is an
+observation-schema change, not a conductor change.
 
-**Forks generate their own updates** (§15.4): they are open positions too. Bound fork-of-a-fork or
-it grows without limit — simplest rule is to skip the adjust pass for orders whose `Variant` is
-already `rl_adjusted`.
+**Forks generate their own updates** (§15.4): they are open positions and the model manages them
+too. But a fork is never itself forked — `applyAdjustment` returns early for `Variant ==
+"rl_adjusted"` — otherwise each adjustment spawns a new branch and the tree grows without bound,
+every leaf drawing model calls forever.
 
-**Go-side clamps to add before any of this is trusted** (§15.11, the `RatchetSLTP` pattern — the
-model is never the safety boundary): minimum and maximum SL distance, a minimum TP:SL ratio, and
-the existing size/leverage ceilings. Early in training the policy is effectively random, and one
-absurd stop would otherwise destroy a position. These belong in config, not hardcoded.
+**Go-side clamps** (`conductor.Clamps`, config `paper_trading.rl_clamps`, the `RatchetSLTP` pattern
+— the model is never the safety boundary): minimum and maximum SL distance and a minimum TP:SL
+ratio, applied to the levels the model sets **on an open**. This is a different question from the
+ratchet, which governs how levels may *move* later and says nothing about initial placement. Early
+in training the policy is effectively random: a stop 0.001% from entry stops out on noise before
+the trade can do anything, one 40% away turns a bounded loss into an account event at high leverage,
+and a target nearer than the stop is negative-expectancy by construction no matter how good the
+entry. Order matters within the clamp — the stop is clamped first and the ratio is checked against
+the *clamped* stop, since validating against a rejected stop would let it silently justify a target
+that no longer matches the risk actually being taken. A level on the wrong side of entry is dropped
+rather than mirrored: guessing what an incoherent output meant would invent a decision the model
+never made, and the strategy's own level is the better fallback.
+
+**One model call per open decision.** `sizeFromAction` was split out of `rlSizing` so the open path
+reuses the same sizing and capping rules without issuing a second `Predict` for one decision — two
+calls would not only waste inference, they could return different answers and leave the order sized
+against one while its levels came from the other.
+
+**Verified end-to-end, not just unit-tested** (2026-08-28): the full lifecycle was driven through
+the real `rlclient` → `rl_service` HTTP path against a live service with `learning_enabled: true`.
+Four trades produced `completed_trades: 4`, `buffer_size: 4`, `pending: 0` (every decision paired
+with its outcome, none orphaned), `last_reward: 0.04` (matching `realized_pnl / account_initial`),
+and `updates: 3` — real SAC gradient steps. Before this change that counter would have stayed at
+zero forever. Migration `000008` was also applied against a real TimescaleDB, confirming the
+regenerated CHECK constraint accepts `rl_early` and still rejects an invalid reason (a dropped-but-
+not-recreated constraint would have silently allowed any string), and that the down migration
+relabels existing `rl_early` rows rather than failing on them.
 
 ### 15.13 Reward penalties still missing from ReplayEnv (NOT YET BUILT)
 

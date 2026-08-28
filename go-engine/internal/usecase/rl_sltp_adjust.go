@@ -23,73 +23,6 @@ const priceContextWindow = 10
 // as the observation's recent-performance tail (CLAUDE.md §15.3/§15.7).
 const recentTradesWindow = 10
 
-// adjustOpenOrdersWithRL is the CLAUDE.md §15.4 in-trade SL/TP adjustment pass: for every open
-// baseline order on this token, ask the RL model for an action and, if it proposes a nonzero
-// SL/TP adjustment, fork a linked copy carrying the ratcheted result rather than editing the
-// original in place (CLAUDE.md §15.4's shadow-fork mechanic — the two are compared later, not
-// merged). Best-effort: any error here is logged and skipped, never propagated. Called from
-// handleTick, throttled to RLAdjustInterval (CLAUDE.md §15.9's freshness fix) — price is always
-// the live tick price, not a candle close.
-func (e *PaperTrader) adjustOpenOrdersWithRL(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) {
-	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
-	if err != nil {
-		logger.Warn("rl sl/tp adjust: list open orders failed", "instId", e.InstID, "error", err)
-		return
-	}
-
-	var baseline []port.PaperOrder
-	for _, o := range open {
-		if o.Variant == "baseline" || o.Variant == "" {
-			baseline = append(baseline, o)
-		}
-	}
-	if len(baseline) == 0 {
-		return
-	}
-
-	obs := e.buildObservation(ctx, bar, price, logger)
-
-	for _, o := range baseline {
-		// Position-specific fields are per-order; the rest of the observation is shared across this
-		// pass, so only these are overwritten per iteration.
-		obs.OrderID = o.ID
-		obs.PositionState = positionStateOf(o, price)
-
-		action, err := e.Model.Predict(ctx, obs)
-		if err != nil {
-			logger.Warn("rl sl/tp adjust: predict failed", "instId", e.InstID, "orderId", o.ID, "error", err)
-			continue
-		}
-		// The action head decides whether to touch this position at all (CLAUDE.md §15.11). A model
-		// meaning "leave it alone" must not fork just because its continuous price outputs happen
-		// to differ from the current levels, which for a continuous output is essentially always.
-		if action.Action != domain.ActionUpdate {
-			continue
-		}
-
-		// The model now sets LEVELS rather than proposing percentage nudges (§15.11), so convert to
-		// the adjustment the ratchet expects: how far each level moves as a fraction of live price.
-		slAdjust := levelAdjustPct(o.SLPx, action.SLPx, price)
-		tpAdjust := levelAdjustPct(o.TPPx, action.TPPx, price)
-		if slAdjust.IsZero() && tpAdjust.IsZero() {
-			continue
-		}
-
-		newSL, newTP := RatchetSLTP(o, price, slAdjust, tpAdjust)
-		if samePriceOrNil(newSL, o.SLPx) && samePriceOrNil(newTP, o.TPPx) {
-			continue // ratchet rejected the proposal entirely; nothing to fork
-		}
-
-		forkID, err := e.Repo.ForkPaperOrderWithSLTP(ctx, o.ID, newSL, newTP)
-		if err != nil {
-			logger.Warn("rl sl/tp adjust: fork failed", "instId", e.InstID, "orderId", o.ID, "error", err)
-			continue
-		}
-		logger.Info("rl sl/tp adjustment forked", "instId", e.InstID, "parentId", o.ID, "forkId", forkID,
-			"newSL", newSL, "newTP", newTP)
-	}
-}
-
 // rlSizing asks the RL agent how much of the SHARED account to put behind a strategy signal that
 // has already decided to trade (CLAUDE.md §15.6/§15.11): SizePct is a fraction of current account
 // equity, LeverageFrac maps onto [1x, MaxLeverage]. Returns ok=false — leaving the caller's
@@ -144,6 +77,26 @@ func (e *PaperTrader) rlSizing(
 		return decimal.Zero, decimal.Zero, false
 	}
 
+	return e.sizeFromAction(action, obs, openOrders, logger)
+}
+
+// sizeFromAction turns a model action into a position notional and leverage, applying the two hard
+// Go-side caps documented on rlSizing. Split out from rlSizing so the lifecycle's open decision
+// (which has already called the model to get the buy/sell answer) can reuse the exact same sizing
+// and capping rules without issuing a second Predict for one decision — two calls would not only
+// waste inference, they could return different answers and leave the order sized against one while
+// its levels came from the other.
+func (e *PaperTrader) sizeFromAction(
+	action *domain.Action,
+	obs domain.Observation,
+	openOrders []port.PaperOrder,
+	logger *slog.Logger,
+) (notional, leverage decimal.Decimal, ok bool) {
+	equity := obs.AccountEquityUSD
+	if !equity.IsPositive() || !e.MaxLeverage.IsPositive() {
+		return decimal.Zero, decimal.Zero, false
+	}
+
 	exposure := clampUnit(action.SizePct.Abs())
 	if !exposure.IsPositive() {
 		// No exposure requested but no explicit skip either; keep the fixed sizing rather than
@@ -190,7 +143,7 @@ func (e *PaperTrader) rlSizing(
 
 	leverage = decimal.NewFromInt(1).Add(clampUnit(action.LeverageFrac).Mul(e.MaxLeverage.Sub(decimal.NewFromInt(1))))
 
-	logger.Debug("rl sizing applied", "instId", e.InstID, "side", signal.Side,
+	logger.Debug("rl sizing applied", "instId", e.InstID,
 		"equity", equity, "exposure", exposure, "notional", notional, "leverage", leverage)
 	return notional, leverage, true
 }
@@ -208,7 +161,7 @@ func clampUnit(d decimal.Decimal) decimal.Decimal {
 	}
 }
 
-// buildObservation assembles the CLAUDE.md §15.3 v3 observation for this token, shared across all
+// buildObservation assembles the CLAUDE.md §15.3 observation for this token, shared across all
 // of this token's open orders for one evaluation pass (position/PnL/dist-to-SL-TP fields are then
 // overwritten per-order by the caller, since those are order-specific). The candle window/strategy
 // signals/price-context (bar-scoped) reflect the most recent finalized candle as before; LastPrice
@@ -250,9 +203,11 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 		LastPrice:         price,
 		Timeframes:        []domain.TimeframeBlock{tb},
 		AccountInitialUSD: e.AccountInitialUSD,
-		// The lifecycle category and per-call Signal are set by the caller, which knows which
-		// decision it is asking for (CLAUDE.md §15.11). CategoryUpdate is the safe default: it is
-		// what a price-driven call is, and it never claims a strategy spoke when none did.
+		// The lifecycle category and per-call Signal are always set by the caller, which is the
+		// only place that knows which decision is being asked (CLAUDE.md §15.12). CategoryUpdate
+		// stands as the fallback because it is the one category that claims nothing — no strategy
+		// spoke, no outcome is being reported — so a caller that somehow forgot to set one cannot
+		// accidentally train the model on a reward or an entry decision that never happened.
 		Category: domain.CategoryUpdate,
 	}
 

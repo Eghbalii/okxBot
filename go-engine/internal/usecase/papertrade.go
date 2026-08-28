@@ -15,6 +15,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
 // StrategyAssignment pairs a live Strategy value with the candle timeframe it evaluates against
@@ -95,6 +96,19 @@ type PaperTrader struct {
 	// SL/TP-adjust decision (CLAUDE.md §15.3). Empty means "the shortest configured bar" — see
 	// decisionBar. Must be one of Bars.
 	RLDecisionBar string
+
+	// RLUpdatePnLThresholdPct / RLUpdateMaxInterval tune the signal-lifecycle conductor's update
+	// cadence (CLAUDE.md §15.12). Zero falls back to the conductor package's defaults.
+	RLUpdatePnLThresholdPct decimal.Decimal
+	RLUpdateMaxInterval     time.Duration
+	// RLEarlyClose lets the model close a position before either level is touched, recorded as
+	// close_reason='rl_early' (CLAUDE.md §15.12). Off by default: it is the one lifecycle action
+	// that destroys the counterfactual, since an early-closed trade can never show what it would
+	// have done.
+	RLEarlyClose bool
+	// RLClamps bound where the model may PLACE stops and targets on an open — distinct from the
+	// ratchet, which governs how they may MOVE afterward (CLAUDE.md §15.11/§15.12).
+	RLClamps conductor.Clamps
 	// MaxLeverage is the ceiling LeverageFrac maps onto ([1x, MaxLeverage]). This mirrors the
 	// config's risk.max_leverage so paper orders can't record leverage the live risk manager would
 	// reject outright (CLAUDE.md §5) — the risk manager remains the real boundary for live trading;
@@ -120,6 +134,11 @@ type PaperTrader struct {
 	// to RLAdjustInterval so a busy token doesn't call rl_service on every single tick.
 	rlAdjustMu     sync.Mutex
 	lastRLAdjustAt time.Time
+
+	// lifecycle is the signal-lifecycle conductor (CLAUDE.md §15.12), built lazily from the RL*
+	// fields above so a struct-literal PaperTrader needs no separate initialization step.
+	conductorOnce sync.Once
+	lifecycle     *conductor.Conductor
 }
 
 // RLAdjustInterval is the minimum time between RL SL/TP-adjust passes for one instrument
@@ -317,11 +336,13 @@ func (e *PaperTrader) handleTick(ctx context.Context, data []byte, logger *slog.
 		return err
 	}
 
-	// CLAUDE.md §15.4/§15.9: RL SL/TP-adjust now runs on the live tick stream (throttled to
-	// RLAdjustInterval), not just at candle close — see the audit note on lastRLAdjustAt's
-	// declaration for why this changed. Best-effort/never blocking, same as the old call site.
+	// The in-trade half of the signal lifecycle (CLAUDE.md §15.12) runs on the live tick stream
+	// rather than at candle close — see the audit note on lastRLAdjustAt's declaration for why.
+	// The RLAdjustInterval throttle bounds how often rl_service is consulted at all; the
+	// conductor's own PnL/time cadence then decides which specific orders are actually due.
+	// Best-effort/never blocking.
 	if e.Model != nil && e.RLSLTPAdjust && e.shouldRunRLAdjust() {
-		e.adjustOpenOrdersWithRL(ctx, e.decisionBar(), price, logger)
+		e.runUpdates(ctx, e.decisionBar(), price, logger)
 	}
 	return nil
 }
@@ -421,11 +442,44 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 
 		order := buildPaperOrder(e.InstID, price, signal, e.NotionalUSD, a.StrategyID)
 
-		// The same observation is used for both the RL sizing decision and the persisted
+		// Retain this signal for carry-forward onto later price-driven update calls (CLAUDE.md
+		// §15.12): a higher-timeframe opinion stays meaningful between its candles, and dropping it
+		// the moment the candle closed would hide it from every update in between.
+		resolved := signal.ResolveLevels(price)
+		e.conductor().RetainSignal(e.InstID, bar, domain.StrategySignal{
+			StrategyID: a.StrategyID,
+			Side:       string(signal.Side),
+			Confidence: signal.Confidence,
+			EntryPx:    resolved.EntryPx,
+			SLPx:       resolved.SLPx,
+			TPPx:       resolved.TPPx,
+			Kind:       a.Kind,
+			Bar:        a.Bar,
+		})
+
+		// The same observation is used for both the model's open decision and the persisted
 		// decision-time record below, so what's stored is exactly what the model was asked.
 		obs := e.buildObservation(ctx, bar, price, logger)
-		if notional, leverage, ok := e.rlSizing(ctx, obs, signal, open, logger); ok {
-			order.Size, order.Leverage = notional, leverage
+		obs.Category = conductor.OpenCategory(string(signal.Side))
+		obs.Signal = e.carriedSignalFor(bar)
+
+		// Ask the model whether to take this signal and how to shape it (CLAUDE.md §15.12). It may
+		// decline outright — a real decision, distinct from "no opinion" — in which case no order is
+		// opened at all.
+		if decision, ok := e.openDecision(ctx, obs, signal, open, price, logger); ok {
+			if decision.Skip {
+				continue
+			}
+			order.Size, order.Leverage = decision.Notional, decision.Leverage
+			// Keep the strategy's levels wherever the model set none: opening a position with no
+			// protection because the model stayed silent would be strictly worse than the
+			// structure-derived stop the strategy already proposed.
+			if decision.SLPx != nil {
+				order.SLPx = decision.SLPx
+			}
+			if decision.TPPx != nil {
+				order.TPPx = decision.TPPx
+			}
 		}
 
 		// CLAUDE.md §15.3/§15.8: persist the actual observation vector at decision time (not just
@@ -468,32 +522,58 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 		if !hit {
 			continue
 		}
-		pnl := realizedPnL(o, price)
-		if err := e.Repo.ClosePaperOrder(ctx, o.ID, price, reason, pnl); err != nil {
+		if err := e.closeOrder(ctx, o, price, reason, realizedPnL(o, price), logger); err != nil {
 			logger.Error("failed to close paper order", "id", o.ID, "error", err)
 			continue
 		}
-		metrics.PaperOrdersClosedTotal.WithLabelValues(e.InstID, reason).Inc()
-		// Prometheus metrics have no decimal support; InexactFloat64 is acceptable here since
-		// this is write-only telemetry, not a value used in further financial arithmetic.
-		metrics.PaperOrdersRealizedPnL.WithLabelValues(e.InstID).Add(pnl.InexactFloat64())
-		logger.Info("closed paper order", "id", o.ID, "instId", e.InstID, "reason", reason, "closePx", price, "pnl", pnl)
-		e.publishOrderEvent(ctx, "closed", o.ID, logger)
+	}
+	return nil
+}
 
-		// CLAUDE.md §15.4/§15.6/§15.7: only a baseline order's outcome moves the shared account
-		// balance — an rl_adjusted fork is tracking-only (its whole purpose is to be compared
-		// against its baseline parent afterward, not to be treated as a second real bet).
-		if o.Variant == "baseline" || o.Variant == "" {
-			if e.AccountInitialUSD.IsPositive() {
-				orderID := o.ID
-				if acct, reset, err := e.Repo.ApplyRealizedPnL(ctx, e.accountMode(), pnl, &orderID, e.InstID); err != nil {
-					logger.Error("failed to apply realized pnl to account", "instId", e.InstID, "error", err)
-				} else if reset {
-					// Recorded as a reason="reset" point in the equity timeline too, so a drain that
-					// happens overnight is visible in the panel's chart afterward, not just here.
-					logger.Warn("account balance drained, reset to initial", "mode", e.accountMode(),
-						"instId", e.InstID, "initialUsd", acct.InitialUSD, "resetCount", acct.ResetCount)
-				}
+// closeOrder is the single close path for a paper order, whether it was stopped out, hit its
+// target, or the model closed it early (CLAUDE.md §15.12). Everything a close must do lives here so
+// no caller can complete a close while skipping one of the steps — in particular the terminal model
+// call, which is the ONLY way a decision ever gets scored (§15.10: the close event is the reward).
+func (e *PaperTrader) closeOrder(
+	ctx context.Context,
+	o port.PaperOrder,
+	price decimal.Decimal,
+	reason string,
+	pnl decimal.Decimal,
+	logger *slog.Logger,
+) error {
+	if err := e.Repo.ClosePaperOrder(ctx, o.ID, price, reason, pnl); err != nil {
+		return err
+	}
+	metrics.PaperOrdersClosedTotal.WithLabelValues(e.InstID, reason).Inc()
+	// Prometheus metrics have no decimal support; InexactFloat64 is acceptable here since
+	// this is write-only telemetry, not a value used in further financial arithmetic.
+	metrics.PaperOrdersRealizedPnL.WithLabelValues(e.InstID).Add(pnl.InexactFloat64())
+	logger.Info("closed paper order", "id", o.ID, "instId", e.InstID, "reason", reason, "closePx", price, "pnl", pnl)
+	e.publishOrderEvent(ctx, "closed", o.ID, logger)
+
+	// Drop the conductor's per-order update state; keeping it would leak one entry per closed
+	// trade for the lifetime of the process.
+	e.conductor().Forget(o.ID)
+
+	// Deliver the realized outcome to the model. Best-effort and deliberately AFTER the order is
+	// durably closed: a model or network problem must never leave a position open in the database
+	// that the price feed has already resolved.
+	e.reportTerminal(ctx, o, price, pnl, reason, logger)
+
+	// CLAUDE.md §15.4/§15.6/§15.7: only a baseline order's outcome moves the shared account
+	// balance — an rl_adjusted fork is tracking-only (its whole purpose is to be compared
+	// against its baseline parent afterward, not to be treated as a second real bet).
+	if o.Variant == "baseline" || o.Variant == "" {
+		if e.AccountInitialUSD.IsPositive() {
+			orderID := o.ID
+			if acct, reset, err := e.Repo.ApplyRealizedPnL(ctx, e.accountMode(), pnl, &orderID, e.InstID); err != nil {
+				logger.Error("failed to apply realized pnl to account", "instId", e.InstID, "error", err)
+			} else if reset {
+				// Recorded as a reason="reset" point in the equity timeline too, so a drain that
+				// happens overnight is visible in the panel's chart afterward, not just here.
+				logger.Warn("account balance drained, reset to initial", "mode", e.accountMode(),
+					"instId", e.InstID, "initialUsd", acct.InitialUSD, "resetCount", acct.ResetCount)
 			}
 		}
 	}

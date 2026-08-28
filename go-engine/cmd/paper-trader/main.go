@@ -20,6 +20,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/rlclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
 func main() {
@@ -124,7 +125,17 @@ func main() {
 			RLDecisionBar:   cfg.PaperTrading.RLDecisionBar,
 			RLSizing:        cfg.PaperTrading.RLSizing,
 			MaxLeverage:     cfg.Risk.MaxLeverage,
-			ActiveTokens:    cfg.Trading.InstIDs,
+			// Signal-lifecycle conductor (CLAUDE.md §15.12): update cadence, early close, and the
+			// clamps bounding where the model may place stops/targets.
+			RLUpdatePnLThresholdPct: cfg.PaperTrading.RLUpdatePnLThresholdPct,
+			RLUpdateMaxInterval:     cfg.PaperTrading.RLUpdateMaxInterval,
+			RLEarlyClose:            cfg.PaperTrading.RLEarlyClose,
+			RLClamps: conductor.Clamps{
+				MinSLDistPct: cfg.PaperTrading.RLClamps.MinSLDistPct,
+				MaxSLDistPct: cfg.PaperTrading.RLClamps.MaxSLDistPct,
+				MinTPSLRatio: cfg.PaperTrading.RLClamps.MinTPSLRatio,
+			},
+			ActiveTokens: cfg.Trading.InstIDs,
 			// One shared account across every token (CLAUDE.md §15.6): each per-instrument engine
 			// trades against the same "paper" balance row, not a slice of it.
 			Mode:                "paper",

@@ -602,7 +602,7 @@ func (f *fakeModelClientRL) Predict(ctx context.Context, obs domain.Observation)
 	return &a, nil
 }
 
-func TestAdjustOpenOrdersWithRL_ForksOnNonZeroAdjustment(t *testing.T) {
+func TestRunUpdates_ForksOnNonZeroAdjustment(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
 	pt.candles = map[string][]domain.Candle{"1m": {
@@ -619,7 +619,7 @@ func TestAdjustOpenOrdersWithRL_ForksOnNonZeroAdjustment(t *testing.T) {
 		t.Fatalf("open baseline order: %v", err)
 	}
 
-	pt.adjustOpenOrdersWithRL(context.Background(), "1m", dec("105"), testLogger())
+	pt.runUpdates(context.Background(), "1m", dec("105"), testLogger())
 
 	if model.calls == 0 {
 		t.Fatalf("expected Predict to be called")
@@ -657,7 +657,7 @@ func TestAdjustOpenOrdersWithRL_ForksOnNonZeroAdjustment(t *testing.T) {
 	}
 }
 
-func TestAdjustOpenOrdersWithRL_NoOpActionDoesNotFork(t *testing.T) {
+func TestRunUpdates_NoOpActionDoesNotFork(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
 	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
@@ -671,7 +671,7 @@ func TestAdjustOpenOrdersWithRL_NoOpActionDoesNotFork(t *testing.T) {
 		t.Fatalf("open baseline order: %v", err)
 	}
 
-	pt.adjustOpenOrdersWithRL(context.Background(), "1m", dec("100"), testLogger())
+	pt.runUpdates(context.Background(), "1m", dec("100"), testLogger())
 
 	orders, err := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
 	if err != nil {
@@ -682,14 +682,14 @@ func TestAdjustOpenOrdersWithRL_NoOpActionDoesNotFork(t *testing.T) {
 	}
 }
 
-func TestAdjustOpenOrdersWithRL_SkipsWhenNoBaselineOrders(t *testing.T) {
+func TestRunUpdates_SkipsWhenNoOpenOrders(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
 	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
 	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionUpdate, SLPx: dec("97")}}
 	pt.Model = model
 
-	pt.adjustOpenOrdersWithRL(context.Background(), "1m", dec("100"), testLogger())
+	pt.runUpdates(context.Background(), "1m", dec("100"), testLogger())
 
 	if model.calls != 0 {
 		t.Errorf("expected Predict never called when there are no open baseline orders, got %d calls", model.calls)
@@ -699,8 +699,7 @@ func TestAdjustOpenOrdersWithRL_SkipsWhenNoBaselineOrders(t *testing.T) {
 // TestHandleTick_TriggersRLAdjustOnLiveTickPrice covers CLAUDE.md §15.9's freshness fix: the RL
 // SL/TP-adjust pass must fire from the tick stream (using the live tick price), not only at
 // candle close — this is the actual behavioral change, previously uncovered by any test since
-// TestAdjustOpenOrdersWithRL_* above call adjustOpenOrdersWithRL directly rather than through
-// handleTick.
+// TestRunUpdates_* above call runUpdates directly rather than through handleTick.
 func TestHandleTick_TriggersRLAdjustOnLiveTickPrice(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
@@ -1265,11 +1264,11 @@ func TestMarketView_IsASnapshot(t *testing.T) {
 	}
 }
 
-// TestAdjustOpenOrdersWithRL_RequiresAdjustOrderAction covers the §15.10 order-action head: the
+// TestRunUpdates_RequiresUpdateOrderAction covers the §15.10 order-action head: the
 // model has to actually ask to adjust. Without this gate a model meaning "leave it alone" would
 // still fork whenever its adjust outputs happened to be nonzero, which for a continuous output is
 // essentially always.
-func TestAdjustOpenOrdersWithRL_RequiresAdjustOrderAction(t *testing.T) {
+func TestRunUpdates_RequiresUpdateOrderAction(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
@@ -1286,7 +1285,7 @@ func TestAdjustOpenOrdersWithRL_RequiresAdjustOrderAction(t *testing.T) {
 		t.Fatalf("open baseline order: %v", err)
 	}
 
-	pt.adjustOpenOrdersWithRL(ctx, "1m", dec("103"), testLogger())
+	pt.runUpdates(ctx, "1m", dec("103"), testLogger())
 
 	open, _ := repo.ListOpenPaperOrders(ctx, "BTC-USDT-SWAP")
 	if len(open) != 1 {

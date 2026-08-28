@@ -65,6 +65,40 @@ paper_trading:
   # learning phase has no sizing signal to learn from. Leverage is capped by risk.max_leverage.
   rl_sizing: false
 
+  # --- Signal-lifecycle conductor (CLAUDE.md §15.12) ---
+  # The conductor decides WHICH lifecycle question to ask the model (buy/sell, update, closed_*)
+  # and at what cadence. Without it nothing ever delivers a reward: rl_service's learner pairs each
+  # decision with the realized PnL that arrives on the terminal close call, so a model with no
+  # terminal calls is asked questions but never told how any answer turned out.
+  #
+  # Update cadence: an `update` call fires when unrealized PnL has moved at least this fraction
+  # since the last update for that order, OR the interval below elapses, OR a strategy fires
+  # (never filtered — a real opinion always reaches the model immediately). PnL-delta rather than a
+  # fixed tick keeps the cadence self-adapting: near-silent while a position ranges, dense while it
+  # actually moves, and roughly 10 meaningful steps per trade instead of thousands of
+  # near-identical ones, which is what makes credit assignment tractable at all.
+  rl_update_pnl_threshold_pct: 0.01
+  # A position grinding sideways must still be observed: funding accrues, setups decay, and "time
+  # passed" is itself information the model should receive.
+  rl_update_max_interval: 15m
+  # Lets the model close a position before either level is touched, recorded as
+  # close_reason='rl_early'. Off by default: it is the one lifecycle action that destroys the
+  # counterfactual — an early-closed trade can never show what it would have done — so enable it
+  # only once the SL/TP-adjust behavior is trusted.
+  rl_early_close: false
+  # Where the model may PLACE stops and targets on an open. Distinct from the ratchet, which
+  # governs how levels may MOVE afterward and says nothing about the initial placement. Early in
+  # training the policy is effectively random: a stop 0.001% from entry stops out on noise, one 40%
+  # away turns a bounded loss into an account event, and a target nearer than the stop is
+  # negative-expectancy by construction no matter how good the entry. Fractions, not percentages;
+  # 0 disables the respective clamp.
+  rl_clamps:
+    min_sl_dist_pct: 0.005
+    max_sl_dist_pct: 0.05
+    # Minimum reward:risk. A too-near target is widened to satisfy it rather than the trade being
+    # rejected, since the entry itself may still be sound.
+    min_tp_sl_ratio: 1.5
+
 # CLAUDE.md §15.6 (revised 2026-08-28): ONE shared capital pool every token trades against,
 # replacing the earlier fixed per-token sub-budgets. How much of it goes into any single position is
 # the RL agent's decision (target_exposure), bounded by the two caps below rather than by splitting
