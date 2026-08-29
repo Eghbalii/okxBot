@@ -29,6 +29,7 @@ from rl_service.obs import (
     observation_tail,
     position_block,
     signal_block,
+    to_vector,
 )
 
 
@@ -142,7 +143,9 @@ def test_decodes_scalars_and_action():
     raw[3] = 0.25   # leverage_frac
     raw[4 + ACTIONS.index("close")] = 1.0
 
-    action = decode_action(raw, _obs(last_price=100.0))
+    # "close" is only legal on an update call — decode_action masks the action head to the
+    # category's legal set, so the category has to match the action being asserted.
+    action = decode_action(raw, _obs(last_price=100.0, category="update"))
 
     # The model chooses a DISTANCE; decode turns it into a real price level.
     # float32 round-trip, so compare approximately rather than exactly.
@@ -153,10 +156,52 @@ def test_decodes_scalars_and_action():
     assert action.action == "close"
 
 def test_action_is_argmax_so_exactly_one_is_chosen():
-    for want in ACTIONS:
+    # Each action is asserted under a category where it is legal (see the masking tests below).
+    for want, category in [
+        ("open", "buy"),
+        ("skip", "sell"),
+        ("none", "update"),
+        ("update", "update"),
+        ("close", "update"),
+    ]:
         raw = np.zeros(ACTION_DIM, dtype=np.float32)
         raw[4 + ACTIONS.index(want)] = 1.0
-        assert decode_action(raw, _obs()).action == want
+        assert decode_action(raw, _obs(category=category)).action == want
+
+
+# --- action masking by category ----------------------------------------------------------------
+#
+# Regression coverage for a production bug (2026-08-29): the argmax ran over ALL five actions
+# regardless of category, so a buy/sell call could answer "none" — not a decision about opening at
+# all. openDecision then had no open/skip answer to act on and fell through to fixed sizing without
+# a log line or metric, which made the model look like it was never consulted when in fact it was
+# being asked on every single signal and answering unusably every time.
+
+@pytest.mark.parametrize("category", ["buy", "sell"])
+@pytest.mark.parametrize("forced", ["none", "update", "close"])
+def test_open_categories_never_return_an_update_action(category, forced):
+    raw = np.zeros(ACTION_DIM, dtype=np.float32)
+    raw[4 + ACTIONS.index(forced)] = 1.0  # policy strongly prefers an illegal action
+    action = decode_action(raw, _obs(category=category)).action
+    assert action in ("open", "skip"), f"{category} returned {action!r}"
+
+
+@pytest.mark.parametrize("forced", ["open", "skip"])
+def test_update_category_never_returns_an_open_action(forced):
+    raw = np.zeros(ACTION_DIM, dtype=np.float32)
+    raw[4 + ACTIONS.index(forced)] = 1.0
+    action = decode_action(raw, _obs(category="update")).action
+    assert action in ("none", "update", "close"), f"update returned {action!r}"
+
+
+def test_masking_still_prefers_the_highest_legal_logit():
+    """Masking must pick the best LEGAL action, not just any legal one — otherwise the policy's
+    preference between open and skip would be discarded along with the illegal options."""
+    raw = np.zeros(ACTION_DIM, dtype=np.float32)
+    raw[4 + ACTIONS.index("none")] = 5.0   # illegal on buy, and the global argmax
+    raw[4 + ACTIONS.index("skip")] = 2.0   # legal, and the better of the two legal options
+    raw[4 + ACTIONS.index("open")] = 1.0
+    assert decode_action(raw, _obs(category="buy")).action == "skip"
 
 
 def test_action_width_does_not_scale_with_strategy_count():
@@ -274,3 +319,50 @@ def test_pnl_extremes_reach_the_model():
     drifted = observation_tail(_obs(position_state=PositionState(
         position_open=1.0, unrealized_pnl_pct=0.01, pnl_max_pct=0.01, pnl_min_pct=0.0)))
     assert not np.array_equal(round_tripped, drifted)
+
+
+# --- to_vector: pad/truncate must always land exactly on expected_dim -------------------------
+#
+# Regression coverage for a real bug found 2026-08-29: a model built from a probe Observation with
+# NO timeframe blocks got obs_dim == len(tail) exactly, so padded_len (expected_dim - len(tail))
+# was 0. features[-padded_len:] with padded_len == 0 is a Python/NumPy footgun — arr[-0:] returns
+# the WHOLE array, not an empty one, since -0 == 0 and arr[0:] is a full-array slice. So instead of
+# truncating features to nothing, the old code left them untouched, overshooting expected_dim and
+# raising "observation vector shape mismatch" on every real /predict call once any timeframe
+# block's price_context contributed even one feature. Never caught because to_vector had zero
+# direct test coverage before this.
+
+def test_to_vector_truncates_to_zero_feature_budget():
+    """expected_dim == len(tail) exactly (no room for ANY features) must produce a vector of
+    exactly expected_dim, not overshoot it. This is the exact shape that crashed in production."""
+    obs = _obs()
+    tail_len = len(observation_tail(obs))
+    vec = to_vector(obs, expected_dim=tail_len)
+    assert vec.shape == (1, tail_len)
+
+
+def test_to_vector_pads_a_short_feature_vector():
+    obs = _obs(timeframes=[])  # no timeframe blocks -> observation_features is empty
+    tail_len = len(observation_tail(obs))
+    vec = to_vector(obs, expected_dim=tail_len + 10)
+    assert vec.shape == (1, tail_len + 10)
+
+
+def test_to_vector_truncates_an_oversized_feature_vector():
+    obs = _obs()  # has real timeframe features, well over a 1-feature budget
+    tail_len = len(observation_tail(obs))
+    vec = to_vector(obs, expected_dim=tail_len + 1)
+    assert vec.shape == (1, tail_len + 1)
+
+
+def test_to_vector_matches_expected_dim_across_a_range_of_budgets():
+    """Sweeps expected_dim across and past the natural feature length, including the exact
+    zero-budget boundary that the bug lived at — every one of these must land exactly on
+    expected_dim, never over or under."""
+    obs = _obs()
+    tail_len = len(observation_tail(obs))
+    natural_features_len = len(observation_features(obs))
+    for offset in range(-2, 5):
+        expected_dim = tail_len + max(natural_features_len + offset, 0)
+        vec = to_vector(obs, expected_dim=expected_dim)
+        assert vec.shape == (1, expected_dim), f"failed at offset={offset}"

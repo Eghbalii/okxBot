@@ -112,6 +112,12 @@ services:
       KAFKA_BROKERS: kafka:9092
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       METRICS_ADDR: ":9102"
+      # Without this, rlclient falls back to its http://localhost:8000 default (CLAUDE.md §15) —
+      # inside this container that's its OWN loopback, not the rl-service container, so every
+      # RL call (open decision, in-trade update, terminal reward report) fails with "connection
+      # refused". Only surfaced once paper_trading.rl_sizing/rl_sltp_adjust were actually turned on
+      # (§14's rollout order) — before that the model call path was never exercised in production.
+      RL_SERVICE_URL: http://rl-service:8000
       OKX_API_KEY: ${OKX_API_KEY}
       OKX_API_SECRET: ${OKX_API_SECRET}
       OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE}
@@ -123,6 +129,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      rl-service:
+        condition: service_started
       timescaledb:
         condition: service_started
 

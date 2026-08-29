@@ -47,6 +47,16 @@ OBSERVATION_SCHEMA_VERSION = 6
 # Order defines the argmax index and must stay stable.
 ACTIONS = ["open", "skip", "none", "update", "close"]
 
+# Which actions are meaningful for each lifecycle category (the table above, as data). decode_action
+# masks the action head to these so the policy can only answer the question it was actually asked.
+# A terminal (closed_*) call's action is discarded by the caller — it exists to deliver reward — so
+# the full set is left legal there rather than inventing a constraint nothing reads.
+LEGAL_ACTIONS_BY_CATEGORY = {
+    "buy": ["open", "skip"],
+    "sell": ["open", "skip"],
+    "update": ["none", "update", "close"],
+}
+
 # ACTION_SCHEMA_VERSION tracks the ACTION vector's layout, independently of the observation's
 # schema_version — a model trained against a different action space cannot serve a caller expecting
 # this one. v1: Box(2,) [target_exposure, leverage_frac]. v2: added sl/tp_adjust plus fixed
@@ -461,11 +471,15 @@ def to_vector(obs: Observation, expected_dim: int) -> np.ndarray:
     tail = observation_tail(obs)
     features = observation_features(obs)
 
+    # padded_len can be 0 (a model built with no feature budget at all, e.g. from a probe
+    # observation with no timeframe blocks) — features[-0:] is a NumPy/Python footgun that returns
+    # the WHOLE array rather than an empty one (-0 == 0, and arr[0:] is a full-array slice), so the
+    # truncation has to special-case zero explicitly rather than relying on negative-index slicing.
     padded_len = expected_dim - len(tail)
     if len(features) < padded_len:
         features = np.pad(features, (padded_len - len(features), 0))
     elif len(features) > padded_len:
-        features = features[-padded_len:]
+        features = features[len(features) - padded_len :] if padded_len > 0 else features[:0]
 
     vec = np.concatenate([features, tail]).reshape(1, -1)
     if vec.shape[1] != expected_dim:
@@ -501,8 +515,15 @@ def decode_action(raw: np.ndarray, obs: Observation) -> Action:
     size_pct = float(np.clip(vec[2], 0.0, 1.0))
     leverage_frac = float(np.clip(vec[3], 0.0, 1.0))
 
-    # An argmax rather than a threshold, so exactly one action is always selected.
-    action = ACTIONS[int(np.argmax(vec[4 : 4 + len(ACTIONS)]))]
+    # An argmax rather than a threshold, so exactly one action is always selected — but only over
+    # the actions that are LEGAL for the category being asked (CLAUDE.md §15.11's table). An
+    # unrestricted argmax lets a buy/sell call answer "none", which is not a decision about opening
+    # at all: the caller then has no open/skip answer to act on and silently falls back to fixed
+    # sizing, so the model looks uninvolved while actually being consulted every time. Masking here
+    # means an untrained policy still returns a well-formed (if arbitrary) open-or-skip.
+    legal = LEGAL_ACTIONS_BY_CATEGORY.get(obs.category, ACTIONS)
+    legal_idx = [ACTIONS.index(a) for a in legal]
+    action = ACTIONS[legal_idx[int(np.argmax(vec[4 : 4 + len(ACTIONS)][legal_idx]))]]
 
     return Action(
         action=action,

@@ -8,6 +8,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
@@ -50,21 +51,42 @@ func (e *PaperTrader) openDecision(
 
 	action, err := e.Model.Predict(ctx, obs)
 	if err != nil {
+		metrics.ModelOpenDecisionsTotal.WithLabelValues(e.InstID, "error").Inc()
 		logger.Warn("lifecycle: open predict failed, falling back to fixed sizing",
 			"instId", e.InstID, "category", category, "error", err)
 		return openDecisionResult{}, false
 	}
 
 	if action.Action == domain.ActionSkip {
+		metrics.ModelOpenDecisionsTotal.WithLabelValues(e.InstID, "skip").Inc()
 		logger.Info("lifecycle: model declined the signal",
 			"instId", e.InstID, "category", category, "side", sig.Side)
 		return openDecisionResult{Skip: true}, true
 	}
 
-	notional, leverage, sized := e.sizeFromAction(action, obs, openOrders, logger)
-	if !sized {
+	// An untrained policy routinely answers a buy/sell call with an update-category action
+	// ("none"), which is not a decision about opening at all. Treating that as an implicit "open"
+	// and then falling through to sizing hid the real state: the model WAS being consulted on every
+	// signal, always answered unusably, and the fallback to fixed sizing left no trace anywhere —
+	// no log line, no metric — so the whole path looked like it had never run.
+	if action.Action != domain.ActionOpen {
+		metrics.ModelOpenDecisionsTotal.WithLabelValues(e.InstID, "unusable").Inc()
+		logger.Info("lifecycle: model gave no open/skip answer, falling back to fixed sizing",
+			"instId", e.InstID, "category", category, "action", action.Action)
 		return openDecisionResult{}, false
 	}
+
+	notional, leverage, sized := e.sizeFromAction(action, obs, openOrders, logger)
+	if !sized {
+		// sizeFromAction declines silently on a zero/unusable size_pct, which an untrained policy
+		// emits constantly. Counted and logged here rather than there so every reason an open
+		// decision did not reach the order is visible from one metric.
+		metrics.ModelOpenDecisionsTotal.WithLabelValues(e.InstID, "unsized").Inc()
+		logger.Info("lifecycle: model action not sizable, falling back to fixed sizing",
+			"instId", e.InstID, "category", category, "sizePct", action.SizePct)
+		return openDecisionResult{}, false
+	}
+	metrics.ModelOpenDecisionsTotal.WithLabelValues(e.InstID, "open").Inc()
 
 	// Clamp where the model wants its levels BEFORE they are written to the order. The ratchet
 	// governs how they may move afterward and says nothing about the initial placement — an absurd
@@ -123,6 +145,7 @@ func (e *PaperTrader) runUpdates(ctx context.Context, bar string, price decimal.
 		if !e.conductor().ShouldUpdate(o.ID, pnl, now) {
 			continue
 		}
+		metrics.ControllerUpdatesTotal.WithLabelValues(e.InstID).Inc()
 
 		obs.OrderID = o.ID
 		obs.PositionState = positionStateOf(o, price)
@@ -141,13 +164,16 @@ func (e *PaperTrader) runUpdates(ctx context.Context, bar string, price decimal.
 
 		switch action.Action {
 		case domain.ActionClose:
+			metrics.ModelUpdateDecisionsTotal.WithLabelValues(e.InstID, "close").Inc()
 			e.closeEarly(ctx, o, price, logger)
 		case domain.ActionUpdate:
+			metrics.ModelUpdateDecisionsTotal.WithLabelValues(e.InstID, "update").Inc()
 			e.applyAdjustment(ctx, o, action, price, logger)
 		default:
 			// ActionNone, or anything the model emitted that has no meaning for an update — leave
 			// the position alone. Treating an unrecognized action as "do nothing" is the safe
 			// default; acting on one would be acting on a decision nobody defined.
+			metrics.ModelUpdateDecisionsTotal.WithLabelValues(e.InstID, "none").Inc()
 		}
 	}
 }

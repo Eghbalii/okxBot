@@ -61,4 +61,31 @@ var (
 		Name: "okxbot_ws_reconnects_total",
 		Help: "Total number of reconnect attempts for an OKX WebSocket connection, by url/channel.",
 	}, []string{"url", "channel"})
+
+	// ModelOpenDecisionsTotal counts every open/skip decision the RL model returns for a strategy
+	// signal (CLAUDE.md §15.12's openDecision) — distinct from StrategySignalsTotal above, which
+	// counts a strategy's own opinion regardless of whether the model (or rl_sizing) is even in the
+	// loop. Only incremented when the model was actually called (RLSizing enabled and a category
+	// resolved), so this reads zero while rl_sizing is off rather than looking like the model is
+	// silently declining everything.
+	ModelOpenDecisionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_model_open_decisions_total",
+		Help: "Total number of RL model open/skip decisions on strategy signals, by instrument and decision (open/skip).",
+	}, []string{"inst_id", "decision"})
+
+	// ControllerUpdatesTotal counts every update the SignalConductor decides is due (CLAUDE.md
+	// §15.12's ShouldUpdate) — i.e. how many times the lifecycle actually asks the model about an
+	// open position, regardless of what the model then answers.
+	ControllerUpdatesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_controller_updates_total",
+		Help: "Total number of in-trade update decisions triggered by the SignalConductor, by instrument.",
+	}, []string{"inst_id"})
+
+	// ModelUpdateDecisionsTotal counts what the RL model answered on each controller-triggered
+	// update call (none/update/close) — pairs with ControllerUpdatesTotal to show how the model's
+	// answers break down, not just how often it was asked.
+	ModelUpdateDecisionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_model_update_decisions_total",
+		Help: "Total number of RL model update decisions on open positions, by instrument and decision (none/update/close).",
+	}, []string{"inst_id", "decision"})
 )
