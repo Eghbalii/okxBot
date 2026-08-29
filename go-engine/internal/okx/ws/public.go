@@ -39,6 +39,14 @@ type subscribeReq struct {
 	Args []Arg  `json:"args"`
 }
 
+// handlerQueueSize bounds how many decoded data-push messages can be queued for Handler before
+// the dispatch goroutine (not the socket read loop) starts blocking. Sized generously — at 10
+// instruments x 5 candle channels this process runs, a slow Handler call (e.g. a Kafka publish
+// hitting transient broker latency) must never stall the socket read loop itself, which is what
+// this queue exists to prevent; see connectAndStream's doc comment for why that mattered in
+// practice, not just in theory.
+const handlerQueueSize = 256
+
 // PublicClient is a reconnecting client for wss://ws.okx.com:8443/ws/v5/public.
 type PublicClient struct {
 	URL     string
@@ -112,6 +120,32 @@ func (c *PublicClient) connectAndStream(ctx context.Context, logger *slog.Logger
 	pingTicker := time.NewTicker(20 * time.Second)
 	defer pingTicker.Stop()
 
+	// Handler (a Kafka publish, in every caller this ships with) runs on its own goroutine via
+	// this queue, deliberately never inline in the socket read loop below. Live-verified root
+	// cause of a real production incident: with Handler called synchronously from the read loop,
+	// any latency in the downstream publish stalls ReadMessage from ever being called again —
+	// OKX's own send-side buffering then appears to silently favor/coalesce the more frequent
+	// forming-candle (confirm=0) pushes over the less frequent but more important finalized
+	// (confirm=1) ones, so the connection kept reporting healthy (pings still succeeded, some
+	// messages still arrived) while candle finalization silently stopped for hours. A full queue
+	// drops the newest message and logs — never blocks the dispatch goroutine either, since a
+	// permanently wedged Handler would just reproduce the exact same failure one level down.
+	queue := make(chan Message, handlerQueueSize)
+	stopDispatch := make(chan struct{})
+	defer close(stopDispatch) // stop the dispatch goroutine below on every return path, incl. reconnect
+	go func() {
+		for {
+			select {
+			case msg := <-queue:
+				if c.Handler != nil {
+					c.Handler(msg)
+				}
+			case <-stopDispatch:
+				return
+			}
+		}
+	}()
+
 	done := make(chan error, 1)
 	go func() {
 		for {
@@ -136,8 +170,10 @@ func (c *PublicClient) connectAndStream(ctx context.Context, logger *slog.Logger
 				}
 				continue
 			}
-			if c.Handler != nil {
-				c.Handler(msg)
+			select {
+			case queue <- msg:
+			default:
+				logger.Warn("okx ws: handler queue full, dropping message", "url", c.URL, "channel", c.Channel, "instId", msg.Arg.InstID)
 			}
 		}
 	}()
