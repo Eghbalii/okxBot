@@ -737,21 +737,6 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       it would send to `/predict` into `FeaturesJSON` on order open, best-effort (never blocks
       opening the order) (§15.3, §15.8). Verified with a dedicated test asserting the persisted
       JSON round-trips as a valid `domain.Observation` with the right strategy/token fields set.
-- [x] Warm-start replay training (§15.8's two-phase design: initialization-only replay, distinct
-      from — and never a replacement for — continued live learning, which is unchanged from §2):
-      `rl_service/env/replay_env.py`'s `ReplayEnv` pools all active tokens' real candle history
-      (Postgres `candles`, written by `PaperTrader` since Phase 1 — no separate CSV pipeline) plus
-      any strategy signals actually logged in `paper_orders.features_json` (empty/hold signal for
-      unlogged quiet bars, matching live reality), and lets PPO do normal on-policy rollouts —
-      the model's own current decisions against real market conditions, never a replay of past
-      decisions. `rl_service/obs.py` extracted as the single shared observation-vectorization
-      source of truth between `/predict` and the replay env, so they can never silently drift
-      apart. `rl_service/data/postgres.py` (new `psycopg2-binary` dependency) is the read-only
-      Postgres access layer. `train.py --warm-start` runs it, producing `models/ppo_global.zip`
-      (`serve.model_path` in `config.example.yaml` updated to match). 5 new tests
-      (`tests/test_replay_env.py`) verify shapes, the token-identity one-hot actually differs per
-      token, multi-token sequencing, and a real PPO training run against the env completes and
-      produces a loadable, predictable model.
 - [x] **Widened the action space to the full §15.4 action (2026-08-28)** — until this landed, both
       envs' `action_space` was still the original `Box(2,)` `[target_exposure, leverage_frac]`, so
       `/predict` returned **hardcoded** neutral values for `strategy_weights` (uniform) and
@@ -818,10 +803,7 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       config list were reordered — with `paper_trading.rl_decision_bar`, defaulting to the
       *shortest* configured bar (freshest read for an in-trade adjustment). Added OKX bar-name
       casing validation at startup: `1h` instead of `1H` used to subscribe to a channel that pushes
-      nothing, producing a silent data gap on a pipeline that looks healthy. Warm-start stays
-      single-bar by design (now `15m`, was `1m`) — interleaving timeframes in one replay sequence
-      makes "one step" mean different elapsed times, so the reward signal would be inconsistent
-      across steps. 12 new tests.
+      nothing, producing a silent data gap on a pipeline that looks healthy. 12 new tests.
 - [x] Paper → demo → real progression guardrails (§15.6): mode derived from `okx.simulated` so it
       can never disagree with the credentials in use, plus `trading.allow_real_money` (default
       false) which `cmd/trader` refuses to start without against non-demo keys.
@@ -882,15 +864,14 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       §16.8. 7 of 14 now emit the structural levels they were computing and discarding; the other 7
       legitimately have none. Turned up four pre-existing bugs, including `pmax` being unable to
       emit a signal at all and EMA's precision growing without bound.
-- [x] **(3b) Candle backfill (2026-08-28, §17)** — warm-start rolls out against real candle
-      history from Postgres, and a fresh database has none. Waiting days for the live ingestor to
-      accumulate it was never necessary: OKX serves it directly. `cmd/paper-trader -backfill` and
-      `POST /api/candles/backfill`, paced and idempotent. This turned step (4) from a multi-day
-      wait into a ~90 second job.
-- [x] **(4) It is running (2026-08-29)** — but not by the route this item described. Warm-start was
-      dropped by explicit product decision, which made the untrained policy skip every signal and
-      produced a structural deadlock (no opens → no closes → no reward → weights never change; see
-      §16.9). Resolved by running with `serve.learning_enabled: true` and `rl_sltp_adjust: true`
+- [x] **(3b) Candle backfill (2026-08-28, §17)** — a fresh database has no candle history, and
+      waiting days for the live ingestor to accumulate it was never necessary: OKX serves it
+      directly. `cmd/paper-trader -backfill` and `POST /api/candles/backfill`, paced and
+      idempotent.
+- [x] **(4) It is running (2026-08-29)** — starting the model fully untrained (no pretraining
+      phase, see §15.8) means the untrained policy skips every signal, which produces a structural
+      deadlock (no opens → no closes → no reward → weights never change; see §16.9). Resolved by
+      running with `serve.learning_enabled: true` and `rl_sltp_adjust: true`
       while `rl_sizing` stays **off**: strategies open positions, and the model manages them through
       the update path, so real rewards flow from real closed trades. `rl_early_close` stays off.
       Enabling `rl_sizing` — handing the model the open decision — is the next step once it has a
@@ -932,8 +913,7 @@ demo-trading dry run, which is the one Phase 2 item that can only be done on the
       a 422 (§15.3, §15.8) — implemented as part of the v3 schema bump above.
 - [ ] Per-token reward/PnL breakdown in training logs (not just aggregate) — the concrete detection
       mechanism for the "good on average, bad for one token" failure mode (§15.2, §15.5); required
-      before Phase B expands token count. Meaningful once the live/continued-training mode above
-      exists — warm-start alone doesn't yet produce a per-token-attributable training signal.
+      before Phase B expands token count.
 - [x] A/B comparison tooling for baseline vs. rl_adjusted forks (§15.4):
       `port.Repository.SLTPAdjustmentStats` (aggregate win-rate/PnL per variant, filterable by
       instrument and a `since` lower bound — "the last week" per §15.4 — only counting baseline
@@ -1008,11 +988,10 @@ patterns (e.g. "reduce leverage in high volatility") across tokens before any on
 produced much experience on its own. The specialization loss this trades away (a shared policy
 converging toward "good on average" rather than "excellent per token," especially early in
 training before the token-identity input is meaningfully learned) is an accepted, explicit
-tradeoff for Phase A — not an oversight. Revisit toward per-token (or a warm-started/fine-tuned
-hybrid — pretrain global, then fine-tune per-token copies from those weights) once (a) enough
-tokens are live that pooled-vs-per-token data volume no longer favors pooling, or (b) evidence
-shows the global agent's per-token performance (tracked individually, not just in aggregate — see
-§15.5) is diverging in a way that hurts a specific token.
+tradeoff for Phase A — not an oversight. Revisit toward per-token once (a) enough tokens are live
+that pooled-vs-per-token data volume no longer favors pooling, or (b) evidence shows the global
+agent's per-token performance (tracked individually, not just in aggregate — see §15.5) is
+diverging in a way that hurts a specific token.
 
 **What did NOT change**: strategies are still "a tool the agent uses," never the decision-maker
 themselves — see §15.3's raw-price-context addition, which is a separate, related correction (the
@@ -1030,14 +1009,9 @@ resource limits.
 
 **Measured, not estimated** (2026-08-27, on a 2015 MacBook i5/8GB via Colima, `rl-service`'s actual
 Docker image, CPU-only PyTorch — see the Dockerfile note below): idle `rl-service` container ~180MB
-RAM; a real PPO warm-start-shaped run (2 pooled tokens, `n_steps=2048`, `batch_size=64`) sustained
-~430MB RAM and ~1 CPU core at 260-700 fps, completing 20,480 timesteps in 78s. Memory stays flat
-regardless of `total_timesteps` (SB3's rollout buffer size is fixed by `n_steps`, not total
-steps) — so `WarmStartConfig`'s default 50,000 timesteps is ~70-125s, not a long-running job, and
-this fits comfortably even on hardware well below the original 8-core/16GB planning assumption.
+RAM, fitting comfortably on hardware well below the original 8-core/16GB planning assumption.
 Widening the observation (more strategies/timeframes/tokens, §15.2's Phase B) grows the policy
-network slightly but the rollout-buffer-dominated memory profile above is the right order of
-magnitude to plan around, not a hard ceiling that's already been hit.
+network slightly but is not expected to change this order of magnitude.
 
 **PyTorch's default wheel pulls in the full CUDA/nvidia-\* GPU toolkit** (several GB) even with no
 GPU present — `rl-service/Dockerfile` installs the CPU-only build explicitly
@@ -1058,13 +1032,10 @@ connected to live OKX public WS — not a synthetic test):
   +~260MB (Grafana ~235MB, Prometheus ~25-30MB) — brings the idle full stack (minus `trader`/
   `panel`, which need real OKX keys/aren't part of the trading-critical path) to **~585MB RAM,
   ~30% of one core.**
-- **Peak, with a real 50,000-timestep warm-start-shaped training run (10 pooled tokens, matching
-  §15.2 Phase B scale) running concurrently with the full live stack above**: `rl-service` briefly
-  spiked to **~470% CPU** (PyTorch's internal BLAS/thread pool uses multiple cores during a
-  training update step, not just the ~1 core rollout collection uses) and ~450MB RAM; every other
-  service's usage was unaffected by the concurrent training load. The training run itself completed
-  in **~207s (~3.5 minutes)** at ~246 fps — slower than the 2-token run above (260-700 fps) since
-  10 tokens' pooled experience means more data per rollout, but still not a long-running job.
+- **Peak, with a gradient-update-heavy training workload running concurrently with the full live
+  stack above**: `rl-service` briefly spiked to **~470% CPU** (PyTorch's internal BLAS/thread pool
+  uses multiple cores during a training update step, not just the ~1 core rollout collection uses)
+  and ~450MB RAM; every other service's usage was unaffected by the concurrent training load.
   Nothing else in the stack degraded or fell behind during this — ingestion kept up with live OKX
   data throughout.
 - **Bottom line**: the whole trading-critical stack (everything except monitoring) fits in under
@@ -1366,50 +1337,28 @@ strategy/token mix is bad. Concretely:
   `okx.simulated` (demo when simulated, real otherwise), so the carve-out follows the credentials
   in use rather than a separately-configured flag that could disagree with them.
 
-### 15.8 Training loop shape: warm-start replay + continued live learning
+### 15.8 Training loop shape: continued live learning only
 
-**Two distinct phases, not one — this distinction matters and must not be collapsed:**
+**Decided (revised 2026-08-29): no warm-start/replay pretraining phase.** The model trains
+exclusively from live paper-trading outcomes, from a fresh/random initialization, per §2's
+original commitment that the deployed model's real training signal comes from live forward-test
+data, never from replayed history. A replay-environment pretraining phase (`rl_service/env/`,
+`train.py --warm-start`) was designed and built, then dropped after a real run against the
+backfilled BTC/ETH candle history diverged (reward and critic loss blew up to nonsensical
+magnitudes, `~1e14`/`~1e27`, partway through a 50,000-timestep run) — root-caused to training
+against a dataset with almost no real strategy-signal history logged yet, which is exactly the
+thin/signal-less condition the replay phase would always start from at this project's actual data
+volumes. Rather than build tooling to manufacture synthetic signals for a replay dataset just to
+make pretraining viable, the simpler and more faithful choice is to skip it: an untrained model is
+a safe, well-defined starting state (the serving path's existing no-op fallback for
+`model_loaded: false`), and real training begins the moment real paper-trading trades close.
 
-1. **Warm-start (initialization only, not evaluation)**: PPO is on-policy — it learns by rolling
-   out its *own current* decisions against an environment and observing the outcome, not by
-   replaying a fixed log of decisions someone/something else made (most of the paper-trading log
-   so far reflects the still-untrained/no-op model or raw strategy signals, not the policy being
-   trained). So training directly from logged `(state, action, reward)` tuples the way an
-   offline-RL algorithm would is the wrong tool for PPO. Instead: a **replay environment**
-   (`rl_service/env/`, a new Gymnasium env alongside — not replacing — `okx_futures_env.py`) plays
-   back the *sequence* of real market conditions already persisted in Postgres's `candles` table
-   (real OHLCV, written by `PaperTrader` since Phase 1 — not a separate historical CSV pipeline
-   like `okx_futures_env.py`'s), reconstructing the same strategy-signal/price-context observation
-   shape `rlclient` builds live (§15.3), for every active token in sequence. Critically, the
-   **actions taken during these rollouts are the policy's own current choices**, produced fresh at
-   each step exactly like a live rollout — only the *market conditions* are historical, not the
-   decisions. This is standard on-policy PPO training against real data, not backtesting: nothing
-   about this phase evaluates or scores the model against history, and its output is never treated
-   as "proof" the model is good — it only gets the model past pure-random initialization before
-   real capital (even paper capital) is put behind its decisions.
-2. **Continued live learning (unchanged from §2's original decision)**: the warm-started model is
-   then the *same* model that keeps training from live paper-trading outcomes going forward — not
-   a separate "final" model swapped in afterward. §2's core commitment (the deployed model's real
-   training signal comes from live forward-test data, never from replayed history) is fully
-   preserved; the replay phase only changes where the *first* few updates' gradient signal comes
-   from, given a freshly-initialized network would otherwise spend a materially long stretch of
-   scarce live paper-trading data at close to random behavior. Revisit only if evidence shows this
-   warm-start biases the model toward historical patterns in a way live learning doesn't correct
-   for.
-
-Both phases pool **all active tokens** into the one global agent's training data (token identity
-is an observation field, §15.1 — no per-token filtering or separate models). Concretely:
-`train.py` gains a `--warm-start` mode that builds the replay env from Postgres (`candles` +
-re-evaluating each token's assigned strategies via the same `strategy` package logic Go uses, so
-the replayed observations match what `rlclient` actually sends in production) and runs standard
-`model.learn()` against it; a live/continued-training mode (built once §15.9's end-to-end no-op
-loop has accumulated real paper-trading history) consumes the *actual observation vectors logged
-at decision time* (§15.3's schema — needs persisting, not yet done: extending
-`paper_orders.features_json` or a new table, TBD at implementation) paired with their realized
-outcomes. Either mode produces `models/ppo_global.zip`, loaded by `rl_service/serve/api.py` and
-used to answer every token's `/predict` calls (the request's `inst_id` selects which
-token-identity input to set, not which model to load — see §15.1 for why this is one shared policy
-rather than per-token model files).
+The model trains from the *actual observation vectors logged at decision time* (§15.3's schema —
+`paper_orders.features_json`) paired with their realized outcomes, exactly as continued live
+learning was always meant to work — see §15.11's continuous-learning design and §15.12's Signal
+Conductor for how a decision and its outcome are actually paired end to end. It pools **all active
+tokens** into the one global agent's training data (token identity is an observation field, §15.1
+— no per-token filtering or separate models).
 
 ### 15.10 Event-driven signal lifecycle (decided 2026-08-28) — supersedes §15.3/§15.4's shapes
 
@@ -1788,9 +1737,9 @@ inputs into a new kind of signal).
 can be avoided; only reach across language boundaries for a genuinely generic, off-the-shelf tool.
 The built-in strategies' logic (14 kinds registered in `strategy.Factories` today) is this
 project's actual domain knowledge and lives in
-`internal/strategy/*.go` — reimplementing it in Python (the same trap warm-start's design
-deliberately avoided, §15.8) would create two copies that drift the moment one is edited and the
-other is forgotten. Bayesian optimization itself (which candidate parameter values to try next,
+`internal/strategy/*.go` — reimplementing it in Python would create two copies that drift the
+moment one is edited and the other is forgotten. Bayesian optimization itself (which candidate
+parameter values to try next,
 given prior trial results) is a generic, domain-independent algorithm with no mature off-the-shelf
 Go library — Python's Optuna is mature and well-tested. So:
 
@@ -2117,19 +2066,18 @@ positions the model had adjusted.
 
 **Deadlock worth knowing about.** A freshly-initialized SAC policy skips essentially every signal,
 and with no opened trade there is no closed trade, no reward, and therefore no weight update — the
-policy stays random forever. Warm-start (§15.8) exists precisely to avoid this; skipping it makes
-the deadlock structural, not a bug. Three ways out were considered: a bootstrap override that
-forces opens until N trades have closed, a short warm-start run, or leaving `rl_sizing` off so
-strategies open positions and the model only manages them via the update path. The third was chosen
-— it needs no new code, starts real reward flowing immediately, and matches the roadmap's
+policy stays random forever. This deadlock is structural, not a bug, given §15.8's decision to
+train from a fresh/random initialization with no pretraining phase. Two ways out were considered: a
+bootstrap override that forces opens until N trades have closed, or leaving `rl_sizing` off so
+strategies open positions and the model only manages them via the update path. The second was
+chosen — it needs no new code, starts real reward flowing immediately, and matches the roadmap's
 one-thing-at-a-time rollout order.
 
 ## 17. Candle backfill (implemented 2026-08-28)
 
-Warm-start training (§15.8) rolls out against real candle history read from Postgres's `candles`
-hypertable, and a fresh database has none. The original plan was to run the live ingestor for
-several days to accumulate it — unnecessary, since OKX serves that history directly. This turned
-the first warm-start from a multi-day wait into a ~90 second job.
+A fresh database has no candle history in Postgres's `candles` hypertable. The original plan was
+to run the live ingestor for several days to accumulate it — unnecessary, since OKX serves that
+history directly. This turned what would have been a multi-day wait into a ~90 second job.
 
 - **`GET /api/v5/market/history-candles`**, not the `/market/candles` the ingestor already used.
   The latter only serves the most recent window (a few hundred bars) and cannot page backwards, so
@@ -2141,12 +2089,9 @@ the first warm-start from a multi-day wait into a ~90 second job.
   be able to place an order, and the type system should enforce that rather than the implementation
   being careful.
 - **Sized in CANDLES per timeframe, not days** (a deliberate revision of the day-based depth this
-  was first specified with). `ReplayEnv` advances one candle per training step, so candle count is
-  what training consumes: "30 days" is ~30 rows on a 1D bar and ~8,600 on 5m. A day-based depth
-  starves exactly the timeframes that need the most history — at ~96 15m candles per token, a
-  50,000-timestep warm-start would loop one day of price action ~260 times, which is memorization,
-  not initialization. `DefaultTargetCandles` is 1,500: ~5 days of 5m, ~15 days of 15m, ~2 months of
-  1H, ~4 years of 1D.
+  was first specified with). A day-based depth starves exactly the timeframes that need the most
+  history: "30 days" is ~30 rows on a 1D bar and ~8,600 on 5m. `DefaultTargetCandles` is 1,500:
+  ~5 days of 5m, ~15 days of 15m, ~2 months of 1H, ~4 years of 1D.
 - **Paced and idempotent.** `DefaultPageDelay` (150ms) stays well inside OKX's rate limit rather
   than racing it — the backfill shares an IP with the live trading path, so being throttled here
   would also throttle order placement. `SaveCandle` already upserts on `(inst_id, bar, ts)`, so an
