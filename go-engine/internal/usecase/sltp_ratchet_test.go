@@ -120,3 +120,43 @@ func TestRatchetSLTP_TPCannotCrossPrice(t *testing.T) {
 		t.Errorf("expected TP unchanged at 100.5 (would cross price), got %s", newTP)
 	}
 }
+
+// A take-profit must never ratchet past ENTRY, in either direction: touching it would realize a
+// loss, so it would not be a take-profit any more. Guarding only against the current price leaves
+// this open once price has moved against the position — "between the old TP and current price"
+// then includes the whole region past entry.
+//
+// Observed 2026-08-29 on orders 100 and 110 (stoch_cross, short, entry 2.649, TP 2.62251): price
+// rose to ~2.68, TP ratcheted "toward price" to 2.676, and both closed with close_reason='tp'
+// carrying a realized PnL of -1.02.
+func TestRatchetSLTP_ShortTPCannotCrossEntry(t *testing.T) {
+	entry := dec("2.649")
+	tp := dec("2.62251")
+	o := port.PaperOrder{Side: "sell", EntryPx: entry, TPPx: &tp}
+
+	// Price has moved AGAINST the short, above entry.
+	_, newTP := RatchetSLTP(o, dec("2.68"), decimal.Zero, dec("0.02"))
+
+	if newTP == nil {
+		t.Fatal("expected the existing TP to be kept, got nil")
+	}
+	if newTP.GreaterThanOrEqual(entry) {
+		t.Errorf("short's TP must stay below entry %s, got %s (hitting it realizes a loss)", entry, newTP)
+	}
+}
+
+func TestRatchetSLTP_LongTPCannotCrossEntry(t *testing.T) {
+	entry := dec("100")
+	tp := dec("110")
+	o := port.PaperOrder{Side: "buy", EntryPx: entry, TPPx: &tp}
+
+	// Price has moved AGAINST the long, below entry.
+	_, newTP := RatchetSLTP(o, dec("96"), decimal.Zero, dec("0.02"))
+
+	if newTP == nil {
+		t.Fatal("expected the existing TP to be kept, got nil")
+	}
+	if newTP.LessThanOrEqual(entry) {
+		t.Errorf("long's TP must stay above entry %s, got %s (hitting it realizes a loss)", entry, newTP)
+	}
+}

@@ -2098,6 +2098,23 @@ levels, not the baseline's — the fork is what carries the adjusted stop, so me
 baseline would let an already-tightened level be re-proposed at its original distance, quietly
 undoing the ratchet's only-tighten guarantee.
 
+**A take-profit that ratcheted past entry, closing trades at a loss under `close_reason='tp'`**
+(orders 100 and 110, `stoch_cross`, short, entry 2.649, original TP 2.62251). `ratchetTP` allows
+the target to move toward the current price and guarded that with `proposed.LessThan(price)` — but
+`price` is the LIVE price, not entry. Once price moved against the short to ~2.68, the region
+"between the old TP and current price" included everything past entry, so the target ratcheted up
+to 2.676 and both trades closed as take-profits with a realized PnL of −1.02.
+
+The invariant the guard was missing: a target that crosses entry is not a target, because touching
+it realizes a loss. `ratchetTP` now takes `entry` and bounds the move by it on both sides. The long
+case was not reproducible in production but is guarded and tested identically — the asymmetry was
+in the guard's reasoning, not in the market.
+
+Worth noting the strategy was NOT at fault here, which is where suspicion naturally falls: the
+signal carried a correct `tp_px` of 2.62251 (below entry for a short), and both `ResolveLevels` and
+`buildPaperOrder` reproduced it correctly. Only the in-trade ratchet inverted it, and only on
+positions the model had adjusted.
+
 **Deadlock worth knowing about.** A freshly-initialized SAC policy skips essentially every signal,
 and with no opened trade there is no closed trade, no reward, and therefore no weight update — the
 policy stays random forever. Warm-start (§15.8) exists precisely to avoid this; skipping it makes

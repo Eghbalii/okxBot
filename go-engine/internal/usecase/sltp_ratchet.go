@@ -32,7 +32,7 @@ func RatchetSLTP(o port.PaperOrder, currentPrice, slAdjustPct, tpAdjustPct decim
 	}
 
 	newSL = ratchetSL(o.SLPx, direction, currentPrice, slAdjustPct)
-	newTP = ratchetTP(o.TPPx, direction, currentPrice, tpAdjustPct)
+	newTP = ratchetTP(o.TPPx, direction, currentPrice, o.EntryPx, tpAdjustPct)
 	return newSL, newTP
 }
 
@@ -66,22 +66,29 @@ func ratchetSL(current *decimal.Decimal, direction, price, adjustPct decimal.Dec
 // ratchetTP only allows moving TP closer to the current price (reducing the distance still needed
 // to hit it, i.e. "locking in" a nearer target) — never further away, which would loosen the
 // original risk/reward budget the order was opened with.
-func ratchetTP(current *decimal.Decimal, direction, price, adjustPct decimal.Decimal) *decimal.Decimal {
+// entry bounds the move independently of price: a take-profit that crosses the entry price is no
+// longer a take-profit, since touching it realizes a LOSS. Guarding only against the CURRENT price
+// is not enough — once price has moved against the position, "between the old TP and current
+// price" includes the whole region past entry. Observed 2026-08-29 on orders 100 and 110
+// (stoch_cross, short, entry 2.649): price rose to ~2.68, the TP ratcheted "toward price" to
+// 2.676, and both closed with close_reason='tp' and a realized PnL of -1.02.
+func ratchetTP(current *decimal.Decimal, direction, price, entry, adjustPct decimal.Decimal) *decimal.Decimal {
 	if current == nil {
 		return nil
 	}
 	delta := direction.Mul(adjustPct).Mul(price)
 	proposed := current.Sub(delta) // subtract: shrinking the TP distance moves TP toward price
 
-	// "Closer to current price" for a long means TP moving down (but never below price); for a
-	// short, TP moving up (but never below... i.e. never past price in the wrong direction).
+	// A long's target sits above entry, a short's below. The proposal may move toward the current
+	// price but must stay on the profitable side of entry, and must not overshoot price itself
+	// (which would make it unreachable in the intended direction).
 	if direction.IsPositive() {
-		if proposed.LessThan(*current) && proposed.GreaterThan(price) {
+		if proposed.LessThan(*current) && proposed.GreaterThan(price) && proposed.GreaterThan(entry) {
 			return &proposed
 		}
 		return current
 	}
-	if proposed.GreaterThan(*current) && proposed.LessThan(price) {
+	if proposed.GreaterThan(*current) && proposed.LessThan(price) && proposed.LessThan(entry) {
 		return &proposed
 	}
 	return current
