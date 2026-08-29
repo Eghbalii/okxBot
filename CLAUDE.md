@@ -580,11 +580,30 @@ each, publishing every event to Kafka (§12 — originally Redis Streams, migrat
 Trading Engine consumes both via consumer groups (`internal/kafkastream.Consumer`/`Dispatcher`):
 every **tick** triggers an immediate SL/TP check against open virtual orders (no missed intra-bar
 wicks, no polling delay), and every **finalized candle** triggers strategy re-evaluation and is
-persisted to Postgres. A REST call (`GetCandles`) is used exactly once at startup, to seed the
-initial in-memory candle window — not on an ongoing poll loop. This replaces the earlier
-REST-polling version, which had a real correctness bug (checking SL/TP only against candle-close
-prices could silently miss a price wick that touched SL/TP and reverted within the same bar) in
-addition to rate-limit/delay concerns.
+persisted to Postgres. This replaces the earlier REST-polling version, which had a real
+correctness bug (checking SL/TP only against candle-close prices could silently miss a price wick
+that touched SL/TP and reverted within the same bar) in addition to rate-limit/delay concerns.
+
+**Candle windows are seeded from Postgres at startup, never from the exchange** (2026-08-29,
+`PaperTrader.seedCandlesFromRepo`). The original REST seed (`GetCandles` once per instrument+bar at
+boot) was removed in `f1af152` because at 10 instruments × 3 bars it fired ~30 concurrent
+`/market/candles` requests that OKX rejected — reported confusingly as "instrument not found"
+(51001) on a different instrument each run, and surviving retry/jitter, pool tuning, a semaphore,
+and two HTTP/1.1 workarounds. Removing it was right, but the accompanying reasoning ("history fills
+in within the first few closed candles") only held for the shortest bar: a 1H window needs ~2 days
+of live feed to reach 50 candles. The observable result was that after every restart only
+short-window strategies on 5m could fire — 12 of 14 strategies returned `Hold` and every open
+position came from the one strategy needing the fewest candles. The fix reads the same candles the
+ingestor has already written to the `candles` table, so it makes no exchange call and that failure
+mode cannot recur. `paper_trading.candle_limit` raised 100 → 300 so long-window strategies fit.
+
+**`PaperTrader` consumes every `ingestion.bars` timeframe, not just the decision bars.** It is the
+only writer of the `candles` table, so a bar nobody consumes is never persisted: the ingestor
+correctly subscribed to `candle4H`/`candle1D` and published them to Kafka, where the messages
+expired unread, leaving the context timeframes (§9) permanently empty in the database while every
+log looked healthy. Consuming a bar does not make it a decision bar — `evaluateStrategies` filters
+assignments by `a.Bar != bar`, so a context-only timeframe maintains its window and persists its
+candles without ever triggering a trade.
 
 Phase 2 — clean architecture refactor & live wiring (current phase):
 - [x] All price/size/leverage/PnL/risk-limit fields migrated `float64` → `decimal.Decimal`
@@ -868,11 +887,19 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       accumulate it was never necessary: OKX serves it directly. `cmd/paper-trader -backfill` and
       `POST /api/candles/backfill`, paced and idempotent. This turned step (4) from a multi-day
       wait into a ~90 second job.
-- [ ] **(4) Then it can genuinely run**: warm-start against the backfilled history, enable
-      `serve.learning_enabled` -> `paper_trading.rl_sizing` -> `rl_sltp_adjust` in paper mode (in
-      that order, so a bad reward curve is attributable), leaving `rl_early_close` off. The reward
-      now flows end to end and the objective no longer rewards over-leveraging, so what it learns
-      from here is worth keeping.
+- [x] **(4) It is running (2026-08-29)** — but not by the route this item described. Warm-start was
+      dropped by explicit product decision, which made the untrained policy skip every signal and
+      produced a structural deadlock (no opens → no closes → no reward → weights never change; see
+      §16.9). Resolved by running with `serve.learning_enabled: true` and `rl_sltp_adjust: true`
+      while `rl_sizing` stays **off**: strategies open positions, and the model manages them through
+      the update path, so real rewards flow from real closed trades. `rl_early_close` stays off.
+      Enabling `rl_sizing` — handing the model the open decision — is the next step once it has a
+      track record. Getting here surfaced four silent-failure bugs and two ordering bugs, all
+      documented in §16.9.
+- [ ] **(5) Hand the model the open decision**: turn on `paper_trading.rl_sizing` once enough closed
+      trades exist that the policy is no longer random (SAC's `learning_starts` is 100, so gradient
+      steps do not begin before that). Watch `okxbot_model_open_decisions_total`'s `skip` vs `open`
+      split — a policy still skipping everything is not ready.
 
 Deferred, in rough priority: per-token reward breakdown in training logs (§15.5 — the detection
 mechanism for "good on average, bad for one token", needed before expanding past 2 tokens); the
@@ -1985,6 +2012,65 @@ invisible while only percentages were emitted:
 
 15 new tests (185 Go total). The `pmax`, EMA, and state-isolation fixes are mutation-checked:
 reverting each one fails the test written for it.
+
+### 16.9 Bringing the RL loop live: four bugs the rollout exposed (2026-08-29)
+
+Turning on `learning_enabled` → `rl_sizing` → `rl_sltp_adjust` for the first time surfaced four
+defects, none of which any test or metric would have caught, because each one failed *silently*.
+Recorded together because they share a theme: **a path that declines to act leaves no trace unless
+something is written to make it visible.**
+
+1. **`paper-trader` had no `RL_SERVICE_URL`.** `docker-compose.yml` set it for `trader` and `api`
+   but not the one service that actually calls the model, so `rlclient` fell back to its
+   `http://localhost:8000` default — inside that container, its own loopback. Every model call
+   failed with connection-refused. Invisible until the flags were switched on, because before that
+   the model call path had never executed in production.
+
+2. **`decode_action` could answer the wrong question.** The action head's argmax ran over all five
+   actions regardless of category, so a `buy`/`sell` call could return `none` — an update-category
+   action, not an open/skip decision. `openDecision` then had no answer to act on and fell through
+   to fixed sizing. Fixed with `LEGAL_ACTIONS_BY_CATEGORY`, masking the argmax to the categories in
+   §15.11's table; the mask still picks the highest *legal* logit, so the policy's preference
+   between `open` and `skip` survives.
+
+3. **Every fallback was unobservable.** `sizeFromAction` returns `ok=false` on a zero `size_pct` —
+   which an untrained policy emits constantly — and did so with no log line and no metric. Combined
+   with (2), the result was that the model was consulted on all 522 signals, answered unusably every
+   time, and `okxbot_model_open_decisions_total` stayed empty, which read as "the model was never
+   called." It was called every time. `ModelOpenDecisionsTotal` now records `open`/`skip`/
+   `unusable`/`unsized`/`error`, so every reason a decision did not reach an order is countable.
+
+4. **The model was serving an 83-dim artifact while the code produced 89.** `to_vector` pads or
+   truncates to whatever the loaded model expects, so at 83 the feature budget was exactly zero and
+   every observation collapsed to the fixed tail — the policy never saw price or signal data at all,
+   which is why it returned an identical `skip` for every input. Root cause was operational: the
+   corrected model was regenerated while `rl-service` was running, and its snapshot hook wrote the
+   old in-memory weights back over the new file. Regenerating with the service stopped fixed it.
+   The check that matters is `SAC.load(...).observation_space.shape[0]`, not `/health`'s
+   `model_loaded: true` — the latter is true for a wrongly-shaped model too.
+
+**Two ordering bugs in the open path, found the same day:**
+
+- **Opposing positions on one token.** `evaluateStrategies` had no check for an already-open
+  position, so every assigned strategy opened independently: `grid_like` (sell) and
+  `weekly_dip_buy` (buy) both opened on TRUMP-USDT-SWAP/5m. §15.12 says a `buy`/`sell` decision
+  exists only when the token is flat — otherwise a firing signal is an `update`. Guarded by
+  `hasOpenBaseline` (forks excluded, §15.4), and the newly-opened order is appended to the local
+  `open` slice so the *next* strategy in the same pass sees it.
+- **The same race across timeframes.** Each bar has its own consumer goroutine, so two bars closing
+  in the same instant both read an empty book — observed as orders 70 (15m) and 71 (5m) on
+  ENA-USDT-SWAP, 13ms apart. The per-call guard could not see a concurrent call. `openMu` now
+  serializes the whole read-then-open sequence. The regression test releases both goroutines from a
+  shared channel and runs under `-race`; mutation-checked by removing the lock (fails with `got 2`).
+
+**Deadlock worth knowing about.** A freshly-initialized SAC policy skips essentially every signal,
+and with no opened trade there is no closed trade, no reward, and therefore no weight update — the
+policy stays random forever. Warm-start (§15.8) exists precisely to avoid this; skipping it makes
+the deadlock structural, not a bug. Three ways out were considered: a bootstrap override that
+forces opens until N trades have closed, a short warm-start run, or leaving `rl_sizing` off so
+strategies open positions and the model only manages them via the update path. The third was chosen
+— it needs no new code, starts real reward flowing immediately, and matches the roadmap's
+one-thing-at-a-time rollout order.
 
 ## 17. Candle backfill (implemented 2026-08-28)
 
