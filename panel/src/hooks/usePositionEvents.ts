@@ -12,6 +12,10 @@ export function usePositionEvents(onEvent: () => void, enabled: boolean) {
 
   useEffect(() => {
     if (!enabled) return
-    return openEventsSocket(() => onEventRef.current())
+    // The socket also carries 'price' ticks now (CLAUDE.md §11.4) — those are handled by
+    // usePriceStream and must not trigger a full positions refetch on every tick.
+    return openEventsSocket((event) => {
+      if (event.type === 'opened' || event.type === 'closed') onEventRef.current()
+    })
   }, [enabled])
 }

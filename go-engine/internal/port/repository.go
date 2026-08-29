@@ -76,6 +76,13 @@ type PaperOrder struct {
 	ID           int64
 	InstID       string
 	StrategyID   *int64
+	// Bar is the decision timeframe the signal that opened this order fired on (e.g. "5m", "1H").
+	// Captured at open time rather than reconstructed from strategy_assignments afterward, since
+	// one strategy can be assigned to several bars for the same instrument (CLAUDE.md §9) and the
+	// assignment table alone can't say which bar THIS particular order came from. A shadow fork
+	// (Variant="rl_adjusted") inherits its parent's bar. Empty for orders opened before this field
+	// existed.
+	Bar          string
 	Side         string // "buy" or "sell"
 	EntryPx      decimal.Decimal
 	SLPx         *decimal.Decimal
@@ -107,6 +114,11 @@ type PaperOrder struct {
 	// token's budget/reward (§15.6/§15.7) — callers filter to Variant="baseline" for that.
 	ParentOrderID *int64
 	Variant       string // "baseline" (default) or "rl_adjusted"
+
+	// StrategyName is joined in by ListPositions for display (CLAUDE.md §11.4's positions panel) —
+	// not a stored column, and not populated by OpenPaperOrder/ListOpenPaperOrders. Empty when
+	// StrategyID is nil (an order opened with no strategy attribution).
+	StrategyName string
 }
 
 // VariantStats summarizes one SL/TP-adjustment variant's closed-trade track record for the

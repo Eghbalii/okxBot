@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,6 +22,25 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )
+
+// tickEvent mirrors usecase.tickEvent's decode of the raw OKX tickers payload (CLAUDE.md §12) —
+// duplicated rather than exported/shared because cmd/api only needs the two fields it re-broadcasts
+// below, not the full ticker shape.
+type tickEvent struct {
+	InstID string `json:"instId"`
+	Last   string `json:"last"`
+}
+
+// priceUpdate is the panel's live-price WebSocket message (CLAUDE.md §11.4's positions panel):
+// last-traded price per instrument, pushed on every tick so the panel can compute moment-to-moment
+// unrealized PnL client-side from entry_px/size/leverage rather than polling REST for it. Same
+// "type" discriminator convention as usecase.PaperOrderEvent so the panel can tell the two kinds of
+// message on this one socket apart.
+type priceUpdate struct {
+	Type   string `json:"type"` // "price"
+	InstID string `json:"instId"`
+	Price  string `json:"price"`
+}
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -92,6 +112,30 @@ func main() {
 		}
 	}()
 
+	// Live last-traded price per instrument, for the positions panel's moment-to-moment PnL
+	// (CLAUDE.md §11.4) — a distinct consumer group ("api-ws-bridge-tickers") from paper-trader's
+	// own "paper-trader" group on the same okx.tickers topic, so this never competes for offsets or
+	// skips messages paper-trader also needs. Reshaped to {type,instId,price} rather than forwarded
+	// as OKX's raw wire payload, so the panel doesn't need to know OKX's ticker JSON shape.
+	pricesConsumer := kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.tickers", "api-ws-bridge-tickers")
+	go func() {
+		err := pricesConsumer.Run(ctx, func(_ context.Context, data []byte) error {
+			var tick tickEvent
+			if err := json.Unmarshal(data, &tick); err != nil {
+				return nil // malformed tick: skip rather than fail the whole consumer loop
+			}
+			out, err := json.Marshal(priceUpdate{Type: "price", InstID: tick.InstID, Price: tick.Last})
+			if err != nil {
+				return nil
+			}
+			srv.Broadcast(out)
+			return nil
+		})
+		if err != nil && ctx.Err() == nil {
+			logger.Error("prices consumer exited", "error", err)
+		}
+	}()
+
 	httpServer := &http.Server{
 		Addr:    cfg.API.Addr,
 		Handler: routes,
@@ -101,6 +145,7 @@ func main() {
 		<-ctx.Done()
 		srv.CloseWS()
 		_ = orderEventsConsumer.Close()
+		_ = pricesConsumer.Close()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)

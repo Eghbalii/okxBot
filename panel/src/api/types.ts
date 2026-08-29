@@ -55,6 +55,15 @@ export interface Position {
   // adjustment, tracked to completion for later comparison rather than editing the parent in place.
   ParentOrderID: number | null
   Variant: 'baseline' | 'rl_adjusted' | ''
+  // Bar is the decision timeframe the signal that opened this order fired on (e.g. "5m", "1H").
+  // Empty for orders opened before this field existed.
+  Bar: string
+  // StrategyName is joined in by ListPositions for display — empty when StrategyID is null.
+  StrategyName: string
+  // FeaturesJSON is the decision-time observation actually sent to the model (CLAUDE.md §15.3),
+  // stored as embedded JSON. Shape is the rl_service Observation; the order-detail view reads the
+  // strategy signal out of it to compare against what the order ended up with.
+  FeaturesJSON: unknown
 }
 
 // VariantStats/SLTPAdjustmentPair back the baseline-vs-rl_adjusted A/B comparison (CLAUDE.md §15.4).

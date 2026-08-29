@@ -79,6 +79,19 @@ body {
   border-radius: 8px;
   padding: 1rem 1.25rem;
   margin-bottom: 1rem;
+  /* min-width:0 is required for a grid/flex child to be allowed to shrink below its content's
+     intrinsic width — without it the positions table (15 columns) forces the card wider than
+     .app-main's 1200px cap and the right-hand columns render outside the card's border. */
+  min-width: 0;
+}
+
+/* Wide tables scroll inside their own card rather than pushing the page sideways. */
+.table-scroll {
+  overflow-x: auto;
+  /* Negative margin + matching padding lets the scroll area span the card's full inner width, so
+     the scrollbar sits at the card edge instead of inset by the padding. */
+  margin: 0 -1.25rem;
+  padding: 0 1.25rem;
 }
 
 .card h2 {
@@ -241,4 +254,76 @@ pre.logs {
 
 .param-edit-cell:hover .param-hover-box {
   display: block;
+}
+
+/* --- Order detail modal (positions page) ------------------------------------------------- */
+
+.order-id-button {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.order-id-button:hover {
+  opacity: 0.8;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 1.5rem;
+}
+
+.modal {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem;
+  max-width: 760px;
+  width: 100%;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.modal-header h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.modal-close {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0.2rem 0.55rem;
+  line-height: 1;
+}
+
+.modal-close:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* The comparison table's headers are not sortable, unlike the positions table's. */
+.modal table th {
+  cursor: default;
 }

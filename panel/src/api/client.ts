@@ -152,10 +152,21 @@ export interface PaperOrderEvent {
   instId: string
 }
 
-// openEventsSocket connects to cmd/api's WebSocket bridge and calls onEvent for every
-// PaperOrderEvent received, reconnecting with backoff if the connection drops. Returns a cleanup
-// function that closes the socket and stops reconnecting.
-export function openEventsSocket(onEvent: (event: PaperOrderEvent) => void): () => void {
+// PriceUpdate mirrors cmd/api's priceUpdate — the live last-traded price pushed over the same
+// socket on every tick (CLAUDE.md §11.4's positions panel), for moment-to-moment PnL client-side.
+export interface PriceUpdate {
+  type: 'price'
+  instId: string
+  price: string
+}
+
+export type WSEvent = PaperOrderEvent | PriceUpdate
+
+// openEventsSocket connects to cmd/api's WebSocket bridge and calls onEvent for every message
+// received (paper order open/close, or a live price tick — discriminate on `type`), reconnecting
+// with backoff if the connection drops. Returns a cleanup function that closes the socket and
+// stops reconnecting.
+export function openEventsSocket(onEvent: (event: WSEvent) => void): () => void {
   let socket: WebSocket | null = null
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let closed = false
@@ -169,7 +180,7 @@ export function openEventsSocket(onEvent: (event: PaperOrderEvent) => void): () 
     socket = new WebSocket(url)
     socket.onmessage = (msg) => {
       try {
-        onEvent(JSON.parse(msg.data) as PaperOrderEvent)
+        onEvent(JSON.parse(msg.data) as WSEvent)
       } catch {
         // ignore malformed frames
       }
