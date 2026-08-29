@@ -168,7 +168,7 @@ func (e *PaperTrader) runUpdates(ctx context.Context, bar string, price decimal.
 			e.closeEarly(ctx, o, price, logger)
 		case domain.ActionUpdate:
 			metrics.ModelUpdateDecisionsTotal.WithLabelValues(e.InstID, "update").Inc()
-			e.applyAdjustment(ctx, o, action, price, logger)
+			e.applyAdjustment(ctx, o, action, price, open, logger)
 		default:
 			// ActionNone, or anything the model emitted that has no meaning for an update — leave
 			// the position alone. Treating an unrecognized action as "do nothing" is the safe
@@ -181,9 +181,23 @@ func (e *PaperTrader) runUpdates(ctx context.Context, bar string, price decimal.
 // applyAdjustment turns the model's proposed SL/TP levels into a shadow fork (CLAUDE.md §15.4):
 // the original order is never edited, so what the un-adjusted trade would have done stays
 // observable. Both run to completion and are compared afterward.
-func (e *PaperTrader) applyAdjustment(ctx context.Context, o port.PaperOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
+func (e *PaperTrader) applyAdjustment(ctx context.Context, o port.PaperOrder, action *domain.Action, price decimal.Decimal, open []port.PaperOrder, logger *slog.Logger) {
 	if o.Variant == "rl_adjusted" {
 		return // no fork-of-a-fork; see runUpdates
+	}
+
+	// At most ONE fork per baseline. §15.4's mechanic is a same-entry A/B — one un-adjusted
+	// control against one adjusted variant — and a second fork of the same parent makes that
+	// comparison meaningless: there is no longer a single "the adjusted trade" to compare against.
+	// Every subsequent adjustment therefore EDITS the existing fork rather than branching again.
+	//
+	// Observed 2026-08-29: 49 forks across only 12 baselines, one parent carrying 8 of them
+	// (HYPE-USDT-SWAP order 51). Each fork is itself an open position that draws its own update
+	// calls, so the branching compounds: more forks produce more adjustments produce more forks.
+	// The guard above only stopped a fork from forking, never a baseline from being forked twice.
+	if existing := forkOf(o.ID, open); existing != nil {
+		e.updateFork(ctx, o, *existing, action, price, logger)
+		return
 	}
 
 	// The model sets levels (§15.11) while the ratchet reasons in relative moves, so convert here.
@@ -205,6 +219,42 @@ func (e *PaperTrader) applyAdjustment(ctx context.Context, o port.PaperOrder, ac
 	}
 	logger.Info("lifecycle: sl/tp adjustment forked", "instId", e.InstID,
 		"parentId", o.ID, "forkId", forkID, "newSL", newSL, "newTP", newTP)
+}
+
+// forkOf returns the open rl_adjusted child of parentID, or nil when it has none.
+func forkOf(parentID int64, open []port.PaperOrder) *port.PaperOrder {
+	for i := range open {
+		o := &open[i]
+		if o.Variant == "rl_adjusted" && o.ParentOrderID != nil && *o.ParentOrderID == parentID {
+			return o
+		}
+	}
+	return nil
+}
+
+// updateFork applies a further adjustment to a baseline's existing fork, in place. The ratchet is
+// evaluated against the FORK's current levels, not the baseline's: the fork is what actually
+// carries the adjusted stop, so measuring the move from the baseline would let a level that has
+// already been tightened be re-proposed as if it were still at its original distance, quietly
+// undoing the ratchet's only-tighten guarantee.
+func (e *PaperTrader) updateFork(ctx context.Context, baseline, fork port.PaperOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
+	slAdjust := levelAdjustPct(fork.SLPx, action.SLPx, price)
+	tpAdjust := levelAdjustPct(fork.TPPx, action.TPPx, price)
+	if slAdjust.IsZero() && tpAdjust.IsZero() {
+		return
+	}
+
+	newSL, newTP := RatchetSLTP(fork, price, slAdjust, tpAdjust)
+	if samePriceOrNil(newSL, fork.SLPx) && samePriceOrNil(newTP, fork.TPPx) {
+		return // the ratchet rejected the proposal entirely
+	}
+
+	if err := e.Repo.UpdatePaperOrderSLTP(ctx, fork.ID, newSL, newTP); err != nil {
+		logger.Warn("lifecycle: fork update failed", "instId", e.InstID, "forkId", fork.ID, "error", err)
+		return
+	}
+	logger.Info("lifecycle: sl/tp adjustment applied to existing fork", "instId", e.InstID,
+		"parentId", baseline.ID, "forkId", fork.ID, "newSL", newSL, "newTP", newTP)
 }
 
 // closeEarly closes a position at the live price because the model asked to (CLAUDE.md §15.12).

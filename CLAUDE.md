@@ -2084,6 +2084,20 @@ rejecting would silently disable every target-only strategy, while a widest-boun
 strategy's own exit intact and makes the loss finite. An order that still has no stop after that is
 refused outright and logged at error.
 
+**One baseline, many forks** — 49 forks across only 12 baselines, one parent (HYPE-USDT-SWAP order
+51) carrying 8. `applyAdjustment` refused to fork a fork (`o.Variant == "rl_adjusted"`) but never
+asked whether the baseline it *was* forking already had one, so every accepted adjustment branched
+again. This compounds rather than merely duplicating: each fork is itself an open position drawing
+its own update calls, so more forks produce more adjustments produce more forks. It also destroys
+what §15.4's mechanic exists for — a same-entry A/B needs one control against one adjusted variant,
+and with eight there is no longer a single "the adjusted trade" to compare against.
+
+Fixed by allowing at most one fork per baseline: a further adjustment now EDITS the existing fork
+(`updateFork`) rather than branching. The ratchet is evaluated against the **fork's** current
+levels, not the baseline's — the fork is what carries the adjusted stop, so measuring from the
+baseline would let an already-tightened level be re-proposed at its original distance, quietly
+undoing the ratchet's only-tighten guarantee.
+
 **Deadlock worth knowing about.** A freshly-initialized SAC policy skips essentially every signal,
 and with no opened trade there is no closed trade, no reward, and therefore no weight update — the
 policy stays random forever. Warm-start (§15.8) exists precisely to avoid this; skipping it makes

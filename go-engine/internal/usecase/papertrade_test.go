@@ -846,6 +846,58 @@ func TestRunUpdates_ForksOnNonZeroAdjustment(t *testing.T) {
 	}
 }
 
+// A baseline gets at most ONE fork: §15.4's mechanic is a same-entry A/B, one control against one
+// adjusted variant, and a second fork of the same parent destroys that comparison. Observed
+// 2026-08-29 as 49 forks across only 12 baselines — HYPE-USDT-SWAP order 51 alone had 8, since
+// each fork is itself an open position drawing its own update calls, so the branching compounded.
+// Further adjustments must EDIT the existing fork instead.
+func TestRunUpdates_SecondAdjustmentEditsForkInsteadOfBranching(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.candles = map[string][]domain.Candle{"1m": {
+		{Close: dec("100")}, {Close: dec("101")}, {Close: dec("102")}, {Close: dec("105")},
+	}, "15m": nil}
+	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionUpdate, SLPx: dec("97"), TPPx: dec("108")}}
+	pt.Model = model
+
+	sl, tp := dec("95"), dec("110")
+	baselineID, err := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp, Size: dec("100"), Leverage: dec("1"),
+	})
+	if err != nil {
+		t.Fatalf("open baseline order: %v", err)
+	}
+
+	// Three adjustment rounds, each proposing a tighter stop than the last.
+	for i, proposed := range []string{"97", "99", "101"} {
+		model.action = domain.Action{Action: domain.ActionUpdate, SLPx: dec(proposed), TPPx: dec("108")}
+		pt.lifecycle = nil // clear the conductor's per-order update cadence so each round fires
+		pt.conductorOnce = sync.Once{}
+		pt.runUpdates(context.Background(), "1m", dec("105"), testLogger())
+
+		orders, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+		forks := 0
+		for _, o := range orders {
+			if o.Variant == "rl_adjusted" {
+				forks++
+			}
+		}
+		if forks > 1 {
+			t.Fatalf("round %d: expected at most 1 fork per baseline, got %d", i+1, forks)
+		}
+	}
+
+	orders, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if len(orders) != 2 {
+		t.Fatalf("expected baseline + exactly 1 fork = 2 orders, got %d", len(orders))
+	}
+	for _, o := range orders {
+		if o.ID == baselineID && (!o.SLPx.Equal(sl) || !o.TPPx.Equal(tp)) {
+			t.Errorf("baseline must stay untouched, got sl=%s tp=%s", o.SLPx, o.TPPx)
+		}
+	}
+}
+
 func TestRunUpdates_NoOpActionDoesNotFork(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
