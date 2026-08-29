@@ -126,6 +126,14 @@ type PaperTrader struct {
 	candlesMu sync.Mutex
 	candles   map[string][]domain.Candle // keyed by bar
 
+	// openMu serializes the whole read-open-orders-then-maybe-open sequence in evaluateStrategies.
+	// Each bar runs in its own consumer goroutine, so without it two timeframes whose candles close
+	// at the same instant both read an empty book and both open a position on the same token —
+	// observed in production as orders 70 (15m) and 71 (5m) on ENA-USDT-SWAP, 13ms apart. The
+	// no-open-position guard inside evaluateStrategies only covers one call; this makes the check
+	// and the write that follows it atomic against the other bars' goroutines.
+	openMu sync.Mutex
+
 	// rlAdjustMu/lastRLAdjustAt throttle the RL SL/TP-adjust pass to tick cadence (CLAUDE.md's
 	// 2026-08-27 MidPrice-freshness audit): previously this only ran on candle close, so the model
 	// could reason about a price up to one full bar interval stale while an open order's SL/TP was
@@ -228,6 +236,53 @@ func (e *PaperTrader) marketView(bar string) strategy.MarketView {
 	return strategy.MarketView{Bar: bar, Candles: bars[bar], Bars: bars}
 }
 
+// seedCandlesFromRepo fills each bar's in-memory window from candles already persisted in
+// Postgres, so strategies can evaluate immediately after a restart instead of waiting to
+// re-accumulate history from the live feed.
+//
+// Why this is not the REST seeding that was removed in f1af152: that version called OKX's
+// /market/candles once per (instrument, bar) at startup, and at 10 instruments x 3 bars it fired
+// ~30 concurrent requests that the exchange rejected — reported confusingly as "instrument not
+// found" (51001) on a different instrument each run. This reads the SAME candles the ingestor has
+// already written to the database, so it makes no exchange call at all and that failure mode
+// cannot occur.
+//
+// Removing the REST seed was still correct; the reasoning that "history fills in within the first
+// few closed candles" just only held for the shortest bar. A 1H window needs ~2 days of live feed
+// to fill 50 candles, so after every restart only short-window strategies on 5m could fire — which
+// is exactly what was observed: 12 of 14 strategies returning hold, and every open position coming
+// from the one strategy that needs the fewest candles.
+//
+// Best-effort per bar: a read failure leaves that window empty and it refills from the live feed,
+// which is strictly the old behavior. Seeding must never keep the engine from starting.
+func (e *PaperTrader) seedCandlesFromRepo(ctx context.Context, logger *slog.Logger) {
+	// CandleWindow is what handleCandle trims to, so an unset window means "keep nothing" there —
+	// seeding into that would be immediately discarded.
+	limit := e.CandleWindow
+	if limit <= 0 {
+		return
+	}
+	for _, bar := range e.Bars {
+		rows, err := e.Repo.ListCandles(ctx, e.InstID, bar, limit)
+		if err != nil {
+			logger.Warn("seed candles from repo failed; window will fill from the live feed",
+				"instId", e.InstID, "bar", bar, "error", err)
+			continue
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		window := make([]domain.Candle, 0, len(rows))
+		for _, r := range rows {
+			window = append(window, r.Candle)
+		}
+		e.candlesMu.Lock()
+		e.candles[bar] = window
+		e.candlesMu.Unlock()
+		logger.Info("seeded candle window from database", "instId", e.InstID, "bar", bar, "candles", len(window))
+	}
+}
+
 // trackPnLExtremes advances an open order's peak/trough unrealized PnL (CLAUDE.md §15.11). Only
 // writes when a new extreme is actually reached, so a position sitting still doesn't generate a
 // database write on every tick.
@@ -277,6 +332,8 @@ func (e *PaperTrader) Run(ctx context.Context) error {
 	e.candlesMu.Lock()
 	e.candles = make(map[string][]domain.Candle, len(e.Bars))
 	e.candlesMu.Unlock()
+
+	e.seedCandlesFromRepo(ctx, logger)
 
 	errCh := make(chan error, 1+len(e.CandleConsumers))
 	go func() {
@@ -393,6 +450,11 @@ func (e *PaperTrader) handleCandle(ctx context.Context, bar string, data []byte,
 }
 
 func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) error {
+	// Held across the whole function: the open-position check and the OpenPaperOrder that may
+	// follow it have to be atomic with respect to the other bars' consumer goroutines. See openMu.
+	e.openMu.Lock()
+	defer e.openMu.Unlock()
+
 	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
 	if err != nil {
 		return fmt.Errorf("list open paper orders: %w", err)
@@ -421,7 +483,18 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 			continue
 		}
 
-		order := buildPaperOrder(e.InstID, price, signal, e.NotionalUSD, a.StrategyID)
+		// A buy/sell decision only exists when this token has NO baseline position open
+		// (CLAUDE.md §15.12): once one is, a firing signal is an `update` about the position that
+		// already exists, not a licence to open another. Without this guard every assigned strategy
+		// opened independently, so two strategies disagreeing on the same token and bar produced a
+		// simultaneous long AND short — positions that cannot both be right and that no single
+		// lifecycle decision ever authorized. Forks are excluded: they shadow their baseline parent
+		// rather than being separate positions (§15.4).
+		if hasOpenBaseline(open) {
+			continue
+		}
+
+		order := buildPaperOrder(e.InstID, price, signal, e.NotionalUSD, a.StrategyID, bar)
 
 		// Retain this signal for carry-forward onto later price-driven update calls (CLAUDE.md
 		// §15.12): a higher-timeframe opinion stays meaningful between its candles, and dropping it
@@ -481,6 +554,12 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 		logger.Info("opened paper order", "id", id, "strategy", s.Name(), "instId", e.InstID, "bar", bar,
 			"side", signal.Side, "entry", price, "confidence", signal.Confidence)
 		e.publishOrderEvent(ctx, "opened", id, logger)
+
+		// `open` was read once before the loop, so without this the NEXT strategy in the same
+		// evaluation still sees an empty book and opens an opposing position microseconds later —
+		// which is exactly how orders 44 (sell) and 45 (buy) ended up coexisting on TRUMP/5m.
+		order.ID = id
+		open = append(open, order)
 	}
 	return nil
 }
@@ -620,7 +699,19 @@ func realizedPnL(o port.PaperOrder, closePx decimal.Decimal) decimal.Decimal {
 	return direction.Mul(closePx.Sub(o.EntryPx)).Div(o.EntryPx).Mul(o.Size).Mul(o.Leverage)
 }
 
-func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signal, notionalUSD decimal.Decimal, strategyID int64) port.PaperOrder {
+// hasOpenBaseline reports whether any of these orders is a real (non-fork) open position. Forks
+// are tracking-only shadows of their baseline parent (CLAUDE.md §15.4), so one must never make the
+// token look occupied to the open-decision path.
+func hasOpenBaseline(orders []port.PaperOrder) bool {
+	for _, o := range orders {
+		if o.Variant == "baseline" || o.Variant == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signal, notionalUSD decimal.Decimal, strategyID int64, bar string) port.PaperOrder {
 	var slPx, tpPx *decimal.Decimal
 	direction := decimal.NewFromInt(1)
 	if signal.Side == strategy.Sell {
@@ -648,6 +739,7 @@ func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signa
 		SLPx:       slPx,
 		TPPx:       tpPx,
 		Size:       notionalUSD,
+		Bar:        bar,
 		// 1x is the un-sized default: the strategy layer has no view on leverage, so an order
 		// opened without the RL sizing pass (PaperTrader.RLSizing) records the unlevered position
 		// the signal itself implies. The caller overwrites Size/Leverage when RL sizing is on.

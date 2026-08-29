@@ -100,8 +100,22 @@ func main() {
 	// via one dispatcher per topic (CLAUDE.md §12).
 	tickDispatcher := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.tickers", "paper-trader"))
 	defer tickDispatcher.Close()
-	candleDispatchers := make(map[string]*kafkastream.Dispatcher, len(cfg.PaperTrading.Bars))
-	for _, bar := range cfg.PaperTrading.Bars {
+	// Consume EVERY ingested bar, not just the decision bars (CLAUDE.md §9): 4H/1D are collected
+	// for higher-timeframe context that a strategy assigned to 5m can consult via
+	// MultiTimeframeStrategy. PaperTrader is also the only writer of the candles table, so a bar
+	// nobody consumes is never persisted — before this, the ingestor published 4H/1D to Kafka and
+	// those messages simply expired unread, leaving the context timeframes permanently empty in
+	// the database while the ingestor's logs showed it correctly subscribed to all five channels.
+	//
+	// Consuming a bar does not make it a decision bar: evaluateStrategies filters assignments by
+	// `a.Bar != bar`, so a context-only timeframe with no assignments maintains its window and
+	// persists its candles without ever triggering a trade.
+	candleBars := cfg.Ingestion.Bars
+	if len(candleBars) == 0 {
+		candleBars = cfg.PaperTrading.Bars
+	}
+	candleDispatchers := make(map[string]*kafkastream.Dispatcher, len(candleBars))
+	for _, bar := range candleBars {
 		d := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.candles."+bar, "paper-trader"))
 		candleDispatchers[bar] = d
 		defer d.Close()
@@ -130,14 +144,16 @@ func main() {
 			os.Exit(1)
 		}
 
-		candleConsumers := make(map[string]port.MarketDataConsumer, len(cfg.PaperTrading.Bars))
+		candleConsumers := make(map[string]port.MarketDataConsumer, len(candleBars))
 		for bar, d := range candleDispatchers {
 			candleConsumers[bar] = d.ForInstrument(instID)
 		}
 
 		engine := &usecase.PaperTrader{
-			InstID:          instID,
-			Bars:            cfg.PaperTrading.Bars,
+			InstID: instID,
+			// Every ingested bar, so the context timeframes get a maintained window (and are seeded
+			// from the database on restart) even though no strategy decides on them.
+			Bars:            candleBars,
 			CandleWindow:    cfg.PaperTrading.CandleLimit,
 			Strategies:      strategies,
 			TickConsumer:    tickDispatcher.ForInstrument(instID),

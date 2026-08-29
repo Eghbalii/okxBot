@@ -383,7 +383,7 @@ func TestRealizedPnL_ExactNoFloatDrift(t *testing.T) {
 
 func TestBuildPaperOrder_SLTPForBuyAndSell(t *testing.T) {
 	buySignal := strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}
-	buyOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), buySignal, dec("100"), 0)
+	buyOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), buySignal, dec("100"), 0, "5m")
 	if buyOrder.SLPx == nil || !buyOrder.SLPx.Equal(dec("99")) {
 		t.Errorf("expected buy SL=99, got %v", buyOrder.SLPx)
 	}
@@ -392,7 +392,7 @@ func TestBuildPaperOrder_SLTPForBuyAndSell(t *testing.T) {
 	}
 
 	sellSignal := strategy.Signal{Side: strategy.Sell, SLPct: dec("0.01"), TPPct: dec("0.02")}
-	sellOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), sellSignal, dec("100"), 0)
+	sellOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), sellSignal, dec("100"), 0, "5m")
 	if sellOrder.SLPx == nil || !sellOrder.SLPx.Equal(dec("101")) {
 		t.Errorf("expected sell SL=101, got %v", sellOrder.SLPx)
 	}
@@ -441,6 +441,155 @@ func TestEvaluateStrategies_OnlyRunsStrategyAssignedToThatBar(t *testing.T) {
 	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
 	if len(open) != 1 {
 		t.Fatalf("expected exactly 1 order opened (from the 1m strategy only), got %d", len(open))
+	}
+}
+
+// After a restart the in-memory candle window must come back from the database rather than
+// re-accumulating from the live feed. Observed 2026-08-29: with empty windows, a 1H bar needs ~2
+// days of live candles to fill a 50-candle window, so 12 of 14 strategies returned hold and every
+// open position came from the one strategy needing the fewest candles (grid_like on 5m). The
+// candles were already in Postgres the whole time — nothing was reading them.
+func TestSeedCandlesFromRepo_FillsWindowFromDatabase(t *testing.T) {
+	repo := newFakeRepository()
+	ctx := context.Background()
+	for i := 0; i < 30; i++ {
+		_ = repo.SaveCandle(ctx, port.Candle{
+			InstID: "BTC-USDT-SWAP", Bar: "1H",
+			Candle: domain.Candle{
+				Timestamp: time.Unix(int64(i)*3600, 0),
+				Open:      dec("100"), High: dec("101"), Low: dec("99"), Close: dec("100"), Volume: dec("1"),
+			},
+		})
+	}
+
+	pt := newTestPaperTrader(repo, nil)
+	pt.Bars = []string{"1H"}
+	pt.CandleWindow = 50
+	pt.candles = make(map[string][]domain.Candle)
+	pt.seedCandlesFromRepo(ctx, testLogger())
+
+	if got := len(pt.candles["1H"]); got != 30 {
+		t.Fatalf("expected the 30 persisted candles to seed the window, got %d", got)
+	}
+}
+
+// The window must respect CandleWindow, so seeding can't hand handleCandle more than it keeps.
+func TestSeedCandlesFromRepo_RespectsWindowLimit(t *testing.T) {
+	repo := newFakeRepository()
+	ctx := context.Background()
+	for i := 0; i < 40; i++ {
+		_ = repo.SaveCandle(ctx, port.Candle{
+			InstID: "BTC-USDT-SWAP", Bar: "5m",
+			Candle: domain.Candle{Timestamp: time.Unix(int64(i)*300, 0), Close: dec("100")},
+		})
+	}
+
+	pt := newTestPaperTrader(repo, nil)
+	pt.Bars = []string{"5m"}
+	pt.CandleWindow = 10
+	pt.candles = make(map[string][]domain.Candle)
+	pt.seedCandlesFromRepo(ctx, testLogger())
+
+	if got := len(pt.candles["5m"]); got != 10 {
+		t.Fatalf("expected the window to be capped at CandleWindow=10, got %d", got)
+	}
+}
+
+// Two strategies on the same token+bar disagreeing must NOT produce a simultaneous long and short
+// (CLAUDE.md §15.12: a buy/sell decision exists only when no baseline position is open). Observed
+// in production 2026-08-29 as orders 44 (sell, grid_like) and 45 (buy, weekly_dip_buy) coexisting
+// on TRUMP-USDT-SWAP/5m — positions that cannot both be right and that no lifecycle decision
+// authorized. The guard has to hold WITHIN one evaluation pass too, since the open-order list is
+// read once before the strategy loop.
+func TestEvaluateStrategies_DoesNotOpenOpposingPositionsInOnePass(t *testing.T) {
+	repo := newFakeRepository()
+	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+	alwaysSell := &stubStrategy{signal: strategy.Signal{Side: strategy.Sell, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+
+	pt := newTestPaperTrader(repo, []StrategyAssignment{
+		{Bar: "5m", Strategy: alwaysBuy},
+		{Bar: "5m", Strategy: alwaysSell},
+	})
+	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+
+	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if len(open) != 1 {
+		t.Fatalf("expected exactly 1 open order, got %d (opposing positions on the same token)", len(open))
+	}
+}
+
+// Each bar has its own consumer goroutine, so two timeframes whose candles close at the same
+// instant must not both open a position on the same token. Observed in production as orders 70
+// (15m) and 71 (5m) on ENA-USDT-SWAP, 13ms apart: the no-open-position guard covered a single
+// evaluateStrategies call but nothing serialized the check against a concurrent one. Run with
+// -race to catch a regression here.
+func TestEvaluateStrategies_ConcurrentBarsDoNotBothOpen(t *testing.T) {
+	repo := newFakeRepository()
+	buy5m := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+	buy15m := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+
+	pt := newTestPaperTrader(repo, []StrategyAssignment{
+		{Bar: "5m", Strategy: buy5m},
+		{Bar: "15m", Strategy: buy15m},
+	})
+	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.candles["15m"] = []domain.Candle{{Close: dec("100")}}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for _, bar := range []string{"5m", "15m"} {
+		wg.Add(1)
+		go func(bar string) {
+			defer wg.Done()
+			<-start // release both goroutines together to maximize overlap
+			_ = pt.evaluateStrategies(context.Background(), bar, dec("100"), testLogger())
+		}(bar)
+	}
+	close(start)
+	wg.Wait()
+
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if len(open) != 1 {
+		t.Fatalf("two bars closing together must open exactly 1 position, got %d", len(open))
+	}
+}
+
+// A signal firing while a position is already open is an `update` about that position, not a new
+// order — so a second evaluation pass must not stack another one on top.
+func TestEvaluateStrategies_SkipsOpenWhenBaselineAlreadyOpen(t *testing.T) {
+	repo := newFakeRepository()
+	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+
+	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", Strategy: alwaysBuy}})
+	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+
+	for i := 0; i < 3; i++ {
+		if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
+			t.Fatalf("evaluateStrategies returned error: %v", err)
+		}
+	}
+
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if len(open) != 1 {
+		t.Fatalf("expected 1 open order after 3 passes, got %d", len(open))
+	}
+}
+
+// A fork shadows its baseline parent rather than being a separate position (CLAUDE.md §15.4), so
+// one left behind after its parent closed must not make the token look permanently occupied.
+func TestHasOpenBaseline_IgnoresForks(t *testing.T) {
+	if hasOpenBaseline([]port.PaperOrder{{Variant: "rl_adjusted"}}) {
+		t.Error("a fork alone must not count as an open baseline position")
+	}
+	if !hasOpenBaseline([]port.PaperOrder{{Variant: "rl_adjusted"}, {Variant: "baseline"}}) {
+		t.Error("a baseline alongside a fork must count")
+	}
+	if !hasOpenBaseline([]port.PaperOrder{{Variant: ""}}) {
+		t.Error("an empty variant is a baseline (pre-fork rows) and must count")
 	}
 }
 
