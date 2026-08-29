@@ -40,12 +40,13 @@ type subscribeReq struct {
 }
 
 // handlerQueueSize bounds how many decoded data-push messages can be queued for Handler before
-// the dispatch goroutine (not the socket read loop) starts blocking. Sized generously — at 10
-// instruments x 5 candle channels this process runs, a slow Handler call (e.g. a Kafka publish
-// hitting transient broker latency) must never stall the socket read loop itself, which is what
-// this queue exists to prevent; see connectAndStream's doc comment for why that mattered in
-// practice, not just in theory.
-const handlerQueueSize = 256
+// the dispatch goroutine (not the socket read loop) starts blocking. Must absorb real bursts, not
+// just protect against pathological stalls: live-verified at 256 that the tickers channel alone
+// (10 liquid instruments, all pushing on every trade) saturated this queue continuously, not just
+// at startup — kafkastream.NewPublisher switching its Writer to Async is the fix for the
+// underlying publish latency, but this queue still needs headroom for legitimate burst traffic on
+// top of that, not just protection against a wedged Handler.
+const handlerQueueSize = 4096
 
 // PublicClient is a reconnecting client for wss://ws.okx.com:8443/ws/v5/public.
 type PublicClient struct {

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -22,15 +23,28 @@ type Publisher struct {
 
 // NewPublisher creates a Publisher for the given brokers and topic.
 func NewPublisher(brokers []string, topic string) *Publisher {
-	return &Publisher{
-		writer: &kafka.Writer{
-			Addr:                   kafka.TCP(brokers...),
-			Topic:                  topic,
-			Balancer:               &kafka.Hash{}, // keyed by Publish's key param, so ordering per key is preserved
-			AllowAutoTopicCreation: true,
-		},
-		Topic: topic,
+	w := &kafka.Writer{
+		Addr:                   kafka.TCP(brokers...),
+		Topic:                  topic,
+		Balancer:               &kafka.Hash{}, // keyed by Publish's key param, so ordering per key is preserved
+		AllowAutoTopicCreation: true,
+		// Async batches writes internally instead of round-tripping to the broker synchronously
+		// on every call — live-verified as a real bottleneck: at 10 liquid instruments' worth of
+		// ticker volume, synchronous WriteMessages couldn't keep up even with WS message handling
+		// already moved off the socket read loop (internal/okx/ws), backing up that loop's own
+		// dispatch queue instead. Publish's own error return becomes unreliable once Async is on
+		// (it usually returns nil immediately, before the write is actually attempted), so
+		// failures are logged from Completion instead — every publisher in this codebase already
+		// treats a publish failure as "log a warning and continue" (CLAUDE.md §12), so this keeps
+		// that same reliability model, just moved to where Async actually surfaces the error.
+		Async: true,
 	}
+	w.Completion = func(messages []kafka.Message, err error) {
+		if err != nil {
+			slog.Default().Warn("kafka async publish failed", "topic", topic, "count", len(messages), "error", err)
+		}
+	}
+	return &Publisher{writer: w, Topic: topic}
 }
 
 // Publish marshals event to JSON and writes it to the topic, partitioned by key.
