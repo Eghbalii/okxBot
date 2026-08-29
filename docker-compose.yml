@@ -1,7 +1,20 @@
+# Docker's json-file driver keeps container logs forever unless told otherwise, and on a 25GB VPS
+# that fills the disk: cmd/api alone reached 29MB, with ~49MB across all containers and no bound on
+# further growth. Capped here rather than per-service so a new service cannot be added without it.
+#
+# This does not lose searchable history — Promtail ships these same files to Loki (CLAUDE.md §11.7),
+# which has its own 14-day retention. The rotation only bounds the copy on local disk.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   # redis is now only used by cmd/strategy-optimizer's disposable trial state (CLAUDE.md §16.3) —
   # the tick/candle/paper-order event bus moved to Kafka (below), CLAUDE.md §12.
   redis:
+    logging: *default-logging
     image: redis:7-alpine
     ports:
       - "6379:6379"
@@ -12,6 +25,7 @@ services:
   # §12): ticks/candles/paper-order events flow ingestor -> Kafka -> paper-trader/
   # strategy-optimizer/cmd/api's WebSocket bridge.
   kafka:
+    logging: *default-logging
     image: apache/kafka:3.9.0
     environment:
       KAFKA_NODE_ID: 1
@@ -42,6 +56,7 @@ services:
       retries: 10
 
   timescaledb:
+    logging: *default-logging
     image: timescale/timescaledb:latest-pg16
     environment:
       POSTGRES_USER: okxbot
@@ -53,6 +68,7 @@ services:
       - timescale-data:/var/lib/postgresql/data
 
   rl-service:
+    logging: *default-logging
     build: ./rl-service
     environment:
       CONFIG_PATH: /app/configs/config.yaml
@@ -69,6 +85,7 @@ services:
       - timescaledb
 
   ingestor:
+    logging: *default-logging
     build:
       context: ./go-engine
       dockerfile: Dockerfile.ingestor
@@ -85,6 +102,7 @@ services:
         condition: service_healthy
 
   trader:
+    logging: *default-logging
     build:
       context: ./go-engine
       dockerfile: Dockerfile.trader
@@ -104,6 +122,7 @@ services:
       - rl-service
 
   paper-trader:
+    logging: *default-logging
     build:
       context: ./go-engine
       dockerfile: Dockerfile.paper-trader
@@ -135,11 +154,13 @@ services:
         condition: service_started
 
   optimizer-service:
+    logging: *default-logging
     build: ./optimizer-service
     ports:
       - "8001:8001"
 
   strategy-optimizer:
+    logging: *default-logging
     build:
       context: ./go-engine
       dockerfile: Dockerfile.strategy-optimizer
@@ -167,6 +188,7 @@ services:
         condition: service_started
 
   api:
+    logging: *default-logging
     build:
       context: ./go-engine
       dockerfile: Dockerfile.api
@@ -191,6 +213,7 @@ services:
         condition: service_started
 
   panel:
+    logging: *default-logging
     build: ./panel
     ports:
       - "8080:80" # bind to the OpenVPN-facing interface only in production, see CLAUDE.md §11
@@ -202,6 +225,7 @@ services:
   # process_* metrics (used elsewhere on the dashboard) are per-service, not host-wide; node-
   # exporter is the standard way to get the underlying VM's numbers into Prometheus at all.
   node-exporter:
+    logging: *default-logging
     image: prom/node-exporter:latest
     command:
       - "--path.rootfs=/host"
@@ -216,6 +240,7 @@ services:
       - "9100:9100"
 
   prometheus:
+    logging: *default-logging
     image: prom/prometheus:latest
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -232,6 +257,7 @@ services:
   # Elasticsearch/ELK at this project's log volume. No object store — filesystem storage on the
   # loki-data volume is appropriate for a single VPS, not a multi-node deployment.
   loki:
+    logging: *default-logging
     image: grafana/loki:latest
     command: -config.file=/etc/loki/loki-config.yml
     volumes:
@@ -247,6 +273,7 @@ services:
   # (time=... level=... msg=...) so "level" becomes a queryable Loki label — this is what makes
   # "search/filter a service's errors separately" work with zero application code changes.
   promtail:
+    logging: *default-logging
     image: grafana/promtail:latest
     command: -config.file=/etc/promtail/promtail-config.yml
     volumes:
@@ -257,6 +284,7 @@ services:
       - loki
 
   grafana:
+    logging: *default-logging
     image: grafana/grafana:latest
     environment:
       GF_SECURITY_ADMIN_PASSWORD: admin
