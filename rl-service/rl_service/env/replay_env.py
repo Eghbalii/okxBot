@@ -100,14 +100,17 @@ def _rows_to_feature_dicts(rows: list[CandleRow]) -> list[dict]:
 
     if not rows:
         return []
+    # Postgres NUMERIC columns come back as decimal.Decimal (CLAUDE.md §7's precision convention
+    # for storage) — numpy ufuncs (np.log, rolling means, etc.) below don't accept Decimal, so
+    # convert to float here, once, at the DataFrame boundary rather than at every call site.
     df = pd.DataFrame(
         {
             "ts": [r.ts for r in rows],
-            "open": [r.open for r in rows],
-            "high": [r.high for r in rows],
-            "low": [r.low for r in rows],
-            "close": [r.close for r in rows],
-            "vol": [r.volume for r in rows],
+            "open": [float(r.open) for r in rows],
+            "high": [float(r.high) for r in rows],
+            "low": [float(r.low) for r in rows],
+            "close": [float(r.close) for r in rows],
+            "vol": [float(r.volume) for r in rows],
         }
     )
     df = add_features(df)  # drops the leading rows that can't fill rolling windows yet

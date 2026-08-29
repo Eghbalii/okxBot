@@ -41,6 +41,20 @@ type Client struct {
 func New(baseURL, apiKey, apiSecret, passphrase string, simulated bool) *Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConnsPerHost = 20
+	// Live-verified okx.com's server unconditionally serves HTTP/2 to this client regardless of
+	// ALPN offer — both ways of disabling h2 client-side (nil TLSNextProto, ForceAttemptHTTP2 =
+	// false) produced "malformed HTTP response \x00\x00\x12\x04..." (a literal HTTP/2 SETTINGS
+	// frame being fed to the HTTP/1.1 parser) instead of fixing anything. HTTP/2 must stay enabled
+	// here — it is not the optional negotiated case the stdlib docs describe for this host.
+	//
+	// Under HTTP/2, maxConcurrentRequests concurrent calls from this Client can still all
+	// multiplex over ONE TCP connection/session rather than the maxConcurrentRequests separate
+	// connections that were the actual intent — connection reuse is what enables that
+	// multiplexing. Disabling keep-alives forces each request onto its own fresh connection
+	// (its own HTTP/2 session with no other concurrent streams on it), which is the one
+	// difference identified between this client and every external tool (curl, wget) used to
+	// investigate these failures that never reproduced them.
+	transport.DisableKeepAlives = true
 	return &Client{
 		BaseURL:    baseURL,
 		APIKey:     apiKey,

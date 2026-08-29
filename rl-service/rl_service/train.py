@@ -110,7 +110,6 @@ def main() -> None:
             vec_env,
             buffer_size=cfg.serve.buffer_size,
             verbose=1,
-            tensorboard_log="data/tensorboard",
         )
     else:
         # The legacy historical-CSV sanity-check path (CLAUDE.md §2) stays on PPO — it exists to
@@ -119,7 +118,6 @@ def main() -> None:
             "MlpPolicy",
             vec_env,
             verbose=1,
-            tensorboard_log="data/tensorboard",
         )
 
     model.learn(total_timesteps=total_timesteps)

@@ -7,6 +7,7 @@ exercised for real whenever build_replay_env is actually run against a live data
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 import numpy as np
 import pytest
@@ -19,6 +20,10 @@ from rl_service.obs import ACTION_DIM, ACTIONS, MAX_SLTP_OFFSET_PCT, Observation
 
 
 def _make_candles(n, start_price=100.0, inst_id="BTC-USDT-SWAP", bar="1m", seed=0):
+    # Decimal, not float: psycopg2 returns NUMERIC columns as decimal.Decimal (CLAUDE.md §7), and
+    # a float fixture here would never have caught _rows_to_feature_dicts failing against what
+    # Postgres actually returns (np.log/rolling ops don't accept Decimal) — this fixture must
+    # match the real read path, not a convenient stand-in for it.
     rng = np.random.default_rng(seed)
     rows = []
     price = start_price
@@ -28,7 +33,9 @@ def _make_candles(n, start_price=100.0, inst_id="BTC-USDT-SWAP", bar="1m", seed=
         rows.append(
             CandleRow(
                 inst_id=inst_id, bar=bar, ts=ts0 + timedelta(minutes=i),
-                open=price, high=price * 1.001, low=price * 0.999, close=price, volume=10.0,
+                open=Decimal(str(price)), high=Decimal(str(price * 1.001)),
+                low=Decimal(str(price * 0.999)), close=Decimal(str(price)),
+                volume=Decimal("10.0"),
             )
         )
     return rows
