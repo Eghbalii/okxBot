@@ -2063,6 +2063,27 @@ something is written to make it visible.**
   serializes the whole read-then-open sequence. The regression test releases both goroutines from a
   shared channel and runs under `-race`; mutation-checked by removing the lock (fails with `got 2`).
 
+**A position opened with no stop-loss at all** (order 80, TRUMP-USDT-SWAP, sell, `stoch_cross`) —
+the most serious defect of the day, because it is unbounded downside rather than a missed
+opportunity. Four independent gaps had to line up:
+
+- `stoch_cross` emits `TPPct` and never sets `SLPct`. That is deliberate for that strategy (it
+  exits on the opposite crossover), and it is the only one of the 14 that does it.
+- `ResolveLevels` derives `SLPx` from `SLPct`. Given nothing to derive from, it leaves the level at
+  zero — it converts, it does not validate.
+- `buildPaperOrder` writes `slPx` as nil and raises no objection.
+- `conductor.Clamps` — the layer whose entire job is where levels may be placed — has exactly one
+  call site, inside `openDecision`, which returns at its first line when `rl_sizing` is off. With
+  the model out of the open path (the §16.9 rollout choice), **nothing validated any order at all**.
+
+The last point is the real lesson: a safety check reachable only through the feature flag of an
+optional subsystem is not a safety check. Validation now runs in `evaluateStrategies` on every
+open, after the model's decision so it sees the levels the order will actually carry, and
+`Clamps.EnsureStop` fills a missing stop at `MaxSLDistPct` rather than rejecting the signal —
+rejecting would silently disable every target-only strategy, while a widest-bound stop keeps the
+strategy's own exit intact and makes the loss finite. An order that still has no stop after that is
+refused outright and logged at error.
+
 **Deadlock worth knowing about.** A freshly-initialized SAC policy skips essentially every signal,
 and with no opened trade there is no closed trade, no reward, and therefore no weight update — the
 policy stays random forever. Warm-start (§15.8) exists precisely to avoid this; skipping it makes

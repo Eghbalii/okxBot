@@ -26,6 +26,36 @@ type Clamps struct {
 	MinTPSLRatio decimal.Decimal
 }
 
+// EnsureStop guarantees a position never opens without a stop.
+//
+// Observed 2026-08-29 as order 80 (TRUMP-USDT-SWAP, sell): stoch_cross emits only TPPct and never
+// sets SLPct at all, ResolveLevels leaves a level it was given nothing to derive from at zero,
+// buildPaperOrder writes a nil sl_px, and the position opened with a take-profit and unbounded
+// downside. Nothing objected anywhere along that path.
+//
+// A missing stop is filled at MaxSLDistPct — the widest distance the clamps already consider
+// acceptable — rather than rejecting the signal. Rejecting would silently disable every
+// strategy that expresses only a target (a legitimate design: stoch_cross exits on the opposite
+// crossover, not on a stop), whereas a worst-case-but-bounded stop preserves the strategy's intent
+// while making the loss finite. It is deliberately the widest rather than the tightest: a stop
+// this position never asked for should interfere with the strategy's own exit as little as
+// possible, and a tight one would stop out on noise before that exit can trigger.
+//
+// Returns the levels unchanged when a usable stop is already present, or when no bound is
+// configured to derive one from.
+func (cl Clamps) EnsureStop(side string, entryPx decimal.Decimal, in Levels) Levels {
+	if in.SLPx != nil && in.SLPx.IsPositive() {
+		return in
+	}
+	if !entryPx.IsPositive() || !cl.MaxSLDistPct.IsPositive() {
+		return in
+	}
+	long := side != "sell"
+	px := offsetFrom(long, entryPx, cl.MaxSLDistPct.Mul(entryPx), true)
+	in.SLPx = &px
+	return in
+}
+
 // Levels is a resolved SL/TP pair. Either may be nil, meaning "not set" — a strategy or model that
 // declined to place one is a real case, not an error.
 type Levels struct {

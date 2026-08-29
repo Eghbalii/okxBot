@@ -536,6 +536,28 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 			}
 		}
 
+		// Validate the levels the order will actually carry, whatever produced them. This runs on
+		// EVERY open, not only when the model shaped it: the clamps used to be applied solely
+		// inside openDecision, which returns immediately when rl_sizing is off, so with the model
+		// out of the open path nothing validated anything. Order 80 opened with no stop at all
+		// that way (CLAUDE.md §16.9) — a safety check must not be reachable only through the
+		// feature flag of an optional subsystem.
+		// EnsureStop runs FIRST, then Apply. Apply's TP:SL ratio check is skipped when there is no
+		// stop to measure against, so filling the stop afterwards would leave the ratio unchecked —
+		// observed as stoch_cross orders opening with a 5% stop against a 1% target, a 0.2
+		// reward:risk that MinTPSLRatio exists to prevent.
+		levels := e.conductorClamps().EnsureStop(string(signal.Side), price, conductor.Levels{
+			SLPx: order.SLPx,
+			TPPx: order.TPPx,
+		})
+		levels = e.conductorClamps().Apply(string(signal.Side), price, levels)
+		if levels.SLPx == nil {
+			logger.Error("refusing to open a position with no stop-loss",
+				"strategy", s.Name(), "instId", e.InstID, "bar", bar, "side", signal.Side)
+			continue
+		}
+		order.SLPx, order.TPPx = levels.SLPx, levels.TPPx
+
 		// CLAUDE.md §15.3/§15.8: persist the actual observation vector at decision time (not just
 		// the realized outcome) so it can later feed live/continued RL training — the whole point
 		// is training data that matches exactly what rlclient would have sent, not a reconstruction.

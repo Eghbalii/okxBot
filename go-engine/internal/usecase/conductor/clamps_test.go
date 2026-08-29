@@ -140,3 +140,29 @@ func TestClamps_NonPositiveEntryIsPassthrough(t *testing.T) {
 		t.Error("a non-positive entry price should pass levels through untouched")
 	}
 }
+
+// A strategy that proposes only a target must still get a bounded stop (CLAUDE.md §16.9): order 80
+// opened with unbounded downside because nothing filled the gap a missing stop leaves.
+func TestEnsureStop_FillsAMissingStopAtTheWidestBound(t *testing.T) {
+	cl := Clamps{MinSLDistPct: dec("0.005"), MaxSLDistPct: dec("0.05"), MinTPSLRatio: dec("1.5")}
+
+	long := cl.EnsureStop("buy", dec("100"), Levels{})
+	if long.SLPx == nil || !long.SLPx.Equal(dec("95")) {
+		t.Errorf("long stop should sit MaxSLDistPct below entry (95), got %v", long.SLPx)
+	}
+
+	short := cl.EnsureStop("sell", dec("100"), Levels{})
+	if short.SLPx == nil || !short.SLPx.Equal(dec("105")) {
+		t.Errorf("short stop should sit MaxSLDistPct above entry (105), got %v", short.SLPx)
+	}
+}
+
+// An existing stop is the strategy's own decision and must not be overwritten.
+func TestEnsureStop_LeavesAnExistingStopAlone(t *testing.T) {
+	cl := Clamps{MaxSLDistPct: dec("0.05")}
+	own := dec("99")
+	got := cl.EnsureStop("buy", dec("100"), Levels{SLPx: &own})
+	if got.SLPx == nil || !got.SLPx.Equal(dec("99")) {
+		t.Errorf("expected the strategy's own stop to survive, got %v", got.SLPx)
+	}
+}

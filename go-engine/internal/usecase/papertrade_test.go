@@ -13,6 +13,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
 // fakeRepository is an in-memory port.Repository for testing, no real Postgres needed. Guarded
@@ -519,6 +520,55 @@ func TestEvaluateStrategies_DoesNotOpenOpposingPositionsInOnePass(t *testing.T) 
 	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
 	if len(open) != 1 {
 		t.Fatalf("expected exactly 1 open order, got %d (opposing positions on the same token)", len(open))
+	}
+}
+
+// A strategy that emits only a target must not produce a position with no stop. Observed as order
+// 80 (TRUMP-USDT-SWAP, sell, stoch_cross): the strategy sets TPPct and never SLPct, ResolveLevels
+// has nothing to derive a stop from, buildPaperOrder writes nil, and the order opened with
+// unbounded downside. The clamps existed but were only reachable inside openDecision, which
+// returns immediately when rl_sizing is off — so with the model out of the open path, nothing
+// validated anything.
+func TestEvaluateStrategies_NeverOpensWithoutStopLoss(t *testing.T) {
+	repo := newFakeRepository()
+	targetOnly := &stubStrategy{signal: strategy.Signal{
+		Side: strategy.Sell, TPPct: dec("0.01"), // no SLPct at all, exactly like stoch_cross
+	}}
+
+	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", Strategy: targetOnly}})
+	pt.RLSizing = false // the configuration order 80 opened under
+	pt.RLClamps = conductor.Clamps{
+		MinSLDistPct: dec("0.005"), MaxSLDistPct: dec("0.05"), MinTPSLRatio: dec("1.5"),
+	}
+	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+
+	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if len(open) != 1 {
+		t.Fatalf("expected the signal to still be traded, got %d orders", len(open))
+	}
+	if open[0].SLPx == nil || !open[0].SLPx.IsPositive() {
+		t.Fatal("order opened with no stop-loss: unbounded downside")
+	}
+	// A short's stop sits above entry.
+	if !open[0].SLPx.GreaterThan(dec("100")) {
+		t.Errorf("short's stop must be above entry, got %s", open[0].SLPx)
+	}
+
+	// The filled stop must still be subject to the TP:SL ratio. Apply skips that check when there
+	// is no stop to measure against, so a stop filled AFTER Apply leaves the ratio unchecked —
+	// which produced live orders with a 5% stop against a 1% target (0.2 reward:risk).
+	if open[0].TPPx == nil {
+		t.Fatal("expected a target")
+	}
+	slDist := open[0].SLPx.Sub(open[0].EntryPx).Abs()
+	tpDist := open[0].EntryPx.Sub(*open[0].TPPx).Abs()
+	if minTP := slDist.Mul(dec("1.5")); tpDist.LessThan(minTP) {
+		t.Errorf("TP:SL ratio below MinTPSLRatio: sl=%s tp=%s (target must be >= %s from entry)",
+			slDist, tpDist, minTP)
 	}
 }
 
