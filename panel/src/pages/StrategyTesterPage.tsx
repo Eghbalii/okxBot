@@ -90,15 +90,17 @@ function VersionCompareModal({ versionId, onClose }: { versionId: number; onClos
   )
 }
 
-// Go duration strings (e.g. "6h", "90m") parsed down to a whole number of hours for a plain
-// numeric input — this panel only ever needs hour-granularity for a position-staleness limit, and
-// round-tripping through hours avoids asking the operator to type Go duration syntax by hand.
+// Go's time.Duration.String() always returns the FULL form (e.g. "6h0m0s", "2h0m0s", "90m0s"),
+// never the short "6h" this used to assume — that mismatch meant the field showed blank instead
+// of the actual configured value. Parses every h/m/s component so any duration Go can produce
+// round-trips through this panel's hour-granularity input correctly, not just a value the
+// operator or the config file happened to already spell as bare hours.
 function parseHours(goDuration: string): string {
-  const match = /^(\d+(?:\.\d+)?)h$/.exec(goDuration.trim())
-  if (match) return match[1]
-  const minutesMatch = /^(\d+)m$/.exec(goDuration.trim())
-  if (minutesMatch) return (Number(minutesMatch[1]) / 60).toString()
-  return ''
+  const match = /^(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s)?$/.exec(goDuration.trim())
+  if (!match || (!match[1] && !match[2] && !match[3])) return ''
+  const hours = Number(match[1] ?? 0) + Number(match[2] ?? 0) / 60 + Number(match[3] ?? 0) / 3600
+  // Round to 2 decimal places so float division (e.g. 0m/60) doesn't render as 0.016666...
+  return (Math.round(hours * 100) / 100).toString()
 }
 
 function ConfigPanel() {
