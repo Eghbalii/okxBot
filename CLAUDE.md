@@ -315,6 +315,30 @@ v1** — the VPN + firewall (only VPN-sourced traffic can reach `cmd/api`'s port
 This is an explicit, revisitable trade-off — if the panel is ever exposed more broadly, add real
 auth before that happens, don't rely on network isolation alone at that point.
 
+**Implemented 2026-08-30, after the model above was found to be aspirational rather than real.**
+Until this date every service port was published on `0.0.0.0` with no firewall of any kind: Redis
+(no password) and TimescaleDB (`okxbot:okxbot`) were reachable from the open internet, alongside
+Grafana on its default `admin`/`admin`. Multiple hosts were actively probing the box, and one
+scan drove Grafana to 1.68GB RSS and triggered a **global OOM kill** that took the host down
+(§16.10). No compromise was found — Redis was empty with a default `dir`/`dbfilename`, no rogue
+cron, no unexpected `authorized_keys` — but nothing had prevented one.
+- **OpenVPN** on `10.8.0.0/24`, split-tunnel (`--no-route-internet`): only server traffic crosses
+  the tunnel, so a client's general browsing is unaffected. Services are reached at the gateway
+  address, e.g. Grafana `http://10.8.0.1:3000`, panel `:8080`, `cmd/api` `:8090`.
+- **Ports still bind `0.0.0.0` deliberately**, which looks wrong and is not. VPN clients arrive on
+  `tun0`, so a `127.0.0.1` bind makes every service unreachable over the tunnel; binding `tun0`'s
+  address directly makes Docker fail to start whenever it precedes OpenVPN (there is no ordering
+  dependency between the two units). The gate is iptables instead.
+- **The DROP must live in `DOCKER-USER`**, not `INPUT`. Docker's own DNAT/FORWARD rules bypass
+  `INPUT` entirely, so an `INPUT`-only rule — or a plain `ufw` rule, the obvious first instinct —
+  looks correct and does nothing. A second chain (`OKXBOT_LOCK`, hooked into `INPUT`) covers the
+  `docker-proxy` userspace path, which does traverse `INPUT`. Persisted via `iptables-persistent`.
+- **Verification matters here more than usual**, because every convenient test is misleading:
+  probing the public IP *from the server* routes locally and never crosses `DOCKER-USER`; a
+  third-party port-checker reported SSH closed while the SSH session running the check was live.
+  The rule was finally confirmed by probing from a dedicated network namespace — the connection
+  was refused and the DROP counter incremented on that exact packet.
+
 A new `cmd/api` service (built on the same use-cases as the trading engine, per §10) exposing four
 panel sections: **resources**, **RL model status**, **strategies**, **positions**. Foundations
 (schema, ports, endpoints) are the priority for the first pass; the strategy timeline/chart view
@@ -337,7 +361,9 @@ its own crash. Instead this is standard process supervision, surfaced through `c
   the panel must distinguish "down" from "up but unloaded," they mean very different things.
 - **Uptime / crash / restart history:** owned by the process supervisor, not application code.
   `rl-service` and `go-engine` processes run under **systemd** (or the Docker restart policy in
-  `docker-compose.yml`, `restart: unless-stopped` + `docker inspect` for restart count/start time)
+  `docker-compose.yml`, `restart: unless-stopped` + `docker inspect` for restart count/start time
+  — note this policy was *assumed* by this section but absent from `docker-compose.yml` until
+  2026-08-30, so for months any transient failure was permanent downtime, §16.10)
   — `cmd/api` shells out to `systemctl show <unit> --property=ActiveState,SubState,ExecMainStartTimestamp,NRestarts`
   (or the Docker equivalent) to answer "is it live," "how long has it been alive," and "how many
   times has it crashed/restarted." Don't reinvent this in Go/Python.
@@ -2118,3 +2144,53 @@ result. Coverage matched the projection — 1H reached ~2 months back, 1D ~3 mon
 the real Postgres implementation upserts, so the idempotency test failed against a fake that could
 not model the behavior being asserted. A fake that diverges from its real counterpart quietly
 weakens every test that uses it, so the fake now upserts on the same key.
+
+### 16.10 The host OOM, and the exposure it uncovered (2026-08-30)
+
+Reported as "Grafana is down." Grafana was the symptom; it was neither the cause nor the most
+serious finding.
+
+**What happened, in order.** `cmd/paper-trader` died at 07:11 on a Kafka DNS lookup timeout. With
+no `restart:` policy on any service it stayed dead, so paper trading and RL reward collection
+stopped silently — the panel and every other service still looked healthy. At 07:22 the kernel's
+global OOM killer took Grafana, which had grown to **1.68GB RSS**. The trigger was in Grafana's own
+logs: a sustained vulnerability scan from the open internet (`/.aws/credentials.copy`, `/info.php`,
+`/config.json.bak`, `/serverless.yml.orig`), 595 requests from one host, with responses taking
+minutes. paper-trader's Kafka timeout 11 minutes earlier was almost certainly the same memory
+pressure.
+
+**The real finding.** Every published port was on `0.0.0.0` with no firewall — including Redis with
+no password and TimescaleDB with `okxbot:okxbot`, both fully reachable from the internet on a host
+demonstrably being probed. Checked for compromise and found none (empty Redis with default
+`dir`/`dbfilename` — the RDB-write backdoor path — no rogue cron, only the owner's SSH key, no
+miner). The window was luck. Fixed per §11's network-model note above: OpenVPN plus an iptables
+lockdown in `DOCKER-USER`.
+
+**Three things this incident teaches that are worth keeping:**
+
+1. **A documented policy is not an implemented one.** §11.2 described `restart: unless-stopped` as
+   though it were in place, and §11 described VPN-only access as the network model. Neither existed
+   in `docker-compose.yml`. Both read as settled decisions for months. When a design doc asserts an
+   operational property, that property needs a check that would fail if it were absent — prose
+   cannot be that check.
+2. **Memory limits are a trading-safety control, not a monitoring nicety.** Nothing bounded any
+   container, so a *monitoring-tier* service under an *external* scan was able to kill the box the
+   trading loop runs on. Grafana, Kafka (whose 1G default heap left a 3.9GB host almost no
+   headroom) and rl-service are now capped. Grafana's cap was raised 512m → 768m after measuring
+   ~440MB idle: a limit that sits at 87% before any load just trades a host OOM for a service crash
+   loop, which is not an improvement.
+3. **`restart: unless-stopped` is wrong for a service that cannot possibly start.** `cmd/trader`
+   exits immediately without OKX credentials, which is the normal state until the demo run (§14
+   Phase 2). Restarting it forever burns CPU and floods the logs; it gets `on-failure:5`, which
+   still recovers from genuine crashes once credentials exist. Applying one policy uniformly to
+   every service would have quietly created a permanent crash loop.
+
+**On verifying a firewall.** Every convenient test here was actively misleading, and each one
+initially suggested a *wrong* conclusion. Probing the public IP *from the server* routes locally and
+never traverses `DOCKER-USER`, so it reported all ports open after they were closed. A third-party
+port-checker reported SSH closed while the SSH session issuing the request was live — which also
+invalidated its "closed" verdicts for the other ports. A zero DROP counter is ambiguous between "the
+rule works" and "traffic bypasses the rule." What finally settled it was probing from a dedicated
+network namespace: the connection was refused *and* the DROP counter incremented on that exact
+packet. When a check's failure mode is silent, prefer the test that produces a positive signal.
+
