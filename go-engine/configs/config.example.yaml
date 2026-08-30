@@ -98,6 +98,9 @@ paper_trading:
     # Minimum reward:risk. A too-near target is widened to satisfy it rather than the trade being
     # rejected, since the entry itself may still be sound.
     min_tp_sl_ratio: 1.5
+  # Force-closes any position open longer than this, close_reason='timeout' (CLAUDE.md §15.14).
+  # Housekeeping, not an RL decision -- fires unconditionally, independent of the RL flags above.
+  rl_max_open_duration: 6h
 
 # CLAUDE.md §15.6 (revised 2026-08-28): ONE shared capital pool every token trades against,
 # replacing the earlier fixed per-token sub-budgets. How much of it goes into any single position is

@@ -177,6 +177,9 @@ func main() {
 				MaxSLDistPct: cfg.PaperTrading.RLClamps.MaxSLDistPct,
 				MinTPSLRatio: cfg.PaperTrading.RLClamps.MinTPSLRatio,
 			},
+			// Force-closes a stale position regardless of RL flags (CLAUDE.md §15.14) — unlike
+			// everything else in this block, this is unconditional housekeeping, not RL behavior.
+			MaxOpenDuration: cfg.PaperTrading.RLMaxOpenDuration,
 			ActiveTokens: cfg.Trading.InstIDs,
 			// One shared account across every token (CLAUDE.md §15.6): each per-instrument engine
 			// trades against the same "paper" balance row, not a slice of it.

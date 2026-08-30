@@ -324,6 +324,7 @@ func (e *PaperTrader) conductor() *conductor.Conductor {
 			UpdateMaxInterval:     e.RLUpdateMaxInterval,
 			AllowEarlyClose:       e.RLEarlyClose,
 			Clamps:                e.RLClamps,
+			MaxOpenDuration:       e.MaxOpenDuration,
 		})
 	})
 	return e.lifecycle

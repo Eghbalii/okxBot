@@ -933,6 +933,12 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       trades exist that the policy is no longer random (SAC's `learning_starts` is 100, so gradient
       steps do not begin before that). Watch `okxbot_model_open_decisions_total`'s `skip` vs `open`
       split — a policy still skipping everything is not ready.
+- [x] **Timeout force-close for stale positions (§15.14, 2026-08-30)** — positions were sitting open
+      a long time with barely-moving PnL, tying up an instrument's one-open-position slot (§16.9).
+      `paper_trading.rl_max_open_duration` (default 6h) force-closes them, `close_reason='timeout'`,
+      reported to the model as `closed_early` rather than a new one-hot category (would need an
+      observation-schema bump on both Go and `rl_service` — deferred, see §15.14's reasoning). 6 new
+      tests.
 
 Deferred, in rough priority: per-token reward breakdown in training logs (§15.5 — the detection
 mechanism for "good on average, bad for one token", needed before expanding past 2 tokens); the
@@ -1731,6 +1737,40 @@ and no reward term depended on it.
 higher leverage earns strictly less reward — plus monotonicity across 1x→100x, and a training run
 that stays finite with the penalties active. Mutation-checked: removing the two penalty lines fails
 three of them.
+
+### 15.14 Timeout force-close for stale positions (2026-08-30)
+
+Added after the operator noticed some paper positions sitting open a long time with barely-moving
+PnL — tying up an instrument's one-open-position slot (§16.9) without the position itself going
+anywhere. `internal/usecase.PaperTrader.MaxOpenDuration` (config `paper_trading.rl_max_open_duration`,
+default **6h**) force-closes any open position, RL-adjusted or not, once it has run past that limit,
+`close_reason='timeout'`. Checked in `monitorOpenOrders` on every tick, only when the genuine SL/TP
+touch check for that tick found nothing — a real touch always wins over a timeout landing on the
+same tick, never the reverse. `'timeout'` was already a valid `close_reason` CHECK value since
+migration `000001` but had never actually been emitted by any code path; no migration was needed.
+
+**Whether the model was already told about this kind of close — the operator's own question:**
+No — before this, a timed-out position had no `close_reason` case at all, so
+`conductor.TerminalCategory` fell through to its default `""` and the trade delivered **zero
+reward**, the same silent gap §15.12 found and fixed for `manual` closes. That gap is now closed,
+but not by adding a fourth terminal category. The three the model has known since §15.10/§15.11 are
+`closed_tp`, `closed_sl`, `closed_early` — a genuinely new `closed_timeout` category was considered
+and explicitly declined for now: `SIGNAL_CATEGORIES`' one-hot is a fixed-width vocabulary shared
+byte-for-byte between Go and `rl_service/obs.py`, so a new entry means bumping
+`OBSERVATION_SCHEMA_VERSION` (6 → 7) on both sides simultaneously — until that ships, every
+`/predict` call 422s on the version mismatch (the model stops being consulted at all), and even
+once it ships the *already-trained* model's replay buffer still holds only the old, narrower
+vectors — `to_vector` pads/truncates to whatever width the loaded model expects (the exact
+mechanism §16.9 found), so nothing actually learns the new signal until enough fresh experience
+accumulates at the new width. Given that cost against a housekeeping close that doesn't yet need
+its own gradient signal, `close_reason='timeout'` instead reuses `closed_early`'s category
+(`conductor.TerminalCategory` maps both `CloseReasonRLEarly` and the new `CloseReasonTimeout` to
+`domain.CategoryClosedEarly`) — the model is told "this was a decision-driven exit," which is true
+of both, and the trade trains something instead of nothing. The distinction still matters to a
+*human* reading `paper_orders`: `close_reason` itself stays `'timeout'` vs `'rl_early'`, so the two
+are never confused when reviewing trade history, even though the model sees one category for both.
+Revisit toward a real fourth category once there's a concrete reason the model needs to tell them
+apart (e.g. evidence it should behave differently after a timeout than after choosing to exit).
 
 ### 15.9 Implementation phasing (tracked in §14 going forward)
 

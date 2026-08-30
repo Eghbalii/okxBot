@@ -664,6 +664,74 @@ func TestMonitorOpenOrders_ClosesOnSLHit(t *testing.T) {
 	}
 }
 
+func TestMonitorOpenOrders_ForceClosesAfterMaxOpenDuration(t *testing.T) {
+	repo := newFakeRepository()
+	sl := dec("50") // far away, so this test only ever exercises the timeout path, never SL/TP
+	tp := dec("500")
+	id, _ := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("100"), Leverage: dec("1"), OpenedAt: time.Now().Add(-7 * time.Hour),
+	})
+
+	pt := newTestPaperTrader(repo, nil)
+	pt.MaxOpenDuration = 6 * time.Hour
+	if err := pt.monitorOpenOrders(context.Background(), dec("100"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders returned error: %v", err)
+	}
+
+	closed := repo.orders[id]
+	if closed.ClosedAt == nil {
+		t.Fatal("expected the 7h-old order to be force-closed")
+	}
+	if closed.CloseReason == nil || *closed.CloseReason != conductor.CloseReasonTimeout {
+		t.Errorf("expected close reason %q, got %v", conductor.CloseReasonTimeout, closed.CloseReason)
+	}
+}
+
+func TestMonitorOpenOrders_DoesNotCloseBeforeMaxOpenDuration(t *testing.T) {
+	repo := newFakeRepository()
+	sl := dec("50")
+	tp := dec("500")
+	id, _ := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("100"), Leverage: dec("1"), OpenedAt: time.Now().Add(-5 * time.Hour),
+	})
+
+	pt := newTestPaperTrader(repo, nil)
+	pt.MaxOpenDuration = 6 * time.Hour
+	if err := pt.monitorOpenOrders(context.Background(), dec("100"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders returned error: %v", err)
+	}
+
+	if repo.orders[id].ClosedAt != nil {
+		t.Fatal("a 5h-old order must not be force-closed against a 6h limit")
+	}
+}
+
+func TestMonitorOpenOrders_SLTPTouchTakesPriorityOverTimeout(t *testing.T) {
+	// A position that is BOTH stale AND has its SL/TP genuinely touched on this exact tick must
+	// close with the real reason, not get relabeled 'timeout' just because it also happens to be
+	// old -- the touch is checked first and only falls through to the timeout check when neither
+	// level was hit.
+	repo := newFakeRepository()
+	sl := dec("99")
+	id, _ := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl,
+		Size: dec("100"), Leverage: dec("1"), OpenedAt: time.Now().Add(-7 * time.Hour),
+	})
+
+	pt := newTestPaperTrader(repo, nil)
+	pt.MaxOpenDuration = 6 * time.Hour
+	if err := pt.monitorOpenOrders(context.Background(), dec("99"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders returned error: %v", err)
+	}
+
+	closed := repo.orders[id]
+	if closed.CloseReason == nil || *closed.CloseReason != "sl" {
+		t.Errorf("expected the genuine SL touch to win, got %v", closed.CloseReason)
+	}
+}
+
 // stubStrategy always returns the configured signal, ignoring the candle input.
 type stubStrategy struct{ signal strategy.Signal }
 

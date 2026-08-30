@@ -119,6 +119,13 @@ type Config struct {
 			MaxSLDistPct decimal.Decimal `yaml:"max_sl_dist_pct"`
 			MinTPSLRatio decimal.Decimal `yaml:"min_tp_sl_ratio"`
 		} `yaml:"rl_clamps"`
+		// RLMaxOpenDuration force-closes any position open longer than this, close_reason='timeout'
+		// (CLAUDE.md §15.14, operator request 2026-08-30: positions were observed sitting open a
+		// long time with barely-moving PnL, tying up an instrument's one-open-position slot,
+		// §16.9, without going anywhere). A hard housekeeping limit, not a model decision — fires
+		// unconditionally, independent of the RL* flags above. Zero falls back to
+		// conductor.DefaultMaxOpenDuration (6h).
+		RLMaxOpenDuration time.Duration `yaml:"rl_max_open_duration"`
 	} `yaml:"paper_trading"`
 
 	// Account is the shared capital pool every token trades against (CLAUDE.md §15.6, revised

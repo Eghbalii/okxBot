@@ -34,6 +34,11 @@ var (
 	// observed, because funding accrues, setups decay, and "time passed" is itself information the
 	// model should get.
 	DefaultUpdateMaxInterval = 15 * time.Minute
+	// DefaultMaxOpenDuration is how long a position may stay open before PaperTrader force-closes
+	// it as a timeout (CLAUDE.md §15.14). 6h per the operator's explicit starting value —
+	// positions were observed sitting open a long time with barely-moving PnL, tying up an
+	// instrument's one-open-position slot (§16.9) without the position itself going anywhere.
+	DefaultMaxOpenDuration = 6 * time.Hour
 )
 
 // Config is the conductor's tunable behavior, sourced from paper_trading.rl_* config keys.
@@ -52,6 +57,11 @@ type Config struct {
 	// random, and one absurd stop would otherwise destroy a position — the model is never the
 	// safety boundary (§15.11, the RatchetSLTP pattern).
 	Clamps Clamps
+
+	// MaxOpenDuration force-closes a position that has been open this long, regardless of what
+	// the model would otherwise decide (CLAUDE.md §15.14) — a hard housekeeping limit, not a
+	// model decision, same posture as Clamps. Non-positive falls back to DefaultMaxOpenDuration.
+	MaxOpenDuration time.Duration
 }
 
 func (c Config) pnlThreshold() decimal.Decimal {
@@ -66,6 +76,14 @@ func (c Config) maxInterval() time.Duration {
 		return c.UpdateMaxInterval
 	}
 	return DefaultUpdateMaxInterval
+}
+
+// maxOpenDuration resolves MaxOpenDuration against its default, same pattern as maxInterval.
+func (c Config) maxOpenDuration() time.Duration {
+	if c.MaxOpenDuration > 0 {
+		return c.MaxOpenDuration
+	}
+	return DefaultMaxOpenDuration
 }
 
 // Conductor tracks per-order update state and answers the two questions PaperTrader has at each
@@ -126,13 +144,22 @@ func OpenCategory(side string) string {
 // TerminalCategory maps a close reason to the terminal category that delivers the reward
 // (CLAUDE.md §15.10 — the close event IS the reward). Returns "" for a reason with no lifecycle
 // meaning, e.g. a manual close, which is not a decision the model made and should not train it.
+//
+// CloseReasonTimeout shares CategoryClosedEarly with CloseReasonRLEarly rather than getting its
+// own category (CLAUDE.md §15.14): a new one-hot category needs a new observation_schema_version
+// on both Go and rl_service, which breaks every /predict call until both sides deploy together
+// and only starts teaching the model anything once retrained on the wider input. The distinction
+// still matters for a HUMAN reading paper_orders — "the model chose to exit" vs. "the position sat
+// too long and we cut it" are different stories — so it stays a separate DB close_reason value
+// ('timeout', already a valid CHECK value since migration 000001, just never emitted); the model
+// itself is simply told "this was a decision-driven exit", which is true of both.
 func TerminalCategory(closeReason string) string {
 	switch closeReason {
 	case "tp":
 		return domain.CategoryClosedTP
 	case "sl":
 		return domain.CategoryClosedSL
-	case CloseReasonRLEarly:
+	case CloseReasonRLEarly, CloseReasonTimeout:
 		return domain.CategoryClosedEarly
 	default:
 		return ""
@@ -144,6 +171,15 @@ func TerminalCategory(closeReason string) string {
 // distinguishable from operator action, and so they can be compared against trades that ran to
 // SL/TP — the same evidence-gathering logic as the shadow forks.
 const CloseReasonRLEarly = "rl_early"
+
+// CloseReasonTimeout marks a position PaperTrader itself force-closed because it stayed open
+// longer than MaxOpenDuration (CLAUDE.md §15.14, operator request 2026-08-30: some positions sat
+// open for a long time with barely-moving PnL). This is a housekeeping/risk decision, not the
+// model's — same "don't trust the model to have learned this" posture as RatchetSLTP and the
+// clamps — so it fires regardless of RLEarlyClose. Still reported to the model via
+// TerminalCategory as closed_early (see its doc comment) so the trade still trains something,
+// rather than the silent-no-reward gap a plain "manual" close would leave.
+const CloseReasonTimeout = "timeout"
 
 // ShouldUpdate reports whether an `update` call is due for the open order at orderID, given its
 // current unrealized PnL. It returns true when either trigger fires (CLAUDE.md §15.12):
@@ -195,6 +231,15 @@ func (c *Conductor) Forget(orderID int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.updates, orderID)
+}
+
+// IsTimedOut reports whether a position opened at openedAt should be force-closed for having run
+// longer than MaxOpenDuration (CLAUDE.md §15.14). Pure and stateless — unlike ShouldUpdate this
+// needs no per-order tracking, since the order's own OpenedAt is all the input required, and a
+// method taking (Config, time, time) rather than an orderID keeps it testable without touching the
+// Conductor's internal maps at all.
+func (c *Conductor) IsTimedOut(openedAt, now time.Time) bool {
+	return now.Sub(openedAt) >= c.Cfg.maxOpenDuration()
 }
 
 // RetainSignal stores the most recent signal for (instID, bar) so it can be carried forward onto

@@ -35,10 +35,12 @@ func TestTerminalCategory(t *testing.T) {
 		{"tp", domain.CategoryClosedTP},
 		{"sl", domain.CategoryClosedSL},
 		{CloseReasonRLEarly, domain.CategoryClosedEarly},
-		// A manual or timeout close is not a decision the model made, so it must not be reported
-		// as one — training on it would attribute an operator's action to the policy.
+		// A timeout close shares closed_early's category (CLAUDE.md §15.14): PaperTrader force-
+		// closed it for running too long, not the model, but the trade still trains something --
+		// unlike a manual close, which is an operator action outside the lifecycle entirely and
+		// must never be attributed to the policy.
+		{CloseReasonTimeout, domain.CategoryClosedEarly},
 		{"manual", ""},
-		{"timeout", ""},
 	} {
 		if got := TerminalCategory(tc.reason); got != tc.want {
 			t.Errorf("TerminalCategory(%q) = %q, want %q", tc.reason, got, tc.want)
@@ -180,5 +182,40 @@ func TestRetainSignal_Overwrites(t *testing.T) {
 	got, _ := c.CarriedSignal("BTC-USDT-SWAP", "1H")
 	if got.Side != "sell" || got.Kind != "macd" {
 		t.Errorf("carry-forward should hold the MOST RECENT signal, got %+v", got)
+	}
+}
+
+func TestIsTimedOut_DefaultSixHours(t *testing.T) {
+	c := New(Config{})
+	openedAt := time.Now().Add(-5 * time.Hour)
+	if c.IsTimedOut(openedAt, time.Now()) {
+		t.Error("5h open should not be timed out against the 6h default")
+	}
+	openedAt = time.Now().Add(-6*time.Hour - time.Second)
+	if !c.IsTimedOut(openedAt, time.Now()) {
+		t.Error("just past 6h open should be timed out against the 6h default")
+	}
+}
+
+func TestIsTimedOut_ConfiguredDuration(t *testing.T) {
+	c := New(Config{MaxOpenDuration: 30 * time.Minute})
+	now := time.Now()
+	if c.IsTimedOut(now.Add(-29*time.Minute), now) {
+		t.Error("29m open should not be timed out against a 30m configured limit")
+	}
+	if !c.IsTimedOut(now.Add(-31*time.Minute), now) {
+		t.Error("31m open should be timed out against a 30m configured limit")
+	}
+}
+
+func TestIsTimedOut_StatelessAcrossCalls(t *testing.T) {
+	// Unlike ShouldUpdate, IsTimedOut takes no orderID and tracks no per-order state -- calling it
+	// repeatedly for the same order must give the same answer each time, not "fires once".
+	c := New(Config{MaxOpenDuration: time.Hour})
+	openedAt := time.Now().Add(-2 * time.Hour)
+	for i := 0; i < 3; i++ {
+		if !c.IsTimedOut(openedAt, time.Now()) {
+			t.Fatalf("call %d: expected timed out every time, stateless", i)
+		}
 	}
 }

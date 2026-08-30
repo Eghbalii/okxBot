@@ -108,6 +108,12 @@ type PaperTrader struct {
 	// RLClamps bound where the model may PLACE stops and targets on an open — distinct from the
 	// ratchet, which governs how they may MOVE afterward (CLAUDE.md §15.11/§15.12).
 	RLClamps conductor.Clamps
+	// MaxOpenDuration force-closes any open position (RL-adjusted or not) that has run longer
+	// than this, close_reason='timeout' (CLAUDE.md §15.14). A hard housekeeping limit, not a
+	// model decision — fires unconditionally, independent of RLEarlyClose/RLSizing/RLSLTPAdjust,
+	// since a position can run long whether or not any RL feature is even turned on. Zero falls
+	// back to conductor.DefaultMaxOpenDuration (6h) via conductor().IsTimedOut.
+	MaxOpenDuration time.Duration
 	// MaxLeverage is the ceiling LeverageFrac maps onto ([1x, MaxLeverage]). This mirrors the
 	// config's risk.max_leverage so paper orders can't record leverage the live risk manager would
 	// reject outright (CLAUDE.md §5) — the risk manager remains the real boundary for live trading;
@@ -593,6 +599,7 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 	}
 	metrics.PaperOrdersOpenGauge.WithLabelValues(e.InstID).Set(float64(len(open)))
 
+	now := time.Now()
 	for _, o := range open {
 		// Track how far this position has travelled in each direction before checking for a close
 		// (CLAUDE.md §15.11) — a trade that ran deep into profit and round-tripped must still show
@@ -601,6 +608,13 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 		e.trackPnLExtremes(ctx, o, price, logger)
 
 		reason, hit := closeReason(o, price)
+		if !hit && e.conductor().IsTimedOut(o.OpenedAt, now) {
+			// A position that has run past MaxOpenDuration is force-closed regardless of what
+			// SL/TP would otherwise decide (CLAUDE.md §15.14) — checked only once neither level
+			// has actually been touched this tick, so a genuine SL/TP hit always takes priority
+			// over a timeout that happens to land on the same tick.
+			reason, hit = conductor.CloseReasonTimeout, true
+		}
 		if !hit {
 			continue
 		}
