@@ -333,6 +333,22 @@ cron, no unexpected `authorized_keys` — but nothing had prevented one.
   `INPUT` entirely, so an `INPUT`-only rule — or a plain `ufw` rule, the obvious first instinct —
   looks correct and does nothing. A second chain (`OKXBOT_LOCK`, hooked into `INPUT`) covers the
   `docker-proxy` userspace path, which does traverse `INPUT`. Persisted via `iptables-persistent`.
+- **Two follow-on bugs surfaced when a client actually connected (2026-08-30)**, neither visible
+  from the server side — every service answered correctly on `10.8.0.1` locally the whole time:
+  1. **The installer's own `OPENVPN_INSTALL_FORWARD` chain REJECTs all forwarded VPN traffic.**
+     Installing with `--no-route-internet` makes it assume clients need nothing beyond the server
+     itself, so VPN clients got `Connection refused` on every containerized service (traffic to a
+     published port is *forwarded* to the container, not delivered locally). Fixed with an ACCEPT
+     for `10.8.0.0/24 -> 172.16.0.0/12` **before** that REJECT, and the same line patched into
+     `/etc/iptables/add-openvpn-rules.sh`, which recreates the chain from scratch on every boot and
+     would otherwise silently re-break access after a reboot.
+  2. **MTU blackhole when OpenVPN runs inside another VPN.** A client on Surfshark (IKEv2,
+     `ipsec0` MTU 1280) completed TCP handshakes but any large response vanished: the panel (455B)
+     loaded instantly while Grafana's `/login` (59KB) hung forever. This reads as a server hang and
+     is not one — small packets pass, large ones are dropped with no error anywhere. Fixed server-
+     side with `tun-mtu 1400` + `mssfix 1100` in `server.conf`, which clamps the MSS for every
+     client rather than needing a per-client edit. Diagnose it with `ping -s 1400` vs `-s 500`
+     against the gateway: 100% loss on the former and 0% on the latter is the signature.
 - **Verification matters here more than usual**, because every convenient test is misleading:
   probing the public IP *from the server* routes locally and never crosses `DOCKER-USER`; a
   third-party port-checker reported SSH closed while the SSH session running the check was live.
