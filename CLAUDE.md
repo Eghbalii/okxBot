@@ -424,8 +424,18 @@ with what parameters — strategy assignment is durable state, not runtime-only 
   this is required for the per-strategy stats below to be computable at all.
 - **Per-strategy stats** (derived from `paper_orders` grouped by `strategy_id`, no new counters
   needed beyond what §7/§11.4 already store): running duration (now − first assignment/first
-  order), signal count, win rate (`close_reason='tp'` vs `'sl'` ratio), realized PnL. Exposed via
-  `cmd/api` as a computed view/query, not a separately maintained table.
+  order), signal count, win rate, realized PnL. Exposed via `cmd/api` as a computed view/query,
+  not a separately maintained table.
+  - **A win is a closed trade with positive realized PnL, not `close_reason='tp'`** (corrected
+    2026-08-30). The original `'tp'` vs `'sl'` ratio silently stopped being meaningful once the
+    RL ratchet (§15.4) began trailing stops into profit: a stop-loss touch then *realizes a gain*.
+    On real data 101 of 152 `'sl'` closes were profitable, so `stepped_trailing` displayed a 0%
+    win rate beside +$36 of realized PnL. The PnL was never wrong — it always summed gains and
+    losses together — but reading the two side by side is what exposed the win rate. Under the
+    corrected definition that strategy reads 71% (24/34), and every strategy's rate now agrees
+    with the sign of its PnL. Note this makes `optimizer.currentBaseline`'s baseline PnL-derived
+    while a trial's own score stays strictly SL/TP-touch based (§16.1); see the note in
+    `internal/optimizer/runner.go` before re-enabling scheduled optimization runs.
 - **Timeline/chart view** (price line with long/short entry markers, red/green SL/TP flags,
   hover-to-edit params) is explicitly a "foundations first" item — backend must expose the data
   (candles + paper_orders for a strategy+instrument+time range) via a clean endpoint, but the
