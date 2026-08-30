@@ -30,11 +30,20 @@ func (s *service) routes() http.Handler {
 // versionView is one version's data plus its stats, shaped for the panel's stats-only display
 // (the operator explicitly asked for aggregate stats per version, not a positions list).
 type versionView struct {
-	ID              int64              `json:"id"`
-	Kind            string             `json:"kind"`
-	Version         int                `json:"version"`
-	DisplayName     string             `json:"displayName"` // "{kind}_v{version}"
-	Config          map[string]float64 `json:"config"`
+	ID          int64  `json:"id"`
+	Kind        string `json:"kind"`
+	Version     int    `json:"version"`
+	DisplayName string `json:"displayName"` // "{kind}_v{version}"
+	// Config holds only the params THIS version explicitly overrides (may be empty for the
+	// origin version, which runs kind's hardcoded factory defaults).
+	Config map[string]float64 `json:"config"`
+	// EffectiveConfig is every one of the kind's tunable params at the value this version
+	// actually runs with — overrides merged onto whatever the factory constructor started with,
+	// resolved by building a live strategy.Strategy and reading its own Params(). Added because
+	// Config alone made the compare-to-parent view show "— -> 21" for a param whose real default
+	// (e.g. rsi_period=14) was never visible anywhere, which read as "nothing changed" rather
+	// than "changed from 14".
+	EffectiveConfig map[string]float64 `json:"effectiveConfig"`
 	ParentVersionID *int64             `json:"parentVersionId,omitempty"`
 	Enabled         bool               `json:"enabled"`
 	Stats           versionStatsView   `json:"stats"`
@@ -82,10 +91,28 @@ func toVersionView(ctx context.Context, s *service, v tester.Version) (versionVi
 		Version:         v.Version,
 		DisplayName:     fmt.Sprintf("%s_v%d", v.Kind, v.Version),
 		Config:          configMap,
+		EffectiveConfig: effectiveConfig(v.Kind, v.Config),
 		ParentVersionID: v.ParentVersionID,
 		Enabled:         v.Enabled,
 		Stats:           toVersionStatsView(stats),
 	}, nil
+}
+
+// effectiveConfig builds a live strategy for kind+config (the exact path this service trades
+// with, strategy.FromConfig) and reads back every tunable param's actual value via Params() —
+// this is what lets the panel show a param's real default rather than a blank cell when a
+// version doesn't explicitly override it.
+func effectiveConfig(kind string, config json.RawMessage) map[string]float64 {
+	live, err := strategy.FromConfig(kind, config)
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]float64, len(live.Params()))
+	for _, spec := range live.Params() {
+		f, _ := spec.Default.Float64()
+		out[spec.Name] = f
+	}
+	return out
 }
 
 // handleStats returns every version with its stats — this is the panel's main table (operator's

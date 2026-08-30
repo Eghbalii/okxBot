@@ -31,6 +31,11 @@ function VersionCompareModal({ versionId, onClose }: { versionId: number; onClos
       .catch((err) => setError((err as Error).message))
   }, [versionId])
 
+  const diffRows = useMemo(
+    () => (detail ? diffConfig(detail.parent?.effectiveConfig, detail.version.effectiveConfig) : []),
+    [detail],
+  )
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -58,17 +63,21 @@ function VersionCompareModal({ versionId, onClose }: { versionId: number; onClos
                 </tr>
               </thead>
               <tbody>
-                {diffConfig(detail.parent?.config, detail.version.config).map((row) => (
+                {/* Diffed on effectiveConfig (every param's ACTUAL value, defaults included), not
+                    the raw override-only config — a version that overrides nothing has an empty
+                    config, which made every row show "— -> new value" and read as if nothing had
+                    a prior value at all. */}
+                {diffRows.map((row) => (
                   <tr key={row.key}>
                     <td className="mono">{row.key}</td>
                     <td className={'mono ' + (row.changed ? 'text-dim' : '')}>{row.from ?? '—'}</td>
                     <td className={'mono ' + (row.changed ? 'text-green' : '')}>{row.to ?? '—'}</td>
                   </tr>
                 ))}
-                {diffConfig(detail.parent?.config, detail.version.config).length === 0 && (
+                {diffRows.length === 0 && (
                   <tr>
                     <td colSpan={3} className="text-dim">
-                      Neither version overrides any parameter — both run kind defaults.
+                      This kind has no tunable parameters.
                     </td>
                   </tr>
                 )}

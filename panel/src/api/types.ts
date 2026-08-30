@@ -148,6 +148,10 @@ export interface TesterVersion {
   version: number
   displayName: string
   config: Record<string, number> | null
+  // Every tunable param's actual running value (overrides merged onto factory defaults) — use
+  // this for a compare/diff view, not `config`, which is empty whenever a version overrides
+  // nothing and would otherwise make every param look like it changed from nothing.
+  effectiveConfig: Record<string, number> | null
   parentVersionId: number | null
   enabled: boolean
   stats: TesterVersionStats
