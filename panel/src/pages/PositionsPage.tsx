@@ -1,13 +1,29 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { usePolling } from '../hooks/usePolling'
 import { usePositionAlerts } from '../hooks/usePositionAlerts'
 import { usePositionEvents } from '../hooks/usePositionEvents'
 import { usePriceStream } from '../hooks/usePriceStream'
 import OrderDetailModal from '../components/OrderDetailModal'
+import Pagination, { DEFAULT_PAGE_SIZE } from '../components/Pagination'
+import SortableTh from '../components/SortableTh'
 import { api } from '../api/client'
+import { formatDateTime, formatUsd, pnlClass } from '../utils/format'
 import type { CloseReason, Position, PositionMode } from '../api/types'
 
-type SortField = 'opened_at' | 'closed_at' | 'pnl' | 'inst_id'
+// Sort fields the backend understands, plus the ones resolved client-side below.
+type SortField =
+  | 'opened_at'
+  | 'closed_at'
+  | 'pnl'
+  | 'inst_id'
+  | 'side'
+  | 'strategy'
+  | 'bar'
+  | 'entry'
+  | 'leverage'
+  | 'size'
+  | 'reason'
+  | 'id'
 type OpenFilter = 'all' | 'open' | 'closed'
 
 function closeReasonBadge(reason: CloseReason | null) {
@@ -33,6 +49,41 @@ function unrealizedPnL(p: Position, lastPrice: string | undefined): { pct: numbe
   return { pct, usd }
 }
 
+// The value a row sorts by for a given column. Returned as number|string so the comparator
+// can stay generic; nulls sort last regardless of direction.
+function sortValue(p: Position, field: SortField, live: number | null): number | string | null {
+  switch (field) {
+    case 'id':
+      return p.ID
+    case 'inst_id':
+      return p.InstID
+    case 'side':
+      return p.Side
+    case 'strategy':
+      return p.StrategyName || ''
+    case 'bar':
+      return p.Bar || ''
+    case 'entry':
+      return Number(p.EntryPx)
+    case 'leverage':
+      return Number(p.Leverage)
+    case 'size':
+      return Number(p.Size)
+    case 'reason':
+      return p.CloseReason ?? ''
+    case 'opened_at':
+      return new Date(p.OpenedAt).getTime()
+    case 'closed_at':
+      return p.ClosedAt ? new Date(p.ClosedAt).getTime() : null
+    case 'pnl':
+      // Closed rows sort on realized PnL; open rows on their live unrealized value, so one
+      // click orders the column the user is actually looking at rather than half of it.
+      return p.RealizedPnL !== null ? Number(p.RealizedPnL) : live
+    default:
+      return null
+  }
+}
+
 export default function PositionsPage() {
   const [mode, setMode] = useState<PositionMode | 'all'>('all')
   const [instId, setInstId] = useState('')
@@ -44,6 +95,11 @@ export default function PositionsPage() {
   const [alertsEnabled, setAlertsEnabled] = useState(true)
   const [wsRefreshCount, setWsRefreshCount] = useState(0)
   const [detailOrderId, setDetailOrderId] = useState<number | null>(null)
+  const [page, setPage] = useState(0)
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
+
+  const showClosedColumns = openFilter !== 'open'
+  const showLiveColumns = openFilter !== 'closed'
 
   const { data, error } = usePolling(
     () =>
@@ -51,11 +107,9 @@ export default function PositionsPage() {
         mode: mode === 'all' ? undefined : mode,
         instId: instId || undefined,
         open: openFilter === 'all' ? undefined : openFilter === 'open',
-        sortBy,
-        sortDesc,
       }),
     5_000,
-    [mode, instId, openFilter, sortBy, sortDesc],
+    [mode, instId, openFilter],
     wsRefreshCount,
   )
 
@@ -68,7 +122,7 @@ export default function PositionsPage() {
 
   usePositionAlerts(data, alertsEnabled)
 
-  const livePrices = usePriceStream(true)
+  const livePrices = usePriceStream(showLiveColumns)
 
   // Resolved from the current poll's data rather than held in state, so an open modal keeps showing
   // fresh values (live PnL, a close that just landed) instead of a snapshot frozen at click time.
@@ -86,6 +140,46 @@ export default function PositionsPage() {
     return ids
   }, [data])
 
+  // Sorting is done client-side so every column is sortable, including the ones the backend has
+  // no ORDER BY for (live PnL, strategy name) and the ones it would need a join to order by.
+  const sorted = useMemo(() => {
+    const rows = [...(data ?? [])]
+    const dir = sortDesc ? -1 : 1
+    rows.sort((a, b) => {
+      const av = sortValue(a, sortBy, unrealizedPnL(a, livePrices[a.InstID])?.usd ?? null)
+      const bv = sortValue(b, sortBy, unrealizedPnL(b, livePrices[b.InstID])?.usd ?? null)
+      // Nulls always sink to the bottom, so flipping direction never fills the first page
+      // with rows that have no value for the sorted column.
+      if (av == null && bv == null) return 0
+      if (av == null) return 1
+      if (bv == null) return -1
+      if (typeof av === 'string' || typeof bv === 'string') {
+        return String(av).localeCompare(String(bv)) * dir
+      }
+      return (av - bv) * dir
+    })
+    return rows
+  }, [data, sortBy, sortDesc, livePrices])
+
+  const total = sorted.length
+  const pageCount = Math.max(1, Math.ceil(total / pageSize))
+  // Clamp rather than reset: a row closing while the user is on the last page shouldn't bounce
+  // them back to page 1, but the page must not point past the end of a shrunken list either.
+  const safePage = Math.min(page, pageCount - 1)
+  const visible = useMemo(
+    () => sorted.slice(safePage * pageSize, safePage * pageSize + pageSize),
+    [sorted, safePage, pageSize],
+  )
+
+  useEffect(() => {
+    if (safePage !== page) setPage(safePage)
+  }, [safePage, page])
+
+  // Any change to what is being listed starts again from the first page.
+  useEffect(() => {
+    setPage(0)
+  }, [mode, instId, openFilter, pageSize])
+
   function toggleSort(field: SortField) {
     if (sortBy === field) {
       setSortDesc((d) => !d)
@@ -93,7 +187,10 @@ export default function PositionsPage() {
       setSortBy(field)
       setSortDesc(true)
     }
+    setPage(0)
   }
+
+  const columnCount = 11 + (showLiveColumns ? 2 : 0) + (showClosedColumns ? 2 : 0)
 
   return (
     <div>
@@ -132,34 +229,63 @@ export default function PositionsPage() {
         <table>
           <thead>
             <tr>
-              <th>ID</th>
-              <th onClick={() => toggleSort('inst_id')}>Instrument {sortBy === 'inst_id' && (sortDesc ? '▼' : '▲')}</th>
-              <th>Mode</th>
-              <th>Side</th>
-              <th>Strategy</th>
-              <th>Timeframe</th>
-              <th>Entry</th>
-              <th>Last</th>
-              <th>SL / TP</th>
-              <th>Leverage</th>
-              <th>Entry Volume</th>
-              <th onClick={() => toggleSort('opened_at')}>
-                Opened {sortBy === 'opened_at' && (sortDesc ? '▼' : '▲')}
-              </th>
-              <th onClick={() => toggleSort('closed_at')}>
-                Closed {sortBy === 'closed_at' && (sortDesc ? '▼' : '▲')}
-              </th>
-              <th>Reason</th>
-              <th onClick={() => toggleSort('pnl')}>PnL {sortBy === 'pnl' && (sortDesc ? '▼' : '▲')}</th>
-              <th>Updated</th>
+              <SortableTh field="id" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                ID
+              </SortableTh>
+              <SortableTh field="inst_id" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                Instrument
+              </SortableTh>
+              <th className="th-static">Mode</th>
+              <SortableTh field="side" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                Side
+              </SortableTh>
+              <SortableTh field="strategy" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                Strategy
+              </SortableTh>
+              <SortableTh field="bar" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                Timeframe
+              </SortableTh>
+              <SortableTh field="entry" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                Entry
+              </SortableTh>
+              {/* Current price is meaningless for a finished trade — its outcome is already
+                  settled — so the live columns only appear where an open position can exist. */}
+              {showLiveColumns && <th className="th-static">Last</th>}
+              <th className="th-static">SL / TP</th>
+              <SortableTh field="leverage" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                Leverage
+              </SortableTh>
+              <SortableTh field="size" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                Entry Volume
+              </SortableTh>
+              <SortableTh field="opened_at" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                Opened
+              </SortableTh>
+              {/* Closed/Reason carry no information in the open-only view, where they are
+                  always "—" and "open" by definition. */}
+              {showClosedColumns && (
+                <SortableTh field="closed_at" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                  Closed
+                </SortableTh>
+              )}
+              {showClosedColumns && (
+                <SortableTh field="reason" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                  Reason
+                </SortableTh>
+              )}
+              <SortableTh field="pnl" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
+                PnL
+              </SortableTh>
+              {showLiveColumns && <th className="th-static">Updated</th>}
             </tr>
           </thead>
           <tbody>
-            {data?.map((p: Position) => {
+            {visible.map((p: Position) => {
               const lastPrice = livePrices[p.InstID]
               const live = unrealizedPnL(p, lastPrice)
               const isFork = p.Variant === 'rl_adjusted'
               const wasUpdated = updatedOrderIds.has(p.ID)
+              const realized = p.RealizedPnL !== null ? Number(p.RealizedPnL) : null
               return (
                 <tr key={p.ID}>
                   <td>
@@ -190,35 +316,37 @@ export default function PositionsPage() {
                   <td>{p.StrategyName || '—'}</td>
                   <td className="mono text-dim">{p.Bar || '—'}</td>
                   <td className="mono">{p.EntryPx}</td>
-                  <td className="mono">{lastPrice ?? '—'}</td>
+                  {showLiveColumns && <td className="mono">{p.ClosedAt ? '—' : (lastPrice ?? '—')}</td>}
                   <td className="mono text-dim">
                     {p.SLPx ?? '—'} / {p.TPPx ?? '—'}
                   </td>
                   <td className="mono">{p.Leverage}x</td>
                   <td className="mono">${Number(p.Size).toLocaleString()}</td>
-                  <td>{new Date(p.OpenedAt).toLocaleString()}</td>
-                  <td>{p.ClosedAt ? new Date(p.ClosedAt).toLocaleString() : '—'}</td>
-                  <td>{closeReasonBadge(p.CloseReason)}</td>
-                  <td className={(p.RealizedPnL ? Number(p.RealizedPnL) : live?.usd ?? 0) < 0 ? 'text-dim' : ''}>
-                    {p.RealizedPnL !== null
-                      ? p.RealizedPnL
+                  <td className="mono">{formatDateTime(p.OpenedAt)}</td>
+                  {showClosedColumns && <td className="mono">{formatDateTime(p.ClosedAt)}</td>}
+                  {showClosedColumns && <td>{closeReasonBadge(p.CloseReason)}</td>}
+                  <td className={'mono ' + pnlClass(realized ?? live?.usd ?? null)}>
+                    {realized !== null
+                      ? formatUsd(realized)
                       : live
-                        ? `${live.pct >= 0 ? '+' : ''}${live.pct.toFixed(2)}% (${live.usd >= 0 ? '+' : ''}$${live.usd.toFixed(2)})`
+                        ? `${live.pct >= 0 ? '+' : '−'}${Math.abs(live.pct).toFixed(2)}% (${formatUsd(live.usd)})`
                         : '—'}
                   </td>
-                  <td>
-                    {wasUpdated ? (
-                      <span className="badge badge-green">yes</span>
-                    ) : (
-                      <span className="badge badge-dim">no</span>
-                    )}
-                  </td>
+                  {showLiveColumns && (
+                    <td>
+                      {wasUpdated ? (
+                        <span className="badge badge-green">yes</span>
+                      ) : (
+                        <span className="badge badge-dim">no</span>
+                      )}
+                    </td>
+                  )}
                 </tr>
               )
             })}
-            {data?.length === 0 && (
+            {total === 0 && (
               <tr>
-                <td colSpan={15} className="text-dim">
+                <td colSpan={columnCount} className="text-dim">
                   No positions match this filter.
                 </td>
               </tr>
@@ -226,6 +354,13 @@ export default function PositionsPage() {
           </tbody>
         </table>
         </div>
+        <Pagination
+          page={safePage}
+          pageSize={pageSize}
+          total={total}
+          onPageChange={setPage}
+          onPageSizeChange={setPageSize}
+        />
       </div>
 
       {detailPosition && (

@@ -1,13 +1,17 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import ParamChangeChart from '../components/ParamChangeChart'
+import { formatUsd, pnlClass } from '../utils/format'
 import type { StrategyAssignment, StrategyConfig, StrategyStats } from '../api/types'
 
+// Wins/Losses come from the backend as "closed with positive realized PnL" vs. non-positive
+// (CLAUDE.md §11.3) — not close_reason='tp'/'sl', which under the RL ratchet reported a
+// profitable strategy as 0%. Open trades are excluded: their outcome isn't decided yet.
 function winRate(stats: StrategyStats | undefined): string {
   if (!stats) return '—'
   const decided = stats.Wins + stats.Losses
   if (decided === 0) return '—'
-  return `${Math.round((stats.Wins / decided) * 100)}%`
+  return `${Math.round((stats.Wins / decided) * 100)}% (${stats.Wins}/${decided})`
 }
 
 function ParamEditor({
@@ -73,6 +77,8 @@ function StrategyRow({
   stats: StrategyStats | undefined
   onChanged: () => void
 }) {
+  const [editing, setEditing] = useState(false)
+
   async function toggleEnabled() {
     await api.updateStrategy(strategy.ID, {
       config: strategy.Config ?? {},
@@ -99,7 +105,6 @@ function StrategyRow({
         {strategy.IsOrigin && <span className="badge badge-dim" style={{ marginLeft: 6 }}>origin</span>}
       </td>
       <td className="mono">{strategy.Kind}</td>
-      <td>{strategy.InstIDs.join(', ') || '—'}</td>
       <td>
         <span className={'badge ' + (strategy.Enabled ? 'badge-green' : 'badge-dim')}>
           {strategy.Enabled ? 'enabled' : 'disabled'}
@@ -107,25 +112,32 @@ function StrategyRow({
       </td>
       <td>{stats?.SignalCount ?? '—'}</td>
       <td>{winRate(stats)}</td>
-      <td className={stats && Number(stats.RealizedPnL) < 0 ? 'text-dim' : ''}>
-        {stats?.RealizedPnL ?? '—'}
+      {/* Rounded for readability — the exact NUMERIC value stays in the database (CLAUDE.md §7).
+          This is the sum of every closed trade's realized PnL, gains and losses together. */}
+      <td className={'mono ' + pnlClass(stats ? Number(stats.RealizedPnL) : null)}>
+        {stats ? formatUsd(Number(stats.RealizedPnL)) : '—'}
       </td>
+      {/* The standalone "Params" column is gone, but parameter editing is not: it moves onto
+          this actions cell, so a sub-strategy's overrides are still reachable (origins stay
+          read-only, CLAUDE.md §11.3). */}
       <td className="param-edit-cell">
-        {strategy.IsOrigin ? (
-          <span className="text-dim">read-only</span>
-        ) : (
-          <>
-            <span>hover to edit</span>
-            <ParamEditor strategy={strategy} onSaved={onChanged} />
-          </>
-        )}
-      </td>
-      <td>
         {!strategy.IsOrigin && (
           <div style={{ display: 'flex', gap: '0.4rem' }}>
             <button onClick={toggleEnabled}>{strategy.Enabled ? 'Disable' : 'Enable'}</button>
+            <button onClick={() => setEditing((v) => !v)}>{editing ? 'Close' : 'Edit params'}</button>
             <button onClick={reset}>Reset to origin</button>
             <button onClick={del}>Delete</button>
+          </div>
+        )}
+        {editing && !strategy.IsOrigin && (
+          <div style={{ marginTop: '0.5rem', maxWidth: 260 }}>
+            <ParamEditor
+              strategy={strategy}
+              onSaved={() => {
+                setEditing(false)
+                onChanged()
+              }}
+            />
           </div>
         )}
       </td>
@@ -183,109 +195,6 @@ function CloneForm({ origins, onCreated }: { origins: StrategyConfig[]; onCreate
       />
       <button type="submit">Clone</button>
     </form>
-  )
-}
-
-function AssignmentsPanel({
-  strategies,
-  assignments,
-  onChanged,
-}: {
-  strategies: StrategyConfig[]
-  assignments: StrategyAssignment[]
-  onChanged: () => void
-}) {
-  // strategies loads asynchronously (empty on first render) — see the identical note on
-  // CloneForm's clonedFrom above. null = no explicit choice yet, default resolved at submit time.
-  const [strategyId, setStrategyId] = useState<number | null>(null)
-  const [instId, setInstId] = useState('')
-  const [bar, setBar] = useState('1m')
-
-  const effectiveStrategyId = strategyId ?? strategies[0]?.ID ?? 0
-
-  const nameFor = (id: number) => strategies.find((s) => s.ID === id)?.Name ?? `#${id}`
-
-  async function create(e: React.FormEvent) {
-    e.preventDefault()
-    if (!effectiveStrategyId || !instId) return
-    await api.createAssignment({ strategyId: effectiveStrategyId, instId, bar })
-    setInstId('')
-    onChanged()
-  }
-
-  return (
-    <div className="card">
-      <h2>Assignments (token + timeframe)</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Strategy</th>
-            <th>Instrument</th>
-            <th>Bar</th>
-            <th>Status</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {assignments.map((a) => (
-            <tr key={a.ID}>
-              <td>{nameFor(a.StrategyID)}</td>
-              <td>{a.InstID}</td>
-              <td>{a.Bar}</td>
-              <td>
-                <span className={'badge ' + (a.Enabled ? 'badge-green' : 'badge-dim')}>
-                  {a.Enabled ? 'enabled' : 'disabled'}
-                </span>
-              </td>
-              <td>
-                <div style={{ display: 'flex', gap: '0.4rem' }}>
-                  <button
-                    onClick={async () => {
-                      await api.setAssignmentEnabled(a.ID, !a.Enabled)
-                      onChanged()
-                    }}
-                  >
-                    {a.Enabled ? 'Disable' : 'Enable'}
-                  </button>
-                  <button
-                    onClick={async () => {
-                      await api.deleteAssignment(a.ID)
-                      onChanged()
-                    }}
-                  >
-                    Delete
-                  </button>
-                </div>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-
-      <form className="toolbar" onSubmit={create} style={{ marginTop: '0.75rem' }}>
-        <select value={effectiveStrategyId} onChange={(e) => setStrategyId(Number(e.target.value))}>
-          {strategies.map((s) => (
-            <option key={s.ID} value={s.ID}>
-              {s.Name}
-            </option>
-          ))}
-        </select>
-        <input
-          type="text"
-          placeholder="inst id, e.g. BTC-USDT-SWAP"
-          value={instId}
-          onChange={(e) => setInstId(e.target.value)}
-        />
-        <select value={bar} onChange={(e) => setBar(e.target.value)}>
-          {['1m', '3m', '5m', '15m', '1H', '4H', '1D'].map((b) => (
-            <option key={b} value={b}>
-              {b}
-            </option>
-          ))}
-        </select>
-        <button type="submit">Assign</button>
-      </form>
-    </div>
   )
 }
 
@@ -376,15 +285,13 @@ export default function StrategiesPage() {
         <table>
           <thead>
             <tr>
-              <th>Name</th>
-              <th>Kind</th>
-              <th>Instruments</th>
-              <th>Status</th>
-              <th>Signals</th>
-              <th>Win rate</th>
-              <th>Realized PnL</th>
-              <th>Params</th>
-              <th></th>
+              <th className="th-static">Name</th>
+              <th className="th-static">Kind</th>
+              <th className="th-static">Status</th>
+              <th className="th-static">Signals</th>
+              <th className="th-static">Win rate</th>
+              <th className="th-static">Realized PnL</th>
+              <th className="th-static"></th>
             </tr>
           </thead>
           <tbody>
@@ -402,8 +309,9 @@ export default function StrategiesPage() {
         </div>
       </div>
 
-      <AssignmentsPanel strategies={strategies} assignments={assignments} onChanged={reload} />
-
+      {/* The Assignments (token + timeframe) panel was removed as unused. The assignment data
+          itself is still fetched, because ChartPanel needs it to know which strategy/inst/bar
+          combinations exist to chart. */}
       <ChartPanel strategies={strategies} assignments={assignments} />
     </div>
   )

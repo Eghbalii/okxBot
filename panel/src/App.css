@@ -327,3 +327,55 @@ pre.logs {
 .modal table th {
   cursor: default;
 }
+
+/* PnL sign colouring: profit green, loss red. Applied wherever a realized or unrealized
+   number is rendered so the sign reads at a glance instead of needing to be parsed. */
+.text-green {
+  color: var(--green);
+}
+
+.text-red {
+  color: var(--red);
+}
+
+/* Sortable column headers. Every th is already cursor:pointer, but only the sortable ones
+   should look interactive, so non-sortable headers opt out via .th-static. */
+.th-static {
+  cursor: default;
+}
+
+.th-static:hover {
+  color: var(--text-dim);
+}
+
+.sort-arrow {
+  margin-left: 0.25rem;
+  font-size: 0.7rem;
+  color: var(--accent);
+}
+
+/* Sorted column keeps full-strength text so the active sort is obvious without reading arrows. */
+th.sorted {
+  color: var(--text);
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 0.2rem 0.1rem;
+  flex-wrap: wrap;
+}
+
+.pagination .spacer {
+  flex: 1;
+}
+
+.pagination button {
+  padding: 0.25rem 0.6rem;
+}
+
+.pagination button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

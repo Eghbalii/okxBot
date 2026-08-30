@@ -53,8 +53,12 @@ type StrategyAssignment struct {
 type StrategyStats struct {
 	StrategyID   int64
 	SignalCount  int64
-	Wins         int64 // close_reason = 'tp'
-	Losses       int64 // close_reason = 'sl'
+	// Wins/Losses are decided by realized PnL, not by close_reason. Counting close_reason='tp'
+	// as the win is wrong once the RL ratchet (CLAUDE.md §15.4) trails a stop into profit: a
+	// stop-loss touch then banks a GAIN. Measured on real data, 101 of 152 'sl' closes were
+	// profitable, so the old definition reported 0% win rate for a strategy making money.
+	Wins         int64 // closed with realized_pnl > 0
+	Losses       int64 // closed with realized_pnl <= 0
 	OpenCount    int64
 	RealizedPnL  decimal.Decimal
 	FirstOpened  *time.Time

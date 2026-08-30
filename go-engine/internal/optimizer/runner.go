@@ -441,6 +441,14 @@ func (r *Run) currentBaseline(ctx context.Context) (Baseline, int64, error) {
 		// against, fall back to the absolute floor (ShouldPersist's Baseline.Exists=false path).
 		return Baseline{}, originID, nil
 	}
+	// NOTE (2026-08-30): StrategyStatsFor now defines a win as positive realized PnL rather than
+	// close_reason='tp', because the RL ratchet makes an 'sl' close frequently profitable. That
+	// makes this baseline PnL-based while a trial's own Wins/Losses (scoring.go) stay strictly
+	// SL/TP-touch based, per §16.1's requirement that trial judgment never depend on anything the
+	// RL agent touched. The two sides therefore measure slightly different things: a trial must
+	// clear a bar set by trades the RL agent may have managed. Left as-is deliberately — the
+	// alternative (an RL-free baseline) needs its own query, and the optimizer is not currently
+	// running on a schedule. Revisit before re-enabling scheduled optimization runs.
 	winRate := decimal.NewFromInt(stats.Wins).Div(decimal.NewFromInt(total)).Mul(decimal.NewFromInt(100))
 	return Baseline{Exists: true, WinRatePct: winRate}, originID, nil
 }

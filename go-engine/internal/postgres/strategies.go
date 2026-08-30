@@ -169,13 +169,17 @@ func (r *Repository) DeleteAssignment(ctx context.Context, id int64) error {
 
 // StrategyStatsFor computes a strategy's paper-trading track record from paper_orders
 // (CLAUDE.md §11.3) — no separately maintained counters.
+//
+// A win is a closed trade with positive realized PnL, NOT close_reason='tp'. Once the RL
+// ratchet trails a stop into profit (CLAUDE.md §15.4) an 'sl' close frequently realizes a
+// gain, so keying off close_reason reported strategies with real profits as 0% win rate.
 func (r *Repository) StrategyStatsFor(ctx context.Context, strategyID int64) (port.StrategyStats, error) {
 	stats := port.StrategyStats{StrategyID: strategyID}
 	err := r.pool.QueryRow(ctx, `
 		SELECT
 			count(*),
-			count(*) FILTER (WHERE close_reason = 'tp'),
-			count(*) FILTER (WHERE close_reason = 'sl'),
+			count(*) FILTER (WHERE closed_at IS NOT NULL AND realized_pnl > 0),
+			count(*) FILTER (WHERE closed_at IS NOT NULL AND realized_pnl <= 0),
 			count(*) FILTER (WHERE closed_at IS NULL),
 			coalesce(sum(realized_pnl), 0),
 			min(opened_at),
