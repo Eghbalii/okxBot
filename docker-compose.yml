@@ -10,11 +10,18 @@ x-logging: &default-logging
     max-size: "10m"
     max-file: "3"
 
+# Every service restarts on failure. Without this a single transient error (a Kafka DNS
+# blip, an OOM kill) is permanent downtime: cmd/paper-trader died on a Kafka lookup timeout
+# and stayed dead, silently stopping all trading and RL reward collection. CLAUDE.md §11.2
+# assumed this policy was already in place -- it was not.
+x-restart: &default-restart unless-stopped
+
 services:
   # redis is now only used by cmd/strategy-optimizer's disposable trial state (CLAUDE.md §16.3) —
   # the tick/candle/paper-order event bus moved to Kafka (below), CLAUDE.md §12.
   redis:
     logging: *default-logging
+    restart: *default-restart
     image: redis:7-alpine
     ports:
       - "6379:6379"
@@ -26,8 +33,14 @@ services:
   # strategy-optimizer/cmd/api's WebSocket bridge.
   kafka:
     logging: *default-logging
+    restart: *default-restart
     image: apache/kafka:3.9.0
+    # Kafka defaulted to a 1G heap on a 3.9GB host, leaving too little headroom for the rest
+    # of the stack; that shortage is what let a single service's spike OOM the machine.
+    # 512m is ample for this project's volume (a few topics, 24h retention, CLAUDE.md §12).
+    mem_limit: 768m
     environment:
+      KAFKA_HEAP_OPTS: "-Xmx512M -Xms512M"
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       # Bare-colon bind shorthand, not an explicit 0.0.0.0 host — the apache/kafka image's config
@@ -57,6 +70,7 @@ services:
 
   timescaledb:
     logging: *default-logging
+    restart: *default-restart
     image: timescale/timescaledb:latest-pg16
     environment:
       POSTGRES_USER: okxbot
@@ -69,6 +83,11 @@ services:
 
   rl-service:
     logging: *default-logging
+    restart: *default-restart
+    # SAC training spikes well above its ~330MB idle footprint (CLAUDE.md §15.1 measured
+    # ~450MB and ~470% CPU during a gradient-heavy run). Capped so a training spike degrades
+    # inference rather than OOM-killing the trading services alongside it.
+    mem_limit: 1g
     build: ./rl-service
     environment:
       CONFIG_PATH: /app/configs/config.yaml
@@ -86,6 +105,7 @@ services:
 
   ingestor:
     logging: *default-logging
+    restart: *default-restart
     build:
       context: ./go-engine
       dockerfile: Dockerfile.ingestor
@@ -103,6 +123,11 @@ services:
 
   trader:
     logging: *default-logging
+    # NOT unless-stopped: cmd/trader exits immediately when OKX API credentials are absent,
+    # which is the normal state until the demo-trading run (CLAUDE.md §14 Phase 2). An
+    # always-restart policy turns that into an endless crash loop burning CPU and log volume.
+    # on-failure with a cap still recovers from genuine crashes once credentials exist.
+    restart: on-failure:5
     build:
       context: ./go-engine
       dockerfile: Dockerfile.trader
@@ -123,6 +148,7 @@ services:
 
   paper-trader:
     logging: *default-logging
+    restart: *default-restart
     build:
       context: ./go-engine
       dockerfile: Dockerfile.paper-trader
@@ -155,12 +181,14 @@ services:
 
   optimizer-service:
     logging: *default-logging
+    restart: *default-restart
     build: ./optimizer-service
     ports:
       - "8001:8001"
 
   strategy-optimizer:
     logging: *default-logging
+    restart: *default-restart
     build:
       context: ./go-engine
       dockerfile: Dockerfile.strategy-optimizer
@@ -189,6 +217,7 @@ services:
 
   api:
     logging: *default-logging
+    restart: *default-restart
     build:
       context: ./go-engine
       dockerfile: Dockerfile.api
@@ -214,6 +243,7 @@ services:
 
   panel:
     logging: *default-logging
+    restart: *default-restart
     build: ./panel
     ports:
       - "8080:80" # bind to the OpenVPN-facing interface only in production, see CLAUDE.md §11
@@ -226,6 +256,7 @@ services:
   # exporter is the standard way to get the underlying VM's numbers into Prometheus at all.
   node-exporter:
     logging: *default-logging
+    restart: *default-restart
     image: prom/node-exporter:latest
     command:
       - "--path.rootfs=/host"
@@ -241,6 +272,7 @@ services:
 
   prometheus:
     logging: *default-logging
+    restart: *default-restart
     image: prom/prometheus:latest
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -258,6 +290,7 @@ services:
   # loki-data volume is appropriate for a single VPS, not a multi-node deployment.
   loki:
     logging: *default-logging
+    restart: *default-restart
     image: grafana/loki:latest
     command: -config.file=/etc/loki/loki-config.yml
     volumes:
@@ -274,6 +307,7 @@ services:
   # "search/filter a service's errors separately" work with zero application code changes.
   promtail:
     logging: *default-logging
+    restart: *default-restart
     image: grafana/promtail:latest
     command: -config.file=/etc/promtail/promtail-config.yml
     volumes:
@@ -285,10 +319,24 @@ services:
 
   grafana:
     logging: *default-logging
+    restart: *default-restart
     image: grafana/grafana:latest
+    # Grafana ballooned to 1.68GB RSS under an internet vulnerability scan and triggered a
+    # system-wide OOM kill that took the host down. The cap bounds the blast radius so the
+    # trading services can never be the collateral of a monitoring-tier memory spike.
+    # 768m, not 512m: measured idle RSS is ~440MB, so a 512m cap sits at ~87% before any
+    # query load and would simply trade the host OOM for a Grafana crash loop.
+    mem_limit: 768m
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Read from the environment; set GRAFANA_ADMIN_PASSWORD in .env. Was hardcoded to
+      # "admin" while the port was reachable from the internet.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
     ports:
+      # Bound to 0.0.0.0 deliberately: VPN clients arrive on tun0 (10.8.0.1), so a
+      # 127.0.0.1 bind would make the panel unreachable over the VPN, and binding tun0's
+      # address directly would break Docker startup whenever it precedes OpenVPN. Access is
+      # gated by the OKXBOT_LOCK/DOCKER-USER iptables rules instead (CLAUDE.md §11).
       - "3000:3000"
     volumes:
       - grafana-data:/var/lib/grafana

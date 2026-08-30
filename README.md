@@ -25,7 +25,8 @@ Prometheus scrapes `/metrics` from the ingestor (`:9101`), paper trader (`:9102`
 strategy optimizer (`:9103`) — see
 `prometheus.yml`. Metrics include strategy signals, paper orders opened/closed (by SL/TP/manual
 reason), open-order count, and cumulative realized PnL (CLAUDE.md §11 has the full list). Grafana
-is at `http://localhost:3000` (default admin/admin, per `docker-compose.yml`) with **both
+is at `http://10.8.0.1:3000` over the OpenVPN tunnel (admin password from
+`GRAFANA_ADMIN_PASSWORD` in `.env`) with **both
 Prometheus and Loki auto-provisioned as data sources** (`grafana/provisioning/datasources/`) — no
 manual setup needed. Dashboards aren't pre-built yet, add them once there's real paper-trading
 data to look at.
@@ -269,9 +270,17 @@ misconfiguration. Reach them either via `docker exec <container> wget -qO- http:
 for a quick check, or by putting the host behind an OpenVPN tunnel (CLAUDE.md §11's intended
 long-term access model) and rebinding to the VPN-facing interface.
 
-Grafana is reachable directly at `http://<server-ip>:3000` (default `admin`/`admin`, per
-`docker-compose.yml`) — both Prometheus and Loki are auto-provisioned as data sources, no manual
-setup. Prometheus itself is at `:9090`, Loki at `:3100`.
+Grafana, and every other service port, is reachable **only over the OpenVPN tunnel** — connect
+with the client profile, then use the VPN gateway address: Grafana at `http://10.8.0.1:3000`,
+the panel at `:8080`, `cmd/api` at `:8090`, Prometheus at `:9090`, Loki at `:3100`. Both
+Prometheus and Loki are auto-provisioned as Grafana data sources, no manual setup. The admin
+password comes from `GRAFANA_ADMIN_PASSWORD` in `.env` (compose refuses to start without it).
+
+Direct `http://<server-ip>:<port>` access is firewalled off. The ports still bind `0.0.0.0`
+deliberately — VPN clients arrive on `tun0`, so a `127.0.0.1` bind would make them unreachable
+over the tunnel, and binding `tun0`'s address directly would break Docker startup whenever it
+precedes OpenVPN. The gate is iptables (`OKXBOT_LOCK` on INPUT, plus a DROP in `DOCKER-USER`,
+which is the only chain Docker's own rules will not bypass), persisted via `iptables-persistent`.
 
 ### 8. Next steps (per CLAUDE.md §14's "NEXT UP" roadmap item 4)
 
