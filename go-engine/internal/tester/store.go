@@ -270,13 +270,17 @@ type RuntimeConfig struct {
 	Bar         *string
 	NotionalUSD *decimal.Decimal
 	Leverage    *decimal.Decimal
+	// MaxOpenDuration is a Go duration string (e.g. "6h"), same format as config.yaml's
+	// tester.max_open_duration — parsed the same way at startup rather than inventing a second
+	// representation for the same value.
+	MaxOpenDuration *string
 }
 
 // GetRuntimeConfig reads the singleton config row, if one has ever been saved.
 func (s *Store) GetRuntimeConfig(ctx context.Context) (RuntimeConfig, error) {
 	var rc RuntimeConfig
-	err := s.pool.QueryRow(ctx, `SELECT bar, notional_usd, leverage FROM tester_config WHERE id = 1`).
-		Scan(&rc.Bar, &rc.NotionalUSD, &rc.Leverage)
+	err := s.pool.QueryRow(ctx, `SELECT bar, notional_usd, leverage, max_open_duration FROM tester_config WHERE id = 1`).
+		Scan(&rc.Bar, &rc.NotionalUSD, &rc.Leverage, &rc.MaxOpenDuration)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return RuntimeConfig{}, nil
@@ -290,14 +294,15 @@ func (s *Store) GetRuntimeConfig(ctx context.Context) (RuntimeConfig, error) {
 // fields the panel actually submitted are updated, via coalesce against the existing row.
 func (s *Store) SaveRuntimeConfig(ctx context.Context, rc RuntimeConfig) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO tester_config (id, bar, notional_usd, leverage, updated_at)
-		VALUES (1, $1, $2, $3, now())
+		INSERT INTO tester_config (id, bar, notional_usd, leverage, max_open_duration, updated_at)
+		VALUES (1, $1, $2, $3, $4, now())
 		ON CONFLICT (id) DO UPDATE SET
 			bar = coalesce($1, tester_config.bar),
 			notional_usd = coalesce($2, tester_config.notional_usd),
 			leverage = coalesce($3, tester_config.leverage),
+			max_open_duration = coalesce($4, tester_config.max_open_duration),
 			updated_at = now()
-	`, rc.Bar, rc.NotionalUSD, rc.Leverage)
+	`, rc.Bar, rc.NotionalUSD, rc.Leverage, rc.MaxOpenDuration)
 	if err != nil {
 		return fmt.Errorf("save tester runtime config: %w", err)
 	}

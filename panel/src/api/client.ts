@@ -157,7 +157,7 @@ export const api = {
   enableTesterVersion: (id: number) =>
     request<{ ok: boolean }>(`/tester/versions/${id}/enable`, { method: 'POST' }),
   testerConfig: () => request<TesterConfig>('/tester/config'),
-  saveTesterConfig: (patch: { bar?: string; notionalUsd?: string; leverage?: string }) =>
+  saveTesterConfig: (patch: { bar?: string; notionalUsd?: string; leverage?: string; maxOpenDuration?: string }) =>
     request<{ ok: boolean; restartRequired: boolean }>('/tester/config', {
       method: 'PUT',
       body: JSON.stringify(patch),

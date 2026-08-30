@@ -60,9 +60,9 @@ func main() {
 	}
 	store := tester.NewStore(repo.Pool())
 
-	// Panel-editable overrides (bar/notional/leverage) take effect at startup — a save from the
-	// panel writes this row then exits the process (see handleRestart), Docker's restart policy
-	// brings it back reading the row it just wrote.
+	// Panel-editable overrides (bar/notional/leverage/max_open_duration) take effect at startup —
+	// a save from the panel writes this row then exits the process (see handleRestart), Docker's
+	// restart policy brings it back reading the row it just wrote.
 	if rc, err := store.GetRuntimeConfig(ctx); err != nil {
 		logger.Error("failed to load tester runtime config", "error", err)
 		os.Exit(1)
@@ -75,6 +75,14 @@ func main() {
 		}
 		if rc.Leverage != nil {
 			cfg.Tester.Leverage = *rc.Leverage
+		}
+		if rc.MaxOpenDuration != nil {
+			d, err := time.ParseDuration(*rc.MaxOpenDuration)
+			if err != nil {
+				logger.Error("invalid saved max_open_duration, keeping config.yaml/default value", "value", *rc.MaxOpenDuration, "error", err)
+			} else {
+				cfg.Tester.MaxOpenDuration = d
+			}
 		}
 	}
 

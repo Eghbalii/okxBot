@@ -90,11 +90,23 @@ function VersionCompareModal({ versionId, onClose }: { versionId: number; onClos
   )
 }
 
+// Go duration strings (e.g. "6h", "90m") parsed down to a whole number of hours for a plain
+// numeric input — this panel only ever needs hour-granularity for a position-staleness limit, and
+// round-tripping through hours avoids asking the operator to type Go duration syntax by hand.
+function parseHours(goDuration: string): string {
+  const match = /^(\d+(?:\.\d+)?)h$/.exec(goDuration.trim())
+  if (match) return match[1]
+  const minutesMatch = /^(\d+)m$/.exec(goDuration.trim())
+  if (minutesMatch) return (Number(minutesMatch[1]) / 60).toString()
+  return ''
+}
+
 function ConfigPanel() {
   const [cfg, setCfg] = useState<TesterConfig | null>(null)
   const [bar, setBar] = useState('')
   const [notional, setNotional] = useState('')
   const [leverage, setLeverage] = useState('')
+  const [maxOpenHours, setMaxOpenHours] = useState('')
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [restarting, setRestarting] = useState(false)
@@ -106,6 +118,7 @@ function ConfigPanel() {
       setBar(c.bar)
       setNotional(c.notionalUsd)
       setLeverage(c.leverage)
+      setMaxOpenHours(parseHours(c.maxOpenDuration))
       setDirty(false)
     })
   }
@@ -115,9 +128,15 @@ function ConfigPanel() {
   async function save() {
     setSaving(true)
     try {
-      await api.saveTesterConfig({ bar, notionalUsd: notional, leverage })
+      const hours = Number(maxOpenHours)
+      await api.saveTesterConfig({
+        bar,
+        notionalUsd: notional,
+        leverage,
+        maxOpenDuration: Number.isFinite(hours) && hours > 0 ? `${hours}h` : undefined,
+      })
       setDirty(false)
-      setMessage('Saved. Restart the service for the new bar/timeframe subscription to take effect.')
+      setMessage('Saved. Restart the service for the changes to take effect.')
     } finally {
       setSaving(false)
     }
@@ -180,6 +199,19 @@ function ConfigPanel() {
               }}
             />
             x
+          </label>
+          <label className="text-dim" style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+            Max open (hours)
+            <input
+              type="text"
+              style={{ width: '4rem' }}
+              value={maxOpenHours}
+              onChange={(e) => {
+                setMaxOpenHours(e.target.value)
+                setDirty(true)
+              }}
+              title="Force-close a position that has been open this long, close_reason='timeout'"
+            />
           </label>
           <button onClick={save} disabled={!dirty || saving}>
             {saving ? 'Saving…' : 'Save'}

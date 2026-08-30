@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/shopspring/decimal"
 
@@ -275,25 +276,28 @@ func (s *service) handleEnableVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 type configView struct {
-	Bar         string   `json:"bar"`
-	InstIDs     []string `json:"instIds"`
-	NotionalUSD string   `json:"notionalUsd"`
-	Leverage    string   `json:"leverage"`
+	Bar             string   `json:"bar"`
+	InstIDs         []string `json:"instIds"`
+	NotionalUSD     string   `json:"notionalUsd"`
+	Leverage        string   `json:"leverage"`
+	MaxOpenDuration string   `json:"maxOpenDuration"` // Go duration string, e.g. "6h"
 }
 
 func (s *service) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, configView{
-		Bar:         s.cfg.Tester.Bar,
-		InstIDs:     s.cfg.Tester.InstIDs,
-		NotionalUSD: s.cfg.Tester.NotionalUSD.String(),
-		Leverage:    s.cfg.Tester.Leverage.String(),
+		Bar:             s.cfg.Tester.Bar,
+		InstIDs:         s.cfg.Tester.InstIDs,
+		NotionalUSD:     s.cfg.Tester.NotionalUSD.String(),
+		Leverage:        s.cfg.Tester.Leverage.String(),
+		MaxOpenDuration: s.cfg.Tester.MaxOpenDuration.String(),
 	})
 }
 
 type saveConfigRequest struct {
-	Bar         *string `json:"bar"`
-	NotionalUSD *string `json:"notionalUsd"`
-	Leverage    *string `json:"leverage"`
+	Bar             *string `json:"bar"`
+	NotionalUSD     *string `json:"notionalUsd"`
+	Leverage        *string `json:"leverage"`
+	MaxOpenDuration *string `json:"maxOpenDuration"`
 }
 
 // handleSaveConfig persists the panel's config edits (bar/notional/leverage) to the tester_config
@@ -323,6 +327,13 @@ func (s *service) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rc.Leverage = &v
+	}
+	if req.MaxOpenDuration != nil {
+		if _, err := time.ParseDuration(*req.MaxOpenDuration); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid maxOpenDuration: "+err.Error())
+			return
+		}
+		rc.MaxOpenDuration = req.MaxOpenDuration
 	}
 	if err := s.store.SaveRuntimeConfig(r.Context(), rc); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

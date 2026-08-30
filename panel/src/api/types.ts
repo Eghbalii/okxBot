@@ -167,4 +167,5 @@ export interface TesterConfig {
   instIds: string[]
   notionalUsd: string
   leverage: string
+  maxOpenDuration: string // Go duration string, e.g. "6h"
 }

@@ -2355,3 +2355,13 @@ and simply blocked by its own design, not stuck.
   Go total). Verified against the real deployment: within minutes, positions spread from 10 (one
   per instrument) to 25 across all 10 instruments with no instrument capped, and every other
   service's uptime was unaffected by the redeploy.
+
+`max_open_duration` was made panel-editable the same day (quick follow-up): a new `tester_config`
+column (migration `000012`, TEXT, same Go duration-string format as `config.yaml`) round-trips
+through `GET/PUT /api/tester/config` and the Config section's new "Max open (hours)" field, applied
+at startup by `POST /restart` exactly like `bar`/`notional_usd`/`leverage` already were. Stored as
+a duration string rather than a numeric column specifically to avoid a second value representation
+that would need its own parse/format path on both the Go and panel sides — the panel converts to
+and from whole hours purely for a friendlier input, the wire format is unchanged. Verified live:
+saved `2h`, restarted, confirmed `2h0m0s` came back from `GET /config`, then reset to the `6h`
+default the same way.
