@@ -242,6 +242,13 @@ type Config struct {
 		NotionalUSD decimal.Decimal `yaml:"notional_usd"`
 		Leverage    decimal.Decimal `yaml:"leverage"`
 		CandleWindow int `yaml:"candle_window"`
+		// MaxOpenDuration force-closes a tester position open longer than this, close_reason=
+		// 'timeout' (2026-08-30 request, mirroring paper_trading.rl_max_open_duration/§15.14 for
+		// the SAME reason on a SEPARATE config path — this service has no in-trade update
+		// mechanic at all, so a position with neither level touched would otherwise sit open
+		// forever). Zero falls back to a 6h default at construction time, same starting value as
+		// production's.
+		MaxOpenDuration time.Duration `yaml:"max_open_duration"`
 	} `yaml:"tester"`
 }
 
@@ -441,6 +448,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Tester.CandleWindow == 0 {
 		cfg.Tester.CandleWindow = 300
+	}
+	if cfg.Tester.MaxOpenDuration == 0 {
+		cfg.Tester.MaxOpenDuration = 6 * time.Hour
 	}
 
 	return cfg, nil

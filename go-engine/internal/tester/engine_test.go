@@ -2,6 +2,7 @@ package tester
 
 import (
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 
@@ -78,5 +79,25 @@ func TestRealizedPnL_LeverageScales(t *testing.T) {
 	pnl10x := RealizedPnL("buy", d("100"), d("110"), d("10"), d("10"))
 	if !pnl10x.Equal(pnl1x.Mul(d("10"))) {
 		t.Fatalf("10x pnl (%s) should be exactly 10x the 1x pnl (%s)", pnl10x, pnl1x)
+	}
+}
+
+func TestIsTimedOut(t *testing.T) {
+	now := time.Now()
+	if IsTimedOut(now.Add(-5*time.Hour), now, 6*time.Hour) {
+		t.Error("5h open should not be timed out against a 6h limit")
+	}
+	if !IsTimedOut(now.Add(-6*time.Hour-time.Second), now, 6*time.Hour) {
+		t.Error("just past 6h open should be timed out against a 6h limit")
+	}
+}
+
+func TestIsTimedOut_Stateless(t *testing.T) {
+	now := time.Now()
+	openedAt := now.Add(-2 * time.Hour)
+	for i := 0; i < 3; i++ {
+		if !IsTimedOut(openedAt, now, time.Hour) {
+			t.Fatalf("call %d: expected timed out every time, stateless", i)
+		}
 	}
 }

@@ -169,3 +169,7 @@ tester:
   notional_usd: 10
   leverage: 10
   candle_window: 300
+  # Force-closes a position open longer than this, close_reason='timeout' (2026-08-30 request).
+  # This service has no in-trade update mechanic, so unlike production a position can otherwise
+  # sit open forever if price never reaches either level.
+  max_open_duration: 6h

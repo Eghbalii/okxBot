@@ -290,8 +290,17 @@ func (s *service) checkOpenOrders(ctx context.Context, instID string, price deci
 	if err != nil {
 		return fmt.Errorf("list open tester orders: %w", err)
 	}
+	now := time.Now()
 	for _, o := range open {
 		reason, hit := usecase.SLTPTouchReason(o.Side, o.SLPx, o.TPPx, price)
+		if !hit && tester.IsTimedOut(o.OpenedAt, now, s.cfg.Tester.MaxOpenDuration) {
+			// Force-closed for running too long (2026-08-30 request) — this service has no
+			// in-trade update mechanic, so unlike production a position here can sit open
+			// indefinitely if price never reaches either level. Checked only when the genuine
+			// SL/TP touch above found nothing, so a real touch always wins over a timeout landing
+			// on the same tick, never the reverse.
+			reason, hit = tester.CloseReasonTimeout, true
+		}
 		if !hit {
 			continue
 		}
@@ -339,9 +348,14 @@ func (s *service) handleCandle(ctx context.Context, instID string, data []byte) 
 }
 
 // evaluateVersions runs every enabled version against the freshly-closed candle for instID,
-// opening a new position for the first one that fires — gated on this instrument having no open
-// position at all (CLAUDE.md §16.9's one-position-per-instrument rule, applied here across every
-// kind rather than per assignment, since this service is deliberately "all kinds, one slot").
+// opening a position for EVERY version that fires (2026-08-30 request: unlike production,
+// cmd/strategy-tester deliberately does NOT limit an instrument to one open position at a time —
+// its whole purpose is judging each of the 14 kinds' signal quality independently, and one shared
+// slot per instrument meant whichever kind opened first blocked every other kind on that token
+// until it closed, sometimes for hours, so most (kind, instrument) pairs barely traded at all).
+// The only remaining limit is one open position per (instrument, version) — a kind cannot stack a
+// second position on the same token before its first one resolves, which would double-count that
+// kind's exposure to one setup rather than adding a genuinely new, independent trial.
 func (s *service) evaluateVersions(ctx context.Context, instID string, window []domain.Candle, price decimal.Decimal) error {
 	s.openMu.Lock()
 	defer s.openMu.Unlock()
@@ -350,8 +364,9 @@ func (s *service) evaluateVersions(ctx context.Context, instID string, window []
 	if err != nil {
 		return fmt.Errorf("list open tester orders: %w", err)
 	}
-	if len(open) > 0 {
-		return nil
+	openVersions := make(map[int64]bool, len(open))
+	for _, o := range open {
+		openVersions[o.VersionID] = true
 	}
 
 	s.versionsMu.Lock()
@@ -359,6 +374,10 @@ func (s *service) evaluateVersions(ctx context.Context, instID string, window []
 	s.versionsMu.Unlock()
 
 	for _, rv := range versions {
+		if openVersions[rv.versionID] {
+			continue // this version already has an open position on this instrument
+		}
+
 		signal, err := rv.live.Evaluate(window)
 		if err != nil {
 			s.logger.Warn("tester strategy evaluation failed", "kind", rv.kind, "instId", instID, "error", err)
@@ -383,7 +402,8 @@ func (s *service) evaluateVersions(ctx context.Context, instID string, window []
 		}
 		s.logger.Info("opened tester order", "id", id, "kind", rv.kind, "versionId", rv.versionID,
 			"instId", instID, "side", order.Side, "entryPx", price)
-		return nil // one open position per instrument; the rest of this candle's signals wait for next time
+		// No early return: every OTHER version still gets to evaluate against this same candle,
+		// since each is judged independently and one kind opening must not block the rest.
 	}
 	return nil
 }

@@ -2317,3 +2317,41 @@ concerns as the strategy-optimizer's §16.1 ("keep the RL agent out of judging s
   clean because `cmd/strategy-tester` had already finished applying migration `000010`). This can
   recur on any future migration where two migrating services first start together — a `pg_advisory_lock`
   around the whole loop would close it, deferred since self-recovery already works.
+
+### 18.1 Removing the one-position-per-instrument limit, and its own timeout (2026-08-30)
+
+Two follow-on changes, made after the operator observed the panel looking "frozen" — real, but
+not a bug: every one of the 10 instruments' single open-position slot (inherited from production's
+own rule, §16.9) was occupied, so no new signal from any of the other 13 kinds on that token could
+open until the occupying one closed, sometimes hours later. Checking Kafka consumer lag (0 on both
+topics), CPU usage, and the live `/api/tester/stats` response all confirmed the service was healthy
+and simply blocked by its own design, not stuck.
+
+- **The one-position-per-instrument limit is REMOVED for this service specifically** (explicit
+  operator instruction — "برای استراتژی تستر نیازی نیست محدودیت یک پوزیشن برای هر توکن داشته
+  باشیم"). `evaluateVersions` now opens a position for every version that fires on a candle close,
+  not just the first one, gated only by **one open position per (instrument, version)** — a kind
+  cannot stack a second position on the same token before its first resolves (that would double-
+  count one setup as two independent trials), but every other kind is free to trade that same
+  token simultaneously. Immediate effect measured live: `ZEC-USDT-SWAP` alone went from 1 to 5
+  concurrent positions across different kinds in one candle close, and several kinds that had
+  produced zero signals in over an hour — `pmax` among them — started firing the moment they were
+  no longer locked out. This does NOT change production's own one-slot rule in
+  `usecase.PaperTrader`/§16.9 at all — the operator explicitly asked that production stay untouched,
+  and the two paths share no code (`cmd/strategy-tester`'s `openMu`/`evaluateVersions` is a
+  separate implementation from `PaperTrader.openMu`/`evaluateStrategies`).
+- **A new timeout force-close was added, mirroring §15.14's reasoning but as fully separate code
+  and config**: `tester.max_open_duration` (default 6h, same starting value as production's
+  `paper_trading.rl_max_open_duration`) force-closes a tester position that has run that long,
+  `close_reason='timeout'` — this service has no in-trade update mechanic at all, so unlike
+  production, a position here can otherwise sit open indefinitely if price never reaches either
+  level. `tester.IsTimedOut` (`internal/tester/engine.go`) is a separate pure function from
+  `conductor.Conductor.IsTimedOut`, deliberately not shared, matching this package's own doc
+  comment that the two services must stay independent. `tester_orders.close_reason`'s CHECK
+  constraint only allowed `'sl'`/`'tp'` (migration `000010`), so migration `000011` widens it —
+  this service has no model to report a terminal category to, so unlike §15.14 there was no
+  observation-schema question to resolve here at all.
+- 2 new tests (`TestIsTimedOut`/`TestIsTimedOut_Stateless` in `internal/tester/engine_test.go`, 219
+  Go total). Verified against the real deployment: within minutes, positions spread from 10 (one
+  per instrument) to 25 across all 10 instruments with no instrument capped, and every other
+  service's uptime was unaffected by the redeploy.

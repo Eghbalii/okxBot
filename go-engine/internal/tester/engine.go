@@ -37,6 +37,22 @@ func BuildOrder(instID string, versionID int64, bar string, price, notionalUSD, 
 	}
 }
 
+// CloseReasonTimeout marks a tester position force-closed for running past the service's
+// max_open_duration (2026-08-30 request) — this service has no in-trade update mechanic at all,
+// so unlike production's SL/TP-adjust ratchet, a position here can genuinely sit open forever if
+// price never reaches either level. Kept separate from 'sl'/'tp' so a human reading tester_orders
+// can tell a real level touch from a housekeeping close.
+const CloseReasonTimeout = "timeout"
+
+// IsTimedOut reports whether a position opened at openedAt has run past maxOpenDuration and
+// should be force-closed (2026-08-30 request). Pure and stateless, mirroring
+// conductor.Conductor.IsTimedOut's shape for production's equivalent check — deliberately not
+// shared code, since this service and cmd/paper-trader must stay independent (CLAUDE.md's
+// package doc comment).
+func IsTimedOut(openedAt, now time.Time, maxOpenDuration time.Duration) bool {
+	return now.Sub(openedAt) >= maxOpenDuration
+}
+
 // RealizedPnL computes a closed position's PnL in USD from entry/close/size/leverage — identical
 // math to usecase.realizedPnL, duplicated here (not imported) because that function is
 // package-private to usecase and this service is deliberately independent of it.
