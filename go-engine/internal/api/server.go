@@ -22,9 +22,13 @@ type Server struct {
 	Repo       port.Repository
 	RLBaseURL  string
 	GrafanaURL string
-	ProcessMgr string
-	Units      []string
-	Logger     *slog.Logger
+	// TesterBaseURL is cmd/strategy-tester's base URL — proxied through so the panel never talks
+	// to it directly (matching every other backend, all reachable only via cmd/api, CLAUDE.md §11).
+	// Empty disables the tester routes with a clear error rather than a confusing connection-reset.
+	TesterBaseURL string
+	ProcessMgr    string
+	Units         []string
+	Logger        *slog.Logger
 
 	// AccountInitialUSD seeds a mode's account row on first read, matching what the trading
 	// services are configured with (CLAUDE.md §15.6) — cmd/api must not invent a different starting
@@ -110,6 +114,17 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/candles", s.handleListCandles)
 	mux.HandleFunc("POST /api/candles/backfill", s.handleBackfillCandles)
 	mux.HandleFunc("GET /api/strategies/{id}/param-changes", s.handleListParamChanges)
+
+	// Independent strategy-tester tab (2026-08-30 request): proxied through, same access-control
+	// posture as every other panel data source (CLAUDE.md §11) — the panel never talks to
+	// cmd/strategy-tester directly.
+	mux.HandleFunc("GET /api/tester/stats", s.proxyTester("/stats"))
+	mux.HandleFunc("GET /api/tester/versions/{id}", s.proxyTesterWithID("/versions/%s"))
+	mux.HandleFunc("POST /api/tester/versions", s.proxyTesterBody("/versions"))
+	mux.HandleFunc("POST /api/tester/versions/{id}/enable", s.proxyTesterWithIDBody("/versions/%s/enable"))
+	mux.HandleFunc("GET /api/tester/config", s.proxyTester("/config"))
+	mux.HandleFunc("PUT /api/tester/config", s.proxyTesterBody("/config"))
+	mux.HandleFunc("POST /api/tester/restart", s.proxyTesterBody("/restart"))
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

@@ -8,6 +8,9 @@ import type {
   StrategyAssignment,
   StrategyConfig,
   StrategyStats,
+  TesterConfig,
+  TesterVersion,
+  TesterVersionDetail,
   VariantStats,
 } from './types'
 
@@ -142,6 +145,24 @@ export const api = {
     if (opts.since) params.set('since', opts.since)
     return requestList<ParamChange>(`/strategies/${strategyId}/param-changes?${params}`)
   },
+
+  // Independent strategy-tester service (2026-08-30 request), proxied through cmd/api.
+  testerStats: () => requestList<TesterVersion>('/tester/stats'),
+  testerVersion: (id: number) => request<TesterVersionDetail>(`/tester/versions/${id}`),
+  createTesterVersion: (kind: string, config: Record<string, number>) =>
+    request<TesterVersion>('/tester/versions', {
+      method: 'POST',
+      body: JSON.stringify({ kind, config }),
+    }),
+  enableTesterVersion: (id: number) =>
+    request<{ ok: boolean }>(`/tester/versions/${id}/enable`, { method: 'POST' }),
+  testerConfig: () => request<TesterConfig>('/tester/config'),
+  saveTesterConfig: (patch: { bar?: string; notionalUsd?: string; leverage?: string }) =>
+    request<{ ok: boolean; restartRequired: boolean }>('/tester/config', {
+      method: 'PUT',
+      body: JSON.stringify(patch),
+    }),
+  restartTester: () => request<{ status: string }>('/tester/restart', { method: 'POST' }),
 }
 
 // PaperOrderEvent mirrors Go's usecase.PaperOrderEvent — the lightweight message pushed over

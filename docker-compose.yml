@@ -215,6 +215,34 @@ services:
       optimizer-service:
         condition: service_started
 
+  # Independent strategy-validation service (2026-08-30 request): a standalone paper-trading
+  # copy that opens real virtual positions against live prices to judge strategy signal quality,
+  # entirely apart from the RL agent and cmd/paper-trader (CLAUDE.md's tester package doc comment
+  # has the full design). Separate storage (tester_orders/tester_strategy_versions, migration
+  # 000010) so it can never collide with production paper-trading data.
+  strategy-tester:
+    logging: *default-logging
+    restart: *default-restart
+    build:
+      context: ./go-engine
+      dockerfile: Dockerfile.strategy-tester
+    environment:
+      CONFIG_PATH: /app/configs/config.yaml
+      KAFKA_BROKERS: kafka:9092
+      POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
+      TESTER_ADDR: "0.0.0.0:8092"
+      METRICS_ADDR: ":9104"
+    ports:
+      - "8092:8092"
+      - "9104:9104"
+    volumes:
+      - ./go-engine/configs:/app/configs
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_started
+
   api:
     logging: *default-logging
     restart: *default-restart
@@ -226,6 +254,7 @@ services:
       KAFKA_BROKERS: kafka:9092 # consumes okx.paper-order-events for the panel's WebSocket bridge, CLAUDE.md §11.4/§12
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       RL_SERVICE_URL: http://rl-service:8000
+      TESTER_SERVICE_URL: http://strategy-tester:8092
       API_ADDR: "0.0.0.0:8090" # container-internal bind; only reachable via the OpenVPN network in prod, see CLAUDE.md §11
       API_PROCESS_MANAGER: docker
     ports:

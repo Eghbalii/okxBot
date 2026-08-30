@@ -2220,3 +2220,60 @@ rule works" and "traffic bypasses the rule." What finally settled it was probing
 network namespace: the connection was refused *and* the DROP counter incremented on that exact
 packet. When a check's failure mode is silent, prefer the test that produces a positive signal.
 
+
+## 18. Independent strategy-validation service (`cmd/strategy-tester`, 2026-08-30)
+
+A standalone paper-trading copy, requested after noticing production's single-open-position-per-
+token rule (§16.9) let the fastest timeframe (5m) monopolize every token's slot — 15m/1H signals
+were firing but never got a chance to open, which made it hard to tell whether a strategy was
+actually bad or simply starved of the slot. This service exists to answer "does this strategy's
+raw signal work" with zero interference from the RL agent's sizing/SL-TP-adjust/update mechanic,
+the shared-account caps, or any other production concern — deliberately the same separation of
+concerns as the strategy-optimizer's §16.1 ("keep the RL agent out of judging signal quality").
+
+- **Storage is entirely separate** (migration `000010`): `tester_strategy_versions` and
+  `tester_orders`, sharing no table, foreign key, or naming with `strategies`/`paper_orders`. A
+  `tester_config` singleton row holds the panel-editable overrides (bar/notional/leverage).
+- **Every registered `strategy.Factories` kind (14) trades every configured instrument** (defaults
+  to the same roster as `trading.inst_ids` — the operator's explicit "don't limit to one or two
+  tokens, use exactly the same tokens" instruction) at one fixed timeframe (`tester.bar`, default
+  `5m` — chosen from the operator's own observation that signals/fills concentrate there in
+  practice, confirmed by checking `paper_orders`: all 10 tokens' open-position slots were filled by
+  5m orders, 15m/1H essentially starved). One open position per instrument across every kind,
+  serialized the same way as `PaperTrader.openMu` (§16.9's exact race, guarded against here too).
+- **No RL, no update mechanic, no sizing decision**: fixed `notional_usd`/`leverage` (default
+  $10/10x) for every position. A signal with no stop-loss is skipped outright, same non-negotiable
+  rule as production (§16.9) — this service has no clamp/`EnsureStop` fallback to fill one in.
+- **Judged by realized PnL sign**, not `close_reason` — same correction just applied to
+  `port.Repository.StrategyStatsFor` (§11.3). This service has no in-trade adjustment today so
+  `sl`↔loss and `tp`↔win will coincide almost always in practice, but keeping one win/loss
+  definition across both services means a reader never has to remember which page uses which rule.
+- **Versioning is manual, not automatic**: the operator edits a kind's params from the panel, which
+  inserts kind's next version number (`grid_like_v2`, etc.) rather than overwriting — the prior
+  version is disabled but its historical stats stay visible, and `parent_version_id` lets the panel
+  diff exactly what changed. There is no auto-versioning from a model or optimizer; this is
+  deliberately a separate, simpler mechanism from `strategy_param_changes` (§16.7).
+- **Config changes need a restart to take effect** (a new bar means a new Kafka subscription and a
+  fresh candle-window reseed) — `POST /restart` on `cmd/strategy-tester` simply calls `os.Exit(0)`
+  and relies on Docker's `restart: unless-stopped` policy to relaunch it reading the config it just
+  saved. This is the ONLY viable mechanism: `cmd/api`'s own `dockerStatus`/`LogTail` already shell
+  out to a `docker` binary that turned out not to be installed in its own image (`Dockerfile.api`
+  never added the Docker CLI) — found while building this, a pre-existing gap left as-is per the
+  operator's own "leave it for now" call. Self-exit + a container-scoped restart policy is what
+  guarantees restarting the tester can never affect any other service, with no shared command path
+  that could accidentally target one.
+- **Panel tab is stats-only, no positions list** (operator's explicit ask): one row per version
+  grouped by kind, showing signal count, open count, TP/SL close counts, win rate, and rounded
+  realized PnL, plus a click-through modal comparing a version's params against its parent's.
+- **Proxied through `cmd/api`** (`GET/POST/PUT /api/tester/*`) rather than exposed directly, same
+  access-control posture as every other panel data source (§11) — the panel never talks to
+  `cmd/strategy-tester`'s port itself, and that port is still firewalled VPN-only regardless.
+- **A pre-existing migration race surfaced during first deploy, left unfixed by explicit choice**:
+  `internal/postgres.Repository.Migrate`'s check-then-act loop (check if a migration filename is
+  already recorded, then apply it) has no lock, so two services starting simultaneously against a
+  fresh database can both see a new migration as unapplied and both attempt it — the loser's
+  transaction fails on a duplicate-key constraint and the process exits, which its restart policy
+  immediately recovers from (observed: `cmd/api` restarted once, `RestartCount=1`, and came up
+  clean because `cmd/strategy-tester` had already finished applying migration `000010`). This can
+  recur on any future migration where two migrating services first start together — a `pg_advisory_lock`
+  around the whole loop would close it, deferred since self-recovery already works.

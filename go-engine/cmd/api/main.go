@@ -73,8 +73,9 @@ func main() {
 
 	srv := &api.Server{
 		Repo:       repo,
-		RLBaseURL:  cfg.RLService.URL,
-		GrafanaURL: cfg.API.GrafanaURL,
+		RLBaseURL:     cfg.RLService.URL,
+		GrafanaURL:    cfg.API.GrafanaURL,
+		TesterBaseURL: cfg.Tester.URL,
 		ProcessMgr: cfg.API.ProcessMgr,
 		Units:      cfg.API.Units,
 		Logger:     logger,

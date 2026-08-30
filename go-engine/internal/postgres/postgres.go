@@ -51,6 +51,16 @@ func (r *Repository) Close() {
 	r.pool.Close()
 }
 
+// Pool exposes the underlying connection pool for a sibling package that needs its own queries
+// against tables port.Repository doesn't own (internal/tester's tester_orders/
+// tester_strategy_versions, deliberately kept out of this interface so the standalone strategy-
+// tester service can't be mistaken for part of the production repository surface). Reuses this
+// pool rather than opening a second one to the same database, and keeps the decimal.Decimal codec
+// registration (AfterConnect above) applied to every connection either package uses.
+func (r *Repository) Pool() *pgxpool.Pool {
+	return r.pool
+}
+
 // Migrate applies any pending .up.sql migrations, tracked in a schema_migrations table.
 func (r *Repository) Migrate(ctx context.Context) error {
 	if _, err := r.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {

@@ -154,3 +154,15 @@ optimizer:
   targets: []
   default_kinds:
     - "rsi_sma"
+
+# cmd/strategy-tester (2026-08-30 request): independent paper-trading copy for validating raw
+# strategy signal quality, entirely apart from the RL agent and cmd/paper-trader. Every registered
+# strategy.Factories kind trades every configured instrument at one fixed timeframe, one open
+# position per instrument, fixed size/leverage — no RL sizing, no in-trade SL/TP update mechanic.
+# Storage is separate (tester_orders/tester_strategy_versions, migration 000010).
+tester:
+  bar: "5m"           # fixed at the timeframe that concentrates signals/fills in practice
+  inst_ids: []        # empty = same roster as trading.inst_ids (the operator's own instruction)
+  notional_usd: 10
+  leverage: 10
+  candle_window: 300

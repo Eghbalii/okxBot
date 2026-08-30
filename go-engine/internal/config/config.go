@@ -207,6 +207,35 @@ type Config struct {
 		// Targets is empty.
 		DefaultKinds []string `yaml:"default_kinds"`
 	} `yaml:"optimizer"`
+
+	// Tester configures cmd/strategy-tester: a standalone paper-trading copy that opens real
+	// positions against live prices to validate strategy signal quality entirely independent of
+	// the RL agent and the production paper-trading path (2026-08-30 request) — separate storage
+	// (tester_orders/tester_strategy_versions, migration 000010), separate config, separate
+	// process, so it can never affect or be affected by cmd/paper-trader.
+	Tester struct {
+		// URL is cmd/strategy-tester's base URL as reached from cmd/api (env only, same pattern
+		// as Optimizer.URL/RLService.URL) — used to proxy the panel's tester tab through cmd/api
+		// rather than exposing this service directly (CLAUDE.md §11).
+		URL string `yaml:"-"`
+		// Addr is cmd/strategy-tester's own HTTP API bind address, analogous to Optimizer.Addr.
+		Addr string `yaml:"addr"`
+		// Bar is the single decision timeframe this service trades on. Set to "5m" per the
+		// operator's own observation (2026-08-30) that signals/fills concentrate there — see
+		// CLAUDE.md for the measured evidence (10/10 tokens' single open-position slot filled by
+		// 5m, 15m/1H essentially starved).
+		Bar string `yaml:"bar"`
+		// InstIDs defaults to Trading.InstIDs when empty (Load below) — deliberately the same
+		// roster the production system trades, per the operator's explicit "don't limit to one or
+		// two tokens, use exactly the same tokens" instruction.
+		InstIDs []string `yaml:"inst_ids"`
+		// NotionalUSD/Leverage are fixed for every position this service opens — there is no RL
+		// sizing here, so "how much" is a flat config value, not a decision (operator's own
+		// "size/leverage doesn't matter, start with $10 and 10x" instruction).
+		NotionalUSD decimal.Decimal `yaml:"notional_usd"`
+		Leverage    decimal.Decimal `yaml:"leverage"`
+		CandleWindow int `yaml:"candle_window"`
+	} `yaml:"tester"`
 }
 
 // OptimizerTarget is one (instrument, strategy-kind) pair cmd/strategy-optimizer's scheduler
@@ -385,6 +414,26 @@ func Load(path string) (*Config, error) {
 				cfg.Optimizer.Targets = append(cfg.Optimizer.Targets, OptimizerTarget{InstID: instID, Kind: kind})
 			}
 		}
+	}
+
+	cfg.Tester.URL = envOr("TESTER_SERVICE_URL", "http://localhost:8092")
+	if cfg.Tester.Addr == "" {
+		cfg.Tester.Addr = envOr("TESTER_ADDR", "0.0.0.0:8092")
+	}
+	if cfg.Tester.Bar == "" {
+		cfg.Tester.Bar = "5m"
+	}
+	if len(cfg.Tester.InstIDs) == 0 {
+		cfg.Tester.InstIDs = cfg.Trading.InstIDs
+	}
+	if cfg.Tester.NotionalUSD.IsZero() {
+		cfg.Tester.NotionalUSD = decimal.NewFromInt(10)
+	}
+	if cfg.Tester.Leverage.IsZero() {
+		cfg.Tester.Leverage = decimal.NewFromInt(10)
+	}
+	if cfg.Tester.CandleWindow == 0 {
+		cfg.Tester.CandleWindow = 300
 	}
 
 	return cfg, nil

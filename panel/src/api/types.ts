@@ -126,3 +126,41 @@ export interface ParamChange {
   Source: 'optimizer' | 'manual'
   CreatedAt: string
 }
+
+// Independent strategy-tester service (2026-08-30 request) — proxied through cmd/api's
+// /api/tester/* routes. Its own JSON uses camelCase (unlike the rest of this file, which mirrors
+// Go's PascalCase field names directly) because cmd/strategy-tester's response is forwarded
+// byte-for-byte rather than re-decoded/re-encoded by cmd/api.
+export interface TesterVersionStats {
+  signalCount: number
+  wins: number
+  losses: number
+  tpCloses: number
+  slCloses: number
+  openCount: number
+  winRatePct: string
+  realizedPnl: string
+}
+
+export interface TesterVersion {
+  id: number
+  kind: string
+  version: number
+  displayName: string
+  config: Record<string, number> | null
+  parentVersionId: number | null
+  enabled: boolean
+  stats: TesterVersionStats
+}
+
+export interface TesterVersionDetail {
+  version: TesterVersion
+  parent?: TesterVersion
+}
+
+export interface TesterConfig {
+  bar: string
+  instIds: string[]
+  notionalUsd: string
+  leverage: string
+}
