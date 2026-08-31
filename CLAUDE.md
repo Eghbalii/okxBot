@@ -2485,3 +2485,16 @@ its fallback-to-first behavior when nothing has enough trades yet, the `sidecar:
 prefix, and `sidecarScore`'s clamping. `docker-compose.yml`'s `strategy-tester` service gained
 `OPTIMIZER_SERVICE_URL` (previously unset — silently defaulting to `localhost:8001`, unreachable
 from inside the container) and a `depends_on: optimizer-service`.
+
+**Post-deploy gotcha caught the same day: nginx caches an upstream container's IP past a
+redeploy.** Redeploying `api` (a `docker compose up -d api`, new container = new internal Docker
+IP) left the panel's nginx still holding the OLD IP for its `/api/*` proxy, since nginx resolves a
+proxied hostname to an IP once and does not re-resolve it just because the container behind that
+hostname changed — this presented as the front-end showing "Bad Gateway" on every `/api/*` call
+while `api` itself was completely healthy (`curl` against it directly worked fine). Nothing about
+this is specific to the strategy-tester optimizer work above; it will recur on ANY future redeploy
+of `api` (or any service the panel's nginx proxies to) unless the panel container is restarted in
+the same breath. Fixed by `docker compose restart panel`, which makes nginx re-resolve the
+hostname on its own restart. **Operational rule going forward: redeploying `api` (or `rl-service`,
+or any container nginx proxies to) requires restarting `panel` immediately after**, not just the
+service that changed.
