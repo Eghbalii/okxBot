@@ -117,6 +117,13 @@ type Config struct {
 		RLClamps struct {
 			MinSLDistPct decimal.Decimal `yaml:"min_sl_dist_pct"`
 			MaxSLDistPct decimal.Decimal `yaml:"max_sl_dist_pct"`
+			// MaxLossPct bounds the REALIZED loss a stop can produce once leverage is applied
+			// (2026-08-31 request: "SL should never allow more than 15% loss, at any leverage, no
+			// cap on profit") — distinct from MaxSLDistPct above, which only bounds the raw price
+			// distance and knows nothing about leverage. At high leverage MaxSLDistPct alone could
+			// still let a stop realize far more than 15% of margin; this narrows the effective
+			// price-distance bound to MaxLossPct/leverage whenever that is tighter. Zero disables it.
+			MaxLossPct   decimal.Decimal `yaml:"max_loss_pct"`
 			MinTPSLRatio decimal.Decimal `yaml:"min_tp_sl_ratio"`
 		} `yaml:"rl_clamps"`
 		// RLMaxOpenDuration force-closes any position open longer than this, close_reason='timeout'
@@ -262,6 +269,21 @@ type Config struct {
 			// free slot to propose a new one (operator's explicit "لوپ رو هر ۱ ساعت اجرا کنیم").
 			CheckInterval time.Duration `yaml:"check_interval"`
 		} `yaml:"optimize"`
+
+		// RLClamps bounds this service's own opened SL levels the same way PaperTrading.RLClamps
+		// does production's (2026-08-31 request) — this service previously had NO clamp/EnsureStop
+		// pass at all (deliberately, since it measures raw strategy signal quality), which also
+		// meant a strategy's own SL had no leverage-aware loss ceiling. Only MaxLossPct is actually
+		// used here (tester.BuildOrder has no "missing stop" fallback to fill — a signal with no
+		// stop is still skipped outright, CLAUDE.md §16.9's rule) — the other fields exist so this
+		// struct's shape matches PaperTrading.RLClamps and a future EnsureStop-style fallback could
+		// reuse it without a config change.
+		RLClamps struct {
+			MinSLDistPct decimal.Decimal `yaml:"min_sl_dist_pct"`
+			MaxSLDistPct decimal.Decimal `yaml:"max_sl_dist_pct"`
+			MaxLossPct   decimal.Decimal `yaml:"max_loss_pct"`
+			MinTPSLRatio decimal.Decimal `yaml:"min_tp_sl_ratio"`
+		} `yaml:"rl_clamps"`
 	} `yaml:"tester"`
 }
 
@@ -467,6 +489,16 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Tester.Optimize.CheckInterval == 0 {
 		cfg.Tester.Optimize.CheckInterval = time.Hour
+	}
+	// MaxLossPct defaults to a hard 15% cap (2026-08-31 request: "no limit with any leverage
+	// should go down more than 15%") — unlike PaperTrading.RLClamps' other fields, this one is
+	// not opt-in-only-if-configured, since an unbounded loss at high leverage is exactly the
+	// failure mode it exists to prevent.
+	if cfg.PaperTrading.RLClamps.MaxLossPct.IsZero() {
+		cfg.PaperTrading.RLClamps.MaxLossPct = decimal.NewFromFloat(0.15)
+	}
+	if cfg.Tester.RLClamps.MaxLossPct.IsZero() {
+		cfg.Tester.RLClamps.MaxLossPct = decimal.NewFromFloat(0.15)
 	}
 
 	return cfg, nil

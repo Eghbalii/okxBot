@@ -107,6 +107,10 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 	}
 	posSize := pos.Pos
 	lever := pos.Lever
+	// OKX's own uplRatio is already leverage-adjusted (unrealized PnL / initial margin), matching
+	// usecase.unrealizedPnLPct's convention on the paper-mode side (rl_sltp_adjust.go) since
+	// 2026-08-31 — before that fix the two paths fed the model this field on different scales
+	// (levered live, unlevered paper), so nothing here needs to change, only paper mode did.
 	uplRatio := pos.UplRatio
 
 	// The exchange's own reported equity is ground truth for demo/real — unlike paper mode, where

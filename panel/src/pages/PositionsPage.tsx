@@ -35,17 +35,22 @@ function closeReasonBadge(reason: CloseReason | null) {
 // Unrealized PnL computed client-side from entry_px/size/leverage against the live streamed price
 // (CLAUDE.md §11.4) — mirrors the same math usecase.unrealizedPnLPct uses Go-side, just so the
 // panel doesn't need a REST round-trip for something it can derive locally from data it already has.
+//
+// pct is PnL as a fraction of margin (the price move scaled by leverage), matching OKX's own
+// uplRatio convention and usd's own leverage multiplication below — before 2026-08-31 pct omitted
+// leverage entirely, so a 1% price move at 20x leverage displayed as 1% instead of the correct 20%
+// while usd (which did multiply by leverage) was already right.
 function unrealizedPnL(p: Position, lastPrice: string | undefined): { pct: number; usd: number } | null {
   if (p.ClosedAt) return null // realized, not unrealized — RealizedPnL covers this case
   if (!lastPrice) return null
   const entry = Number(p.EntryPx)
   const last = Number(lastPrice)
   const size = Number(p.Size)
-  const leverage = Number(p.Leverage)
+  const leverage = Number(p.Leverage) || 1
   if (!entry || !Number.isFinite(last)) return null
   const direction = p.Side === 'buy' ? 1 : -1
-  const pct = (direction * (last - entry) * 100) / entry
-  const usd = ((direction * (last - entry)) / entry) * size * (leverage || 1)
+  const pct = (direction * (last - entry) * 100 * leverage) / entry
+  const usd = ((direction * (last - entry)) / entry) * size * leverage
   return { pct, usd }
 }
 

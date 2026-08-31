@@ -1651,8 +1651,8 @@ func TestPositionStateOf_MarksForks(t *testing.T) {
 	if !ps.PositionOpen || !ps.Side.Equal(dec("1")) || !ps.SizeUSD.Equal(dec("25")) {
 		t.Errorf("position state did not carry the order's own state: %+v", ps)
 	}
-	if !ps.UnrealizedPnLPct.Equal(dec("0.04")) { // (104-100)/100 on a long
-		t.Errorf("want unrealized PnL 0.04, got %s", ps.UnrealizedPnLPct)
+	if !ps.UnrealizedPnLPct.Equal(dec("0.4")) { // (104-100)/100 * 10x leverage on a long
+		t.Errorf("want unrealized PnL 0.4, got %s", ps.UnrealizedPnLPct)
 	}
 }
 

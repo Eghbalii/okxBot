@@ -324,10 +324,16 @@ class ReplayEnv(gym.Env):
         )
 
     def _unrealized_pnl_pct(self, price: float) -> float:
+        """PnL as a fraction of margin (price move scaled by leverage) — matches OKX's own
+        uplRatio convention and the Go paper-mode side's usecase.unrealizedPnLPct (fixed together
+        2026-08-31). Before that fix this returned the raw price-change ratio with no leverage
+        applied, disagreeing with the live path's already-levered uplRatio and with
+        okx_futures_env.py's own (correct) levered version of this same quantity.
+        """
         if self.entry_price is None or self.position_notional == 0 or not self.entry_price:
             return 0.0
         direction = 1.0 if self.position_notional > 0 else -1.0
-        return direction * (price / self.entry_price - 1.0)
+        return direction * (price / self.entry_price - 1.0) * self.leverage
 
     def _current_obs_vec(self) -> np.ndarray:
         series = self._current_series()

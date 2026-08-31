@@ -17,13 +17,41 @@ import (
 // Zero-valued fields disable the corresponding clamp, so a partially-configured Clamps is valid.
 type Clamps struct {
 	// MinSLDistPct / MaxSLDistPct bound the stop's distance from entry, as a fraction of entry
-	// price (0.005 = 0.5%).
+	// price (0.005 = 0.5%). This is a raw PRICE-move bound, independent of leverage.
 	MinSLDistPct decimal.Decimal
 	MaxSLDistPct decimal.Decimal
+	// MaxLossPct bounds the REALIZED loss the stop can produce once leverage is applied (0.15 =
+	// 15% of margin) — a distinct question from MaxSLDistPct above, which only limits the price
+	// distance and says nothing about leverage (2026-08-31 request: "SL should never allow more
+	// than 15% loss, at any leverage, but no limit on profit"). At entry+leverage, a price-distance
+	// stop of D% produces a D%*leverage loss, so this clamp is enforced by capping the effective
+	// price distance to MaxLossPct/leverage — the tighter of that and MaxSLDistPct wins. Deliberately
+	// separate from MaxSLDistPct rather than replacing it: MaxSLDistPct still bounds a 1x/unleveraged
+	// stop from being absurdly wide, while MaxLossPct is what actually matters once leverage is
+	// applied. No equivalent exists for TP — profit is never capped, only loss.
+	MaxLossPct decimal.Decimal
 	// MinTPSLRatio is the minimum reward:risk ratio — the TP distance must be at least this
 	// multiple of the SL distance. A too-near target is widened to satisfy it rather than the trade
 	// being rejected, since the entry itself may still be sound.
 	MinTPSLRatio decimal.Decimal
+}
+
+// maxSLDistPctFor returns the effective SL-distance cap for a position at the given leverage: the
+// tighter of the raw MaxSLDistPct and MaxLossPct/leverage. A non-positive leverage is treated as
+// 1x (unleveraged), matching usecase.unrealizedPnLPct's same defensive fallback.
+func (cl Clamps) maxSLDistPctFor(leverage decimal.Decimal) decimal.Decimal {
+	max := cl.MaxSLDistPct
+	if cl.MaxLossPct.IsPositive() {
+		lev := leverage
+		if !lev.IsPositive() {
+			lev = decimal.NewFromInt(1)
+		}
+		lossBound := cl.MaxLossPct.Div(lev)
+		if !max.IsPositive() || lossBound.LessThan(max) {
+			max = lossBound
+		}
+	}
+	return max
 }
 
 // EnsureStop guarantees a position never opens without a stop.
@@ -42,16 +70,18 @@ type Clamps struct {
 // possible, and a tight one would stop out on noise before that exit can trigger.
 //
 // Returns the levels unchanged when a usable stop is already present, or when no bound is
-// configured to derive one from.
-func (cl Clamps) EnsureStop(side string, entryPx decimal.Decimal, in Levels) Levels {
+// configured to derive one from. leverage narrows the effective distance via MaxLossPct — see
+// maxSLDistPctFor.
+func (cl Clamps) EnsureStop(side string, entryPx, leverage decimal.Decimal, in Levels) Levels {
 	if in.SLPx != nil && in.SLPx.IsPositive() {
 		return in
 	}
-	if !entryPx.IsPositive() || !cl.MaxSLDistPct.IsPositive() {
+	max := cl.maxSLDistPctFor(leverage)
+	if !entryPx.IsPositive() || !max.IsPositive() {
 		return in
 	}
 	long := side != "sell"
-	px := offsetFrom(long, entryPx, cl.MaxSLDistPct.Mul(entryPx), true)
+	px := offsetFrom(long, entryPx, max.Mul(entryPx), true)
 	in.SLPx = &px
 	return in
 }
@@ -73,7 +103,11 @@ type Levels struct {
 // A level on the wrong side of entry (a long's stop above its entry) is dropped rather than
 // mirrored: an inverted level means the model produced something incoherent, and guessing what it
 // meant would invent a decision it did not make.
-func (cl Clamps) Apply(side string, entryPx decimal.Decimal, in Levels) Levels {
+//
+// leverage narrows the SL distance bound via MaxLossPct so a leveraged position's stop can never
+// realize more than that fraction of margin, regardless of how wide MaxSLDistPct alone would
+// allow (2026-08-31 request). TP has no such leverage-aware cap — profit is never limited.
+func (cl Clamps) Apply(side string, entryPx, leverage decimal.Decimal, in Levels) Levels {
 	if !entryPx.IsPositive() {
 		return in
 	}
@@ -81,11 +115,12 @@ func (cl Clamps) Apply(side string, entryPx decimal.Decimal, in Levels) Levels {
 
 	out := Levels{}
 	slDist := decimal.Zero
+	maxSLDist := cl.maxSLDistPctFor(leverage)
 
 	if in.SLPx != nil {
 		dist := signedDist(long, entryPx, *in.SLPx, true)
 		if dist.IsPositive() {
-			dist = clampRange(dist, cl.MinSLDistPct.Mul(entryPx), cl.MaxSLDistPct.Mul(entryPx))
+			dist = clampRange(dist, cl.MinSLDistPct.Mul(entryPx), maxSLDist.Mul(entryPx))
 			slDist = dist
 			px := offsetFrom(long, entryPx, dist, true)
 			out.SLPx = &px

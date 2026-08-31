@@ -2536,3 +2536,95 @@ the same breath. Fixed by `docker compose restart panel`, which makes nginx re-r
 hostname on its own restart. **Operational rule going forward: redeploying `api` (or `rl-service`,
 or any container nginx proxies to) requires restarting `panel` immediately after**, not just the
 service that changed.
+
+## 19. Unrealized PnL% missing leverage, and a hard 15% loss cap (2026-08-31)
+
+### 19.1 Unrealized PnL% was never multiplied by leverage
+
+Reported as a panel display bug ("we show price-change %, not PnL%") — real, but the actual bug
+was in the shared Go helper the panel's display math mirrors, not the panel alone, and it reached
+the RL model's own observation input.
+
+**Root cause**: `usecase.unrealizedPnLPct` (`rl_sltp_adjust.go`) computed
+`direction*(price-entry)/entry` — a raw price-change ratio with no leverage applied at all. Every
+dollar-PnL computation elsewhere in the same package (`realizedPnL`, `papertrade.go`) already
+multiplies by `o.Leverage`; this one didn't. Correct only by coincidence back when every paper
+order opened at the old 1x default (§14's fixed-sizing history) — silently wrong at any other
+leverage, e.g. a 1% price move at 20x displayed as 1% instead of the correct 20%.
+
+**Worse than the display symptom**: this same function feeds `PositionState.UnrealizedPnLPct` —
+sent to `rl_service` as a live model input — and `PnLMaxPct`/`PnLMinPct`, both persisted to
+`paper_orders` and also fed to the model. Meanwhile the live/demo path (`trade.go`) reports OKX's
+own `uplRatio`, which **is** already leverage-adjusted (unrealized PnL ÷ initial margin). So the
+model was trained on paper-mode observations carrying an unlevered number and served live/demo
+observations carrying a levered one for the identical field — a train/serve skew on top of the
+raw wrongness, the same category of bug §15.6 already fixed once for `ActiveTokens`/token equity.
+
+Also found: `rl_service/env/replay_env.py`'s `_unrealized_pnl_pct` (the actively-used training
+env) had the identical unlevered bug, while the older/secondary `okx_futures_env.py` already
+computed it correctly (`* self.leverage`) — the two Python envs disagreed with each other too.
+
+**Not affected**: the reward function itself (`replay_env.py`'s `reward = (realized_pnl -
+fee_cost) / initial_equity_usd`) uses dollar PnL derived from notional, which already embeds
+leverage via `target_notional` — so training was not learning from a corrupted reward, only from
+a corrupted *observation* feature (which the policy could not use correctly regardless of how
+good the reward signal was).
+
+**Fix**: `unrealizedPnLPct` now multiplies by `o.Leverage` (falling back to 1x if unset/zero, same
+defensive pattern as elsewhere); `replay_env.py`'s equivalent now multiplies by `self.leverage`;
+the panel's `unrealizedPnL()` (`PositionsPage.tsx`) now applies `leverage` to `pct` the same way
+it already did to `usd`. `trade.go`'s live path needed no change — it was already correct — but
+gained a comment explaining why, so a future reader doesn't wonder why it looks different from the
+paper-mode helper it must agree with. One test updated (`TestPositionStateOf_MarksForks`, 10x
+fixture: `0.04` → `0.4`); `TestTrackPnLExtremes_RecordsPeakAndTrough` needed no change since its
+fixture already used 1x, where the corrected formula is numerically identical to the old one.
+
+**Known consequence, accepted rather than migrated**: existing `paper_orders.pnl_max_pct`/
+`pnl_min_pct` rows stay on the old unlevered scale; only newly-written rows use the corrected one.
+Since these values are direct RL model inputs, the model sees a step change in this feature's
+distribution at the deploy boundary — no different in kind from any other observation-schema
+change already documented (§15.3's version-bump discipline), except this one didn't get a version
+bump because the *shape* of the observation didn't change, only the *meaning* of one already-
+existing field. Worth watching training curves for a discontinuity right after this deploys.
+
+### 19.2 Hard 15% realized-loss cap on stop-loss placement, independent of leverage
+
+Explicit operator decision, same conversation: "for signals and strategies we have to limit the
+SL to not going down more than 15% with any leverage. But no limit for profit." — distinct from
+`conductor.Clamps.MaxSLDistPct` (§15.11/§15.12), which bounds the raw price-distance of a stop and
+knows nothing about leverage. At 20x, a stop placed at the old `MaxSLDistPct` ceiling alone could
+still realize far more than 15% of margin — the two clamps answer different questions and both
+are needed.
+
+**`conductor.Clamps` gained `MaxLossPct`** (`clamps.go`): `Apply` and `EnsureStop` now take a
+`leverage` parameter and narrow the effective SL-distance bound to `MaxLossPct/leverage` whenever
+that is tighter than `MaxSLDistPct` — implemented as `maxSLDistPctFor(leverage)`, the single place
+both entry points compute the effective bound from. A non-positive leverage is treated as 1x, the
+same defensive fallback as §19.1's `unrealizedPnLPct` fix. No equivalent exists for take-profit —
+profit is never capped, only loss, per the operator's explicit instruction. The existing ratchet
+(`usecase.RatchetSLTP`) needed no change: it only ever tightens an already-placed (now correctly
+capped) stop, so it structurally cannot reintroduce more risk than the initial placement allowed.
+
+Both of `Apply`/`EnsureStop`'s two production call sites (`lifecycle.go`'s model-driven open path,
+`papertrade.go`'s strategy-driven open path) already had `leverage` in scope at the call site
+before this change — sizing/leverage is decided earlier in both paths and the clamp call was
+simply never given it. `internal/config`'s `PaperTrading.RLClamps` gained `MaxLossPct`
+(`max_loss_pct`), defaulted to **0.15 even when left unset in config.yaml** — unlike this
+struct's other fields (zero = disabled), an unbounded loss at high leverage is exactly the failure
+mode this clamp exists to prevent, so it is not opt-in.
+
+**`cmd/strategy-tester` gained the same cap**, which it had no equivalent of at all before (its
+own doc comment: "this service has no clamp/EnsureStop pass to fall back on" — true for the
+missing-stop fallback, but a strategy's own SL still needs the leverage-aware ceiling). Rather than
+importing `conductor` (this package's own doc comment requires it stay independent of
+production/`usecase` code), `internal/tester.BuildOrder` gained a `maxLossPct` parameter and a
+small duplicated `clampSLForLoss` helper — the tester's existing pattern for pure math it needs
+without the production coupling (see `RealizedPnL`'s identical duplication-over-import precedent).
+`config.Tester.RLClamps.MaxLossPct` defaults to 0.15 the same way; the struct's other clamp fields
+exist only so its shape matches `PaperTrading.RLClamps`, unused today since this service's
+missing-stop case is still a hard skip, not a fill.
+
+13 new Go tests total (5 in `conductor/clamps_test.go`, 5 in `internal/tester/engine_test.go`, plus
+3 pre-existing `clamps_test.go` tests updated for the new `leverage` parameter): tightening at high
+leverage, no effect at 1x, zero-leverage treated as 1x, no effect on take-profit, and the
+missing-stop fallback path respecting the cap too.

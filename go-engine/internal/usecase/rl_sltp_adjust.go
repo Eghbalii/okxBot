@@ -321,6 +321,15 @@ func buildPriceContext(window []domain.Candle) domain.PriceContext {
 	return pc
 }
 
+// unrealizedPnLPct is the position's unrealized PnL as a fraction of margin (entry-to-price move
+// scaled by leverage), matching OKX's own uplRatio convention (internal/okx's live/demo path,
+// usecase/trade.go) and the dollar PnL math elsewhere in this package (realizedPnL,
+// papertrade.go), which both already multiply by leverage. Before 2026-08-31 this returned the
+// raw price-change ratio with no leverage applied at all — correct only by coincidence at the
+// service's old 1x default, and silently wrong at any other leverage (a 1% price move at 20x
+// showed as 1% instead of 20%). That mismatch also meant paper-mode observations (built from this
+// function) and live/demo observations (built from OKX's already-levered uplRatio, trade.go) fed
+// the model two different scales for the same field — fixed together, not just the display.
 func unrealizedPnLPct(o port.PaperOrder, price decimal.Decimal) decimal.Decimal {
 	if !o.EntryPx.IsPositive() {
 		return decimal.Zero
@@ -329,7 +338,11 @@ func unrealizedPnLPct(o port.PaperOrder, price decimal.Decimal) decimal.Decimal 
 	if o.Side == "sell" {
 		direction = decimal.NewFromInt(-1)
 	}
-	return direction.Mul(price.Sub(o.EntryPx)).Div(o.EntryPx)
+	leverage := o.Leverage
+	if !leverage.IsPositive() {
+		leverage = decimal.NewFromInt(1)
+	}
+	return direction.Mul(price.Sub(o.EntryPx)).Div(o.EntryPx).Mul(leverage)
 }
 
 func distPct(px *decimal.Decimal, price decimal.Decimal) decimal.Decimal {

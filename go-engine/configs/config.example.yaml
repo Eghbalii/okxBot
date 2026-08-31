@@ -99,6 +99,13 @@ paper_trading:
   rl_clamps:
     min_sl_dist_pct: 0.005
     max_sl_dist_pct: 0.05
+    # Caps the REALIZED loss a stop can produce once leverage is applied — 0.15 = never more than
+    # 15% of margin, at any leverage (2026-08-31 request). Distinct from max_sl_dist_pct above,
+    # which only bounds the raw price distance and knows nothing about leverage: at 20x, a stop
+    # placed at max_sl_dist_pct alone would realize a 100% loss. Defaults to 0.15 even if left
+    # unset here (internal/config.Load) — unlike the other rl_clamps fields, this one is not
+    # opt-in-only-if-configured. No equivalent cap exists for take-profit; profit is never limited.
+    max_loss_pct: 0.15
     # Minimum reward:risk. A too-near target is widened to satisfy it rather than the trade being
     # rejected, since the entry itself may still be sound.
     min_tp_sl_ratio: 1.5
@@ -189,3 +196,12 @@ tester:
   # strategy_assignments tables and its own optimizer's studies.
   optimize:
     check_interval: 1h   # how often the loop checks every kind for a judgeable/proposable candidate
+
+  # Caps a strategy's own SL at the realized-loss level, same reasoning/default as
+  # paper_trading.rl_clamps.max_loss_pct above (2026-08-31 request) — this service has no
+  # EnsureStop-style fallback (a signal with no stop is skipped outright, CLAUDE.md §16.9), but an
+  # SL that IS set must still respect the cap. min_sl_dist_pct/max_sl_dist_pct/min_tp_sl_ratio are
+  # unused today (only max_loss_pct is wired into tester.BuildOrder) — present so this struct's
+  # shape matches paper_trading.rl_clamps.
+  rl_clamps:
+    max_loss_pct: 0.15

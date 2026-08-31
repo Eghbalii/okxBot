@@ -91,7 +91,7 @@ func (e *PaperTrader) openDecision(
 	// Clamp where the model wants its levels BEFORE they are written to the order. The ratchet
 	// governs how they may move afterward and says nothing about the initial placement — an absurd
 	// first stop would already have done its damage by the time any update runs.
-	levels := e.conductorClamps().Apply(string(sig.Side), price, conductor.Levels{
+	levels := e.conductorClamps().Apply(string(sig.Side), price, leverage, conductor.Levels{
 		SLPx: nonZeroPx(action.SLPx),
 		TPPx: nonZeroPx(action.TPPx),
 	})

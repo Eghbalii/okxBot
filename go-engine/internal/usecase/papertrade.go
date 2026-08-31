@@ -555,11 +555,11 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 		// stop to measure against, so filling the stop afterwards would leave the ratio unchecked —
 		// observed as stoch_cross orders opening with a 5% stop against a 1% target, a 0.2
 		// reward:risk that MinTPSLRatio exists to prevent.
-		levels := e.conductorClamps().EnsureStop(string(signal.Side), price, conductor.Levels{
+		levels := e.conductorClamps().EnsureStop(string(signal.Side), price, order.Leverage, conductor.Levels{
 			SLPx: order.SLPx,
 			TPPx: order.TPPx,
 		})
-		levels = e.conductorClamps().Apply(string(signal.Side), price, levels)
+		levels = e.conductorClamps().Apply(string(signal.Side), price, order.Leverage, levels)
 		if levels.SLPx == nil {
 			logger.Error("refusing to open a position with no stop-loss",
 				"strategy", s.Name(), "instId", e.InstID, "bar", bar, "side", signal.Side)

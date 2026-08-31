@@ -405,7 +405,7 @@ func (s *service) evaluateVersions(ctx context.Context, instID string, window []
 			continue
 		}
 
-		order := tester.BuildOrder(instID, rv.versionID, s.cfg.Tester.Bar, price, s.cfg.Tester.NotionalUSD, s.cfg.Tester.Leverage, signal)
+		order := tester.BuildOrder(instID, rv.versionID, s.cfg.Tester.Bar, price, s.cfg.Tester.NotionalUSD, s.cfg.Tester.Leverage, s.cfg.Tester.RLClamps.MaxLossPct, signal)
 		if order.SLPx == nil {
 			// Same non-negotiable rule as production (CLAUDE.md §16.9): a position with no
 			// stop-loss is unbounded downside, not a missed opportunity. Skip rather than open

@@ -19,7 +19,7 @@ func d(s string) decimal.Decimal {
 
 func TestBuildOrder_ResolvesLevelsFromPercentages(t *testing.T) {
 	sig := strategy.Signal{Side: strategy.Buy, SLPct: d("0.02"), TPPct: d("0.05")}
-	o := BuildOrder("BTC-USDT-SWAP", 7, "5m", d("100"), d("10"), d("10"), sig)
+	o := BuildOrder("BTC-USDT-SWAP", 7, "5m", d("100"), d("10"), d("10"), decimal.Zero, sig)
 
 	if o.InstID != "BTC-USDT-SWAP" || o.VersionID != 7 || o.Bar != "5m" || o.Side != "buy" {
 		t.Fatalf("unexpected order shape: %+v", o)
@@ -40,7 +40,7 @@ func TestBuildOrder_ResolvesLevelsFromPercentages(t *testing.T) {
 
 func TestBuildOrder_SellDirection(t *testing.T) {
 	sig := strategy.Signal{Side: strategy.Sell, SLPct: d("0.02"), TPPct: d("0.05")}
-	o := BuildOrder("XRP-USDT-SWAP", 1, "5m", d("100"), d("10"), d("10"), sig)
+	o := BuildOrder("XRP-USDT-SWAP", 1, "5m", d("100"), d("10"), d("10"), decimal.Zero, sig)
 
 	if o.SLPx == nil || !o.SLPx.Equal(d("102")) {
 		t.Fatalf("sell sl = %v, want 102 (above entry)", o.SLPx)
@@ -52,9 +52,58 @@ func TestBuildOrder_SellDirection(t *testing.T) {
 
 func TestBuildOrder_NoLevelsWhenSignalHasNone(t *testing.T) {
 	sig := strategy.Signal{Side: strategy.Buy}
-	o := BuildOrder("BTC-USDT-SWAP", 1, "5m", d("100"), d("10"), d("10"), sig)
+	o := BuildOrder("BTC-USDT-SWAP", 1, "5m", d("100"), d("10"), d("10"), decimal.Zero, sig)
 	if o.SLPx != nil || o.TPPx != nil {
 		t.Fatalf("expected nil levels for a signal with no pct/px set, got sl=%v tp=%v", o.SLPx, o.TPPx)
+	}
+}
+
+// MaxLossPct caps the REALIZED loss a strategy's own SL can produce once leverage is applied
+// (2026-08-31 request: "SL should never allow more than 15% loss, at any leverage, no cap on
+// profit") — this service has no EnsureStop-style fallback, but an SL that IS set must still
+// respect the cap.
+func TestBuildOrder_MaxLossPctTightensStopAtHighLeverage(t *testing.T) {
+	// 10% price-distance SL at 20x leverage would realize 200% loss; capped to 15% means the
+	// price distance must shrink to 0.75%.
+	sig := strategy.Signal{Side: strategy.Buy, SLPct: d("0.10")}
+	o := BuildOrder("BTC-USDT-SWAP", 1, "5m", d("100"), d("10"), d("20"), d("0.15"), sig)
+	if o.SLPx == nil || !o.SLPx.Equal(d("99.25")) {
+		t.Fatalf("sl = %v, want tightened to 99.25 (0.75%% distance caps 20x loss at 15%%)", o.SLPx)
+	}
+}
+
+func TestBuildOrder_MaxLossPctDoesNotWidenAnAlreadyTighterStop(t *testing.T) {
+	// A 1% price-distance SL at 20x already realizes only 20% — wait, that's OVER 15%, so it
+	// should still tighten. Use a genuinely-safe 0.5% distance (10% loss at 20x) to confirm the
+	// clamp leaves an already-compliant stop untouched.
+	sig := strategy.Signal{Side: strategy.Buy, SLPct: d("0.005")}
+	o := BuildOrder("BTC-USDT-SWAP", 1, "5m", d("100"), d("10"), d("20"), d("0.15"), sig)
+	if o.SLPx == nil || !o.SLPx.Equal(d("99.5")) {
+		t.Fatalf("sl = %v, want unchanged 99.5 (10%% loss at 20x is within the 15%% cap)", o.SLPx)
+	}
+}
+
+func TestBuildOrder_MaxLossPctMirroredForSell(t *testing.T) {
+	sig := strategy.Signal{Side: strategy.Sell, SLPct: d("0.10")}
+	o := BuildOrder("BTC-USDT-SWAP", 1, "5m", d("100"), d("10"), d("20"), d("0.15"), sig)
+	if o.SLPx == nil || !o.SLPx.Equal(d("100.75")) {
+		t.Fatalf("sell sl = %v, want tightened to 100.75 (above entry, mirrored)", o.SLPx)
+	}
+}
+
+func TestBuildOrder_MaxLossPctZeroDisablesTheClamp(t *testing.T) {
+	sig := strategy.Signal{Side: strategy.Buy, SLPct: d("0.10")}
+	o := BuildOrder("BTC-USDT-SWAP", 1, "5m", d("100"), d("10"), d("20"), decimal.Zero, sig)
+	if o.SLPx == nil || !o.SLPx.Equal(d("90")) {
+		t.Fatalf("sl = %v, want unchanged 90 when maxLossPct is disabled", o.SLPx)
+	}
+}
+
+func TestBuildOrder_MaxLossPctHasNoEffectOnTakeProfit(t *testing.T) {
+	sig := strategy.Signal{Side: strategy.Buy, SLPct: d("0.10"), TPPct: d("2.0")}
+	o := BuildOrder("BTC-USDT-SWAP", 1, "5m", d("100"), d("10"), d("20"), d("0.15"), sig)
+	if o.TPPx == nil || !o.TPPx.Equal(d("300")) {
+		t.Fatalf("tp = %v, want unchanged 300 — profit is never capped regardless of leverage", o.TPPx)
 	}
 }
 

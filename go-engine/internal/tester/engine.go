@@ -12,11 +12,19 @@ import (
 // sizing here, per the operator's own "size/leverage doesn't matter, start flat" instruction),
 // levels resolved from the signal's own percentages/prices via strategy.Signal.ResolveLevels so
 // this reuses exactly the same price-resolution logic production strategies already rely on.
-func BuildOrder(instID string, versionID int64, bar string, price, notionalUSD, leverage decimal.Decimal, signal strategy.Signal) Order {
+//
+// maxLossPct caps the REALIZED loss the stop can produce once leverage is applied (2026-08-31
+// request: "SL should never allow more than 15% loss, at any leverage, no cap on profit") — a
+// strategy's own SL percentage is a raw price distance with no leverage awareness, so at high
+// leverage it could otherwise realize far more than the intended loss. Zero disables the cap.
+// Deliberately duplicated rather than importing conductor.Clamps (this package's own doc comment:
+// it must stay independent of usecase/production code) — the math is small enough that a second
+// copy costs less than the coupling would.
+func BuildOrder(instID string, versionID int64, bar string, price, notionalUSD, leverage decimal.Decimal, maxLossPct decimal.Decimal, signal strategy.Signal) Order {
 	resolved := signal.ResolveLevels(price)
 	var slPx, tpPx *decimal.Decimal
 	if resolved.SLPx.IsPositive() {
-		v := resolved.SLPx
+		v := clampSLForLoss(signal.Side == strategy.Buy, price, resolved.SLPx, leverage, maxLossPct)
 		slPx = &v
 	}
 	if resolved.TPPx.IsPositive() {
@@ -35,6 +43,33 @@ func BuildOrder(instID string, versionID int64, bar string, price, notionalUSD, 
 		Leverage:  leverage,
 		OpenedAt:  time.Now().UTC(),
 	}
+}
+
+// clampSLForLoss tightens sl toward entry if it would realize more than maxLossPct of margin at
+// the given leverage — never widens a tighter stop, only pulls in one that is too permissive. A
+// non-positive leverage is treated as 1x and a non-positive maxLossPct disables the clamp
+// entirely, matching usecase's equivalent (conductor.Clamps.maxSLDistPctFor).
+func clampSLForLoss(long bool, entry, sl, leverage, maxLossPct decimal.Decimal) decimal.Decimal {
+	if !maxLossPct.IsPositive() || !entry.IsPositive() {
+		return sl
+	}
+	lev := leverage
+	if !lev.IsPositive() {
+		lev = decimal.NewFromInt(1)
+	}
+	maxDist := maxLossPct.Div(lev).Mul(entry)
+	if long {
+		floor := entry.Sub(maxDist)
+		if sl.LessThan(floor) {
+			return floor
+		}
+		return sl
+	}
+	ceiling := entry.Add(maxDist)
+	if sl.GreaterThan(ceiling) {
+		return ceiling
+	}
+	return sl
 }
 
 // CloseReasonTimeout marks a tester position force-closed for running past the service's
