@@ -28,6 +28,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
+	"github.com/eghbalii/okxBot/go-engine/internal/optimizer"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 	"github.com/eghbalii/okxBot/go-engine/internal/tester"
@@ -109,6 +110,15 @@ func main() {
 		logger.Error("failed to load enabled versions", "error", err)
 		os.Exit(1)
 	}
+
+	// Automatic per-kind optimization loop (2026-08-31 request): proposes/judges parameter
+	// candidates on its own schedule, entirely independent of the RL agent and production's own
+	// cmd/strategy-optimizer — see internal/tester/optimizer_loop.go's package doc comment.
+	// Reuses the SAME optimizer-service sidecar deployment as production (Optimizer.URL) since the
+	// sidecar's Optuna studies are isolated per opaque study_id string with no shared state
+	// (tester.StudyID uses a "tester:" prefix production's own "{inst_id}:{kind}" can never match).
+	optimizerLoop := tester.NewOptimizerLoop(store, optimizer.NewSidecarClient(cfg.Optimizer.URL), logger)
+	go optimizerLoop.StartScheduler(ctx, cfg.Tester.Optimize.CheckInterval, kinds, svc.reloadStrategies)
 
 	instIDs := cfg.Tester.InstIDs
 	for _, instID := range instIDs {

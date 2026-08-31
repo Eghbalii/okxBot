@@ -2394,3 +2394,94 @@ that would need its own parse/format path on both the Go and panel sides — the
 and from whole hours purely for a friendlier input, the wire format is unchanged. Verified live:
 saved `2h`, restarted, confirmed `2h0m0s` came back from `GET /config`, then reset to the `6h`
 default the same way.
+
+### 18.2 Automatic per-kind optimization loop (2026-08-31)
+
+The panel had a fully-wired `POST /tester/versions` route (`internal/tester.Store.CreateVersion` +
+`api.createTesterVersion`) with no UI ever calling it — verified end to end via a manual `curl`
+(created and immediately reverted a real `rsi_sma_fuzzy_v2`) before concluding the backend was not
+the problem. That traced back to the actual ask: the operator does not want to hand-edit params at
+all — the tester service itself should propose new parameter candidates, judge them by their own
+performance, and build progressively better versions on its own; the operator's role is only to
+later pick a version to trust from the panel, never to invent one.
+
+**Reuses production's Optuna sidecar (`optimizer-service/`) rather than standing up a second one**
+(operator's own instruction, after confirming the sidecar has no state that could leak between
+callers): `optimizer_service/api.py` keys every study by an opaque, caller-chosen `study_id` string
+in an in-memory dict with zero cross-key interaction, so a distinct prefix is sufficient isolation.
+`internal/tester.StudyID` uses `"tester:{kind}"`, which can never collide with production's
+`internal/optimizer.StudyID`'s `"{inst_id}:{kind}"` convention (verified: `"tester"` cannot appear
+as a real `inst_id`, and even a hypothetical collision would need not just a string match but an
+identically-keyed request from both services, which the two services' code paths cannot produce).
+`internal/optimizer.SidecarClient`/`Candidate`/`SidecarParamSpec` (pure HTTP types, no DB
+dependency) are reused directly rather than duplicated — this is the one and only cross-import
+between the two packages, and it carries no production state across.
+
+**One in-flight candidate per kind, not a batch** (operator's explicit "یکی یکی، ساده" over a
+parallel/batched design like production's optimizer): `tester_optimizer_state` (migration `000013`)
+tracks at most one candidate version id per kind. `OptimizerLoop.Tick`, run every
+`tester.optimize.check_interval` (default 1h, operator's explicit "لوپ رو هر ۱ ساعت اجرا کنیم تا
+ببینه کی اماده هست"), either judges that kind's in-flight candidate once it has closed
+`internal/tester.MinTradesToScore` (30) trades, or — if the kind has no candidate in flight —
+proposes a new one immediately.
+
+**A new candidate is created already `enabled`**, unlike production's shadow-fork A/B mechanic
+(§15.4): this service trades one version per kind live at a time by design (§18), so there is no
+shadow slot to hold a candidate in while comparing — the candidate itself starts trading and
+accumulating the very trades that will judge it.
+
+**Every new candidate is built from whichever version currently scores best across the kind's
+entire history, never just the most recent version** — the operator's explicit simplification of an
+earlier, more complex proposal: *"هر سری که میخواد ورژن جدید بسازه یدور تمام ورژن قدیمی ها رو بخونه
+نتایجشون رو و آپدیت جدید رو از روی اون بسازه"*. `proposeCandidate` calls `Store.VersionsForKind`
+(new — returns every version of one kind including the origin), scores each via `VersionStatsFor`,
+and picks the best with `BestScore`. This means a candidate that underperforms never poisons the
+lineage: the next proposal simply reverts to basing itself on the origin or whichever earlier
+version still leads, exactly the "if bad, go back to the best version, not just the last one"
+behavior the operator asked for, achieved without needing to track a separate "lineage" concept at
+all — the full history is re-scored fresh every time.
+
+**Scoring combines win rate AND realized PnL, deliberately not win-rate-alone like production's
+optimizer** (operator's explicit "winrate , pnl در کنار هم و در تعداد بالای ترید" — §16's
+`scoring.go` intentionally excludes PnL per §16.1's RL-independence rationale, which does not apply
+here since this loop has no RL agent to protect the judgment from). `VersionScore.Better` requires a
+candidate to be not-worse on **both** dimensions and strictly better on **at least one** — a
+candidate with a higher win rate but worse PnL (many small wins funding a few large losses) does
+NOT count as an improvement, and neither does the reverse. This is a deliberately conservative
+choice: an ambiguous result leaves the current best version in place rather than churning on noise.
+`MinTradesToScore = 30`, doubled from production optimizer's example config of 15, per the
+operator's explicit "۱۵ ترید عدد کافی ای نیست" — each version needs enough trades to make a real
+comparison, and the once-an-hour cadence just checks whether that threshold has been crossed yet,
+it does not itself gate how long a candidate needs to run.
+
+**No version is ever deleted automatically — origin or otherwise** (operator's explicit "ورژن
+اولیه که همیشه هست و پاک نمیشه. ورژن های جدید هم پاک نمیشن مگر توسط خودم"). The panel gained a
+**Delete** button (`DELETE /api/tester/versions/{id}` → `cmd/strategy-tester`'s own
+`DELETE /versions/{id}` → `Store.DeleteVersion`) for the operator's own manual cleanup — refuses to
+delete the currently-enabled version (would leave the kind with nothing trading and no obvious
+fallback), and clears any `parent_version_id`/`tester_optimizer_state` reference to the deleted row
+first so a delete can never leave a dangling foreign key or a candidate pointer aimed at nothing.
+
+**`tester_strategy_versions` gained `source` (`'origin' | 'manual' | 'optimizer'`) and `trial_id`**
+(migration `000013`) so a person reading the panel — and the code judging a candidate — can always
+tell how a version came to exist. `trial_id` is the Optuna sidecar's own trial number for a
+version proposed by this loop (`NULL` for the origin and for manual panel edits), letting
+`judgeCandidate` call `sidecar.Report` on exactly the trial that produced the version being judged,
+closing the ask/tell loop Optuna needs to actually learn across proposals for the same kind.
+
+**`sidecarScore` blends win rate and PnL sign into Optuna's required `[0,1]` maximize objective**
+rather than reusing production's win-rate-only `Score()` — a `+0.1`/`-0.1` nudge for positive/
+negative PnL, clamped to `[0,1]`, so Optuna's own TPE sampler is pushed in the same direction as
+this loop's own `Better` comparison rather than optimizing a different, win-rate-only signal that
+`Better` would then partly override anyway.
+
+A kind with no tunable `strategy.ParamSpec`s (a pure crossover with nothing to search over) is
+skipped by the loop rather than erroring — there is nothing a candidate could differ by.
+
+17 new Go tests (`internal/tester/optimize_test.go`, 228 Go total): win-rate/PnL scoring from raw
+stats, the `Better` comparison's not-worse-on-either-dimension rule (including both single-
+dimension-worse cases that must NOT count as improvement), `BestScore`'s eligibility filtering and
+its fallback-to-first behavior when nothing has enough trades yet, the `sidecar:{kind}` study-id
+prefix, and `sidecarScore`'s clamping. `docker-compose.yml`'s `strategy-tester` service gained
+`OPTIMIZER_SERVICE_URL` (previously unset — silently defaulting to `localhost:8001`, unreachable
+from inside the container) and a `depends_on: optimizer-service`.

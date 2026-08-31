@@ -249,6 +249,19 @@ type Config struct {
 		// forever). Zero falls back to a 6h default at construction time, same starting value as
 		// production's.
 		MaxOpenDuration time.Duration `yaml:"max_open_duration"`
+
+		// Optimize configures cmd/strategy-tester's own automatic per-kind optimization loop
+		// (2026-08-31 request): the service proposes new parameter candidates for each strategy
+		// kind, judges them by win rate + PnL once enough trades accumulate, and always builds the
+		// next candidate from whichever version (including the origin) currently scores best —
+		// entirely independent of Optimizer above (separate storage, separate Optuna study
+		// namespace via tester.StudyID). Reuses Optimizer.URL's sidecar deployment (the operator's
+		// own call: the sidecar is generic and safely shared, studies are isolated per study_id).
+		Optimize struct {
+			// CheckInterval is how often the loop checks every kind for a judgeable candidate or a
+			// free slot to propose a new one (operator's explicit "لوپ رو هر ۱ ساعت اجرا کنیم").
+			CheckInterval time.Duration `yaml:"check_interval"`
+		} `yaml:"optimize"`
 	} `yaml:"tester"`
 }
 
@@ -451,6 +464,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Tester.MaxOpenDuration == 0 {
 		cfg.Tester.MaxOpenDuration = 6 * time.Hour
+	}
+	if cfg.Tester.Optimize.CheckInterval == 0 {
+		cfg.Tester.Optimize.CheckInterval = time.Hour
 	}
 
 	return cfg, nil

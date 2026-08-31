@@ -20,9 +20,10 @@ import (
 )
 
 // Version is one numbered parameter set for a strategy kind (e.g. kind="grid_like", version=2).
-// Version 1 is the unmodified origin defaults; every later version comes from an operator editing
-// params in the panel, which creates a NEW row rather than overwriting — ParentVersionID points at
-// what it was cloned from, so the panel can diff "what changed" (2026-08-30 request).
+// Version 1 is the unmodified origin defaults; every later version comes from either an operator
+// editing params in the panel or the automatic optimizer loop proposing one (2026-08-31), both of
+// which create a NEW row rather than overwriting — ParentVersionID points at what it was cloned
+// from, so the panel can diff "what changed".
 type Version struct {
 	ID              int64
 	Kind            string
@@ -31,6 +32,12 @@ type Version struct {
 	ParentVersionID *int64
 	Enabled         bool
 	CreatedAt       time.Time
+	// TrialID is the Optuna sidecar's opaque trial number this version was proposed from, nil for
+	// the origin and for manually-created versions (CLAUDE.md's automatic optimizer loop).
+	TrialID *int
+	// Source distinguishes how this version came to exist: "origin", "manual" (panel edit), or
+	// "optimizer" (automatic proposal) — lets the panel/operator tell them apart at a glance.
+	Source string
 }
 
 // Order is one virtual position (mirrors paper_orders' shape but in its own table/namespace).
@@ -83,8 +90,8 @@ func NewStore(pool *pgxpool.Pool) *Store {
 func (s *Store) EnsureOriginVersion(ctx context.Context, kind string) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO tester_strategy_versions (kind, version, config, parent_version_id, enabled)
-		VALUES ($1, 1, '{}'::jsonb, NULL, true)
+		INSERT INTO tester_strategy_versions (kind, version, config, parent_version_id, enabled, source)
+		VALUES ($1, 1, '{}'::jsonb, NULL, true, 'origin')
 		ON CONFLICT (kind, version) DO UPDATE SET kind = EXCLUDED.kind
 		RETURNING id
 	`, kind).Scan(&id)
@@ -94,10 +101,20 @@ func (s *Store) EnsureOriginVersion(ctx context.Context, kind string) (int64, er
 	return id, nil
 }
 
+const versionColumns = `id, kind, version, config, parent_version_id, enabled, created_at, trial_id, source`
+
+func scanVersion(row pgx.Row) (Version, error) {
+	var v Version
+	err := row.Scan(&v.ID, &v.Kind, &v.Version, &v.Config, &v.ParentVersionID, &v.Enabled, &v.CreatedAt, &v.TrialID, &v.Source)
+	return v, err
+}
+
 // CreateVersion inserts the next version number for kind, cloned from parentVersionID, and
 // disables the parent so exactly one version per kind trades live at a time (the panel still
-// shows every version's historical stats — see ListVersions).
-func (s *Store) CreateVersion(ctx context.Context, kind string, config json.RawMessage, parentVersionID int64) (int64, error) {
+// shows every version's historical stats — see ListVersions). source/trialID distinguish a manual
+// panel edit ("manual", nil) from an automatic optimizer proposal ("optimizer", the Optuna trial
+// number it was proposed from) — see CreateManualVersion/CreateCandidateVersion below.
+func (s *Store) CreateVersion(ctx context.Context, kind string, config json.RawMessage, parentVersionID int64, source string, trialID *int) (int64, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin tx: %w", err)
@@ -111,10 +128,10 @@ func (s *Store) CreateVersion(ctx context.Context, kind string, config json.RawM
 
 	var id int64
 	if err := tx.QueryRow(ctx, `
-		INSERT INTO tester_strategy_versions (kind, version, config, parent_version_id, enabled)
-		VALUES ($1, $2, $3, $4, true)
+		INSERT INTO tester_strategy_versions (kind, version, config, parent_version_id, enabled, source, trial_id)
+		VALUES ($1, $2, $3, $4, true, $5, $6)
 		RETURNING id
-	`, kind, nextVersion, config, parentVersionID).Scan(&id); err != nil {
+	`, kind, nextVersion, config, parentVersionID, source, trialID).Scan(&id); err != nil {
 		return 0, fmt.Errorf("insert version: %w", err)
 	}
 
@@ -130,11 +147,7 @@ func (s *Store) CreateVersion(ctx context.Context, kind string, config json.RawM
 
 // ListVersions returns every version across every kind, newest-first within each kind.
 func (s *Store) ListVersions(ctx context.Context) ([]Version, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, kind, version, config, parent_version_id, enabled, created_at
-		FROM tester_strategy_versions
-		ORDER BY kind, version DESC
-	`)
+	rows, err := s.pool.Query(ctx, `SELECT `+versionColumns+` FROM tester_strategy_versions ORDER BY kind, version DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list versions: %w", err)
 	}
@@ -142,8 +155,29 @@ func (s *Store) ListVersions(ctx context.Context) ([]Version, error) {
 
 	var out []Version
 	for rows.Next() {
-		var v Version
-		if err := rows.Scan(&v.ID, &v.Kind, &v.Version, &v.Config, &v.ParentVersionID, &v.Enabled, &v.CreatedAt); err != nil {
+		v, err := scanVersion(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan version: %w", err)
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// VersionsForKind returns every version of one kind, newest-first — used by the optimizer loop to
+// find the best-scoring version to base its next candidate on (CLAUDE.md: "هر سری که میخواد ورژن
+// جدید بسازه یدور تمام ورژن قدیمی ها رو بخونه").
+func (s *Store) VersionsForKind(ctx context.Context, kind string) ([]Version, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+versionColumns+` FROM tester_strategy_versions WHERE kind = $1 ORDER BY version DESC`, kind)
+	if err != nil {
+		return nil, fmt.Errorf("list versions for kind %q: %w", kind, err)
+	}
+	defer rows.Close()
+
+	var out []Version
+	for rows.Next() {
+		v, err := scanVersion(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan version: %w", err)
 		}
 		out = append(out, v)
@@ -154,11 +188,7 @@ func (s *Store) ListVersions(ctx context.Context) ([]Version, error) {
 // EnabledVersions returns the single currently-enabled version per kind — what the trading loop
 // actually runs.
 func (s *Store) EnabledVersions(ctx context.Context) ([]Version, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, kind, version, config, parent_version_id, enabled, created_at
-		FROM tester_strategy_versions WHERE enabled = true
-		ORDER BY kind
-	`)
+	rows, err := s.pool.Query(ctx, `SELECT `+versionColumns+` FROM tester_strategy_versions WHERE enabled = true ORDER BY kind`)
 	if err != nil {
 		return nil, fmt.Errorf("list enabled versions: %w", err)
 	}
@@ -166,8 +196,8 @@ func (s *Store) EnabledVersions(ctx context.Context) ([]Version, error) {
 
 	var out []Version
 	for rows.Next() {
-		var v Version
-		if err := rows.Scan(&v.ID, &v.Kind, &v.Version, &v.Config, &v.ParentVersionID, &v.Enabled, &v.CreatedAt); err != nil {
+		v, err := scanVersion(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan version: %w", err)
 		}
 		out = append(out, v)
@@ -177,15 +207,51 @@ func (s *Store) EnabledVersions(ctx context.Context) ([]Version, error) {
 
 // GetVersion fetches one version by id — used by the panel's "compare to parent" view.
 func (s *Store) GetVersion(ctx context.Context, id int64) (Version, error) {
-	var v Version
-	err := s.pool.QueryRow(ctx, `
-		SELECT id, kind, version, config, parent_version_id, enabled, created_at
-		FROM tester_strategy_versions WHERE id = $1
-	`, id).Scan(&v.ID, &v.Kind, &v.Version, &v.Config, &v.ParentVersionID, &v.Enabled, &v.CreatedAt)
+	v, err := scanVersion(s.pool.QueryRow(ctx, `SELECT `+versionColumns+` FROM tester_strategy_versions WHERE id = $1`, id))
 	if err != nil {
 		return Version{}, fmt.Errorf("get version %d: %w", id, err)
 	}
 	return v, nil
+}
+
+// DeleteVersion permanently removes one version and its trade history (2026-08-31 request: the
+// panel gains a delete action for versions the operator wants gone — automatic optimizer proposals
+// are otherwise kept forever, per the operator's explicit "ورژن های جدید هم پاک نمیشن مگر توسط
+// خودم"). Refuses to delete the currently-enabled version, since that would leave the kind with
+// nothing trading and no obvious version to fall back to — the operator must enable a different
+// version first. tester_orders rows for this version are deleted too (no FK-cascade reliance,
+// explicit for clarity) since they are meaningless without the version they scored.
+func (s *Store) DeleteVersion(ctx context.Context, id int64) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var enabled bool
+	if err := tx.QueryRow(ctx, `SELECT enabled FROM tester_strategy_versions WHERE id = $1`, id).Scan(&enabled); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("version %d not found", id)
+		}
+		return fmt.Errorf("lookup version %d: %w", id, err)
+	}
+	if enabled {
+		return fmt.Errorf("cannot delete the currently-enabled version; enable a different version first")
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE tester_strategy_versions SET parent_version_id = NULL WHERE parent_version_id = $1`, id); err != nil {
+		return fmt.Errorf("clear child parent references for version %d: %w", id, err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE tester_optimizer_state SET candidate_version_id = NULL WHERE candidate_version_id = $1`, id); err != nil {
+		return fmt.Errorf("clear optimizer state referencing version %d: %w", id, err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM tester_orders WHERE version_id = $1`, id); err != nil {
+		return fmt.Errorf("delete orders for version %d: %w", id, err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM tester_strategy_versions WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("delete version %d: %w", id, err)
+	}
+	return tx.Commit(ctx)
 }
 
 // OpenOrder inserts a new virtual position.
@@ -333,4 +399,32 @@ func (s *Store) SetEnabled(ctx context.Context, id int64, enabled bool) error {
 		return fmt.Errorf("set enabled for version %d: %w", id, err)
 	}
 	return tx.Commit(ctx)
+}
+
+// CandidateVersionID returns the version id the optimizer loop currently has in flight for kind,
+// if any — nil means the loop is free to propose a new candidate for this kind.
+func (s *Store) CandidateVersionID(ctx context.Context, kind string) (*int64, error) {
+	var id *int64
+	err := s.pool.QueryRow(ctx, `SELECT candidate_version_id FROM tester_optimizer_state WHERE kind = $1`, kind).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get optimizer state for kind %q: %w", kind, err)
+	}
+	return id, nil
+}
+
+// SetCandidateVersionID records kind's in-flight optimizer candidate (or clears it with nil once
+// judged), so a service restart doesn't lose track of what it was waiting on.
+func (s *Store) SetCandidateVersionID(ctx context.Context, kind string, versionID *int64) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO tester_optimizer_state (kind, candidate_version_id, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (kind) DO UPDATE SET candidate_version_id = $2, updated_at = now()
+	`, kind, versionID)
+	if err != nil {
+		return fmt.Errorf("set optimizer state for kind %q: %w", kind, err)
+	}
+	return nil
 }

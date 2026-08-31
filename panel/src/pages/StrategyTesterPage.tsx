@@ -269,6 +269,16 @@ export default function StrategyTesterPage() {
     reload()
   }
 
+  async function remove(v: TesterVersion) {
+    if (!confirm(`Delete ${v.displayName}? This permanently removes it and its trade history.`)) return
+    try {
+      await api.deleteTesterVersion(v.id)
+      reload()
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }
+
   return (
     <div>
       <div className="text-dim" style={{ marginBottom: '0.75rem' }}>
@@ -286,6 +296,7 @@ export default function StrategyTesterPage() {
             <thead>
               <tr>
                 <th>Version</th>
+                <th>Source</th>
                 <th>Status</th>
                 <th>Signals</th>
                 <th>Open</th>
@@ -300,7 +311,7 @@ export default function StrategyTesterPage() {
               {byKind.map(([kind, list]) => (
                 <>
                   <tr key={`${kind}-header`}>
-                    <td colSpan={9} className="text-dim" style={{ fontWeight: 600, paddingTop: '0.8rem' }}>
+                    <td colSpan={10} className="text-dim" style={{ fontWeight: 600, paddingTop: '0.8rem' }}>
                       {kind}
                     </td>
                   </tr>
@@ -316,6 +327,11 @@ export default function StrategyTesterPage() {
                         </button>
                       </td>
                       <td>
+                        <span className={'badge ' + (v.source === 'optimizer' ? 'badge-green' : 'badge-dim')}>
+                          {v.source}
+                        </span>
+                      </td>
+                      <td>
                         <span className={'badge ' + (v.enabled ? 'badge-green' : 'badge-dim')}>
                           {v.enabled ? 'live' : 'inactive'}
                         </span>
@@ -328,8 +344,13 @@ export default function StrategyTesterPage() {
                       <td className={'mono ' + pnlClass(Number(v.stats.realizedPnl))}>
                         ${Number(v.stats.realizedPnl).toFixed(0)}
                       </td>
-                      <td>
+                      <td style={{ display: 'flex', gap: '0.4rem' }}>
                         {!v.enabled && <button onClick={() => enable(v.id)}>Make live</button>}
+                        {!v.enabled && (
+                          <button onClick={() => remove(v)} title="Permanently delete this version">
+                            Delete
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -337,7 +358,7 @@ export default function StrategyTesterPage() {
               ))}
               {versions.length === 0 && !error && (
                 <tr>
-                  <td colSpan={9} className="text-dim">
+                  <td colSpan={10} className="text-dim">
                     No strategy versions yet.
                   </td>
                 </tr>

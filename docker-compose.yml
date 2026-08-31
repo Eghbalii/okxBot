@@ -232,6 +232,11 @@ services:
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       TESTER_ADDR: "0.0.0.0:8092"
       METRICS_ADDR: ":9104"
+      # Reuses the SAME optimizer-service sidecar deployment as strategy-optimizer for the
+      # automatic per-kind optimization loop (2026-08-31, internal/tester/optimizer_loop.go) — safe
+      # because Optuna studies are isolated per opaque study_id string (tester.StudyID's "tester:"
+      # prefix can never collide with strategy-optimizer's own "{inst_id}:{kind}" convention).
+      OPTIMIZER_SERVICE_URL: http://optimizer-service:8001
     ports:
       - "8092:8092"
       - "9104:9104"
@@ -241,6 +246,8 @@ services:
       kafka:
         condition: service_healthy
       timescaledb:
+        condition: service_started
+      optimizer-service:
         condition: service_started
 
   api:

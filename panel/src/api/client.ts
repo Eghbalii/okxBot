@@ -156,6 +156,10 @@ export const api = {
     }),
   enableTesterVersion: (id: number) =>
     request<{ ok: boolean }>(`/tester/versions/${id}/enable`, { method: 'POST' }),
+  // 2026-08-31: lets the operator permanently remove a version they no longer want kept — the
+  // automatic optimizer loop otherwise never deletes anything on its own.
+  deleteTesterVersion: (id: number) =>
+    request<{ ok: boolean }>(`/tester/versions/${id}`, { method: 'DELETE' }),
   testerConfig: () => request<TesterConfig>('/tester/config'),
   saveTesterConfig: (patch: { bar?: string; notionalUsd?: string; leverage?: string; maxOpenDuration?: string }) =>
     request<{ ok: boolean; restartRequired: boolean }>('/tester/config', {

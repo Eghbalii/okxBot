@@ -21,6 +21,7 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("GET /versions/{id}", s.handleGetVersion)
 	mux.HandleFunc("POST /versions", s.handleCreateVersion)
 	mux.HandleFunc("POST /versions/{id}/enable", s.handleEnableVersion)
+	mux.HandleFunc("DELETE /versions/{id}", s.handleDeleteVersion)
 	mux.HandleFunc("GET /config", s.handleGetConfig)
 	mux.HandleFunc("PUT /config", s.handleSaveConfig)
 	mux.HandleFunc("POST /restart", s.handleRestart)
@@ -47,7 +48,10 @@ type versionView struct {
 	EffectiveConfig map[string]float64 `json:"effectiveConfig"`
 	ParentVersionID *int64             `json:"parentVersionId,omitempty"`
 	Enabled         bool               `json:"enabled"`
-	Stats           versionStatsView   `json:"stats"`
+	// Source distinguishes an operator's manual param edit from the automatic optimizer loop's own
+	// proposal (2026-08-31) — "origin" for version 1, "manual", or "optimizer".
+	Source  string           `json:"source"`
+	Stats   versionStatsView `json:"stats"`
 }
 
 type versionStatsView struct {
@@ -95,6 +99,7 @@ func toVersionView(ctx context.Context, s *service, v tester.Version) (versionVi
 		EffectiveConfig: effectiveConfig(v.Kind, v.Config),
 		ParentVersionID: v.ParentVersionID,
 		Enabled:         v.Enabled,
+		Source:          v.Source,
 		Stats:           toVersionStatsView(stats),
 	}, nil
 }
@@ -236,7 +241,7 @@ func (s *service) handleCreateVersion(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	id, err := s.store.CreateVersion(r.Context(), req.Kind, configJSON, parentID)
+	id, err := s.store.CreateVersion(r.Context(), req.Kind, configJSON, parentID, "manual", nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -271,6 +276,22 @@ func (s *service) handleEnableVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.reloadStrategies(r.Context()); err != nil {
 		s.logger.Error("failed to reload strategies after enabling version", "error", err)
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleDeleteVersion permanently removes a version the operator no longer wants kept
+// (2026-08-31 request — automatic optimizer proposals are otherwise never deleted). Refuses to
+// delete the currently-enabled version (Store.DeleteVersion's own guard).
+func (s *service) handleDeleteVersion(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.store.DeleteVersion(r.Context(), id); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

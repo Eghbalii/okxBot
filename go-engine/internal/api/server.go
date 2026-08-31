@@ -122,6 +122,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/tester/versions/{id}", s.proxyTesterWithID("/versions/%s"))
 	mux.HandleFunc("POST /api/tester/versions", s.proxyTesterBody("/versions"))
 	mux.HandleFunc("POST /api/tester/versions/{id}/enable", s.proxyTesterWithIDBody("/versions/%s/enable"))
+	mux.HandleFunc("DELETE /api/tester/versions/{id}", s.proxyTesterWithID("/versions/%s"))
 	mux.HandleFunc("GET /api/tester/config", s.proxyTester("/config"))
 	mux.HandleFunc("PUT /api/tester/config", s.proxyTesterBody("/config"))
 	mux.HandleFunc("POST /api/tester/restart", s.proxyTesterBody("/restart"))

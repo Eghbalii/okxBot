@@ -154,6 +154,9 @@ export interface TesterVersion {
   effectiveConfig: Record<string, number> | null
   parentVersionId: number | null
   enabled: boolean
+  // "origin" | "manual" | "optimizer" — distinguishes the seeded default, an operator's panel
+  // edit, and the automatic optimizer loop's own proposal (2026-08-31).
+  source: string
   stats: TesterVersionStats
 }
 

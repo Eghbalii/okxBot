@@ -177,3 +177,15 @@ tester:
   # This service has no in-trade update mechanic, so unlike production a position can otherwise
   # sit open forever if price never reaches either level.
   max_open_duration: 6h
+
+  # Automatic per-kind optimization loop (2026-08-31 request): the service itself proposes new
+  # parameter candidates via the SAME Optuna sidecar production's cmd/strategy-optimizer uses
+  # (OPTIMIZER_SERVICE_URL, safe because studies are isolated per opaque study_id string — see
+  # internal/tester/optimizer_loop.go), judges each candidate by win rate AND realized PnL together
+  # once it accumulates internal/tester.MinTradesToScore (30) trades, and always builds the next
+  # candidate from whichever version scores best across the kind's ENTIRE history (origin
+  # included) — never just the most recent one. No version is ever deleted automatically; only a
+  # manual delete from the panel removes one. Entirely independent of production's strategies/
+  # strategy_assignments tables and its own optimizer's studies.
+  optimize:
+    check_interval: 1h   # how often the loop checks every kind for a judgeable/proposable candidate
