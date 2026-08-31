@@ -933,6 +933,22 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
       trades exist that the policy is no longer random (SAC's `learning_starts` is 100, so gradient
       steps do not begin before that). Watch `okxbot_model_open_decisions_total`'s `skip` vs `open`
       split — a policy still skipping everything is not ready.
+      - **First live attempt, 2026-08-30/31, reverted**: `rl_sizing` was turned on directly in the
+        server's deployed config around 17:00 UTC on 2026-08-30 (ahead of this checklist item, and
+        with only 39 of the learner's own `completed_trades` — well short of SAC's
+        `learning_starts=100` — even though total closed `paper_orders` was already 195; those are
+        different counts, see below). Within ~20 minutes the policy converged to answering `skip`
+        on 100% of buy/sell calls across all 10 instruments (2,488 `skip` vs 0 `open` in
+        `okxbot_model_open_decisions_total` over the following ~14h) — exactly the failure mode
+        this item warns about. rl-service itself never crashed or restarted and strategies kept
+        firing normally (2,541 signals/24h) the whole time, so the symptom ("no new positions")
+        showed up nowhere except this one metric — worth checking first next time, before assuming
+        a pipeline outage. Reverted `rl_sizing` to `false` on the server and restarted
+        `paper-trader`; positions resumed opening immediately via the fixed-sizing fallback path
+        (`openDecision` returns `ok=false, falls through` on `unusable`/`unsized`, but returns
+        `ok=true, Skip=true` — no fallback — on a genuine `skip` answer). Re-attempt only once
+        `completed_trades` (not total `paper_orders`) has cleared 100 by a comfortable margin, and
+        watch the skip/open split closely in the first hour after re-enabling.
 - [x] **Timeout force-close for stale positions (§15.14, 2026-08-30)** — positions were sitting open
       a long time with barely-moving PnL, tying up an instrument's one-open-position slot (§16.9).
       `paper_trading.rl_max_open_duration` (default 6h) force-closes them, `close_reason='timeout'`,
