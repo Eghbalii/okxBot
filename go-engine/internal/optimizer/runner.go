@@ -296,8 +296,18 @@ func (r *Run) CheckTick(ctx context.Context, price decimal.Decimal) {
 		}
 		win := reason == "tp"
 
-		if err := r.store.Close(ctx, r.ID, t); err != nil {
+		closed, err := r.store.Close(ctx, r.ID, t)
+		if err != nil {
 			r.logger.Error("failed to close trial", "trialId", t.TrialID, "error", err)
+			continue
+		}
+		if !closed {
+			// Another caller already closed this exact trial (e.g. two ticks landing close
+			// together both saw it open before either's Close took effect) — that caller already
+			// recorded the outcome and reported it to the sidecar, so doing either again here would
+			// double-count the trial's win/loss and would make Optuna's study.tell() reject a
+			// second report for an already-COMPLETE trial.
+			continue
 		}
 
 		r.mu.Lock()

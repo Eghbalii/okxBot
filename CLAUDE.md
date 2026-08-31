@@ -2289,6 +2289,44 @@ rule works" and "traffic bypasses the rule." What finally settled it was probing
 network namespace: the connection was refused *and* the DROP counter incremented on that exact
 packet. When a check's failure mode is silent, prefer the test that produces a positive signal.
 
+### 16.11 Double-reporting a trial outcome to the sidecar (found and fixed 2026-08-31)
+
+Found while investigating a "Bad Gateway" report on the panel — a coincidence, not related: the
+gateway issue was nginx caching a redeployed `api` container's old IP (§11's own operational-rule
+addendum), but checking the surrounding logs surfaced a real, unrelated bug in the same window.
+`optimizer-service`'s log showed `ValueError: Cannot tell a COMPLETE trial.` from
+`optuna.study.tell()`, twice in 24h, both from `cmd/strategy-optimizer`'s own IP for the same
+`trialId`.
+
+**Root cause**: `internal/optimizer.Run.CheckTick` (called from the tick-Kafka-consumer goroutine
+on every price tick) read a trial as open via `store.OpenForInst`, computed the SL/TP touch, then
+called `store.Close` followed by `sidecar.Report` — three separate steps with no lock spanning all
+of them, and `TrialStore.Close` itself unconditionally issued `DEL` with no signal for whether it
+was the first caller to remove that key. Two ticks landing close together (or a tick racing the
+30-second `awaitRun`/candle-close path touching the same run's state) could both observe the same
+trial as still open before either had closed it, both compute the identical win/loss outcome, and
+both call `sidecar.Report` for the same trial — Optuna correctly rejects `tell()` on a trial number
+already marked `COMPLETE` by the first call, which is what surfaced as the 500.
+
+**Impact was cosmetic, not correctness-affecting**: the first `Report` for a given trial always
+succeeded and recorded the real outcome; the second was pure duplicate noise — no trial's score was
+ever double-counted in `r.candidates` (that update happens only when `Close` reports it was the
+actual closer, per the fix below) and no run's final candidate selection was affected. Root-caused
+by checking which service's IP the sidecar's failing request came from (`172.18.0.13`, matching
+`strategy-optimizer`, not the newer `strategy-tester` container also sharing this sidecar per
+§18.2) before concluding anything about the new code — the timing coincided with the strategy-
+tester optimizer loop's own deploy that same day, and confirming the actual caller ruled that out
+immediately rather than chasing the wrong service's logs.
+
+**Fix**: `TrialStore.Close` now returns `(closed bool, err error)`, using Redis `DEL`'s own reply
+(count of keys actually removed) as an atomic per-key signal of whether THIS call was the one that
+closed the trial. `Run.CheckTick` only updates `r.candidates`' win/loss tally and calls
+`sidecar.Report` when `closed == true`; a `false` means another caller already did both, so this
+one silently no-ops. 1 new test (`TestTrialStore_CloseIsIdempotent`, asserting the second `Close`
+on an already-closed trial reports `closed=false`), 37 optimizer tests total. The trial-store tests
+are Redis-integration tests that skip cleanly with no local Redis reachable (existing pattern,
+`redisAvailable`) — verify this fix against the server's real Redis after deploying, not just the
+skip-clean local run.
 
 ## 18. Independent strategy-validation service (`cmd/strategy-tester`, 2026-08-30)
 

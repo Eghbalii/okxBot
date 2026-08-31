@@ -66,8 +66,12 @@ func TestTrialStore_OpenCloseBookkeeping(t *testing.T) {
 		t.Errorf("unexpected trial round-trip: %+v", open[0])
 	}
 
-	if err := store.Close(ctx, runID, trial); err != nil {
+	closed, err := store.Close(ctx, runID, trial)
+	if err != nil {
 		t.Fatalf("Close failed: %v", err)
+	}
+	if !closed {
+		t.Error("expected closed=true for the first Close of an open trial")
 	}
 
 	open, err = store.OpenForInst(ctx, runID, instID)
@@ -76,6 +80,54 @@ func TestTrialStore_OpenCloseBookkeeping(t *testing.T) {
 	}
 	if len(open) != 0 {
 		t.Errorf("expected 0 open trials after close, got %d: %+v", len(open), open)
+	}
+}
+
+// TestTrialStore_CloseIsIdempotent covers the race that produced a real production failure
+// ("Cannot tell a COMPLETE trial" from Optuna, CLAUDE.md's optimizer runner doc): two callers
+// (e.g. two near-simultaneous ticks) can both observe a trial as open before either has closed it.
+// Close's return value must let the SECOND caller know it did nothing, so runner.CheckTick can
+// skip reporting the outcome to the sidecar a second time for an already-completed trial.
+func TestTrialStore_CloseIsIdempotent(t *testing.T) {
+	addr := "localhost:6379"
+	if !redisAvailable(addr) {
+		t.Skip("no local Redis reachable at " + addr + "; skipping Redis-backed trial store test")
+	}
+
+	store := NewTrialStore(addr)
+	defer store.CloseConn()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runID := "test-run-idempotent-" + time.Now().Format("20060102150405.000000000")
+	instID := "BTC-USDT-SWAP"
+	trial := OpenTrial{
+		StudyID:  StudyID(instID, "rsi_sma"),
+		TrialID:  1,
+		InstID:   instID,
+		Side:     "buy",
+		EntryPx:  decimal.NewFromInt(100),
+		OpenedAt: time.Now(),
+	}
+	if err := store.Open(ctx, runID, trial, time.Minute); err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	first, err := store.Close(ctx, runID, trial)
+	if err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+	if !first {
+		t.Fatal("expected the first Close to report closed=true")
+	}
+
+	second, err := store.Close(ctx, runID, trial)
+	if err != nil {
+		t.Fatalf("second Close failed: %v", err)
+	}
+	if second {
+		t.Error("expected the second Close on an already-closed trial to report closed=false")
 	}
 }
 
@@ -117,7 +169,7 @@ func TestTrialStore_MultipleCandidatesIndependentlyTracked(t *testing.T) {
 	}
 
 	// Close just trial 2; 1 and 3 should remain.
-	if err := store.Close(ctx, runID, open[1]); err != nil {
+	if _, err := store.Close(ctx, runID, open[1]); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
 	remaining, err := store.OpenForInst(ctx, runID, instID)

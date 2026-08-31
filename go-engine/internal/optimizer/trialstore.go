@@ -115,14 +115,24 @@ func (s *TrialStore) OpenForInst(ctx context.Context, runID, instID string) ([]O
 }
 
 // Close removes a trial's state (CLAUDE.md §16.3 step 4: "delete the Redis trial key" on
-// SL/TP touch).
-func (s *TrialStore) Close(ctx context.Context, runID string, t OpenTrial) error {
+// SL/TP touch). Returns closed=true only if THIS call is the one that actually deleted the key —
+// Redis's DEL reports how many keys it removed, which is an atomic per-key signal even when two
+// callers race to close the same trial. A caller must only report the trial's outcome to the
+// sidecar when closed=true: two ticks (or a tick and the candle-close path) can both observe the
+// same trial as open before either has closed it, both compute the same SL/TP touch, and without
+// this guard both would call sidecar.Report for the same trial — the second Optuna study.tell()
+// then fails with "Cannot tell a COMPLETE trial." (observed in production, CLAUDE.md's optimizer
+// runner doc). The trial's outcome (win/loss) itself is idempotent to compute from the same tick
+// price, so the guard only needs to dedupe the SIDE EFFECT (the sidecar call), not the computation.
+func (s *TrialStore) Close(ctx context.Context, runID string, t OpenTrial) (closed bool, err error) {
 	key := trialKey(runID, t.InstID, t.TrialID)
-	pipe := s.rdb.TxPipeline()
-	pipe.Del(ctx, key)
-	pipe.SRem(ctx, trialIndexKey(runID, t.InstID), key)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("close trial %s/%d: %w", t.InstID, t.TrialID, err)
+	delCmd := s.rdb.Del(ctx, key)
+	if _, err := s.rdb.SRem(ctx, trialIndexKey(runID, t.InstID), key).Result(); err != nil {
+		return false, fmt.Errorf("remove trial index entry %s/%d: %w", t.InstID, t.TrialID, err)
 	}
-	return nil
+	n, err := delCmd.Result()
+	if err != nil {
+		return false, fmt.Errorf("close trial %s/%d: %w", t.InstID, t.TrialID, err)
+	}
+	return n > 0, nil
 }
