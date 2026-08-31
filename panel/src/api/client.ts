@@ -117,6 +117,10 @@ export const api = {
     if (opts?.sortDesc) params.set('sortDesc', 'true')
     return requestList<Position>(`/positions?${params}`)
   },
+  // Manual close from the panel (2026-08-31): flags the order for PaperTrader to close on its
+  // next tick, close_reason='manual', reported to the model as closed_early. Paper mode only.
+  closePosition: (id: number) =>
+    request<{ ok: boolean }>(`/positions/${id}/close`, { method: 'POST' }),
 
   // Baseline-vs-rl_adjusted A/B comparison (CLAUDE.md §15.4). `since` is an RFC3339 timestamp
   // (e.g. `new Date(Date.now() - 7*86400e3).toISOString()` for "the last week").

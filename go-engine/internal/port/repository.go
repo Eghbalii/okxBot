@@ -123,6 +123,11 @@ type PaperOrder struct {
 	// not a stored column, and not populated by OpenPaperOrder/ListOpenPaperOrders. Empty when
 	// StrategyID is nil (an order opened with no strategy attribution).
 	StrategyName string
+
+	// ManualCloseRequested is set by RequestManualClose (the panel's Close button, 2026-08-31
+	// request) and checked by PaperTrader.monitorOpenOrders on its next tick — cmd/api runs in a
+	// separate process and cannot run the real close path itself, so this is intent, not a close.
+	ManualCloseRequested bool
 }
 
 // VariantStats summarizes one SL/TP-adjustment variant's closed-trade track record for the
@@ -235,6 +240,16 @@ type Repository interface {
 	// Callers MUST have already run slPx/tpPx through the ratchet clamp (usecase.RatchetSLTP).
 	ForkPaperOrderWithSLTP(ctx context.Context, parentID int64, slPx, tpPx *decimal.Decimal) (int64, error)
 	ListOpenPaperOrders(ctx context.Context, instID string) ([]PaperOrder, error)
+	// RequestManualClose flags an open order for the panel's manual close button (2026-08-31
+	// request). cmd/api runs in a separate process from the PaperTrader that owns this order's
+	// instrument, so it cannot run the real close path itself — it only sets this flag; PaperTrader
+	// closes the order at the live price on its next tick (usecase.PaperTrader.monitorOpenOrders),
+	// close_reason='manual', reported to the model as closed_early (conductor.TerminalCategory),
+	// the same "decision-driven exit, trains something rather than nothing" treatment as a timeout
+	// close (CLAUDE.md §15.14) — chosen over reporting nothing at all, since the model has no
+	// closed_manual category to report a plain manual close under. Returns an error if id is not a
+	// currently-open order.
+	RequestManualClose(ctx context.Context, id int64) error
 	// UpdatePaperOrderPnLExtremes records new peak/trough unrealized PnL for an open order
 	// (CLAUDE.md §15.11). Both are written together since they move as one high-water pair.
 	UpdatePaperOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error

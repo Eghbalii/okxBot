@@ -83,7 +83,7 @@ func (r *Repository) UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, t
 // SL/TP independently; only reward/budget attribution filters by Variant, CLAUDE.md §15.4).
 func (r *Repository) ListOpenPaperOrders(ctx context.Context, instID string) ([]port.PaperOrder, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, parent_order_id, variant, pnl_max_pct, pnl_min_pct, bar
+		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, parent_order_id, variant, pnl_max_pct, pnl_min_pct, bar, manual_close_requested
 		FROM paper_orders
 		WHERE inst_id = $1 AND closed_at IS NULL
 		ORDER BY opened_at
@@ -97,7 +97,7 @@ func (r *Repository) ListOpenPaperOrders(ctx context.Context, instID string) ([]
 	for rows.Next() {
 		var o port.PaperOrder
 		var bar *string
-		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.OpenedAt, &o.FeaturesJSON, &o.ParentOrderID, &o.Variant, &o.PnLMaxPct, &o.PnLMinPct, &bar); err != nil {
+		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.OpenedAt, &o.FeaturesJSON, &o.ParentOrderID, &o.Variant, &o.PnLMaxPct, &o.PnLMinPct, &bar, &o.ManualCloseRequested); err != nil {
 			return nil, fmt.Errorf("scan paper order: %w", err)
 		}
 		if bar != nil {
@@ -106,6 +106,23 @@ func (r *Repository) ListOpenPaperOrders(ctx context.Context, instID string) ([]
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// RequestManualClose flags an open order for PaperTrader to close on its next tick (CLAUDE.md
+// 2026-08-31 panel Close button). Errors if id is not currently open — closing an already-closed
+// or nonexistent order silently would hide a stale/duplicate request from the panel.
+func (r *Repository) RequestManualClose(ctx context.Context, id int64) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE paper_orders SET manual_close_requested = true
+		WHERE id = $1 AND closed_at IS NULL
+	`, id)
+	if err != nil {
+		return fmt.Errorf("request manual close for order %d: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("order %d is not open", id)
+	}
+	return nil
 }
 
 // positionSortColumns maps PositionFilter.SortBy to a safe, allowlisted SQL column/expression —

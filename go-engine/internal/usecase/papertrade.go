@@ -610,7 +610,15 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 		// reason to block the close itself.
 		e.trackPnLExtremes(ctx, o, price, logger)
 
-		reason, hit := closeReason(o, price)
+		// A manual close request from the panel (2026-08-31) wins over everything else — the
+		// operator explicitly asked to exit right now, unlike the timeout/SL/TP checks below,
+		// which are the engine's own background decisions. Checked first rather than after the
+		// touch check, since "close it now" should not wait for a coincidental SL/TP touch on the
+		// same tick to decide the reason for a close that was already requested.
+		reason, hit := conductor.CloseReasonManual, o.ManualCloseRequested
+		if !hit {
+			reason, hit = closeReason(o, price)
+		}
 		if !hit && e.conductor().IsTimedOut(o.OpenedAt, now) {
 			// A position that has run past MaxOpenDuration is force-closed regardless of what
 			// SL/TP would otherwise decide (CLAUDE.md §15.14) — checked only once neither level

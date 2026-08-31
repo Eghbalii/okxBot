@@ -36,11 +36,13 @@ func TestTerminalCategory(t *testing.T) {
 		{"sl", domain.CategoryClosedSL},
 		{CloseReasonRLEarly, domain.CategoryClosedEarly},
 		// A timeout close shares closed_early's category (CLAUDE.md §15.14): PaperTrader force-
-		// closed it for running too long, not the model, but the trade still trains something --
-		// unlike a manual close, which is an operator action outside the lifecycle entirely and
-		// must never be attributed to the policy.
+		// closed it for running too long, not the model, but the trade still trains something.
 		{CloseReasonTimeout, domain.CategoryClosedEarly},
-		{"manual", ""},
+		// A manual close (the panel's Close button, 2026-08-31) shares the same category for the
+		// same reason: the model has no closed_manual category, and reporting nothing would leave
+		// that trade training nothing at all.
+		{CloseReasonManual, domain.CategoryClosedEarly},
+		{"nonsense", ""},
 	} {
 		if got := TerminalCategory(tc.reason); got != tc.want {
 			t.Errorf("TerminalCategory(%q) = %q, want %q", tc.reason, got, tc.want)

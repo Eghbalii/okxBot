@@ -143,23 +143,27 @@ func OpenCategory(side string) string {
 
 // TerminalCategory maps a close reason to the terminal category that delivers the reward
 // (CLAUDE.md §15.10 — the close event IS the reward). Returns "" for a reason with no lifecycle
-// meaning, e.g. a manual close, which is not a decision the model made and should not train it.
+// meaning at all.
 //
-// CloseReasonTimeout shares CategoryClosedEarly with CloseReasonRLEarly rather than getting its
-// own category (CLAUDE.md §15.14): a new one-hot category needs a new observation_schema_version
-// on both Go and rl_service, which breaks every /predict call until both sides deploy together
-// and only starts teaching the model anything once retrained on the wider input. The distinction
-// still matters for a HUMAN reading paper_orders — "the model chose to exit" vs. "the position sat
-// too long and we cut it" are different stories — so it stays a separate DB close_reason value
-// ('timeout', already a valid CHECK value since migration 000001, just never emitted); the model
-// itself is simply told "this was a decision-driven exit", which is true of both.
+// CloseReasonTimeout and CloseReasonManual both share CategoryClosedEarly with CloseReasonRLEarly
+// rather than getting their own categories (CLAUDE.md §15.14's reasoning, extended 2026-08-31 to
+// the panel's manual close button): a new one-hot category needs a new observation_schema_version
+// on both Go and rl_service, which breaks every /predict call until both sides deploy together and
+// only starts teaching the model anything once retrained on the wider input. The distinction still
+// matters for a HUMAN reading paper_orders — "the model chose to exit" vs. "the position sat too
+// long" vs. "an operator closed it by hand" are different stories — so each stays its own DB
+// close_reason value ('timeout' since migration 000001, 'manual' since the very first migration);
+// the model itself is simply told "this was a decision-driven exit", which is true of all three.
+// The alternative — reporting nothing for a manual close, so a human decision is never attributed
+// to the policy — was considered and rejected: it would leave that trade training nothing at all,
+// and the model has no closed_manual category to report it under honestly either way.
 func TerminalCategory(closeReason string) string {
 	switch closeReason {
 	case "tp":
 		return domain.CategoryClosedTP
 	case "sl":
 		return domain.CategoryClosedSL
-	case CloseReasonRLEarly, CloseReasonTimeout:
+	case CloseReasonRLEarly, CloseReasonTimeout, CloseReasonManual:
 		return domain.CategoryClosedEarly
 	default:
 		return ""
@@ -180,6 +184,12 @@ const CloseReasonRLEarly = "rl_early"
 // TerminalCategory as closed_early (see its doc comment) so the trade still trains something,
 // rather than the silent-no-reward gap a plain "manual" close would leave.
 const CloseReasonTimeout = "timeout"
+
+// CloseReasonManual marks a position an operator closed by hand from the panel's Close button
+// (2026-08-31 request). Reported to the model via TerminalCategory as closed_early, same
+// "decision-driven exit, trains something rather than nothing" treatment as CloseReasonTimeout —
+// see TerminalCategory's doc comment for why neither gets its own one-hot category.
+const CloseReasonManual = "manual"
 
 // ShouldUpdate reports whether an `update` call is due for the open order at orderID, given its
 // current unrealized PnL. It returns true when either trigger fires (CLAUDE.md §15.12):

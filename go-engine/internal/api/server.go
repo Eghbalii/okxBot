@@ -99,6 +99,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("DELETE /api/assignments/{id}", s.handleDeleteAssignment)
 
 	mux.HandleFunc("GET /api/positions", s.handleListPositions)
+	mux.HandleFunc("POST /api/positions/{id}/close", s.handleClosePosition)
 
 	// CLAUDE.md §15.6/§15.7: the shared account's current balance and its timeline, backing the
 	// panel's balance chart — the point of which is that a drain-and-reset that happened overnight
@@ -434,6 +435,26 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// handleClosePosition lets the panel close an open paper position by hand (2026-08-31 request).
+// cmd/api runs in a separate process from the PaperTrader that actually owns this order's
+// instrument's tick stream, so it cannot close the order itself — it only flags intent via
+// RequestManualClose; PaperTrader closes it at the live price on its next tick, close_reason=
+// 'manual', reported to the model as closed_early (conductor.TerminalCategory). Only meaningful
+// for paper-mode positions, since that is the only mode PaperTrader's loop monitors — demo/real
+// positions have no equivalent close-my-own-order path yet.
+func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt64(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.Repo.RequestManualClose(r.Context(), id); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
 
 // handleSLTPAdjustmentStats serves the baseline-vs-rl_adjusted A/B comparison (CLAUDE.md §15.4):

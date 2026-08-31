@@ -116,6 +116,17 @@ func (r *fakeRepository) ClosePaperOrder(ctx context.Context, id int64, closePx 
 	r.orders[id] = o
 	return nil
 }
+func (r *fakeRepository) RequestManualClose(ctx context.Context, id int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.orders[id]
+	if !ok || o.ClosedAt != nil {
+		return fmt.Errorf("order %d is not open", id)
+	}
+	o.ManualCloseRequested = true
+	r.orders[id] = o
+	return nil
+}
 func (r *fakeRepository) UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -661,6 +672,61 @@ func TestMonitorOpenOrders_ClosesOnSLHit(t *testing.T) {
 	}
 	if closed.CloseReason == nil || *closed.CloseReason != "sl" {
 		t.Errorf("expected close reason 'sl', got %v", closed.CloseReason)
+	}
+}
+
+// A manual close request from the panel (2026-08-31) wins over everything else: even a position
+// that hasn't touched SL/TP and isn't timed out must close the moment the flag is set.
+func TestMonitorOpenOrders_ClosesOnManualCloseRequest(t *testing.T) {
+	repo := newFakeRepository()
+	sl := dec("50") // far away — never touched by the test's price
+	tp := dec("500")
+	id, _ := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("100"), Leverage: dec("1"),
+	})
+	if err := repo.RequestManualClose(context.Background(), id); err != nil {
+		t.Fatalf("RequestManualClose: %v", err)
+	}
+
+	pt := newTestPaperTrader(repo, nil)
+	if err := pt.monitorOpenOrders(context.Background(), dec("103"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders returned error: %v", err)
+	}
+
+	closed := repo.orders[id]
+	if closed.ClosedAt == nil {
+		t.Fatal("expected the order to close once manual close was requested")
+	}
+	if closed.CloseReason == nil || *closed.CloseReason != conductor.CloseReasonManual {
+		t.Errorf("expected close reason %q, got %v", conductor.CloseReasonManual, closed.CloseReason)
+	}
+	if closed.RealizedPnL == nil || !closed.RealizedPnL.Equal(dec("3")) {
+		t.Errorf("expected realized pnl at the live price (100->103, 1x, want 3), got %v", closed.RealizedPnL)
+	}
+}
+
+// A manual close request must win even on the SAME tick a genuine SL/TP touch would also fire —
+// the operator explicitly asked to exit now, so the reason recorded is 'manual', not 'sl'/'tp'.
+func TestMonitorOpenOrders_ManualCloseTakesPriorityOverSLTPTouch(t *testing.T) {
+	repo := newFakeRepository()
+	sl := dec("99")
+	id, _ := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, Size: dec("100"), Leverage: dec("1"),
+	})
+	if err := repo.RequestManualClose(context.Background(), id); err != nil {
+		t.Fatalf("RequestManualClose: %v", err)
+	}
+
+	pt := newTestPaperTrader(repo, nil)
+	// Price is AT the SL level, so a real touch would also fire this same tick.
+	if err := pt.monitorOpenOrders(context.Background(), dec("99"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders returned error: %v", err)
+	}
+
+	closed := repo.orders[id]
+	if closed.CloseReason == nil || *closed.CloseReason != conductor.CloseReasonManual {
+		t.Errorf("expected manual close to win over a coincidental SL touch, got %v", closed.CloseReason)
 	}
 }
 

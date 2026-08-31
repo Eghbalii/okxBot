@@ -176,7 +176,13 @@ func TestClose_TerminalFailureDoesNotBlockTheClose(t *testing.T) {
 	}
 }
 
-func TestClose_NoTerminalCallForManualClose(t *testing.T) {
+// A manual close (the panel's Close button, 2026-08-31) DOES produce a terminal call — reported
+// as closed_early, the same "decision-driven exit, trains something rather than nothing"
+// treatment as a timeout close (CLAUDE.md's TerminalCategory doc comment). This is a deliberate
+// revision from the original "manual closes report nothing" design: the model has no
+// closed_manual category to report it under honestly either way, and reporting nothing would
+// leave that trade training nothing at all.
+func TestClose_ManualCloseReportsClosedEarly(t *testing.T) {
 	repo := newFakeRepository()
 	model := &recordingModel{action: domain.Action{Action: domain.ActionNone}}
 	pt := lifecycleTrader(repo, model)
@@ -185,13 +191,12 @@ func TestClose_NoTerminalCallForManualClose(t *testing.T) {
 	id, _ := repo.OpenPaperOrder(context.Background(), o)
 	o.ID = id
 
-	// A manual close is an operator's action, not the model's. Reporting it as a terminal outcome
-	// would attribute a human decision to the policy and train on it.
 	if err := pt.closeOrder(context.Background(), o, dec("105"), "manual", dec("5"), testLogger()); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if cats := model.categories(); len(cats) != 0 {
-		t.Errorf("a manual close must not produce a terminal call, got %v", cats)
+	cats := model.categories()
+	if len(cats) != 1 || cats[0] != domain.CategoryClosedEarly {
+		t.Errorf("a manual close should report closed_early, got %v", cats)
 	}
 }
 

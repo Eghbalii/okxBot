@@ -105,6 +105,7 @@ export default function PositionsPage() {
 
   const showClosedColumns = openFilter !== 'open'
   const showLiveColumns = openFilter !== 'closed'
+  const [closingId, setClosingId] = useState<number | null>(null)
 
   const { data, error } = usePolling(
     () =>
@@ -195,7 +196,24 @@ export default function PositionsPage() {
     setPage(0)
   }
 
-  const columnCount = 11 + (showLiveColumns ? 2 : 0) + (showClosedColumns ? 2 : 0)
+  // Manual close (2026-08-31 request): flags the order for PaperTrader to close at the live price
+  // on its next tick — cmd/api can't close it directly (a separate process owns the tick stream),
+  // so this only requests it, then triggers the same immediate refetch the WebSocket bridge uses
+  // rather than waiting for the 5s poll to notice the position disappeared.
+  async function closePosition(p: Position) {
+    if (!confirm(`Close ${p.InstID} #${p.ID} now at the live price? Reason will be recorded as "manual".`)) return
+    setClosingId(p.ID)
+    try {
+      await api.closePosition(p.ID)
+      setWsRefreshCount((c) => c + 1)
+    } catch (err) {
+      alert(`Failed to request close: ${(err as Error).message}`)
+    } finally {
+      setClosingId(null)
+    }
+  }
+
+  const columnCount = 11 + (showLiveColumns ? 2 : 0) + (showClosedColumns ? 2 : 0) + (showLiveColumns ? 1 : 0)
 
   return (
     <div>
@@ -282,6 +300,7 @@ export default function PositionsPage() {
                 PnL
               </SortableTh>
               {showLiveColumns && <th className="th-static">Updated</th>}
+              {showLiveColumns && <th className="th-static"></th>}
             </tr>
           </thead>
           <tbody>
@@ -343,6 +362,19 @@ export default function PositionsPage() {
                         <span className="badge badge-green">yes</span>
                       ) : (
                         <span className="badge badge-dim">no</span>
+                      )}
+                    </td>
+                  )}
+                  {showLiveColumns && (
+                    <td>
+                      {!p.ClosedAt && p.Mode === 'paper' && (
+                        <button
+                          onClick={() => closePosition(p)}
+                          disabled={closingId === p.ID}
+                          title="Close this position now at the live price (close_reason='manual')"
+                        >
+                          {closingId === p.ID ? 'Closing…' : 'Close'}
+                        </button>
                       )}
                     </td>
                   )}

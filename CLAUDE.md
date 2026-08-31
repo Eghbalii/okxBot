@@ -2628,3 +2628,52 @@ missing-stop case is still a hard skip, not a fill.
 3 pre-existing `clamps_test.go` tests updated for the new `leverage` parameter): tightening at high
 leverage, no effect at 1x, zero-leverage treated as 1x, no effect on take-profit, and the
 missing-stop fallback path respecting the cap too.
+
+## 20. Manual close button in the panel (2026-08-31)
+
+Explicit operator request: a Close button per open position in the panel, closing at the live
+price on demand.
+
+**The real design question wasn't the button — it was what the model is told.** §15.12's original
+design deliberately reported nothing to the model for a manual close ("that is an operator's
+action, and reporting it would attribute a human decision to the policy"). But §15.14 had already
+revised that stance once for `timeout` closes, reasoning that the model has no `closed_manual`
+category to report an operator close under anyway (`SIGNAL_CATEGORIES`/`ACTION_SCHEMA_VERSION` is
+a fixed one-hot vocabulary of exactly three terminal categories — `closed_tp`/`closed_sl`/
+`closed_early` — shared byte-for-byte between Go and `rl_service`, so adding a fourth needs an
+observation-schema bump on both sides simultaneously), and reporting nothing means that trade
+trains nothing at all. Asked directly whether the *model itself* only knows three close categories
+or whether `manual` already had a defined slot — it does not — the operator chose to extend
+§15.14's precedent rather than adding a fourth category: a manual close now reports `closed_early`
+to the model, the same "this was a decision-driven exit, true of all three" treatment as `timeout`.
+`close_reason` in `paper_orders` still stays `'manual'` (a plain-text column, no CHECK-constraint
+or schema-version concern, already valid since migration `000001`), so a human reading the table
+can always tell an operator close from a model-driven `rl_early` or a housekeeping `timeout` apart
+— only what the *model* is told collapses the three into one category, not what a human sees.
+
+**Why the button can't just call the close path directly**: `cmd/api` (where the panel's HTTP
+request lands) runs in a separate OS process from `cmd/paper-trader`, which is the only thing that
+owns the instrument's live tick stream, its conductor's per-order update-cadence state, and the
+single `PaperTrader.closeOrder` path that atomically closes the order, reports the terminal call,
+and updates the shared account balance. `cmd/api` cannot safely do any of that itself without
+duplicating that whole path in a second process. So the flow is intent, not action: a new
+`paper_orders.manual_close_requested` boolean (migration `000014`), set by a new
+`Repository.RequestManualClose(id)` (erroring if the order isn't currently open, so a stale/
+duplicate click from an already-closed row is visible rather than silently ignored) —
+`POST /api/positions/{id}/close` sets it, and `PaperTrader.monitorOpenOrders` (the same per-tick
+loop that already checks every open order for an SL/TP touch) checks the flag FIRST, ahead of the
+SL/TP touch and timeout checks, and closes at the live price with `close_reason='manual'` the
+moment it sees it set — "the operator asked to exit now" outranks the engine's own background
+decisions, including a coincidental SL/TP touch landing on the very same tick.
+
+Paper mode only — `RequestManualClose`/the panel button only make sense against `PaperTrader`'s
+own monitoring loop; demo/real positions have no equivalent operator-close path yet, so the panel
+button only renders for `Mode === 'paper'` rows. `conductor.CloseReasonManual` was added alongside
+the existing `CloseReasonRLEarly`/`CloseReasonTimeout` constants rather than a bare string literal,
+matching that file's own pattern of a named constant per close reason with a doc comment explaining
+its terminal-category mapping.
+
+3 new Go tests (`TestMonitorOpenOrders_ClosesOnManualCloseRequest`,
+`TestMonitorOpenOrders_ManualCloseTakesPriorityOverSLTPTouch`,
+`TestClose_ManualCloseReportsClosedEarly` — this last one replaces the now-inverted
+`TestClose_NoTerminalCallForManualClose`), plus `TestTerminalCategory` updated for the new mapping.
