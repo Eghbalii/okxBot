@@ -949,6 +949,19 @@ Phase 5 — global RL agent over price + strategy signals (§15, current phase):
         `ok=true, Skip=true` — no fallback — on a genuine `skip` answer). Re-attempt only once
         `completed_trades` (not total `paper_orders`) has cleared 100 by a comfortable margin, and
         watch the skip/open split closely in the first hour after re-enabling.
+      - **Fixed-sizing defaults changed 2026-08-31 (explicit operator decision), independent of the
+        rl_sizing question above**: `paper_trading.notional_usd` 100 → 10 and
+        `defaultPaperLeverage` (`internal/usecase/papertrade.go`) 1x → 20x — the deployed service is
+        meant to run small-notional/high-leverage, so the fixed-sizing path (used whenever
+        `rl_sizing` is off, or falls back on an unusable/unsized model answer) should exercise that
+        combination rather than a profile the service will never actually use. A separate idea —
+        randomizing notional/leverage per order to manufacture sizing variance for training — was
+        considered and rejected: a value chosen by Go, independent of the observation and outside
+        the model's own action, adds noise to the reward signal without building an action-reward
+        relationship SAC can learn from (only the model's *own* action varying, via its exploration
+        noise once `rl_sizing` is on, produces a learnable signal). §15.6's design docs' own
+        `[1x, MAX_LEVERAGE]` language and the RL agent's `leverage_frac` range are unaffected — this
+        only changes what a fixed/fallback order looks like.
 - [x] **Timeout force-close for stale positions (§15.14, 2026-08-30)** — positions were sitting open
       a long time with barely-moving PnL, tying up an instrument's one-open-position slot (§16.9).
       `paper_trading.rl_max_open_duration` (default 6h) force-closes them, `close_reason='timeout'`,

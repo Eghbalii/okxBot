@@ -162,7 +162,10 @@ type PaperTrader struct {
 const RLAdjustInterval = 2 * time.Second
 
 // defaultPaperLeverage is what a paper order records when the RL sizing pass isn't active.
-var defaultPaperLeverage = decimal.NewFromInt(1)
+// Set to 20x (2026-08-31, explicit operator request) rather than 1x: the deployed service is
+// meant to run at low notional/high leverage, and paper trading should exercise that combination
+// too rather than a leverage profile the service will never actually use.
+var defaultPaperLeverage = decimal.NewFromInt(20)
 
 // barSeconds converts an OKX bar name ("1m", "15m", "1H", "4H", "1D", "1W") to its duration in
 // seconds, for ordering timeframes shortest-to-longest. Unknown names sort last rather than

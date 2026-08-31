@@ -36,7 +36,11 @@ ingestion:
     - "1D"
 
 paper_trading:
-  notional_usd: 100
+  # Low notional, high fixed leverage (2026-08-31, explicit operator decision): the deployed
+  # service targets small-account/high-leverage operation, so paper trading should exercise that
+  # combination when rl_sizing is off (defaultPaperLeverage in papertrade.go carries the matching
+  # 20x). Also each order's own size/leverage line, unaffected by this default.
+  notional_usd: 10
   max_open_orders: 3
   # The timeframes strategies actually DECIDE on — the RL model's training cadence (CLAUDE.md §9).
   # Must be a subset of ingestion.bars above (validated at startup: a bar the ingestor isn't

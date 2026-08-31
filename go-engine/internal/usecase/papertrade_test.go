@@ -1280,8 +1280,8 @@ func TestEvaluateStrategies_RLSizingDisabledKeepsFixedSizing(t *testing.T) {
 	}
 
 	o := openedOrder(t, repo)
-	if !o.Size.Equal(dec("100")) || !o.Leverage.Equal(dec("1")) {
-		t.Errorf("expected the fixed 100 @ 1x while rl_sizing is off, got %s @ %sx", o.Size, o.Leverage)
+	if !o.Size.Equal(dec("100")) || !o.Leverage.Equal(dec("20")) {
+		t.Errorf("expected the fixed 100 @ 20x while rl_sizing is off, got %s @ %sx", o.Size, o.Leverage)
 	}
 	if model.calls != 0 {
 		t.Errorf("expected the model never consulted while rl_sizing is off, got %d calls", model.calls)
@@ -1300,8 +1300,8 @@ func TestEvaluateStrategies_RLSizingFallsBackWhenModelErrors(t *testing.T) {
 	}
 
 	o := openedOrder(t, repo)
-	if !o.Size.Equal(dec("100")) || !o.Leverage.Equal(dec("1")) {
-		t.Errorf("expected fallback to the fixed 100 @ 1x, got %s @ %sx", o.Size, o.Leverage)
+	if !o.Size.Equal(dec("100")) || !o.Leverage.Equal(dec("20")) {
+		t.Errorf("expected fallback to the fixed 100 @ 20x, got %s @ %sx", o.Size, o.Leverage)
 	}
 	if model.calls != 1 {
 		t.Errorf("expected one Predict attempt before falling back, got %d", model.calls)
