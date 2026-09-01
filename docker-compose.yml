@@ -203,10 +203,10 @@ services:
       # refused". Only surfaced once paper_trading.rl_sizing/rl_sltp_adjust were actually turned on
       # (§14's rollout order) — before that the model call path was never exercised in production.
       RL_SERVICE_URL: http://rl-service:8000
-      OKX_API_KEY: ${OKX_API_KEY}
-      OKX_API_SECRET: ${OKX_API_SECRET}
-      OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE}
-      OKX_SIMULATED_TRADING: ${OKX_SIMULATED_TRADING:-1}
+      # CLAUDE.md §27.1: cmd/paper-trader no longer talks to OKX directly at all (its only REST
+      # dependency was the -backfill flag, removed entirely 2026-09-01 per explicit operator
+      # instruction — GetHistoryCandles must never be called). It has no gateway-routed calls
+      # today, so no OKX_GATEWAY_URL is needed here; left unset intentionally, not an oversight.
     ports:
       - "9102:9102"
       - "8093:8093"
@@ -241,6 +241,9 @@ services:
       OPTIMIZER_SERVICE_URL: http://optimizer-service:8001
       OPTIMIZER_ADDR: "0.0.0.0:8091"
       METRICS_ADDR: ":9103"
+      # CLAUDE.md §27.1: talks to OKX only through cmd/okx-gateway now (its only OKX call is
+      # trial candle-window seeding via GetCandles) — no OKX credentials held here directly.
+      OKX_GATEWAY_URL: http://okx-gateway:8094
     ports:
       - "8091:8091"
       - "9103:9103"
@@ -254,6 +257,8 @@ services:
       timescaledb:
         condition: service_started
       optimizer-service:
+        condition: service_started
+      okx-gateway:
         condition: service_started
 
   # Independent strategy-validation service (2026-08-30 request): a standalone paper-trading
@@ -278,6 +283,9 @@ services:
       # because Optuna studies are isolated per opaque study_id string (tester.StudyID's "tester:"
       # prefix can never collide with strategy-optimizer's own "{inst_id}:{kind}" convention).
       OPTIMIZER_SERVICE_URL: http://optimizer-service:8001
+      # CLAUDE.md §27.1: talks to OKX only through cmd/okx-gateway now (its only OKX call is
+      # seedWindow's read-only GetCandles) — no OKX credentials held here directly.
+      OKX_GATEWAY_URL: http://okx-gateway:8094
     ports:
       - "8092:8092"
       - "9104:9104"
@@ -289,6 +297,8 @@ services:
       timescaledb:
         condition: service_started
       optimizer-service:
+        condition: service_started
+      okx-gateway:
         condition: service_started
 
   api:

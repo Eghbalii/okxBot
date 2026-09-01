@@ -25,9 +25,9 @@ import (
 
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/gatewayclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
-	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
 	"github.com/eghbalii/okxBot/go-engine/internal/optimizer"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
@@ -66,7 +66,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	restClient := rest.New(cfg.OKX.RESTBaseURL, cfg.OKX.APIKey, cfg.OKX.APISecret, cfg.OKX.APIPassphrase, cfg.OKX.Simulated)
+	// CLAUDE.md §27.1: talks to OKX only through cmd/okx-gateway, never rest.Client directly — this
+	// service's only OKX call is trial candle-window seeding (GetCandles), so it gets no gateway
+	// priority (only "trader" does).
+	gwClient := gatewayclient.New(cfg.Gateway.URL, "strategy-optimizer")
 	sidecar := optimizer.NewSidecarClient(cfg.Optimizer.URL)
 	store := optimizer.NewTrialStore(cfg.Redis.Addr)
 	defer store.CloseConn()
@@ -87,7 +90,7 @@ func main() {
 		cfg:        cfg,
 		runCfg:     runCfg,
 		repo:       repo,
-		exchange:   restClient,
+		exchange:   gwClient,
 		sidecar:    sidecar,
 		store:      store,
 		logger:     logger,

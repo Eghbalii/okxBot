@@ -25,9 +25,9 @@ import (
 
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
+	"github.com/eghbalii/okxBot/go-engine/internal/gatewayclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
-	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
 	"github.com/eghbalii/okxBot/go-engine/internal/optimizer"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
@@ -87,7 +87,10 @@ func main() {
 		}
 	}
 
-	restClient := rest.New(cfg.OKX.RESTBaseURL, cfg.OKX.APIKey, cfg.OKX.APISecret, cfg.OKX.APIPassphrase, cfg.OKX.Simulated)
+	// CLAUDE.md §27.1: talks to OKX only through cmd/okx-gateway, never rest.Client directly — this
+	// service's only OKX call is seedWindow's read-only GetCandles, so it gets no gateway priority
+	// (only "trader" does).
+	gwClient := gatewayclient.New(cfg.Gateway.URL, "strategy-tester")
 
 	// One version-1 row per registered kind, created if missing. Every kind starts enabled — the
 	// operator later disables ones they don't want live from the panel's config section.
@@ -122,7 +125,7 @@ func main() {
 
 	instIDs := cfg.Tester.InstIDs
 	for _, instID := range instIDs {
-		if err := svc.seedWindow(restClient, instID); err != nil {
+		if err := svc.seedWindow(gwClient, instID); err != nil {
 			logger.Error("failed to seed candle window", "instId", instID, "error", err)
 		}
 	}
