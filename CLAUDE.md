@@ -3084,3 +3084,324 @@ the value it's supposed to verify. 257 Go tests total, all passing after the cha
 the server (`paper-trader` rebuilt and restarted) and confirmed live: the first two orders opened
 after the restart (TRUMP/ZEC, 11:40 UTC) both carry exactly `size=4, leverage=10`, and a sweep of
 every open position found zero still violating the 15% SL cap (§23) under the new leverage.
+
+## 27. Real-money go-live design (2026-09-01) — decided, not yet implemented
+
+**Forced by circumstance, not by plan**: OKX would only issue real-account API keys, not demo
+keys, for this account. §14's Phase 2 "OKX demo trading dry run" item is therefore skipped, not
+completed — the first live order this bot ever places will use real capital. Per the operator's
+own framing: the REST/WS endpoints and request shapes are identical between demo and real trading
+(only the `x-simulated-trading: 1` header and host differ, §4), so nothing about §15's design
+needs to change to *support* real trading — what changes is that starting to trade at all is now
+a real-money action, and several gaps that were tolerable while nothing traded for real money are
+not tolerable now. This section is the design for closing those gaps. **Nothing below is
+implemented yet** — this is the plan, written before code per this project's own established
+practice (§16.10's own lesson: a documented policy is not an implemented one, so each item below
+needs an actual verification step, not just a code change, before being marked done).
+
+Audited current state before designing (2026-09-01): `cmd/trader`/`usecase.Trader` (the only code
+path that will place real orders) predates the entire §15.10-§15.12 signal-lifecycle redesign.
+Concretely, today it has **no** strategy signals, **no** `conductor.SignalConductor`, **no**
+SL/TP clamps (§19.2's 15% loss cap does not exist on this path at all), **no** order-status
+polling after placement (a market order's `SCode` acceptance is checked, then never followed up),
+`ExchangeClient.CancelOrder` exists on the REST client but isn't even in the `port.ExchangeClient`
+interface so nothing can call it, and margin mode (`TdMode`) is a single static config string sent
+on every request with no read-back verification that OKX actually applied it. This is a
+substantially bigger gap than "flip some config values" — real trading needs `cmd/trader` brought
+to real parity with the paper-trading engine's lifecycle/conductor/clamp machinery that already
+protects every paper order, which is exactly what was still open in §22's own scoping note
+("`cmd/trader`... predates the §15.10-§15.12 signal-lifecycle redesign entirely").
+
+### 27.1 Central OKX API gateway (multi-tenant rate limiting)
+
+**Decision**: one new Go service, `cmd/okx-gateway`, sits in front of OKX's REST API. Every other
+service that currently constructs its own `rest.Client` (`cmd/trader`, `cmd/paper-trader`,
+`cmd/ingestor`, `cmd/strategy-tester`, `cmd/strategy-optimizer`, `cmd/api`) instead calls the
+gateway over an internal HTTP (or gRPC — decide at implementation, HTTP/JSON is simpler and
+matches this project's existing internal-service style, §16.2/§18) API, and the gateway is the
+only process that ever holds real OKX credentials and talks to `www.okx.com` directly.
+
+**Why centralize rather than give each service its own limiter** (the alternative the operator
+was offered and explicitly rejected): five independent processes each enforcing "don't exceed N
+requests/2s" locally cannot see each other's request volume, so the actual aggregate rate hitting
+OKX is unbounded by any single service's own limiter — which is exactly the failure mode already
+hit once (§14's `history-candles` incident, ~30 concurrent requests from one process alone
+triggering a confusing `51001` error, before any other service was even in the picture). A
+gateway makes the aggregate rate an enforceable, observable, single number.
+
+**Priority**: `cmd/trader`'s requests (order placement, cancel, leverage, position/balance reads
+needed for the live risk-management loop) get strict priority over every other consumer's
+requests — the gateway must never let a burst of paper-trading/backfill/optimizer traffic delay a
+real order or a real risk-check read. Implementation approach: **per-consumer, per-endpoint-class
+token buckets**, with the trader's bucket for trade-critical endpoint classes (order/cancel/
+leverage/positions/balance) refilled and drained ahead of every other consumer's queued request
+when both are contending for the same underlying OKX-side budget — a priority queue keyed by
+consumer identity, not a single shared bucket every consumer draws from equally. Endpoint classes
+matter because OKX's own limits are per-endpoint (§27.1's own rate-limit table below) — a gateway
+that only rate-limits "requests per second" in aggregate, ignoring which endpoint each request
+targets, would either under-utilize headroom OKX actually gives per endpoint or blow through a
+tighter endpoint-specific limit while under the aggregate number.
+
+**What the gateway owns**:
+- The real API key/secret/passphrase (moved out of every other service's config/env — they call
+  the gateway with a service identity, not OKX credentials directly). This also shrinks the
+  credential blast radius per §16.10's incident: fewer processes holding real secrets.
+- Per-endpoint-class rate limiting against OKX's actual documented limits (§4/§27.1 below) — one
+  place to get this right instead of five.
+- Retry/backoff on OKX 429/`50011`-class rate-limit responses (**does not exist anywhere in the
+  codebase today** — `rest.Client.do()` returns the first error immediately, no retry of any
+  kind). The gateway is the natural single place to add exponential backoff with jitter, since
+  centralizing retries here means the other five services don't each need their own retry logic.
+- A consistent request-logging/metrics surface (`okxbot_gateway_requests_total{consumer,endpoint,
+  status}`, matching the existing Prometheus convention, §11.6) — visibility into exactly who is
+  consuming how much OKX-side budget, which today is impossible to see (each service's own `sem`
+  of 3 concurrent requests, per the code audit below, is invisible to every other service).
+
+**Exact OKX rate-limit numbers must be re-verified from the live docs at implementation time**
+(`https://www.okx.com/docs-v5/en/#overview-rate-limits` and each endpoint's own page), not taken
+from this document — third-party summaries checked while writing this section disagreed with each
+other on some numbers and the official page's exact per-endpoint table did not fetch cleanly
+through available tooling. Build the gateway's limits as **config values**, not hardcoded
+constants, specifically so a correction after checking the real docs (or a VIP-tier fill-ratio
+change per OKX's own tiered-limit system, mentioned in every source checked) doesn't need a code
+change. Directionally confirmed across multiple sources: trading endpoints (place/cancel/amend
+order) share one limit independent from market-data endpoints, limits are defined **per
+Instrument ID** (not global) for trading endpoints, and there is a separate account-wide aggregate
+cap on top of the per-instrument one — the gateway's design (per-consumer, per-endpoint-class,
+with an aggregate ceiling above the per-class buckets) already matches this shape; only the exact
+numbers need confirming before shipping.
+
+**Audited current state, confirming the gap this closes**: every one of the five services builds
+its own independent `rest.Client`, each with its own `maxConcurrentRequests = 3` semaphore — this
+exists only to work around a specific concurrency bug against `/market/candles` (§14's incident,
+documented in-code as a `51001` misbehavior under burst load, not OKX's real rate-limit response)
+and is not a general-purpose, endpoint-aware OKX rate limiter at all. Nothing today coordinates
+actual OKX-side rate-limit budget across processes.
+
+**Migration order**: `cmd/trader` moves to calling the gateway FIRST (it's the priority consumer
+and the smallest, newest surface — least regression risk), verified against real OKX before
+anything else migrates. The other four services (`paper-trader`, `ingestor`, `strategy-tester`,
+`strategy-optimizer`) migrate after, each independently, so a problem in one migration can't take
+down the others — matching this project's own "incremental and verified" pattern (§14's own
+closing note). `cmd/api` never needs to migrate — it doesn't call OKX directly except through
+`cmd/trader`/`cmd/paper-trader`'s existing proxy pattern (§18's `tester_proxy.go`/§22's
+`paper_trader_proxy.go`).
+
+### 27.2 Margin mode: cross → isolated for real trading
+
+**Decision**: real trading uses `isolated` margin, not `cross` (the current, currently-checked-in
+default, §27's audit above — `configs/config.yaml`'s `td_mode: "cross"`). Rationale (operator's
+own): isolating each position's margin means one position's liquidation cannot cascade into
+draining margin backing every other open position on the account — directly relevant now that
+"the account" is one shared $40 real-money pool across every token (§15.6/§26), where a cross-
+margin liquidation on one token would draw down the collateral every other token's position
+depends on.
+
+**Config**: `configs/config.yaml`'s `td_mode` becomes `isolated` for the real-trading deployment;
+`internal/config`'s default (currently `"cross"` if unset, `config.go:362-363`) should also flip
+to `isolated` so a config omitting the field fails safe toward the more conservative mode, not the
+less conservative one — matches this project's own established "unbounded loss is not opt-in"
+precedent for defaults (§19.2's `MaxLossPct` default-even-if-unset treatment).
+
+**Verification gap to close, not just the config flip**: today `Trader.TdMode`/`LeverageChange.
+MgnMode`/`OrderRequest.TdMode` are sent on every request but never checked against what OKX
+reports back — `domain.Position.MgnMode` is already populated from `GetPositions`'s response and
+already carried in the domain type, it's simply never compared against the configured mode
+anywhere. Add that comparison (log/alert loudly, and treat a mismatch as a reason to halt via
+`risk.Manager`, the same circuit-breaker path `CheckDrawdown` already uses) — silently trading in
+the wrong margin mode because a config value didn't take effect the way it was assumed to is
+exactly the kind of "documented but not verified" gap §16.10 warns about.
+
+**Liquidation-buffer estimate must be revisited alongside this**: `risk.Manager.Approve`'s
+liquidation-buffer check uses a rough `100/leverage` approximation that ignores maintenance margin
+and — per the existing in-code comment already found during the audit — bakes in an
+isolated-margin-shaped assumption in its derivation "regardless of the actual configured TdMode."
+Moving to isolated margin for real is the point at which that approximation's assumption finally
+matches reality, but it should still be cross-checked against OKX's own reported `Position.LiqPx`
+(already fetched, never consulted by `risk.Manager` today) rather than trusted as exact — same
+"don't trust one layer alone" pattern as §19's SL cap plus the liquidation-buffer floor.
+
+### 27.3 No shadow-fork in real trading — one position per token per side, model edits in place
+
+**Decision, confirmed with the operator**: the §15.4 shadow-fork A/B mechanic (baseline vs.
+`rl_adjusted` as two independently-tracked virtual positions) is **paper-trading-only** and stays
+that way — it was never reachable from `cmd/trader` to begin with (confirmed by the code audit:
+`usecase.Trader.execute()` has no update/adjustment pass at all, `lifecycle.go`'s fork logic lives
+entirely inside `usecase.PaperTrader`/`internal/postgres`'s paper-order tables). Real trading
+needs a **different**, real-money-appropriate lifecycle, not a port of the fork mechanic:
+
+- **One open position per token per side** (i.e. at most one long and, only if `PosMode` is
+  hedge-mode, at most one short — matches OKX's own net-mode-vs-hedge-mode position model,
+  `PosMode`, already config-driven per §27's audit). No forking: when the model wants to adjust
+  SL/TP on an open real position, it **edits that position's stop/target in place** — there is
+  only ever one real order/position per token+side to edit, never a second parallel one.
+- **Every edit is logged as its own row, not overwritten in place at the storage layer** — the
+  operator's explicit requirement: "even if a stop-loss is changed 5 times on one order, all 5
+  changes must be visible," each with its own timestamp. This reuses the existing
+  `strategy_param_changes` shape's *spirit* (§16.7 — an append-only change log, never an
+  in-place-only update) but needs its own table (working name `real_order_adjustments`:
+  `order_id` (FK-equivalent, referencing the real order's row/exchange `ordId`), `field`
+  (`'sl'`/`'tp'`), `old_value`, `new_value`, `changed_at`, `changed_by` (`'model'` — real trading
+  has no operator-triggered adjustments in scope for v1, but the column exists so a future manual
+  override, §20's paper-trading precedent, has somewhere to record itself distinctly from a
+  model-driven one)) — decide the exact table name/shape at implementation, but the append-only
+  requirement itself is fixed.
+- **Panel**: clicking an order's `order-id` opens the same shape of detail modal
+  `OrderDetailModal` already provides for paper orders (§14 Phase 3), extended to show the full
+  adjustment history for a real order as a chronological list (timestamp → field → old → new) —
+  not just the latest SL/TP, the complete edit trail. This is a real-trading-specific view; it
+  does not change the existing paper-order detail modal, which has its own baseline/fork
+  comparison view already (§15.4's A/B tab, `SLTPComparisonPage.tsx`) that stays exactly as-is.
+- **Conflicting signal while a position is already open**: per the operator's explicit decision,
+  a signal for the *opposite* side while a position is already open on that token is **ignored**
+  until the model itself decides to close the existing position — it is never treated as an
+  automatic flip/reversal. This matches §15.12's conductor category rules exactly as already
+  designed for paper trading (a strategy firing while a position is open is an `update` category,
+  never a new `buy`/`sell` — §15.12's table), so real trading's conductor usage needs no new rule
+  here, only for `cmd/trader` to actually route through `conductor.SignalConductor` at all (which
+  it does not do today — see §27's opening audit, and §27.5 below).
+
+**Consequence for `cmd/trader`'s architecture**: since real trading must reuse the conductor's
+category/cadence/clamp logic (not reinvent a parallel version of it) and the conductor was built
+as `PaperTrader`'s IO half (`internal/usecase/lifecycle.go`), bringing `cmd/trader` to this
+design is not a small patch to `trade.go` — it needs the same strategy-signal-driven,
+conductor-mediated lifecycle paper-trading already has, adapted for exactly-one-real-position
+instead of paper-trading's baseline+fork model. This is the real scope hiding behind "remove
+forking for real trading," flagged explicitly so it isn't underestimated at implementation time.
+
+### 27.4 Balance and margin: continuous tracking, not poll-interval snapshots
+
+**Decision**: given real money is now at stake, balance/margin must be tracked continuously
+rather than only refreshed on `Trader`'s existing fixed `PollInterval` ticker (today's only
+`GetBalance`/`GetPositions` read cadence, per the audit — `step()` polls once per tick and does
+nothing between ticks). Two changes:
+- Shorten `PollInterval` for the real-trading deployment specifically (exact value TBD at
+  implementation — balance polling has its own OKX rate-limit budget the gateway must account
+  for, §27.1, so this isn't a free "poll faster" change; it competes with order/leverage calls for
+  the trader's own priority-consumer budget).
+- Consider a private-WS-driven balance/position push (OKX's `wss://ws.okx.com:8443/ws/v5/private`
+  account/positions channels, §4 — already documented as available, not yet used anywhere in this
+  codebase) as a lower-latency, rate-limit-free complement to REST polling, matching the
+  event-driven-over-polling preference already established for market data (§12). This would be
+  new work — no private-WS client exists in `internal/okx/ws` today (only public WS is
+  implemented, per `go-engine/internal/okx/ws/public.go`) — so treat it as a stretch goal for this
+  phase, not a blocker for going live, since REST polling alone is a correct (if slower) baseline.
+- Regardless of cadence, every balance change must land in `account_equity_history` in real mode
+  exactly as documented in §15.7/§11's `account_equity` design — this already exists
+  (`cmd/trader` records demo/real equity by observing the exchange's reported equity each poll,
+  §15.7) and needs no new design, just confirming it's actually wired for the `real` mode path
+  once real trading starts (verify, don't assume — §16.10's lesson again).
+
+### 27.5 Order fill timeout and cancel-and-wait-for-next-signal
+
+**Decision, per explicit operator instruction**: real futures orders are expected to fill
+immediately in the overwhelming majority of cases (market orders against a liquid perpetual), but
+the code must not assume this — an order that hasn't filled within a timeout gets **canceled**,
+and the bot does **not** immediately retry at a new price. It waits for the model to produce a new
+signal/price on its own next cycle, rather than the engine manufacturing a retry loop with a price
+it invented.
+
+- **Timeout: 60 seconds**, per the operator's own figure, added as a new config value:
+  `trading.order_fill_timeout_sec` (default 60) — `internal/config`'s `Trading` struct and
+  `configs/config.yaml`/`config.example.yaml`, alongside the existing `td_mode`/`pos_mode`
+  fields the audit found nearby.
+- **Mechanism**: after `PlaceOrder` returns an accepted `OrdID` (`SCode == "0"`), start a
+  timeout-bounded poll of that order's status. This needs a capability that **does not exist
+  anywhere in the codebase today** (confirmed by the audit): no `GetOrder`/order-status-query
+  method exists on `rest.Client`, `port.ExchangeClient`, or the gateway design above — only
+  `PlaceOrder`'s immediate acceptance response and the next poll cycle's `GetPositions` snapshot.
+  Add `GET /api/v5/trade/order` (single order status by `instId`+`ordId`) to the REST client, the
+  `ExchangeClient` port, and route it through the gateway (§27.1) like every other trade-critical
+  call — it belongs in the trader's priority endpoint class, not the general one, since a slow
+  status check directly blocks the fill-or-cancel decision.
+  - **`CancelOrder` already exists on `rest.Client` today but is unused and not part of
+    `port.ExchangeClient`** (confirmed dead code by the audit) — add it to the port interface as
+    part of this work; the implementation is already there, only the wiring is missing.
+- **On timeout**: call `CancelOrder`, log the outcome, and stop — no synthetic retry, no
+  re-pricing. The next real signal (from the strategy/conductor lifecycle once `cmd/trader` is on
+  it, §27.3) is what triggers the next attempt, on its own normal cadence.
+- **Futures partial fills**: per the operator's own expectation, perpetual futures market orders
+  against a liquid book essentially always fill completely, unlike spot/limit order books where
+  partial fills are common — so this is treated as a rare edge case to detect and handle
+  correctly, not the primary design target. The order-status poll above still needs to
+  distinguish `filled` from `partially_filled` from `live`/`canceled` (OKX's `state` field on the
+  order-status response) rather than assuming a binary filled/not-filled — a partial fill within
+  the timeout window should be treated as a real, smaller-than-intended position (update the
+  domain `Order`/position state to the actual filled size, do not wait for the remainder or
+  assume it will complete) rather than left ambiguous.
+- **New domain gap this closes**: `domain.OrderResult` today has no status/fill-price/filled-size
+  fields at all (§27's audit — it's purely the *acceptance* response: `OrdID, ClOrdID, SCode,
+  SMsg`). This work needs a proper order-lifecycle domain type (a new `domain.Order` or an
+  extended `OrderResult`, decide the exact shape at implementation) carrying OKX's `state`
+  (`live`/`partially_filled`/`filled`/`canceled`), `avgPx`, `accFillSz` — the fields OKX's own
+  order-status response already provides but nothing in this codebase currently models.
+
+### 27.6 Order-status sync with the exchange, not self-reported state alone
+
+**Decision, per explicit operator instruction**: real order/position state must be kept
+synchronized against what OKX itself reports, not trusted from this system's own bookkeeping
+alone — the same principle already applied to balance (§27.4) extended to individual orders.
+Concretely:
+- The order-status polling added for the fill-timeout mechanism (§27.5) is the first piece of
+  this — every real order's local state is confirmed against `GET /api/v5/trade/order`, not
+  assumed from the placement response.
+- Beyond the fill-or-timeout window, **open real positions must be periodically reconciled**
+  against `GetPositions`' authoritative response — this already happens every `PollInterval` tick
+  today (`step()` already calls `GetPositions`), so the gap isn't "add position polling," it's
+  that nothing today **compares** the freshly-polled position against this system's own last-
+  known state and surfaces a discrepancy (size, `MgnMode`, `LiqPx` drifting from what was
+  expected). Add that comparison — logged loudly, and routed through the same halt/alert path a
+  margin-mode mismatch (§27.2) would use — rather than silently overwriting local state with
+  whatever OKX reports and moving on, which would hide exactly the kind of drift this section
+  exists to catch.
+- This reconciliation is what a WebSocket-private-channel push (§27.4's stretch goal) would also
+  serve, if built — the two aren't competing designs, a push channel plus periodic REST
+  reconciliation is a reasonable defense-in-depth pair (matches this project's own repeated "don't
+  trust one layer alone" precedent, e.g. §19.2/§19.3's three independent SL-cap enforcement
+  points), not a case for picking only one.
+
+### 27.7 Implementation checklist (ordered; update as work progresses)
+
+- [ ] `cmd/okx-gateway`: new service, owns real OKX credentials, per-consumer/per-endpoint-class
+      token-bucket rate limiting with `cmd/trader` prioritized, retry/backoff on 429/`50011`,
+      Prometheus metrics. Verify exact OKX rate-limit numbers against the live docs before
+      shipping (§27.1) — do not trust this document's numbers.
+- [ ] Migrate `cmd/trader` to call the gateway first; verify against real OKX; then migrate
+      `paper-trader`, `ingestor`, `strategy-tester`, `strategy-optimizer` independently.
+- [ ] `configs/config.yaml`/`config.example.yaml`/`internal/config` default: `td_mode` →
+      `isolated` for real trading; add margin-mode read-back verification against
+      `Position.MgnMode` with a halt on mismatch (§27.2).
+- [ ] Revisit `risk.Manager`'s liquidation-buffer estimate against OKX's own reported `LiqPx`
+      rather than the `100/leverage` approximation alone (§27.2).
+- [ ] Bring `cmd/trader` onto the strategy-signal + `conductor.SignalConductor` lifecycle (the
+      real scope behind "no forking for real trading," §27.3) — one position per token per side,
+      model edits SL/TP in place, opposite-side signals while a position is open are ignored
+      (routed as conductor `update`, never a flip) until the model itself closes the position.
+- [ ] New append-only real-order-adjustment log (table TBD, `real_order_adjustments` working
+      name) — every SL/TP edit its own row with a timestamp, never overwritten in place (§27.3).
+- [ ] Panel: order-detail modal for real orders showing the full chronological adjustment
+      history, not just latest SL/TP (§27.3).
+- [ ] Add `GET /api/v5/trade/order` (order status) to `rest.Client` + `port.ExchangeClient` +
+      route through the gateway in the trader's priority class; add `CancelOrder` to
+      `port.ExchangeClient` (already implemented on `rest.Client`, currently unreachable/dead
+      code) (§27.5).
+- [ ] New `domain.Order`/extended `OrderResult` carrying OKX's `state`/`avgPx`/`accFillSz`
+      (§27.5).
+- [ ] `trading.order_fill_timeout_sec` config (default 60) + fill-or-cancel logic: cancel on
+      timeout, no synthetic retry/re-pricing, wait for the model's next real signal (§27.5).
+- [ ] Handle a partial fill within the timeout window as a real smaller-than-intended position,
+      not left ambiguous (§27.5).
+- [ ] Position-state reconciliation: compare each poll's `GetPositions` response against this
+      system's last-known state per position, surface/alert on drift instead of silently
+      overwriting (§27.6).
+- [ ] Confirm `account_equity_history` is actually being written for `real` mode once live
+      trading starts — don't assume the existing `cmd/trader` equity-recording code (§15.7) was
+      ever exercised against a real account before now (§27.4).
+- [ ] (Stretch, not a go-live blocker) OKX private WebSocket client
+      (`wss://ws.okx.com:8443/ws/v5/private`) for lower-latency balance/position/order pushes,
+      complementing REST polling/reconciliation rather than replacing it (§27.4/§27.6).
+
+**Deployment note**: per standing instruction, connect to the server via the `okx` SSH host and
+transfer files with `scp`; keep the server in sync with every change made here, and commit each
+implementation step in its own git commit as the work lands (matching this project's existing
+one-focused-commit-per-step convention, §6) rather than bundling §27's items into one commit.
