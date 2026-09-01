@@ -41,6 +41,16 @@ function fmt(v: string | number | null | undefined): string {
   return String(v)
 }
 
+// Distance of a SL/TP level from entry, as a signed percent (negative = below entry). Shown next
+// to the raw price so a level can be read without mentally computing the distance each time.
+function pctFromEntry(level: string | number | null | undefined, entryPx: string): string {
+  const entry = Number(entryPx)
+  const lvl = Number(level)
+  if (!entry || level === null || level === undefined || level === '' || Number.isNaN(lvl)) return ''
+  const pct = ((lvl - entry) / entry) * 100
+  return ` (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`
+}
+
 // A row where the two sides differ is the interesting case: it means the model actually moved the
 // level the strategy proposed. Equal values mean the strategy's own number survived untouched.
 function Row({ label, strategy, model }: { label: string; strategy: string; model: string }) {
@@ -103,8 +113,16 @@ export default function OrderDetailModal({
           <tbody>
             <Row label="Side" strategy={fmt(sig?.side)} model={fmt(position.Side)} />
             <Row label="Entry price" strategy={fmt(sig?.entry_px)} model={fmt(position.EntryPx)} />
-            <Row label="Stop loss" strategy={fmt(sig?.sl_px)} model={fmt(position.SLPx)} />
-            <Row label="Take profit" strategy={fmt(sig?.tp_px)} model={fmt(position.TPPx)} />
+            <Row
+              label="Stop loss"
+              strategy={fmt(sig?.sl_px) + (sig?.sl_px ? pctFromEntry(sig.sl_px, sig?.entry_px || position.EntryPx) : '')}
+              model={fmt(position.SLPx) + (position.SLPx ? pctFromEntry(position.SLPx, position.EntryPx) : '')}
+            />
+            <Row
+              label="Take profit"
+              strategy={fmt(sig?.tp_px) + (sig?.tp_px ? pctFromEntry(sig.tp_px, sig?.entry_px || position.EntryPx) : '')}
+              model={fmt(position.TPPx) + (position.TPPx ? pctFromEntry(position.TPPx, position.EntryPx) : '')}
+            />
             <Row label="Size (USD)" strategy="—" model={fmt(position.Size)} />
             <Row label="Leverage" strategy="—" model={fmt(position.Leverage) + 'x'} />
             <Row label="Confidence" strategy={fmt(sig?.confidence)} model="—" />
