@@ -2995,3 +2995,38 @@ gate `evaluateStrategies` (new opens), never `monitorOpenOrders`, matching the o
 instruction that disabling a token/strategy must not force-close existing positions; only the
 panel's own copy needed correcting to describe this accurately (both modals already said this,
 `TokenModal`'s logic already matched it, only `StrategyKindModal`'s checked-state was wrong).
+
+## 25. Panel crashed to a blank white page on every load (2026-09-01, same-day follow-up)
+
+Reported directly: "it shows the menu for a millisecond and then just a white page" — the exact
+signature of an uncaught render error unmounting the whole React tree with nothing catching it.
+
+**Root cause**: `GET /api/paper-trading/config`'s `activeKinds`/`disabledInstIds`/`activeBars`
+fields marshal as JSON `null` when the underlying Postgres array columns are unset (the fresh
+`paper_trading_config` row migration `000015` inserts has all three `NULL` until an operator ever
+saves a restriction) — the exact same Go-nil-slice-becomes-JSON-null behavior CLAUDE.md's Phase 3
+history (§14) already documented and fixed once before via `client.ts`'s `requestList` wrapper for
+every list endpoint. `paperTradingConfig()` used the plain `request()` instead, so this one
+endpoint never got that normalization. `PaperControls` then called `.length` on
+`cfg.activeKinds`/`cfg.disabledInstIds` (§24's tile summary counts) — `null.length` throws
+`TypeError`, and with **no error boundary anywhere in the app**, React's default behavior on an
+uncaught render error is to unmount the entire tree. Since the config box renders on the Positions
+page (the app's default route), this meant **every single page load crashed**, immediately after
+the nav bar's first paint — matching the reported symptom exactly. This was a real, 100%-reproducible
+regression from the moment §22's feature deployed, not a flake.
+
+**Fix**: `client.ts`'s `paperTradingConfig()` now normalizes all three array fields (plus
+`allInstIds`) with `?? []` before resolving, same pattern as `requestList`, so every consumer can
+rely on them always being arrays.
+
+**Also added, since this incident showed the failure mode has no visibility at all**: a top-level
+`ErrorBoundary` (`panel/src/components/ErrorBoundary.tsx`, wrapping `<App />` in `main.tsx`) — the
+panel had zero error boundaries anywhere before this, so any future uncaught render error anywhere
+in the tree still blanks the whole page today with nothing to look at. Now it shows the error
+message and a "Try again" button instead of silently vanishing. This does not change the underlying
+discipline (fields from Go must still be treated as possibly-null and normalized at the API client
+boundary, not caught after the fact) — it exists so the NEXT bug like this is visible and
+debuggable instead of an unexplained blank page.
+
+Verified against the real server: `GET /api/paper-trading/config` still returns `null` for the
+three fields (unchanged, correct backend behavior), but the panel now loads and renders normally.

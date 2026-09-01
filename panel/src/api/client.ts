@@ -176,7 +176,19 @@ export const api = {
 
   // Paper-trading control box + stats box (2026-09-01 request), above the Positions table.
   paperTradingStats: () => request<PaperTradingStats>('/paper-trading/stats'),
-  paperTradingConfig: () => request<PaperTradingConfig>('/paper-trading/config'),
+  // Go's null-array-column columns (activeKinds/disabledInstIds/activeBars) marshal as JSON null,
+  // not [] — normalized here the same way requestList does for list endpoints, so PaperTradingConfig
+  // consumers can always call .length/.map on these fields without a crash (found live: an
+  // unnormalized null.length threw and unmounted the whole app to a blank page after the initial
+  // paint, since nothing here has an error boundary).
+  paperTradingConfig: () =>
+    request<PaperTradingConfig>('/paper-trading/config').then((c) => ({
+      ...c,
+      activeKinds: c.activeKinds ?? [],
+      disabledInstIds: c.disabledInstIds ?? [],
+      activeBars: c.activeBars ?? [],
+      allInstIds: c.allInstIds ?? [],
+    })),
   savePaperTradingConfig: (patch: Partial<Omit<PaperTradingConfig, 'allInstIds'>>) =>
     request<{ ok: boolean; restartRequired: boolean }>('/paper-trading/config', {
       method: 'PUT',
