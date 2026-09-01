@@ -10,7 +10,10 @@ trading:
   inst_ids:
     - "BTC-USDT-SWAP"
   poll_interval_sec: 5
-  td_mode: "cross"        # "cross" or "isolated"
+  # isolated, not cross (CLAUDE.md §27.2, 2026-09-01 decision): one position's liquidation must
+  # never be able to cascade into draining the margin backing every other open position on the
+  # shared real-money account (§15.6/§26). Was "cross" before real trading was wired up.
+  td_mode: "isolated"     # "cross" or "isolated"
   pos_mode: "net"         # "net" or "long_short" (hedge mode)
   min_order_usd: 10       # skip rebalancing orders smaller than this
   # CLAUDE.md §15.6: the paper -> demo -> real progression. cmd/trader REFUSES to start against
@@ -18,6 +21,13 @@ trading:
   # so, not just forgetting to set OKX_SIMULATED_TRADING. Trading mode itself is derived from that
   # env var (simulated => demo, otherwise real), so mode can never disagree with the keys in use.
   allow_real_money: false
+
+# CLAUDE.md §27.5, explicit operator decision (2026-09-01): a placed order not filled within this
+# window is CANCELED, and the engine does NOT re-price/retry automatically — it waits for the
+# model's next real signal. Futures market orders against a liquid perpetual are expected to fill
+# essentially immediately; this exists only to bound the rare case where one doesn't.
+trading_fill_timeout:
+  order_fill_timeout_sec: 60
 
 # The always-on data collector (cmd/ingestor): a broad, stable set of timeframes it publishes to
 # Redis 24/7, independent of what any given paper-trading/strategy test run actually evaluates.
@@ -230,3 +240,32 @@ tester:
   # shape matches paper_trading.rl_clamps.
   rl_clamps:
     max_loss_pct: 0.15
+
+# cmd/okx-gateway (CLAUDE.md §27.1): the single process that will hold real OKX credentials and
+# rate-limit/prioritize REST calls across every other service, once each service is migrated to
+# call it instead of building its own rest.Client. Every class below overrides only the fields
+# that differ from gateway.DefaultLimits() — leave a class out entirely to use the code-level
+# default for every one of its fields.
+#
+# THE NUMBERS BELOW ARE NOT VERIFIED AGAINST OKX'S LIVE DOCS — re-check
+# https://www.okx.com/docs-v5/en/#overview-rate-limits and each endpoint's own page before
+# deploying against real trading (CLAUDE.md §27.1's own warning; third-party sources consulted
+# while designing this disagreed with each other).
+gateway:
+  addr: "0.0.0.0:8094"
+  trade:
+    capacity: 20
+    refill: 20
+    interval_ms: 2000
+  leverage:
+    capacity: 10
+    refill: 10
+    interval_ms: 2000
+  account:
+    capacity: 10
+    refill: 10
+    interval_ms: 2000
+  market:
+    capacity: 20
+    refill: 20
+    interval_ms: 2000

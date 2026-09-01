@@ -298,6 +298,43 @@ type Config struct {
 			MinTPSLRatio decimal.Decimal `yaml:"min_tp_sl_ratio"`
 		} `yaml:"rl_clamps"`
 	} `yaml:"tester"`
+
+	// Gateway configures cmd/okx-gateway, the single process that holds real OKX credentials and
+	// rate-limits/prioritizes REST calls across every other service (CLAUDE.md §27.1). Every
+	// class left unconfigured (zero fields) falls back to gateway.DefaultLimits() at okx-gateway's
+	// own startup — see that function's own doc comment on why the numbers here must be verified
+	// against OKX's live docs before real trading, not trusted from this codebase alone.
+	Gateway struct {
+		// URL is how every OTHER service reaches this gateway (env only, same pattern as
+		// RLService.URL/Tester.URL) — once a service migrates to calling the gateway instead of
+		// building its own rest.Client (CLAUDE.md §27.1's migration order), it reads this.
+		URL string `yaml:"-"`
+		// Addr is this service's own HTTP bind address.
+		Addr     string            `yaml:"addr"`
+		Trade    GatewayClassLimit `yaml:"trade"`
+		Leverage GatewayClassLimit `yaml:"leverage"`
+		Account  GatewayClassLimit `yaml:"account"`
+		Market   GatewayClassLimit `yaml:"market"`
+	} `yaml:"gateway"`
+
+	// FillTimeout controls cmd/trader's fill-or-cancel behavior for a placed order (CLAUDE.md
+	// §27.5, explicit operator decision): an order not filled within this window is canceled, and
+	// the engine does NOT re-price/retry automatically — it waits for the model's next real
+	// signal. Futures market orders against a liquid perpetual are expected to fill immediately in
+	// the overwhelming majority of cases; this exists to bound the rare case where one doesn't.
+	FillTimeout struct {
+		OrderFillTimeoutSec int `yaml:"order_fill_timeout_sec"`
+	} `yaml:"trading_fill_timeout"`
+}
+
+// GatewayClassLimit is one endpoint class's config-overridable rate limit (CLAUDE.md §27.1). A
+// zero field means "use gateway.DefaultLimits()' value for this field" — this struct intentionally
+// allows overriding only some fields of a class (e.g. just Capacity) rather than requiring every
+// field to be set once any override is present.
+type GatewayClassLimit struct {
+	Capacity   int `yaml:"capacity"`
+	Refill     int `yaml:"refill"`
+	IntervalMs int `yaml:"interval_ms"`
 }
 
 // OptimizerTarget is one (instrument, strategy-kind) pair cmd/strategy-optimizer's scheduler
@@ -483,6 +520,15 @@ func Load(path string) (*Config, error) {
 
 	cfg.Tester.URL = envOr("TESTER_SERVICE_URL", "http://localhost:8092")
 	cfg.PaperTrading.URL = envOr("PAPER_TRADER_SERVICE_URL", "http://localhost:8093")
+	cfg.Gateway.URL = envOr("OKX_GATEWAY_URL", "http://localhost:8094")
+	if cfg.Gateway.Addr == "" {
+		cfg.Gateway.Addr = envOr("GATEWAY_ADDR", "0.0.0.0:8094")
+	}
+	if cfg.FillTimeout.OrderFillTimeoutSec == 0 {
+		// 60s, per explicit operator decision (CLAUDE.md §27.5) — cancel-and-wait-for-next-signal,
+		// never a synthetic retry at a new price.
+		cfg.FillTimeout.OrderFillTimeoutSec = 60
+	}
 	if cfg.Tester.Addr == "" {
 		cfg.Tester.Addr = envOr("TESTER_ADDR", "0.0.0.0:8092")
 	}

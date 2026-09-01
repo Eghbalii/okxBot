@@ -121,6 +121,32 @@ services:
       kafka:
         condition: service_healthy
 
+  # okx-gateway is the single process that holds real OKX credentials and rate-limits/prioritizes
+  # REST calls across every other service (CLAUDE.md §27.1). Deployed here but NOT YET the
+  # exclusive credential holder — cmd/trader and the other services still read OKX_API_KEY/etc
+  # directly until each is migrated to call this gateway instead (§27.1's migration order: trader
+  # first, verified against real OKX, then paper-trader/ingestor/strategy-tester/
+  # strategy-optimizer independently). Until that migration lands this service runs unused.
+  okx-gateway:
+    logging: *default-logging
+    restart: *default-restart
+    build:
+      context: ./go-engine
+      dockerfile: Dockerfile.okx-gateway
+    environment:
+      CONFIG_PATH: /app/configs/config.yaml
+      GATEWAY_ADDR: "0.0.0.0:8094"
+      METRICS_ADDR: ":9105"
+      OKX_API_KEY: ${OKX_API_KEY}
+      OKX_API_SECRET: ${OKX_API_SECRET}
+      OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE}
+      OKX_SIMULATED_TRADING: ${OKX_SIMULATED_TRADING:-1}
+    ports:
+      - "8094:8094"
+      - "9105:9105"
+    volumes:
+      - ./go-engine/configs:/app/configs
+
   trader:
     logging: *default-logging
     # NOT unless-stopped: cmd/trader exits immediately when OKX API credentials are absent,
