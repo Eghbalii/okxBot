@@ -8,8 +8,10 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
@@ -76,14 +78,71 @@ func main() {
 
 	logger.Info("starting paper trader", "instIds", cfg.Trading.InstIDs)
 
+	// Panel control-box config (CLAUDE.md): read fresh from Postgres at every start, same
+	// crash-recovery posture as loadStrategyAssignments below — a restart resumes with exactly the
+	// pause/stop/direction/kind/token/bar restrictions the panel last saved, not whatever was true
+	// in memory before the process last exited.
+	ptCfg, err := repo.GetPaperTradingConfig(ctx)
+	if err != nil {
+		logger.Error("failed to load paper trading config", "error", err)
+		os.Exit(1)
+	}
+	// active_bars overrides which timeframes strategies actually DECIDE on (paper_trading.bars),
+	// not which the ingestor collects/this process consumes from Kafka (ingestion.bars) — a bar
+	// removed here just stops triggering evaluateStrategies, it keeps being persisted for context.
+	paperTradingBars := cfg.PaperTrading.Bars
+	if len(ptCfg.ActiveBars) > 0 {
+		paperTradingBars = ptCfg.ActiveBars
+	}
+	// disabled_inst_ids never removes a token's PaperTrader goroutine (monitorOpenOrders must keep
+	// closing its existing positions normally) — it's applied per-instrument below via
+	// PaperTrader.OpensDisabled instead, so the full configured roster is used here unchanged.
+	tradingPaused := ptCfg.TradingState != "running"
+	if tradingPaused {
+		logger.Info("paper trading is not in the running state", "tradingState", ptCfg.TradingState)
+	}
+
 	if err := strategy.SeedOrigins(ctx, repo); err != nil {
 		logger.Error("failed to seed origin strategies", "error", err)
 		os.Exit(1)
 	}
-	if err := ensureDefaultAssignment(ctx, repo, cfg.Trading.InstIDs, cfg.PaperTrading.Bars); err != nil {
+	if err := ensureDefaultAssignment(ctx, repo, cfg.Trading.InstIDs, paperTradingBars); err != nil {
 		logger.Error("failed to ensure default strategy assignment", "error", err)
 		os.Exit(1)
 	}
+	// Global per-kind "active strategies" toggle (CLAUDE.md): bulk-applied to strategy_assignments
+	// BEFORE loadStrategyAssignments reads them below, so ListAssignments(enabledOnly=true) picks
+	// up the result with no change needed to that function. A no-op when ActiveKinds is empty.
+	if err := repo.SetAssignmentsEnabledForKinds(ctx, ptCfg.ActiveKinds); err != nil {
+		logger.Error("failed to apply active-strategy-kinds restriction", "error", err)
+		os.Exit(1)
+	}
+	// trading_state="stopped" force-closes every currently-open paper order, once, at startup —
+	// same manual-close path and model-reward treatment as the panel's per-order Close button
+	// (CLAUDE.md §20/§15.14). Deliberately a startup sweep, not a continuous poll: "stopped" is a
+	// deliberate, infrequent operator action, and every open position closes on its very next tick
+	// regardless of how this flag was applied.
+	if ptCfg.TradingState == "stopped" {
+		n, err := repo.RequestManualCloseAll(ctx)
+		if err != nil {
+			logger.Error("failed to request manual close of all open orders", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("trading_state=stopped: flagged open orders for close", "count", n)
+	}
+
+	// Panel control-box HTTP surface (CLAUDE.md) — GET/PUT /config + POST /restart, mirroring
+	// cmd/strategy-tester's own pattern. GET /config reflects ptCfg as loaded at THIS startup, not
+	// a live DB round-trip, same asymmetry as the tester (a save is only "live" after a restart).
+	ptSvc := &paperTraderService{repo: repo, logger: logger, current: ptCfg, allInstIDs: cfg.Trading.InstIDs}
+	ptAddr := envOr("PAPER_TRADER_ADDR", "0.0.0.0:8093")
+	ptHTTPServer := &http.Server{Addr: ptAddr, Handler: ptSvc.routes()}
+	go func() {
+		logger.Info("serving paper-trader control-box api", "addr", ptAddr)
+		if err := ptHTTPServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("paper-trader control-box api stopped", "error", err)
+		}
+	}()
 
 	// CLAUDE.md §15.4: nil unless explicitly enabled, so PaperTrader's SL/TP-adjustment pass is a
 	// strict no-op wherever operators haven't opted in — same "additive, never required" posture
@@ -180,7 +239,7 @@ func main() {
 			// Force-closes a stale position regardless of RL flags (CLAUDE.md §15.14) — unlike
 			// everything else in this block, this is unconditional housekeeping, not RL behavior.
 			MaxOpenDuration: cfg.PaperTrading.RLMaxOpenDuration,
-			ActiveTokens: cfg.Trading.InstIDs,
+			ActiveTokens:    cfg.Trading.InstIDs,
 			// One shared account across every token (CLAUDE.md §15.6): each per-instrument engine
 			// trades against the same "paper" balance row, not a slice of it.
 			Mode:                "paper",
@@ -188,6 +247,13 @@ func main() {
 			MaxPositionPct:      cfg.Account.MaxPositionPct,
 			MaxTotalExposurePct: cfg.Account.MaxTotalExposurePct,
 			OrderEvents:         orderEventsPub,
+			// Panel control-box gates (CLAUDE.md): TradingPaused is process-wide (running vs.
+			// paused/stopped), OpensDisabled is per-token — both only stop NEW opens, existing
+			// positions keep closing normally regardless.
+			TradingPaused: tradingPaused,
+			OpensDisabled: slices.Contains(ptCfg.DisabledInstIDs, instID),
+			DisableLong:   ptCfg.DisableLong,
+			DisableShort:  ptCfg.DisableShort,
 		}
 		delay := time.Duration(i) * engineStartStagger
 		go func() {

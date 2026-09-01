@@ -182,6 +182,33 @@ type EquityPoint struct {
 	CreatedAt time.Time
 }
 
+// PaperTradingConfig is the panel-editable control-box config for cmd/paper-trader (CLAUDE.md):
+// pause/stop trading, disable one signal direction, restrict which strategy kinds/timeframes/
+// tokens are active. Restart-required to apply, same posture as cmd/strategy-tester's own
+// runtime config — cmd/paper-trader reads this fresh from Postgres at every start.
+type PaperTradingConfig struct {
+	TradingState    string // "running", "paused", or "stopped"
+	DisableLong     bool
+	DisableShort    bool
+	ActiveKinds     []string // empty = no per-kind restriction
+	DisabledInstIDs []string // empty = no token disabled
+	ActiveBars      []string // empty = use paper_trading.bars from config.yaml as-is
+	UpdatedAt       time.Time
+}
+
+// PaperTradingConfigPatch is SavePaperTradingConfig's input — nil fields leave the corresponding
+// column unchanged, matching tester.RuntimeConfig's patch shape. The slice fields are pointers to
+// a slice (not a bare slice) so "explicitly set to empty" (clear the restriction) is distinguishable
+// from "field omitted" (leave whatever restriction is already saved untouched).
+type PaperTradingConfigPatch struct {
+	TradingState    *string
+	DisableLong     *bool
+	DisableShort    *bool
+	ActiveKinds     *[]string
+	DisabledInstIDs *[]string
+	ActiveBars      *[]string
+}
+
 // ParamChange is one recorded strategy parameter-change event (CLAUDE.md §16): either
 // cmd/strategy-optimizer persisting a winning tuned candidate (Source="optimizer") or an operator
 // editing a sub-strategy's params by hand via the panel (Source="manual"). Backs the panel's
@@ -250,6 +277,10 @@ type Repository interface {
 	// closed_manual category to report a plain manual close under. Returns an error if id is not a
 	// currently-open order.
 	RequestManualClose(ctx context.Context, id int64) error
+	// RequestManualCloseAll is RequestManualClose's bulk form, used when the operator sets
+	// trading_state="stopped" from the panel's control box (CLAUDE.md): flags every open paper
+	// order for close on its next tick. Returns how many rows were flagged.
+	RequestManualCloseAll(ctx context.Context) (int, error)
 	// UpdatePaperOrderPnLExtremes records new peak/trough unrealized PnL for an open order
 	// (CLAUDE.md §15.11). Both are written together since they move as one high-water pair.
 	UpdatePaperOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error
@@ -291,4 +322,14 @@ type Repository interface {
 	// ListParamChanges returns instID's parameter-change history at or after since (zero time =
 	// no lower bound), oldest first — the shape the panel's marker-overlay chart consumes.
 	ListParamChanges(ctx context.Context, instID string, since time.Time) ([]ParamChange, error)
+
+	// GetPaperTradingConfig returns the panel-editable control-box config (CLAUDE.md), seeding it
+	// at column defaults if it hasn't been written yet.
+	GetPaperTradingConfig(ctx context.Context) (PaperTradingConfig, error)
+	// SavePaperTradingConfig applies patch's non-nil fields onto the singleton row.
+	SavePaperTradingConfig(ctx context.Context, patch PaperTradingConfigPatch) (PaperTradingConfig, error)
+	// SetAssignmentsEnabledForKinds bulk-enables/disables strategy_assignments so only assignments
+	// whose strategy's Kind is in activeKinds are enabled — the global per-kind "active strategies"
+	// toggle. A no-op when activeKinds is empty (no restriction configured).
+	SetAssignmentsEnabledForKinds(ctx context.Context, activeKinds []string) error
 }

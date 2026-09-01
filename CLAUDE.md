@@ -2755,3 +2755,125 @@ same instrument concurrently, so multiple *versions* of one kind trading concurr
 small extension of the same guard — but the panel's stats view and `judgeCandidate`'s "which
 version is currently the comparison baseline" logic both assume at most one enabled version per
 kind today and would need to change together with the store layer, not before it.
+
+## 22. Panel control box + stats box for paper trading, and the DOGE → XAU-USDT-SWAP swap (2026-09-01)
+
+Explicit product request, framed as the first step toward eventually activating OKX demo trading:
+a stats box (open orders, total equity, 24h/1w/1month PnL) and a config box (pause/stop, long/
+short disable, active strategies/tokens/timeframes) above the Positions table.
+
+**Scoped to paper trading, not demo, per explicit decision.** `cmd/trader` (the live/demo loop)
+was investigated first and found to predate the §15.10-§15.12 signal-lifecycle redesign entirely:
+no strategy signals, no `conductor.SignalConductor`, no SL/TP clamps (§19.2's 15% cap is nowhere
+in its path), it never writes to `paper_orders` (so a demo position would never even appear in the
+panel), and it never sends a terminal close call — meaning it generates **zero training reward**
+today. Building these controls against a not-yet-real demo loop would mean re-building them again
+once `cmd/trader` is actually brought up to parity with `cmd/paper-trader`, so they were built
+against paper-trading (the thing actually running and training the model) with the explicit intent
+that demo trading inherits the same controls later rather than getting a separate set.
+
+**Every control is "edit + restart," not live-reload**, per explicit decision — matches
+`cmd/strategy-tester`'s already-proven `GET/PUT /config` + `POST /restart` pattern (§18) rather
+than teaching `cmd/paper-trader` to poll/reload mid-run. `cmd/paper-trader` was headless before
+this (only `/metrics` bound) — it gained a new small HTTP surface
+(`cmd/paper-trader/handlers.go`, `PAPER_TRADER_ADDR`, default `0.0.0.0:8093`) purely to receive
+`POST /restart` and self-`os.Exit(0)`, the same reasoning as strategy-tester's own handler: this
+binary has no Docker socket access either, so self-exit + the container's existing
+`restart: unless-stopped` policy is the only mechanism that guarantees restarting paper-trader can
+never affect any other service.
+
+**New singleton table `paper_trading_config`** (migration `000015`, same shape as `tester_config`):
+`trading_state` (`running`/`paused`/`stopped`), `disable_long`/`disable_short`, `active_kinds`,
+`disabled_inst_ids`, `active_bars`. Read fresh from Postgres at `cmd/paper-trader`'s own startup
+(`GetPaperTradingConfig`), same crash-recovery posture as `loadStrategyAssignments` — a restart
+resumes with exactly the restrictions the panel last saved, not whatever was true in memory before
+the process last exited.
+
+- **`trading_state`**: `paused` and `stopped` both set a new `PaperTrader.TradingPaused` field,
+  checked as the first line of `evaluateStrategies` — no new position opens, but
+  `monitorOpenOrders` keeps monitoring/closing existing ones normally regardless (a config toggle
+  must never orphan an open position). `stopped` additionally does a one-time
+  `Repository.RequestManualCloseAll` sweep at startup — flags every open paper order via the exact
+  same `manual_close_requested` column and reward-reporting path as the panel's per-order Close
+  button (§20: `close_reason='manual'`, reported to the model as `closed_early`) — rather than
+  inventing a new close reason or a continuous poll. A real touch or the operator's own per-order
+  Close always still wins on whichever tick actually closes it; this is just "flag everything,
+  then let the existing per-tick close logic do its job."
+- **`disable_long` / `disable_short`**: new `PaperTrader.DisableLong`/`DisableShort` fields,
+  checked in `evaluateStrategies` right after the `Hold` check — a strategy still evaluates and its
+  signal is still counted in `okxbot_strategy_signals_total`, this only gates whether the disabled
+  side is acted on. Existing open positions on the disabled side are left alone (same "don't
+  hard-close on a macro toggle" reasoning as the token disable below).
+- **`active_kinds`** (the "which strategies are active" control): NOT a new `PaperTrader` field —
+  applied once at startup via a new `Repository.SetAssignmentsEnabledForKinds`, a single
+  `UPDATE strategy_assignments SET enabled = (kind = ANY($1)) ...` bulk toggle, run BEFORE
+  `loadStrategyAssignments` reads them. This is deliberately a NEW, coarser layer on top of the
+  existing per-token/per-timeframe `strategy_assignments.enabled` (§11.3) rather than replacing
+  it: one switch per strategy KIND, applied uniformly across every token (e.g. "only `grid_like`
+  trades, everywhere"), which is what the operator's framing ("activate grid_like for now, more
+  later") actually asked for — the existing per-assignment granularity stays the underlying
+  mechanism this toggle drives, still independently editable from the Strategies page. Empty
+  `active_kinds` is a no-op (no restriction), preserving today's behavior for anyone who never
+  touches this control.
+- **`disabled_inst_ids`** (per-token disable, e.g. a future "disable DOGE"): explicitly does
+  **not** remove that instrument's `PaperTrader` goroutine or drop it from the per-instrument
+  construction loop — doing so would also stop `monitorOpenOrders` for that token, orphaning any
+  position already open on it. Instead a new `PaperTrader.OpensDisabled bool` field
+  (`slices.Contains(disabledInstIDs, instID)`) gates only the open path, identically to
+  `TradingPaused`. Ingestion (`cmd/ingestor`) is entirely untouched by this — a disabled token
+  keeps collecting candles/ticks the whole time, so re-enabling it later has no data gap. The
+  operator can still manually close an existing position on a disabled token via the ordinary
+  per-order Close button.
+- **`active_bars`**: overrides which timeframes `evaluateStrategies` actually fires decisions on
+  (`paper_trading.bars`), computed once at startup as `ptCfg.ActiveBars` if non-empty else
+  `cfg.PaperTrading.Bars` — deliberately does NOT touch `cfg.Ingestion.Bars`/`candleBars` (what
+  `cmd/paper-trader` consumes from Kafka and persists to the `candles` table for context, §9): a
+  timeframe removed from `active_bars` just stops triggering trades, it keeps being collected and
+  persisted, so re-adding it later has full history waiting rather than a cold start.
+
+**Panel** (`PositionsPage.tsx` gains two new boxes above the existing toolbar/table, both polling
+at 15s — slower than the position table's own 5s poll, since this data doesn't need that
+freshness): `PaperTradingStatsBox` (open count, total equity, 24h/1w/1month PnL in both % and $)
+and `PaperTradingConfigBox` (state selector with a confirm-dialog on Stopped since it force-closes
+positions, long/short checkboxes, timeframe checkboxes, and two "Manage…" buttons opening
+`StrategyKindModal`/`TokenModal` — the "top-up window" the operator asked for, both new components
+mirroring `OrderDetailModal`'s existing conditional-render-in-parent pattern). The config box's
+Save/Restart split and "restart required" messaging directly reuses `StrategyTesterPage.tsx`'s own
+`ConfigPanel` UX rather than inventing a new one.
+
+**No new backend aggregate query for the stats box** — `GET /api/paper-trading/stats`
+(`internal/api/paper_trading.go`) computes 24h/7d/30d PnL by calling the existing
+`Repository.ListEquityHistory(mode="paper", since=now-30d, limit=0)` once (the longest window
+covers all three) and folding `DeltaUSD` where `Reason="trade"` over each sub-window in Go
+(`realizedPnLOverWindow`) — no new SQL aggregate needed. `GET/PUT /api/paper-trading/config` read/
+write Postgres directly through `Repo` (like every other `cmd/api` handler) rather than proxying
+to `cmd/paper-trader`, so they stay available even when that process is down or mid-restart; only
+`POST /api/paper-trading/restart` proxies through (`internal/api/paper_trader_proxy.go`, a small
+duplicate of `tester_proxy.go`'s shape rather than a generalized one — matches this codebase's
+existing "duplication over coupling" precedent for small per-service proxies, e.g. §16.9's
+`RealizedPnL`). New `PaperTraderBaseURL` field on `Server`, `PAPER_TRADER_SERVICE_URL` env var
+(mirrors `TESTER_SERVICE_URL`'s exact pattern), `docker-compose.yml`'s `api` service gains it
+pointed at `http://paper-trader:8093`.
+
+**DOGE-USDT-SWAP → XAU-USDT-SWAP token swap**, done directly in `trading.inst_ids` config
+(independent of the per-token disable feature above — that's for toggling without a config edit
+going forward, not how XAU was added this one time). Verified against the real OKX API before
+swapping: `XAU-USDT-SWAP` exists (`ctValCcy: XAU`, `settleCcy: USDT`, `state: live`, `lever: 100`)
+and — checked against real hourly candles spanning the most recent Saturday/Sunday — trades with
+**zero gap** through the weekend, identical to any crypto perpetual (it's OKX's own USDT-settled
+synthetic gold product, not a traditional gold-exchange contract with market hours), so no special
+weekend-handling code was needed anywhere in the ingestor/paper-trader pipeline. Backfilled 4,500
+candles across all three decision timeframes (`POST /api/candles/backfill`) immediately after the
+swap so it wasn't starting cold, matching §17's whole reason for existing.
+
+5 new Go tests in `internal/api/paper_trading_test.go` (window-sum arithmetic, the zero-division
+guard, exclusion of out-of-window points) plus 4 new tests in `internal/usecase/papertrade_test.go`
+(`TestEvaluateStrategies_TradingPausedOpensNothing`, `OpensDisabledStopsNewOpensOnly`,
+`DisableLongSkipsBuySignalsOnly`, `DisableShortSkipsSellSignalsOnly`) — 252 Go tests total.
+Verified end-to-end against the real server: migration applied cleanly, the paper-trader
+control-box HTTP surface answers `GET /config` with the real 10-token roster (XAU included),
+`PUT /config` correctly patches only the touched field (coalesce semantics confirmed both ways),
+`POST /api/paper-trading/restart` proxied through `cmd/api` and genuinely restarted only the
+`paper-trader` container (confirmed via `docker compose ps` showing a fresh uptime, every other
+service untouched), and `GET /api/paper-trading/stats` returned real computed numbers (10 open
+orders, live equity, real 24h/7d/30d PnL) against production data.

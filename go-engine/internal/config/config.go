@@ -66,6 +66,10 @@ type Config struct {
 	} `yaml:"ingestion"`
 
 	PaperTrading struct {
+		// URL is cmd/paper-trader's own control-box HTTP surface as reached from cmd/api (env only,
+		// same pattern as Tester.URL/RLService.URL) — used to proxy the panel's restart button
+		// through cmd/api rather than exposing this service directly (CLAUDE.md §11).
+		URL           string          `yaml:"-"`
 		NotionalUSD   decimal.Decimal `yaml:"notional_usd"`
 		MaxOpenOrders int             `yaml:"max_open_orders"`
 		// Bars is the subset of Ingestion.Bars that cmd/paper-trader actually maintains candle
@@ -255,9 +259,9 @@ type Config struct {
 		// NotionalUSD/Leverage are fixed for every position this service opens — there is no RL
 		// sizing here, so "how much" is a flat config value, not a decision (operator's own
 		// "size/leverage doesn't matter, start with $10 and 10x" instruction).
-		NotionalUSD decimal.Decimal `yaml:"notional_usd"`
-		Leverage    decimal.Decimal `yaml:"leverage"`
-		CandleWindow int `yaml:"candle_window"`
+		NotionalUSD  decimal.Decimal `yaml:"notional_usd"`
+		Leverage     decimal.Decimal `yaml:"leverage"`
+		CandleWindow int             `yaml:"candle_window"`
 		// MaxOpenDuration force-closes a tester position open longer than this, close_reason=
 		// 'timeout' (2026-08-30 request, mirroring paper_trading.rl_max_open_duration/§15.14 for
 		// the SAME reason on a SEPARATE config path — this service has no in-trade update
@@ -475,6 +479,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.Tester.URL = envOr("TESTER_SERVICE_URL", "http://localhost:8092")
+	cfg.PaperTrading.URL = envOr("PAPER_TRADER_SERVICE_URL", "http://localhost:8093")
 	if cfg.Tester.Addr == "" {
 		cfg.Tester.Addr = envOr("TESTER_ADDR", "0.0.0.0:8092")
 	}

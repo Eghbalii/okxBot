@@ -172,3 +172,32 @@ export interface TesterConfig {
   leverage: string
   maxOpenDuration: string // Go duration string, e.g. "6h"
 }
+
+// Paper-trading control box + stats box (2026-09-01 request), proxied/read through cmd/api's
+// /api/paper-trading/* routes.
+export interface PaperTradingStats {
+  openCount: number
+  totalEquityUsd: string
+  pnl24hUsd: string
+  pnl24hPct: string
+  pnl7dUsd: string
+  pnl7dPct: string
+  pnl30dUsd: string
+  pnl30dPct: string
+}
+
+export type TradingState = 'running' | 'paused' | 'stopped'
+
+export interface PaperTradingConfig {
+  tradingState: TradingState
+  disableLong: boolean
+  disableShort: boolean
+  // Empty = no per-kind restriction (every currently-enabled assignment applies as-is).
+  activeKinds: string[]
+  disabledInstIds: string[]
+  // Empty = use paper_trading.bars from config.yaml as-is.
+  activeBars: string[]
+  // Not itself part of the saved config — the full configured trading.inst_ids roster, so the
+  // token-manage modal knows what tokens exist to toggle.
+  allInstIds: string[]
+}

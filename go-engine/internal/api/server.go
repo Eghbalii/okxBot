@@ -26,9 +26,14 @@ type Server struct {
 	// to it directly (matching every other backend, all reachable only via cmd/api, CLAUDE.md §11).
 	// Empty disables the tester routes with a clear error rather than a confusing connection-reset.
 	TesterBaseURL string
-	ProcessMgr    string
-	Units         []string
-	Logger        *slog.Logger
+	// PaperTraderBaseURL is cmd/paper-trader's control-box HTTP surface — used only to proxy the
+	// restart button (CLAUDE.md): GET/PUT /api/paper-trading/config talk to Postgres directly via
+	// Repo instead, same as every other cmd/api handler, since that data must stay readable/
+	// writable even when cmd/paper-trader itself happens to be down or mid-restart.
+	PaperTraderBaseURL string
+	ProcessMgr         string
+	Units              []string
+	Logger             *slog.Logger
 
 	// AccountInitialUSD seeds a mode's account row on first read, matching what the trading
 	// services are configured with (CLAUDE.md §15.6) — cmd/api must not invent a different starting
@@ -127,6 +132,15 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/tester/config", s.proxyTester("/config"))
 	mux.HandleFunc("PUT /api/tester/config", s.proxyTesterBody("/config"))
 	mux.HandleFunc("POST /api/tester/restart", s.proxyTesterBody("/restart"))
+
+	// Panel control-box for paper trading (CLAUDE.md): pause/stop, long/short toggle, active
+	// strategies/tokens/timeframes. Config reads/writes hit Postgres directly (Repo) rather than
+	// proxying to cmd/paper-trader, so they stay available even if that process is down or
+	// mid-restart; only the restart action itself needs to reach the running process.
+	mux.HandleFunc("GET /api/paper-trading/stats", s.handlePaperTradingStats)
+	mux.HandleFunc("GET /api/paper-trading/config", s.handleGetPaperTradingConfig)
+	mux.HandleFunc("PUT /api/paper-trading/config", s.handleSavePaperTradingConfig)
+	mux.HandleFunc("POST /api/paper-trading/restart", s.proxyPaperTrader("/restart"))
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

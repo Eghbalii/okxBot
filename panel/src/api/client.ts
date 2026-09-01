@@ -1,6 +1,8 @@
 import type {
   Candle,
   ModelStatus,
+  PaperTradingConfig,
+  PaperTradingStats,
   ParamChange,
   Position,
   PositionMode,
@@ -171,6 +173,16 @@ export const api = {
       body: JSON.stringify(patch),
     }),
   restartTester: () => request<{ status: string }>('/tester/restart', { method: 'POST' }),
+
+  // Paper-trading control box + stats box (2026-09-01 request), above the Positions table.
+  paperTradingStats: () => request<PaperTradingStats>('/paper-trading/stats'),
+  paperTradingConfig: () => request<PaperTradingConfig>('/paper-trading/config'),
+  savePaperTradingConfig: (patch: Partial<Omit<PaperTradingConfig, 'allInstIds'>>) =>
+    request<{ ok: boolean; restartRequired: boolean }>('/paper-trading/config', {
+      method: 'PUT',
+      body: JSON.stringify(patch),
+    }),
+  restartPaperTrader: () => request<{ status: string }>('/paper-trading/restart', { method: 'POST' }),
 }
 
 // PaperOrderEvent mirrors Go's usecase.PaperOrderEvent — the lightweight message pushed over

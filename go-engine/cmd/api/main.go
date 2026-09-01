@@ -72,13 +72,14 @@ func main() {
 	}
 
 	srv := &api.Server{
-		Repo:       repo,
-		RLBaseURL:     cfg.RLService.URL,
-		GrafanaURL:    cfg.API.GrafanaURL,
-		TesterBaseURL: cfg.Tester.URL,
-		ProcessMgr: cfg.API.ProcessMgr,
-		Units:      cfg.API.Units,
-		Logger:     logger,
+		Repo:               repo,
+		RLBaseURL:          cfg.RLService.URL,
+		GrafanaURL:         cfg.API.GrafanaURL,
+		TesterBaseURL:      cfg.Tester.URL,
+		PaperTraderBaseURL: cfg.PaperTrading.URL,
+		ProcessMgr:         cfg.API.ProcessMgr,
+		Units:              cfg.API.Units,
+		Logger:             logger,
 		// Must match what the trading services seed their account row with (CLAUDE.md §15.6) —
 		// both read through GetAccountEquity, so a different value here would seed a balance the
 		// engine never actually traded against.

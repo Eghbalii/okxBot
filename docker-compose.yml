@@ -157,6 +157,10 @@ services:
       KAFKA_BROKERS: kafka:9092
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       METRICS_ADDR: ":9102"
+      # Panel control-box HTTP surface (pause/stop, long/short toggle, active strategies/tokens/
+      # timeframes) — cmd/paper-trader was headless before this; mirrors strategy-tester's own
+      # TESTER_ADDR pattern (8092), next free app port at 8093.
+      PAPER_TRADER_ADDR: "0.0.0.0:8093"
       # Without this, rlclient falls back to its http://localhost:8000 default (CLAUDE.md §15) —
       # inside this container that's its OWN loopback, not the rl-service container, so every
       # RL call (open decision, in-trade update, terminal reward report) fails with "connection
@@ -169,6 +173,7 @@ services:
       OKX_SIMULATED_TRADING: ${OKX_SIMULATED_TRADING:-1}
     ports:
       - "9102:9102"
+      - "8093:8093"
     volumes:
       - ./go-engine/configs:/app/configs
     depends_on:
@@ -262,6 +267,7 @@ services:
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       RL_SERVICE_URL: http://rl-service:8000
       TESTER_SERVICE_URL: http://strategy-tester:8092
+      PAPER_TRADER_SERVICE_URL: http://paper-trader:8093
       API_ADDR: "0.0.0.0:8090" # container-internal bind; only reachable via the OpenVPN network in prod, see CLAUDE.md §11
       API_PROCESS_MANAGER: docker
     ports:

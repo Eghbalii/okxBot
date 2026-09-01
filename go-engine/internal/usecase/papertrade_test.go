@@ -21,13 +21,14 @@ import (
 // which can call into the repository concurrently (real Postgres handles this natively; this
 // fake must emulate that instead of assuming single-goroutine test access).
 type fakeRepository struct {
-	mu           sync.Mutex
-	nextID       int64
-	orders       map[int64]port.PaperOrder
-	candles      []port.Candle
-	accounts     map[string]port.AccountEquity
-	equityPoints []port.EquityPoint
-	paramChanges []port.ParamChange
+	mu                 sync.Mutex
+	nextID             int64
+	orders             map[int64]port.PaperOrder
+	candles            []port.Candle
+	accounts           map[string]port.AccountEquity
+	equityPoints       []port.EquityPoint
+	paramChanges       []port.ParamChange
+	paperTradingConfig *port.PaperTradingConfig
 }
 
 func newFakeRepository() *fakeRepository {
@@ -125,6 +126,58 @@ func (r *fakeRepository) RequestManualClose(ctx context.Context, id int64) error
 	}
 	o.ManualCloseRequested = true
 	r.orders[id] = o
+	return nil
+}
+func (r *fakeRepository) RequestManualCloseAll(ctx context.Context) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for id, o := range r.orders {
+		if o.ClosedAt == nil {
+			o.ManualCloseRequested = true
+			r.orders[id] = o
+			n++
+		}
+	}
+	return n, nil
+}
+func (r *fakeRepository) GetPaperTradingConfig(ctx context.Context) (port.PaperTradingConfig, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.paperTradingConfig == nil {
+		return port.PaperTradingConfig{TradingState: "running"}, nil
+	}
+	return *r.paperTradingConfig, nil
+}
+func (r *fakeRepository) SavePaperTradingConfig(ctx context.Context, patch port.PaperTradingConfigPatch) (port.PaperTradingConfig, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c := port.PaperTradingConfig{TradingState: "running"}
+	if r.paperTradingConfig != nil {
+		c = *r.paperTradingConfig
+	}
+	if patch.TradingState != nil {
+		c.TradingState = *patch.TradingState
+	}
+	if patch.DisableLong != nil {
+		c.DisableLong = *patch.DisableLong
+	}
+	if patch.DisableShort != nil {
+		c.DisableShort = *patch.DisableShort
+	}
+	if patch.ActiveKinds != nil {
+		c.ActiveKinds = *patch.ActiveKinds
+	}
+	if patch.DisabledInstIDs != nil {
+		c.DisabledInstIDs = *patch.DisabledInstIDs
+	}
+	if patch.ActiveBars != nil {
+		c.ActiveBars = *patch.ActiveBars
+	}
+	r.paperTradingConfig = &c
+	return c, nil
+}
+func (r *fakeRepository) SetAssignmentsEnabledForKinds(ctx context.Context, activeKinds []string) error {
 	return nil
 }
 func (r *fakeRepository) UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
@@ -531,6 +584,85 @@ func TestEvaluateStrategies_DoesNotOpenOpposingPositionsInOnePass(t *testing.T) 
 	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
 	if len(open) != 1 {
 		t.Fatalf("expected exactly 1 open order, got %d (opposing positions on the same token)", len(open))
+	}
+}
+
+// Panel control-box "paused"/"stopped" state (CLAUDE.md): TradingPaused must stop new opens
+// outright, without even touching the repository's open-order list.
+func TestEvaluateStrategies_TradingPausedOpensNothing(t *testing.T) {
+	repo := newFakeRepository()
+	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+
+	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", Strategy: alwaysBuy}})
+	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.TradingPaused = true
+
+	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if len(open) != 0 {
+		t.Fatalf("expected no orders opened while paused, got %d", len(open))
+	}
+}
+
+// Panel control-box per-token disable (CLAUDE.md): OpensDisabled stops new opens on this
+// instrument, but an existing open position must still be monitorable/closable normally — this
+// test only asserts the open-gate side; monitorOpenOrders is untouched by either flag.
+func TestEvaluateStrategies_OpensDisabledStopsNewOpensOnly(t *testing.T) {
+	repo := newFakeRepository()
+	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+
+	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", Strategy: alwaysBuy}})
+	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.OpensDisabled = true
+
+	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if len(open) != 0 {
+		t.Fatalf("expected no orders opened for a disabled token, got %d", len(open))
+	}
+}
+
+// Panel control-box long/short toggle (CLAUDE.md): a disabled side's signal must not open a
+// position, but the opposite side must still work normally in the same pass.
+func TestEvaluateStrategies_DisableLongSkipsBuySignalsOnly(t *testing.T) {
+	repo := newFakeRepository()
+	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+
+	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", Strategy: alwaysBuy}})
+	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.DisableLong = true
+
+	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if len(open) != 0 {
+		t.Fatalf("expected no buy orders opened while long is disabled, got %d", len(open))
+	}
+}
+
+func TestEvaluateStrategies_DisableShortSkipsSellSignalsOnly(t *testing.T) {
+	repo := newFakeRepository()
+	alwaysSell := &stubStrategy{signal: strategy.Signal{Side: strategy.Sell, SLPct: dec("0.01"), TPPct: dec("0.02")}}
+
+	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", Strategy: alwaysSell}})
+	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.DisableShort = true
+
+	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	if len(open) != 0 {
+		t.Fatalf("expected no sell orders opened while short is disabled, got %d", len(open))
 	}
 }
 

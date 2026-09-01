@@ -120,6 +120,28 @@ type PaperTrader struct {
 	// this is the paper-mode equivalent so the two produce comparable data.
 	MaxLeverage decimal.Decimal
 
+	// TradingPaused stops evaluateStrategies from opening any new position (panel control-box
+	// "paused"/"stopped" state) — existing open positions are unaffected, still monitored/closed
+	// normally by monitorOpenOrders. "stopped" additionally force-closes every open position at
+	// startup via a one-time RequestManualCloseAll sweep (cmd/paper-trader/main.go), which is why
+	// this field alone is enough to represent both states in the per-instrument engine: after that
+	// startup sweep, "stopped" behaves exactly like "paused" going forward (nothing left open, and
+	// nothing new opens either).
+	TradingPaused bool
+	// OpensDisabled stops evaluateStrategies from opening a NEW position on this one instrument
+	// (panel control-box per-token disable) while monitorOpenOrders keeps running unconditionally,
+	// so an already-open position on a disabled token still closes normally via its own SL/TP/
+	// timeout — disabling a token must not orphan a position that was already open when it was
+	// disabled.
+	OpensDisabled bool
+	// DisableLong / DisableShort drop a newly-fired buy/sell signal before it can open a position
+	// (panel control-box long/short toggle) — a strategy still evaluates and fires normally, this
+	// only gates whether evaluateStrategies acts on the disabled side. Existing open positions on
+	// the disabled side are untouched, same "don't hard-close based on a macro toggle" reasoning as
+	// OpensDisabled.
+	DisableLong  bool
+	DisableShort bool
+
 	// OrderEvents publishes a lightweight open/close notification for every paper order this
 	// engine opens or closes, onto the internal event bus (CLAUDE.md §12) — consumed by cmd/api's
 	// WebSocket bridge to push real-time position alerts to the panel. May be nil, in which case
@@ -459,6 +481,14 @@ func (e *PaperTrader) handleCandle(ctx context.Context, bar string, data []byte,
 }
 
 func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) error {
+	// Panel control-box gate (CLAUDE.md): pause/stop and per-token disable both mean "open nothing
+	// new here" — checked before taking openMu at all, since there is nothing to do. Existing open
+	// positions are untouched; monitorOpenOrders keeps monitoring/closing them regardless of either
+	// flag.
+	if e.TradingPaused || e.OpensDisabled {
+		return nil
+	}
+
 	// Held across the whole function: the open-position check and the OpenPaperOrder that may
 	// follow it have to be atomic with respect to the other bars' consumer goroutines. See openMu.
 	e.openMu.Lock()
@@ -489,6 +519,12 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 		}
 		metrics.StrategySignalsTotal.WithLabelValues(s.Name(), e.InstID, string(signal.Side)).Inc()
 		if signal.Side == strategy.Hold {
+			continue
+		}
+		// Panel control-box long/short toggle (CLAUDE.md): the strategy still evaluates and its
+		// signal is still counted in the metric above, this only gates whether it's acted on —
+		// existing open positions on the disabled side are left to close normally.
+		if (e.DisableLong && signal.Side == strategy.Buy) || (e.DisableShort && signal.Side == strategy.Sell) {
 			continue
 		}
 

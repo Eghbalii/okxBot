@@ -4,6 +4,8 @@ import { usePositionAlerts } from '../hooks/usePositionAlerts'
 import { usePositionEvents } from '../hooks/usePositionEvents'
 import { usePriceStream } from '../hooks/usePriceStream'
 import OrderDetailModal from '../components/OrderDetailModal'
+import PaperTradingConfigBox from '../components/PaperTradingConfigBox'
+import PaperTradingStatsBox from '../components/PaperTradingStatsBox'
 import Pagination, { DEFAULT_PAGE_SIZE } from '../components/Pagination'
 import SortableTh from '../components/SortableTh'
 import { api } from '../api/client'
@@ -217,6 +219,9 @@ export default function PositionsPage() {
 
   return (
     <div>
+      <PaperTradingStatsBox />
+      <PaperTradingConfigBox />
+
       <div className="toolbar">
         <select value={mode} onChange={(e) => setMode(e.target.value as PositionMode | 'all')}>
           <option value="all">All modes</option>
