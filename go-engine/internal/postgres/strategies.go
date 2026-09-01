@@ -173,6 +173,11 @@ func (r *Repository) DeleteAssignment(ctx context.Context, id int64) error {
 // A win is a closed trade with positive realized PnL, NOT close_reason='tp'. Once the RL
 // ratchet trails a stop into profit (CLAUDE.md §15.4) an 'sl' close frequently realizes a
 // gain, so keying off close_reason reported strategies with real profits as 0% win rate.
+//
+// Scoped to variant='baseline' only. A high adjustment rate can fork one baseline signal into
+// several 'rl_adjusted' rows (CLAUDE.md §16.9's fork-count incident), and those forks are the
+// same underlying signal monitored a second time, not independent evidence of the strategy's
+// quality — counting them here would let fork volume dilute/skew a strategy's real track record.
 func (r *Repository) StrategyStatsFor(ctx context.Context, strategyID int64) (port.StrategyStats, error) {
 	stats := port.StrategyStats{StrategyID: strategyID}
 	err := r.pool.QueryRow(ctx, `
@@ -185,7 +190,7 @@ func (r *Repository) StrategyStatsFor(ctx context.Context, strategyID int64) (po
 			min(opened_at),
 			max(coalesce(closed_at, opened_at))
 		FROM paper_orders
-		WHERE strategy_id = $1
+		WHERE strategy_id = $1 AND variant = 'baseline'
 	`, strategyID).Scan(&stats.SignalCount, &stats.Wins, &stats.Losses, &stats.OpenCount,
 		&stats.RealizedPnL, &stats.FirstOpened, &stats.LastActivity)
 	if err != nil {
