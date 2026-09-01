@@ -80,6 +80,7 @@ func main() {
 		CandleWindow:          cfg.Optimizer.CandleWindow,
 		BatchSize:             cfg.Optimizer.BatchSize,
 		TrialTTLBuffer:        time.Duration(cfg.Optimizer.TrialTTLBufferSec) * time.Second,
+		MaxLossPct:            cfg.Optimizer.MaxLossPct,
 	}
 
 	svc := &service{

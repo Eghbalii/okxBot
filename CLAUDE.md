@@ -2629,6 +2629,29 @@ missing-stop case is still a hard skip, not a fill.
 leverage, no effect at 1x, zero-leverage treated as 1x, no effect on take-profit, and the
 missing-stop fallback path respecting the cap too.
 
+### 19.3 The 15% cap missed a third SL-placing path: `cmd/strategy-optimizer` (2026-09-01)
+
+§19.2 covered production's model-driven open path (`conductor.Clamps`) and `cmd/strategy-tester`
+(`clampSLForLoss`), but there is a third place a strategy's raw `SLPct` becomes a price: the
+optimizer's own trial evaluation, `internal/optimizer.signalPrices` (called from
+`Run.EvaluateCandle`). It had no cap at all — a candidate parameter set proposing a wide SLPct
+(Optuna's search space is exactly `strategy.ParamSpec`'s full `Min`/`Max` range, so this is not a
+hypothetical) opened a trial with an uncapped stop distance.
+
+Optimizer trials carry no leverage (`OpenTrial` has no leverage field — trials are evaluated
+unleveraged, §16.3), so this needed neither `conductor.maxSLDistPctFor`'s leverage division nor a
+second duplicated `clampSLForLoss` — `signalPrices` now takes `maxLossPct` directly and clamps
+`SLPct` to it before computing the SL price, tightening only (never widening a tighter stop,
+never touching TP — the same "profit is never capped" rule as the other two paths).
+`config.Optimizer.MaxLossPct` (`max_loss_pct`, defaults to 0.15 even if unset in config.yaml,
+matching `PaperTrading.RLClamps.MaxLossPct`/`Tester.RLClamps.MaxLossPct`'s identical "not opt-in"
+treatment) flows through `RunConfig.MaxLossPct` into `Run.EvaluateCandle`'s call site. All three
+SL-placing paths — production's model-driven open, `strategy-tester`, and now the optimizer's
+trial evaluation — enforce the same 15% cap.
+
+5 new tests in `internal/optimizer/runner_test.go` (56 optimizer tests total): buy- and sell-side
+clamping, a tighter SL left unwidened, and a zero `maxLossPct` disabling the cap entirely.
+
 ## 20. Manual close button in the panel (2026-08-31)
 
 Explicit operator request: a Close button per open position in the panel, closing at the live

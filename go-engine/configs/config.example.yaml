@@ -168,6 +168,9 @@ optimizer:
   targets: []
   default_kinds:
     - "rsi_sma"
+  # Caps a trial's SL distance from entry (2026-08-31 request, CLAUDE.md §19.2) — trials are
+  # unleveraged, so this is a direct price-distance cap. Defaults to 0.15 even if left unset.
+  max_loss_pct: 0.15
 
 # cmd/strategy-tester (2026-08-30 request): independent paper-trading copy for validating raw
 # strategy signal quality, entirely apart from the RL agent and cmd/paper-trader. Every registered

@@ -220,6 +220,15 @@ type Config struct {
 		// DefaultKinds is the strategy kinds considered for every Trading.InstIDs entry when
 		// Targets is empty.
 		DefaultKinds []string `yaml:"default_kinds"`
+		// MaxLossPct caps the loss a trial's own SL can realize, as a fraction of entry price
+		// (2026-08-31 request: "SL should never allow more than 15% loss, at any leverage" — the
+		// optimizer's trials are unleveraged, §16.3, so this is a direct price-distance cap here
+		// rather than needing maxSLDistPctFor's leverage division). Applied in signalPrices before
+		// a trial is ever opened, mirroring PaperTrading.RLClamps.MaxLossPct/Tester.RLClamps.
+		// MaxLossPct's same 15% cap on the two other SL-placing paths — this was the one path that
+		// had no cap at all. Zero disables the cap; defaulted to 0.15 below (not opt-in), same
+		// reasoning as the other two.
+		MaxLossPct decimal.Decimal `yaml:"max_loss_pct"`
 	} `yaml:"optimizer"`
 
 	// Tester configures cmd/strategy-tester: a standalone paper-trading copy that opens real
@@ -499,6 +508,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Tester.RLClamps.MaxLossPct.IsZero() {
 		cfg.Tester.RLClamps.MaxLossPct = decimal.NewFromFloat(0.15)
+	}
+	if cfg.Optimizer.MaxLossPct.IsZero() {
+		cfg.Optimizer.MaxLossPct = decimal.NewFromFloat(0.15)
 	}
 
 	return cfg, nil

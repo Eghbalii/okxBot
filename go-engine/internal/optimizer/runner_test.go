@@ -12,7 +12,7 @@ func TestSignalPrices_BuySide(t *testing.T) {
 	entry := decimal.NewFromInt(100)
 	signal := strategy.Signal{Side: strategy.Buy, SLPct: decimal.NewFromFloat(0.01), TPPct: decimal.NewFromFloat(0.02)}
 
-	sl, tp := signalPrices(entry, signal)
+	sl, tp := signalPrices(entry, signal, decimal.Zero)
 	if sl == nil || !sl.Equal(decimal.NewFromInt(99)) {
 		t.Errorf("expected SL 99 for a buy 1%% below entry, got %v", sl)
 	}
@@ -25,7 +25,7 @@ func TestSignalPrices_SellSide(t *testing.T) {
 	entry := decimal.NewFromInt(100)
 	signal := strategy.Signal{Side: strategy.Sell, SLPct: decimal.NewFromFloat(0.01), TPPct: decimal.NewFromFloat(0.02)}
 
-	sl, tp := signalPrices(entry, signal)
+	sl, tp := signalPrices(entry, signal, decimal.Zero)
 	if sl == nil || !sl.Equal(decimal.NewFromInt(101)) {
 		t.Errorf("expected SL 101 for a sell 1%% above entry, got %v", sl)
 	}
@@ -38,12 +38,56 @@ func TestSignalPrices_NoSLOrTPWhenPctZero(t *testing.T) {
 	entry := decimal.NewFromInt(100)
 	signal := strategy.Signal{Side: strategy.Buy}
 
-	sl, tp := signalPrices(entry, signal)
+	sl, tp := signalPrices(entry, signal, decimal.Zero)
 	if sl != nil {
 		t.Errorf("expected nil SL when SLPct is zero, got %v", sl)
 	}
 	if tp != nil {
 		t.Errorf("expected nil TP when TPPct is zero, got %v", tp)
+	}
+}
+
+func TestSignalPrices_CapsSLAtMaxLossPct_BuySide(t *testing.T) {
+	entry := decimal.NewFromInt(100)
+	// SLPct of 30% would place SL at 70, far past the 15% cap.
+	signal := strategy.Signal{Side: strategy.Buy, SLPct: decimal.NewFromFloat(0.30), TPPct: decimal.NewFromFloat(0.02)}
+
+	sl, tp := signalPrices(entry, signal, decimal.NewFromFloat(0.15))
+	if sl == nil || !sl.Equal(decimal.NewFromInt(85)) {
+		t.Errorf("expected SL clamped to 85 (15%% below entry), got %v", sl)
+	}
+	if tp == nil || !tp.Equal(decimal.NewFromInt(102)) {
+		t.Errorf("expected TP unaffected by the loss cap, got %v", tp)
+	}
+}
+
+func TestSignalPrices_CapsSLAtMaxLossPct_SellSide(t *testing.T) {
+	entry := decimal.NewFromInt(100)
+	signal := strategy.Signal{Side: strategy.Sell, SLPct: decimal.NewFromFloat(0.30)}
+
+	sl, _ := signalPrices(entry, signal, decimal.NewFromFloat(0.15))
+	if sl == nil || !sl.Equal(decimal.NewFromInt(115)) {
+		t.Errorf("expected SL clamped to 115 (15%% above entry), got %v", sl)
+	}
+}
+
+func TestSignalPrices_MaxLossPctNeverWidensATighterSL(t *testing.T) {
+	entry := decimal.NewFromInt(100)
+	signal := strategy.Signal{Side: strategy.Buy, SLPct: decimal.NewFromFloat(0.01)}
+
+	sl, _ := signalPrices(entry, signal, decimal.NewFromFloat(0.15))
+	if sl == nil || !sl.Equal(decimal.NewFromInt(99)) {
+		t.Errorf("expected SL to stay at 99 (already inside the cap), got %v", sl)
+	}
+}
+
+func TestSignalPrices_ZeroMaxLossPctDisablesCap(t *testing.T) {
+	entry := decimal.NewFromInt(100)
+	signal := strategy.Signal{Side: strategy.Buy, SLPct: decimal.NewFromFloat(0.30)}
+
+	sl, _ := signalPrices(entry, signal, decimal.Zero)
+	if sl == nil || !sl.Equal(decimal.NewFromInt(70)) {
+		t.Errorf("expected uncapped SL of 70 when maxLossPct is zero, got %v", sl)
 	}
 }
 

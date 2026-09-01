@@ -51,6 +51,10 @@ type RunConfig struct {
 	CandleWindow          int
 	BatchSize             int
 	TrialTTLBuffer        time.Duration
+	// MaxLossPct caps a trial's SL distance from entry, as a fraction of entry price (2026-08-31
+	// request, CLAUDE.md §19.2/config.Optimizer.MaxLossPct) — trials are unleveraged (§16.3), so
+	// this is applied directly as a price-distance bound in signalPrices. Zero disables it.
+	MaxLossPct decimal.Decimal
 }
 
 // Run is one time-boxed optimization pass for a single (InstID, Kind) target (CLAUDE.md §16.3).
@@ -234,7 +238,7 @@ func (r *Run) EvaluateCandle(ctx context.Context, window []domain.Candle, price 
 			continue
 		}
 
-		slPx, tpPx := signalPrices(price, signal)
+		slPx, tpPx := signalPrices(price, signal, r.cfg.MaxLossPct)
 		trial := OpenTrial{
 			StudyID:  r.studyID,
 			TrialID:  w.trialID,
@@ -261,14 +265,25 @@ func (r *Run) EvaluateCandle(ctx context.Context, window []domain.Candle, price 
 	}
 }
 
-func signalPrices(entry decimal.Decimal, signal strategy.Signal) (*decimal.Decimal, *decimal.Decimal) {
+// signalPrices resolves a signal's SL/TP percentages into prices. maxLossPct caps the SL distance
+// from entry (2026-08-31 request, CLAUDE.md §19.2) — trials are unleveraged (no leverage field on
+// OpenTrial, §16.3), so this is a direct price-distance cap rather than needing a leverage
+// division like conductor.Clamps.maxSLDistPctFor does for production/tester positions. Only
+// tightens an SL that would realize more than maxLossPct; never widens one, and never touches TP —
+// profit is never capped, matching the other two SL-placing paths' identical rule. Zero disables
+// the cap.
+func signalPrices(entry decimal.Decimal, signal strategy.Signal, maxLossPct decimal.Decimal) (*decimal.Decimal, *decimal.Decimal) {
 	var slPx, tpPx *decimal.Decimal
 	direction := decimal.NewFromInt(1)
 	if signal.Side == strategy.Sell {
 		direction = decimal.NewFromInt(-1)
 	}
 	if signal.SLPct.IsPositive() {
-		v := entry.Sub(direction.Mul(signal.SLPct).Mul(entry))
+		slPct := signal.SLPct
+		if maxLossPct.IsPositive() && slPct.GreaterThan(maxLossPct) {
+			slPct = maxLossPct
+		}
+		v := entry.Sub(direction.Mul(slPct).Mul(entry))
 		slPx = &v
 	}
 	if signal.TPPct.IsPositive() {
