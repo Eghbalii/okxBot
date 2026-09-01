@@ -3434,3 +3434,65 @@ Concretely:
 transfer files with `scp`; keep the server in sync with every change made here, and commit each
 implementation step in its own git commit as the work lands (matching this project's existing
 one-focused-commit-per-step convention, §6) rather than bundling §27's items into one commit.
+
+## 28. Kafka consumer goroutines died permanently on any transient error, not just real failures (found and fixed 2026-09-01)
+
+Reported directly: after a service restart, the panel's live price stream (positions page) never
+connects/shows a price again. Traced to `internal/kafkastream.Consumer.Run` — used by every
+service's Kafka reading in this codebase (`cmd/api`'s two WS-bridge consumers, `cmd/paper-trader`'s
+tick/candle dispatchers, `cmd/strategy-tester`'s, `cmd/strategy-optimizer`'s) — which returned
+immediately on **any** error from `FetchMessage`/`CommitMessages` other than context cancellation.
+Every call site's own wiring is `go func() { err := consumer.Run(ctx, handler); if err != nil {
+logger.Error(...) }}()` — the goroutine just logs the error and exits. The outer process keeps
+running and looks completely healthy (HTTP still answers, WebSocket clients still connect
+successfully) while that one data path is silently, permanently dead — no crash, no restart, no
+visible symptom except "this specific thing stopped updating."
+
+This is exactly what happened live: building three services concurrently on the server (§16.10's
+"don't build multiple Go services at once on this box" lesson relearned the hard way, see the
+session log) OOM-pressured Kafka into an unclean shutdown and restart. `cmd/api`'s price-ticks
+consumer hit a transient fetch error during that window, `Run` returned, the goroutine exited, and
+`cmd/api` itself never noticed or recovered — it kept serving the panel's WebSocket connection
+perfectly, just with nothing ever broadcasting a `type:"price"` event on it again, for the rest of
+that process's lifetime. Only restarting `cmd/api` itself would have fixed it, which is not
+obvious from any visible symptom ("the panel's WS connects fine, it's just quiet").
+
+**Fix**: `Consumer.Run` now retries transient fetch/commit errors with exponential backoff (1s
+doubling to a 30s cap, same shape as the existing OKX WS reconnect backoff,
+`internal/okx/ws/public.go`) instead of returning. Only two things actually stop the loop now
+(`classifyRunError`): `ctx` being done, or `io.EOF` — kafka-go's own signal that `Close()` was
+called on the reader, confirmed against its source rather than assumed. Every other error is
+treated as transient and retried forever, on the reasoning that a Kafka consumer's job is to keep
+consuming for the life of the process; there is no error a live trading/data pipeline should give
+up on silently.
+
+**A real correctness gap surfaced while building the commit-retry path, not just the fetch-retry
+path**: the natural-looking fix — on a commit failure, back off and `continue` the outer loop — is
+wrong, because `kafka.Reader.FetchMessage` always returns the *next* message from its internal
+channel regardless of whether the previous one was ever committed (confirmed against kafka-go's
+own source, not assumed). Looping back to `FetchMessage` on a commit failure would silently
+abandon that specific commit retry and move on to a different message instead — the retry would
+appear to work (no crash, message flow continues) while quietly never actually retrying the thing
+that failed. Fixed by giving the commit path its **own** inner retry loop that calls
+`CommitMessages` again for the *same* message, never re-fetching until that exact commit succeeds.
+
+`internal/kafkastream.kafkaReader` — a new interface narrowing `*kafka.Reader` to exactly
+`FetchMessage`/`CommitMessages`/`Close` — was added so this retry/backoff decision logic is
+unit-tested against a fake that can inject a scripted sequence of transient failures, a `Close()`-
+shaped `io.EOF`, and context cancellation on demand, none of which are practical to provoke
+reliably against a real broker in a unit test. 11 new tests (289 Go total), including a
+regression test proving the exact bug (`TestRun_RetriesTransientFetchErrorThenSucceeds`) and one
+proving the commit-retry-must-not-re-fetch correctness fix
+(`TestRun_RetriesTransientCommitErrorThenSucceeds`, synchronizing its assertion from inside the
+fake's `onCommitSuccess` callback — called synchronously before `Run`'s goroutine can loop around
+to a second fetch — after an earlier version of the test flaked by checking from the test
+goroutine instead, racing that exact next iteration).
+
+**Known gap, not fixed here**: there is still no metric/alert for "this Kafka consumer goroutine
+has exited" — the fix means transient errors can no longer kill a consumer, but a `Close()`-shaped
+`io.EOF` or an unexpected `ctx` cancellation still legitimately stops `Run`, and nothing currently
+surfaces that as anything other than one log line. Matches §16.10's own "a documented property
+needs a check that would fail if it were absent" lesson — worth a `okxbot_kafka_consumer_up{topic,
+group}` gauge (set to 0 in the `Run` goroutine's own exit path) at some point, not done as part of
+this fix since the actual reported bug (silent permanent death from a transient error) is now
+structurally impossible rather than just monitored-for.
