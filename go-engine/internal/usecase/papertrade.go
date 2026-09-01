@@ -640,6 +640,19 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 
 	now := time.Now()
 	for _, o := range open {
+		// Self-healing 15%-loss enforcement (2026-09-01 incident): buildRLClamps' MaxLossPct field
+		// was missing from cmd/paper-trader/main.go's construction of e.RLClamps for some time, so
+		// several already-open positions were opened with a leverage-blind stop (e.g. order 636: 5%
+		// price distance at 20x = ~100% margin loss on touch, instead of the intended 15% ceiling).
+		// That construction bug is fixed, so no NEW order can carry an over-wide stop — but a
+		// config/construction bug like this could recur in some other form, and an already-open
+		// position from before a fix is deployed needs no manual intervention to become safe again.
+		// Checked and tightened in-place on every tick, before any close/touch decision below, so a
+		// stop that's already too wide is corrected before it can be touched at its old, wider level.
+		if tightened, ok := e.tightenOverWideStop(ctx, o, logger); ok {
+			o = tightened
+		}
+
 		// Track how far this position has travelled in each direction before checking for a close
 		// (CLAUDE.md §15.11) — a trade that ran deep into profit and round-tripped must still show
 		// that peak even on the tick that stops it out. Best-effort: this is model input, never a
@@ -671,6 +684,35 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 		}
 	}
 	return nil
+}
+
+// tightenOverWideStop re-derives o's SL/TP through the SAME clamp pipeline evaluateStrategies uses
+// at open time (conductor.Clamps.Apply, entry price + actual leverage) and persists a correction if
+// the currently-stored SL is looser than what MaxLossPct/MaxSLDistPct actually allow at this order's
+// leverage — self-healing for an already-open position that was opened before a clamp-wiring bug
+// (like the missing MaxLossPct field fixed 2026-09-01, CLAUDE.md) is fixed, without needing a
+// manual DB edit or a manual close for every affected order. Apply only ever tightens a stop that's
+// too wide (clampRange clamps into a [min,max] range) — a stop already inside bounds returns
+// unchanged, so this is a safe no-op on every order that was never affected. Returns the order with
+// its in-memory SLPx/TPPx updated (so this same tick's touch-check below uses the corrected level)
+// and true if a correction was actually persisted; the original order and false otherwise.
+func (e *PaperTrader) tightenOverWideStop(ctx context.Context, o port.PaperOrder, logger *slog.Logger) (port.PaperOrder, bool) {
+	if o.SLPx == nil || !o.EntryPx.IsPositive() {
+		return o, false
+	}
+	corrected := e.conductorClamps().Apply(o.Side, o.EntryPx, o.Leverage, conductor.Levels{SLPx: o.SLPx, TPPx: o.TPPx})
+	if corrected.SLPx == nil || corrected.SLPx.Equal(*o.SLPx) {
+		return o, false
+	}
+	if err := e.Repo.UpdatePaperOrderSLTP(ctx, o.ID, corrected.SLPx, corrected.TPPx); err != nil {
+		logger.Error("failed to tighten over-wide stop", "id", o.ID, "instId", e.InstID, "error", err)
+		return o, false
+	}
+	logger.Warn("tightened an over-wide stop on an already-open position",
+		"id", o.ID, "instId", e.InstID, "leverage", o.Leverage,
+		"oldSLPx", o.SLPx, "newSLPx", corrected.SLPx)
+	o.SLPx, o.TPPx = corrected.SLPx, corrected.TPPx
+	return o, true
 }
 
 // closeOrder is the single close path for a paper order, whether it was stopped out, hit its

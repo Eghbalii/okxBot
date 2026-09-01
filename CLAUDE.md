@@ -2877,3 +2877,77 @@ control-box HTTP surface answers `GET /config` with the real 10-token roster (XA
 `paper-trader` container (confirmed via `docker compose ps` showing a fresh uptime, every other
 service untouched), and `GET /api/paper-trading/stats` returned real computed numbers (10 open
 orders, live equity, real 24h/7d/30d PnL) against production data.
+
+## 23. The 15% loss cap was never actually applied to a live paper order — found via a position at 80% loss (2026-09-01)
+
+Reported directly by the operator: order 636 (PUMP-USDT-SWAP) was sitting at **-71.5% unrealized
+loss**, only 1.48% from its own stop, which itself was a 5% price-distance SL on a **20x-leverage**
+position — meaning a stop touch would realize ~100% of margin, not the 15% ceiling §19.2 was
+supposed to guarantee. This was correctly identified as a trading-system-severity bug, not a
+one-off, and the operator asked for it to be found, fixed at every relevant layer, and for the
+already-broken *open* positions to be self-corrected by the controller rather than hand-edited.
+
+**Root cause, isolated precisely**: `conductor.Clamps` itself (the leverage-aware
+`maxSLDistPctFor`/`Apply`/`EnsureStop` machinery from §19.2) was correct and already covered by 18
+passing tests — this was never a math bug. The break was one specific construction site:
+`cmd/paper-trader/main.go`'s inline `conductor.Clamps{...}` struct literal, built once at process
+startup and assigned to every per-instrument `PaperTrader.RLClamps`, simply never included
+`MaxLossPct: cfg.PaperTrading.RLClamps.MaxLossPct`. Confirmed as the ONLY such construction site
+in the codebase (`grep -rn "conductor.Clamps{"` across `cmd/`/`internal/` outside tests). Without
+it, `maxSLDistPctFor` silently fell back to the leverage-blind `MaxSLDistPct` alone (0.05 on the
+server) — so a strategy's raw 5%-distance SL passed the open-time `EnsureStop`/`Apply` calls in
+`evaluateStrategies` cleanly at any leverage, 1x or 100x. This is the same failure shape as §16.9's
+`stoch_cross`-no-stop incident and §18.2's version-disable bug: a correctly-implemented, correctly-
+tested safety feature that one wiring point forgot to actually use.
+
+**Blast radius, checked immediately**: querying every currently-open paper order for
+`abs(entry_px-sl_px)/entry_px*leverage` found **13 open positions violating the cap**, 5 of them at
+the full ~100% ceiling (BTC, TRUMP, ETH, PUMP, ENA×2 all opened at 20x with a naive 5% stop) — not
+an isolated incident.
+
+**Fix, at the three layers the operator specifically asked to be verified**:
+1. **Strategy signal output** and **2. after the model's decision** — both already funnel through
+   the SAME single `EnsureStop`→`Apply` call in `evaluateStrategies` (§16.9's own documented
+   reasoning: validation runs after the model's decision so it sees the levels the order will
+   actually carry, not the strategy's raw proposal alone) — so fixing the one construction site
+   fixes both layers at once; there was no second gap to find there. `main.go`'s inline literal was
+   replaced with a new `buildRLClamps(cfg *config.Config) conductor.Clamps` function specifically
+   so a future field added to either `config.PaperTrading.RLClamps` or `conductor.Clamps` can't be
+   silently dropped from a large struct literal buried inside `main()` — extracting it makes the
+   field list a reviewable, independently testable unit. `TestBuildRLClamps_MapsMaxLossPct` and
+   `TestBuildRLClamps_ProductionScenarioIsNowCaught` (the latter reproducing order 636's exact
+   numbers end-to-end through the real clamp pipeline) both mutation-verified: reverting the fix
+   fails them with the production numbers (100% loss reported, "not tightened").
+2. **A third, previously-nonexistent layer — self-healing already-open positions.** The clamp fix
+   above only protects orders opened AFTER it deploys; the 13 already-open violators needed
+   correcting without a manual close for each one, per the operator's explicit instruction. New
+   `PaperTrader.tightenOverWideStop` (`internal/usecase/papertrade.go`), called from
+   `monitorOpenOrders` at the top of its per-tick loop — before the manual-close/SL-TP-touch/
+   timeout checks, so a stop that needed tightening is corrected before this same tick's touch
+   check runs against it. Re-derives the order's SL/TP through the identical `conductorClamps().
+   Apply(side, entryPx, leverage, ...)` call the open-time path uses, and persists a correction via
+   the already-existing `Repository.UpdatePaperOrderSLTP` only if the result actually differs —
+   `Apply`'s own `clampRange` semantics guarantee this only ever tightens, never widens, so it is a
+   safe no-op on every order that was never affected (confirmed by
+   `TestMonitorOpenOrders_DoesNotTightenAnAlreadySafeStop`). No new close reason, no separate
+   background job — reuses the per-tick loop and per-order update path that already runs
+   unconditionally for every open position. 3 new tests
+   (`TestMonitorOpenOrders_TightensAnOverWideStopToMaxLossPct`,
+   `DoesNotTightenAnAlreadySafeStop`, `TightenedStopAppliesOnTheSameTick` — the last confirming the
+   corrected, tighter stop is what the same tick's touch-check evaluates against, not the stale one).
+
+**Server config gap fixed too**: the server's real `config.yaml` had `min_sl_dist_pct`/
+`max_sl_dist_pct`/`min_tp_sl_ratio` under `paper_trading.rl_clamps` but was missing `max_loss_pct`
+entirely (unlike `config.example.yaml`, which already documented it correctly) — added
+`max_loss_pct: 0.15` there too, redundant with `buildRLClamps`'s code-level fix but explicit rather
+than relying solely on `config.Load`'s in-code default.
+
+**Verified end-to-end against real production data after deploying**: all 13 previously-violating
+open positions now read exactly 15.00% loss-at-leverage in Postgres — 3 had already touched their
+newly-tightened stop and closed with `close_reason='sl'` at a realized loss capped at 15% of
+margin (order 636 itself: entry 0.004533, corrected stop 0.0044990025 = 0.75% price distance ×
+20x = exactly 15%, vs. the original 5%-distance stop that would have realized ~100%), the other 10
+remain open with their stops now correctly tightened. No position needed manual intervention.
+
+3 new tests in `cmd/paper-trader/main_test.go` + 3 new tests in `internal/usecase/papertrade_test.go`
+— 257 Go tests total.

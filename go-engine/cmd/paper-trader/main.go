@@ -231,11 +231,7 @@ func main() {
 			RLUpdatePnLThresholdPct: cfg.PaperTrading.RLUpdatePnLThresholdPct,
 			RLUpdateMaxInterval:     cfg.PaperTrading.RLUpdateMaxInterval,
 			RLEarlyClose:            cfg.PaperTrading.RLEarlyClose,
-			RLClamps: conductor.Clamps{
-				MinSLDistPct: cfg.PaperTrading.RLClamps.MinSLDistPct,
-				MaxSLDistPct: cfg.PaperTrading.RLClamps.MaxSLDistPct,
-				MinTPSLRatio: cfg.PaperTrading.RLClamps.MinTPSLRatio,
-			},
+			RLClamps:                buildRLClamps(cfg),
 			// Force-closes a stale position regardless of RL flags (CLAUDE.md §15.14) — unlike
 			// everything else in this block, this is unconditional housekeeping, not RL behavior.
 			MaxOpenDuration: cfg.PaperTrading.RLMaxOpenDuration,
@@ -276,6 +272,24 @@ func main() {
 			logger.Error("paper trader stopped with error", "error", err)
 			os.Exit(1)
 		}
+	}
+}
+
+// buildRLClamps maps every configured conductor.Clamps field from cfg.PaperTrading.RLClamps.
+// Extracted into its own function (2026-09-01 incident fix) specifically so a future field added
+// to config.PaperTrading.RLClamps or conductor.Clamps can't be silently left out of a large inline
+// struct literal buried inside main() the way MaxLossPct was: this bug meant §19.2's leverage-
+// aware 15%-loss cap was never actually applied to a single real paper order — a strategy's raw
+// SLPct (leverage-blind) passed straight through MaxSLDistPct alone. Observed in production as
+// order 636: 20x leverage, a 5% price-distance stop, meaning a 100% margin loss on touch instead
+// of the intended 15% ceiling. TestBuildRLClamps_MapsMaxLossPct below exists so this specific class
+// of regression (a field silently dropped from the mapping) fails a test, not a live position.
+func buildRLClamps(cfg *config.Config) conductor.Clamps {
+	return conductor.Clamps{
+		MinSLDistPct: cfg.PaperTrading.RLClamps.MinSLDistPct,
+		MaxSLDistPct: cfg.PaperTrading.RLClamps.MaxSLDistPct,
+		MaxLossPct:   cfg.PaperTrading.RLClamps.MaxLossPct,
+		MinTPSLRatio: cfg.PaperTrading.RLClamps.MinTPSLRatio,
 	}
 }
 

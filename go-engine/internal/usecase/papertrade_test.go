@@ -807,6 +807,103 @@ func TestMonitorOpenOrders_ClosesOnSLHit(t *testing.T) {
 	}
 }
 
+// Regression coverage for the 2026-09-01 incident (CLAUDE.md): a 20x-leverage position opened with
+// a naive 5% price-distance stop (order 636's exact numbers) must be tightened in-place, on the
+// very next tick, to respect MaxLossPct — self-healing an already-open position without a manual
+// DB edit, since the open-time clamp fix alone only protects orders opened AFTER it's deployed.
+func TestMonitorOpenOrders_TightensAnOverWideStopToMaxLossPct(t *testing.T) {
+	repo := newFakeRepository()
+	entry := dec("0.004533")
+	sl := dec("0.00430635") // order 636's actual stop: 5% below entry
+	id, _ := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: entry, SLPx: &sl,
+		Size: dec("10"), Leverage: dec("20"), OpenedAt: time.Now(),
+	})
+
+	pt := newTestPaperTrader(repo, nil)
+	pt.RLClamps = conductor.Clamps{MaxSLDistPct: dec("0.05"), MaxLossPct: dec("0.15")}
+
+	// Above both the original stop (0.00430635) AND the corrected one (~0.0044990025, MaxLossPct
+	// 0.15/20x = 0.75% below entry) — the order must stay open here either way; this test only
+	// asserts the STOP ITSELF moved, not that the position closed.
+	livePrice := dec("0.0045200")
+	if err := pt.monitorOpenOrders(context.Background(), livePrice, testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders returned error: %v", err)
+	}
+
+	updated := repo.orders[id]
+	if updated.ClosedAt != nil {
+		t.Fatalf("expected the order to still be open (tightened, not closed) at price %s, got closed with reason %v", livePrice, updated.CloseReason)
+	}
+	if updated.SLPx == nil {
+		t.Fatal("expected SLPx to remain set after tightening")
+	}
+	actualLossPct := entry.Sub(*updated.SLPx).Div(entry).Mul(dec("20"))
+	maxAllowed := dec("0.15")
+	if actualLossPct.GreaterThan(maxAllowed) {
+		t.Errorf("stop %s still realizes %s loss at 20x, want <= %s (MaxLossPct not applied to an already-open position)",
+			updated.SLPx, actualLossPct, maxAllowed)
+	}
+	if updated.SLPx.Equal(sl) {
+		t.Error("expected the stop to have moved from its original 5-percent-distance value, it did not")
+	}
+}
+
+// A stop that's already inside MaxLossPct/MaxSLDistPct must be left untouched — tightening must not
+// fire on every tick for every order, only on ones that actually violate the cap.
+func TestMonitorOpenOrders_DoesNotTightenAnAlreadySafeStop(t *testing.T) {
+	repo := newFakeRepository()
+	entry := dec("100")
+	sl := dec("99.5") // 0.5% distance at 20x = 10% loss, already within MaxLossPct=0.15
+	id, _ := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: entry, SLPx: &sl,
+		Size: dec("100"), Leverage: dec("20"), OpenedAt: time.Now(),
+	})
+
+	pt := newTestPaperTrader(repo, nil)
+	pt.RLClamps = conductor.Clamps{MaxSLDistPct: dec("0.05"), MaxLossPct: dec("0.15")}
+
+	if err := pt.monitorOpenOrders(context.Background(), dec("100"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders returned error: %v", err)
+	}
+
+	updated := repo.orders[id]
+	if updated.SLPx == nil || !updated.SLPx.Equal(sl) {
+		t.Errorf("expected the already-safe stop to remain unchanged at %s, got %v", sl, updated.SLPx)
+	}
+}
+
+// The tightened stop must apply on the SAME tick, before the touch check — otherwise a position
+// whose price has already crossed the corrected (tighter) level, but not the original wider one,
+// would incorrectly stay open for one more tick.
+func TestMonitorOpenOrders_TightenedStopAppliesOnTheSameTick(t *testing.T) {
+	repo := newFakeRepository()
+	entry := dec("100")
+	sl := dec("95") // 5% distance at 20x = 100% loss (violates MaxLossPct)
+	id, _ := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: entry, SLPx: &sl,
+		Size: dec("100"), Leverage: dec("20"), OpenedAt: time.Now(),
+	})
+
+	pt := newTestPaperTrader(repo, nil)
+	pt.RLClamps = conductor.Clamps{MaxSLDistPct: dec("0.05"), MaxLossPct: dec("0.15")}
+	// Corrected stop at MaxLossPct=0.15/20x = 0.75% distance -> 99.25. A price of 99.2 is below the
+	// corrected stop (should trigger a close) but still above the original, wider 95 stop.
+	livePrice := dec("99.2")
+
+	if err := pt.monitorOpenOrders(context.Background(), livePrice, testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders returned error: %v", err)
+	}
+
+	updated := repo.orders[id]
+	if updated.ClosedAt == nil {
+		t.Fatal("expected the order to close on the same tick its stop was tightened past the live price")
+	}
+	if updated.CloseReason == nil || *updated.CloseReason != "sl" {
+		t.Errorf("expected close reason 'sl', got %v", updated.CloseReason)
+	}
+}
+
 // A manual close request from the panel (2026-08-31) wins over everything else: even a position
 // that hasn't touched SL/TP and isn't timed out must close the moment the flag is set.
 func TestMonitorOpenOrders_ClosesOnManualCloseRequest(t *testing.T) {
