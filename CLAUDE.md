@@ -3081,6 +3081,6 @@ coincidentally.
 `RLSizingFallsBackWhenModelErrors`) to assert against `defaultPaperLeverage` rather than a
 hardcoded `"20"` literal, so a future leverage-default change doesn't silently desync the test from
 the value it's supposed to verify. 257 Go tests total, all passing after the change. Deployed to
-the server (`paper-trader` rebuilt and restarted) — verification that a freshly-opened paper order
-actually carries the new $4/10x still in progress as of this writing, see the next entry in this
-file once confirmed.
+the server (`paper-trader` rebuilt and restarted) and confirmed live: the first two orders opened
+after the restart (TRUMP/ZEC, 11:40 UTC) both carry exactly `size=4, leverage=10`, and a sweep of
+every open position found zero still violating the 15% SL cap (§23) under the new leverage.
