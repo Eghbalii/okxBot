@@ -3419,8 +3419,21 @@ Concretely:
       real scope behind "no forking for real trading," §27.3) — one position per token per side,
       model edits SL/TP in place, opposite-side signals while a position is open are ignored
       (routed as conductor `update`, never a flip) until the model itself closes the position.
-      NOT STARTED — `cmd/trader` still runs its original delta-notional-rebalance loop with no
-      strategy signals or conductor involvement at all.
+      Real conditional/algo orders on OKX (not in-process monitoring) + a manual panel SL/TP-edit
+      control, per explicit operator decisions 2026-09-01 — full design in the approved plan,
+      `CLAUDE.md`-external at `/Users/rez/.claude/plans/glimmering-hopping-dahl.md`.
+      IN PROGRESS — commit 1 of the plan's 11-commit rollout done: `internal/usecase/tickfeed.go`
+      extracts the candle/tick IO skeleton (`decodeTick`/`decodeCandle`/`applyCandle`/
+      `snapshotCandles`/`seedCandlesFromRepo`/`decisionBarFor`/`barSeconds`/`parseCandleFields`)
+      as free functions `PaperTrader` now delegates to — zero behavior change (all 297 pre-existing
+      tests pass unchanged, +13 new tests for the extracted functions directly, 310 total).
+      Deliberately did NOT embed a shared struct into `PaperTrader`/give it new field names, per a
+      design correction made while implementing: `PaperTrader`'s ~40 existing struct-literal test
+      constructions and direct `pt.candles`/`pt.candlesMu` field access would have needed changing
+      for a refactor the plan intended to be low-risk and mechanical — the candle-window mutex+map
+      pair stays as plain fields on each of `PaperTrader`/(future) `RealTrader`, only the LOGIC
+      operating on them is shared via free functions taking that state as parameters. `RealTrader`
+      itself, commits 2-11, and the algo-order/manual-edit machinery are NOT yet started.
 - [ ] New append-only real-order-adjustment log (table TBD, `real_order_adjustments` working
       name) — every SL/TP edit its own row with a timestamp, never overwritten in place (§27.3).
 - [ ] Panel: order-detail modal for real orders showing the full chronological adjustment

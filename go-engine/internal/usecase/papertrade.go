@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"sync"
 	"time"
 
@@ -190,44 +189,6 @@ const RLAdjustInterval = 2 * time.Second
 // (2026-08-31) before OKX's real-account limit was confirmed.
 var defaultPaperLeverage = decimal.NewFromInt(10)
 
-// barSeconds converts an OKX bar name ("1m", "15m", "1H", "4H", "1D", "1W") to its duration in
-// seconds, for ordering timeframes shortest-to-longest. Unknown names sort last rather than
-// erroring — this only picks a default decision context, and a bar nobody recognizes is a poor
-// choice for it anyway.
-//
-// The unit is matched case-INSENSITIVELY on purpose. OKX's channel names are case-sensitive
-// ("1H" and "1D" are capitalized, minutes are not), and a config written as "1h" is a real and
-// easy mistake; sorting must not silently misbehave on it. Note that fixing the ordering here does
-// NOT make a mis-cased bar work end-to-end — the ingestor still needs OKX's exact casing to
-// subscribe at all, which is why config.ValidateBarNames rejects it at startup instead.
-func barSeconds(bar string) int {
-	if bar == "" {
-		return 1 << 30
-	}
-	n := 0
-	i := 0
-	for ; i < len(bar) && bar[i] >= '0' && bar[i] <= '9'; i++ {
-		n = n*10 + int(bar[i]-'0')
-	}
-	if n == 0 || i >= len(bar) {
-		return 1 << 30
-	}
-	switch bar[i] {
-	case 'm': // minutes — lowercase only; 'M' is months in OKX's scheme, handled below
-		return n * 60
-	case 'H', 'h':
-		return n * 3600
-	case 'D', 'd':
-		return n * 86400
-	case 'W', 'w':
-		return n * 604800
-	case 'M':
-		return n * 2592000 // ~30d; only used for ordering, never for arithmetic on real timestamps
-	default:
-		return 1 << 30
-	}
-}
-
 // decisionBar picks which timeframe's strategy signals and price context feed a TICK-driven RL
 // decision (CLAUDE.md §15.3/§15.9). A tick doesn't belong to any one bar, so this has to be chosen
 // rather than inferred.
@@ -241,31 +202,19 @@ func barSeconds(bar string) int {
 // Note this selects the DECISION context only. The observation still reports one timeframe block,
 // but a multi-timeframe strategy contributing signals to it sees every bar (marketView), so
 // higher-timeframe context still reaches the model through those signals.
+//
+// Delegates to decisionBarFor (tickfeed.go), shared with RealTrader's equivalent.
 func (e *PaperTrader) decisionBar() string {
-	if e.RLDecisionBar != "" {
-		return e.RLDecisionBar
-	}
-	shortest := ""
-	for _, b := range e.Bars {
-		if shortest == "" || barSeconds(b) < barSeconds(shortest) {
-			shortest = b
-		}
-	}
-	return shortest
+	return decisionBarFor(e.RLDecisionBar, e.Bars)
 }
 
 // marketView snapshots every maintained timeframe under one lock, so a multi-timeframe strategy
 // (CLAUDE.md §9) sees bars that are consistent with each other, and so no lock is held across a
 // Strategy.Evaluate call. bar is the timeframe that just closed — the decision cadence.
+//
+// Delegates to snapshotCandles (tickfeed.go), shared with RealTrader's equivalent.
 func (e *PaperTrader) marketView(bar string) strategy.MarketView {
-	e.candlesMu.Lock()
-	bars := make(map[string][]domain.Candle, len(e.candles))
-	for b, window := range e.candles {
-		bars[b] = append([]domain.Candle(nil), window...)
-	}
-	e.candlesMu.Unlock()
-
-	return strategy.MarketView{Bar: bar, Candles: bars[bar], Bars: bars}
+	return snapshotCandles(&e.candlesMu, e.candles, bar)
 }
 
 // seedCandlesFromRepo fills each bar's in-memory window from candles already persisted in
@@ -287,32 +236,14 @@ func (e *PaperTrader) marketView(bar string) strategy.MarketView {
 //
 // Best-effort per bar: a read failure leaves that window empty and it refills from the live feed,
 // which is strictly the old behavior. Seeding must never keep the engine from starting.
+//
+// Delegates to the free function of the same name in tickfeed.go, shared with RealTrader's
+// equivalent (Go's method vs. free-function namespaces are distinct, so this name is not a
+// collision).
 func (e *PaperTrader) seedCandlesFromRepo(ctx context.Context, logger *slog.Logger) {
 	// CandleWindow is what handleCandle trims to, so an unset window means "keep nothing" there —
 	// seeding into that would be immediately discarded.
-	limit := e.CandleWindow
-	if limit <= 0 {
-		return
-	}
-	for _, bar := range e.Bars {
-		rows, err := e.Repo.ListCandles(ctx, e.InstID, bar, limit)
-		if err != nil {
-			logger.Warn("seed candles from repo failed; window will fill from the live feed",
-				"instId", e.InstID, "bar", bar, "error", err)
-			continue
-		}
-		if len(rows) == 0 {
-			continue
-		}
-		window := make([]domain.Candle, 0, len(rows))
-		for _, r := range rows {
-			window = append(window, r.Candle)
-		}
-		e.candlesMu.Lock()
-		e.candles[bar] = window
-		e.candlesMu.Unlock()
-		logger.Info("seeded candle window from database", "instId", e.InstID, "bar", bar, "candles", len(window))
-	}
+	seedCandlesFromRepo(ctx, &e.candlesMu, e.candles, e.Repo, e.InstID, e.Bars, e.CandleWindow, logger)
 }
 
 // trackPnLExtremes advances an open order's peak/trough unrealized PnL (CLAUDE.md §15.11). Only
@@ -336,17 +267,6 @@ func (e *PaperTrader) accountMode() string {
 		return "paper"
 	}
 	return e.Mode
-}
-
-type tickEvent struct {
-	InstID string `json:"instId"`
-	Last   string `json:"last"`
-}
-
-type candleEvent struct {
-	InstID string   `json:"instId"`
-	Bar    string   `json:"bar"`
-	Candle []string `json:"candle"`
 }
 
 // Run consumes ticks/candles from the event bus until ctx is cancelled. Candle windows start
@@ -391,16 +311,12 @@ func (e *PaperTrader) Run(ctx context.Context) error {
 }
 
 func (e *PaperTrader) handleTick(ctx context.Context, data []byte, logger *slog.Logger) error {
-	var tick tickEvent
-	if err := json.Unmarshal(data, &tick); err != nil {
-		return fmt.Errorf("decode tick: %w", err)
-	}
-	if tick.InstID != e.InstID {
-		return nil // shared stream across instruments; this engine only cares about its own
-	}
-	price, err := decimal.NewFromString(tick.Last)
+	price, ok, err := decodeTick(data, e.InstID)
 	if err != nil {
-		return fmt.Errorf("parse tick price %q: %w", tick.Last, err)
+		return err
+	}
+	if !ok {
+		return nil // shared stream across instruments; this engine only cares about its own
 	}
 	if err := e.monitorOpenOrders(ctx, price, logger); err != nil {
 		return err
@@ -431,41 +347,22 @@ func (e *PaperTrader) shouldRunRLAdjust() bool {
 }
 
 func (e *PaperTrader) handleCandle(ctx context.Context, bar string, data []byte, logger *slog.Logger) error {
-	var event candleEvent
-	if err := json.Unmarshal(data, &event); err != nil {
-		return fmt.Errorf("decode candle event: %w", err)
+	dc, ok, err := decodeCandle(data, e.InstID)
+	if err != nil {
+		return err
 	}
-	if event.InstID != e.InstID || len(event.Candle) < 6 {
+	if !ok {
 		return nil
 	}
-
-	confirm := ""
-	if len(event.Candle) >= 9 {
-		confirm = event.Candle[8]
-	}
-	c, err := parseCandleFields(event.Candle[0], event.Candle[1], event.Candle[2], event.Candle[3], event.Candle[4], event.Candle[5])
-	if err != nil {
-		return fmt.Errorf("parse candle (bar %s): %w", bar, err)
-	}
+	c := dc.Candle
 
 	// OKX pushes the same bar repeatedly as it forms (confirm=0) and once more when it closes
 	// (confirm=1). Appending every push would fill the window with partial copies of one bar, so a
 	// push REPLACES the last entry whenever it carries the same timestamp — the window then always
 	// ends with the live forming candle, which is what the observation's OHLC reports (§15.11).
-	e.candlesMu.Lock()
-	window := e.candles[bar]
-	if n := len(window); n > 0 && window[n-1].Timestamp.Equal(c.Timestamp) {
-		window[n-1] = c
-	} else {
-		window = append(window, c)
-	}
-	if len(window) > e.CandleWindow {
-		window = window[len(window)-e.CandleWindow:]
-	}
-	e.candles[bar] = window
-	e.candlesMu.Unlock()
+	applyCandle(&e.candlesMu, e.candles, bar, c, e.CandleWindow)
 
-	if confirm != "1" {
+	if !dc.Confirmed {
 		return nil // still forming; wait for the finalized bar before persisting/evaluating
 	}
 	if err := e.Repo.SaveCandle(ctx, port.Candle{InstID: e.InstID, Bar: bar, Candle: c}); err != nil {
@@ -871,32 +768,4 @@ func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signa
 		// the signal itself implies. The caller overwrites Size/Leverage when RL sizing is on.
 		Leverage: defaultPaperLeverage,
 	}
-}
-
-func parseCandleFields(ts, open, high, low, close, vol string) (domain.Candle, error) {
-	ms, err := strconv.ParseInt(ts, 10, 64)
-	if err != nil {
-		return domain.Candle{}, fmt.Errorf("parse ts %q: %w", ts, err)
-	}
-	o, err := decimal.NewFromString(open)
-	if err != nil {
-		return domain.Candle{}, fmt.Errorf("parse open %q: %w", open, err)
-	}
-	h, err := decimal.NewFromString(high)
-	if err != nil {
-		return domain.Candle{}, fmt.Errorf("parse high %q: %w", high, err)
-	}
-	l, err := decimal.NewFromString(low)
-	if err != nil {
-		return domain.Candle{}, fmt.Errorf("parse low %q: %w", low, err)
-	}
-	c, err := decimal.NewFromString(close)
-	if err != nil {
-		return domain.Candle{}, fmt.Errorf("parse close %q: %w", close, err)
-	}
-	v, err := decimal.NewFromString(vol)
-	if err != nil {
-		return domain.Candle{}, fmt.Errorf("parse vol %q: %w", vol, err)
-	}
-	return domain.Candle{Timestamp: time.UnixMilli(ms).UTC(), Open: o, High: h, Low: l, Close: c, Volume: v}, nil
 }
