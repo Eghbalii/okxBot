@@ -2700,3 +2700,58 @@ its terminal-category mapping.
 `TestMonitorOpenOrders_ManualCloseTakesPriorityOverSLTPTouch`,
 `TestClose_ManualCloseReportsClosedEarly` — this last one replaces the now-inverted
 `TestClose_NoTerminalCallForManualClose`), plus `TestTerminalCategory` updated for the new mapping.
+
+## 21. Known issue: `cmd/strategy-tester` disables a version's predecessor on every new version, defeating its own comparison design (found 2026-09-01, not yet fixed)
+
+**Stopped on the server (2026-09-01)** — `strategy-tester` was one of four consumers of the
+high-volume `okx.tickers` topic (alongside `paper-trader`, `strategy-optimizer`, `api`'s WS
+bridge), each committing a Kafka offset after every single tick message
+(`kafkastream.Consumer.Run` has no `CommitInterval` batching — a separate, pre-existing
+inefficiency shared by all four, not fixed here). Restarting `strategy-optimizer` earlier the same
+day to deploy §19.3's SL cap made it rejoin its consumer group at full tick volume, and combined
+with `strategy-tester` already running, pushed Kafka to ~71% CPU and 88% of its 768MB memory cap
+(`docker-compose.yml`'s post-§16.10 limit) with no sign of settling. `docker compose stop
+strategy-tester` dropped Kafka CPU to ~6% within 30s. Nothing on the main trading pipeline
+(`ingestor`, `paper-trader`, `trader`, `api`, `rl-service`, `strategy-optimizer`,
+`optimizer-service` — shared with production's optimizer, §16.7, so deliberately left running —
+Kafka/Postgres/Redis) was touched. `strategy-tester` stays stopped until the underlying bug below
+is fixed; restarting it before then just reproduces the same load for no benefit, since its
+versions aren't being validated correctly anyway.
+
+**The design bug, separate from the load issue above**: §18.2 states new tester versions are
+created already-`enabled` and that "no version is ever deleted automatically... new versions
+don't get deleted either, unless the operator does it manually" — the intent being every version
+stays alive and comparable. In practice `internal/tester.Store.CreateVersion`
+(`internal/tester/store.go:138`) does this on every insert, operator-triggered or automatic alike:
+
+```sql
+UPDATE tester_strategy_versions SET enabled = false WHERE kind = $1 AND id <> $2
+```
+
+This disables **every other version of that kind**, not just the immediate parent — the moment a
+new version exists, its predecessor (and everything before it) stops trading. `enabled` is what
+gates whether a version's strategy actually opens live positions (`evaluateVersions`), so
+"disabled" is functionally the same as paused, not merely hidden — the row survives (matching
+§18's "never deleted" claim literally) but stops accumulating the trade history the whole
+optimizer loop depends on.
+
+This directly undermines §18.2's own scoring design: `OptimizerLoop.judgeCandidate` waits for
+`MinTradesToScore` (30) closed trades before comparing a new candidate against
+`proposeCandidate`'s "best version across the kind's entire history" — but the candidate's
+predecessor (frequently the actual best-scoring version so far) is disabled at the instant the
+candidate is created, so it can never accumulate more evidence to be compared against. The
+operator's own observation matches this exactly: **new versions were never being properly
+optimized/validated before going live**, because there was no live A/B window at all — one
+version silences the other on creation, so `judgeCandidate` at 30 trades is scoring the new
+version against stale historical stats from whenever the predecessor was last enabled, not a
+fair concurrent comparison.
+
+**Not yet fixed.** The likely direction (not yet decided/built): stop disabling siblings on
+`CreateVersion`/`ForceOverride` and let every version of a kind trade concurrently — closer to
+production's own shadow-fork A/B mechanic (§15.4) than to "exactly one live version per kind."
+That has knock-on effects worth resolving before implementing: `evaluateVersions`' one-open-
+position-per-(instrument,version) guard (§18.1) already permits multiple *kinds* to trade the
+same instrument concurrently, so multiple *versions* of one kind trading concurrently may be a
+small extension of the same guard — but the panel's stats view and `judgeCandidate`'s "which
+version is currently the comparison baseline" logic both assume at most one enabled version per
+kind today and would need to change together with the store layer, not before it.
