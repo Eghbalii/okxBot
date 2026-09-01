@@ -3030,3 +3030,57 @@ debuggable instead of an unexplained blank page.
 
 Verified against the real server: `GET /api/paper-trading/config` still returns `null` for the
 three fields (unchanged, correct backend behavior), but the panel now loads and renders normally.
+
+## 26. Real-money sizing decision: 10x leverage cap, $40 account, $4/token (2026-09-01)
+
+Explicit operator request ahead of connecting a real OKX account: OKX rejects leverage above 10x
+on that account, and the account is funded with $40. Four config values changed together, all
+consistently — `risk.max_leverage` (100 → 10), `defaultPaperLeverage` in
+`internal/usecase/papertrade.go` (20 → 10), `account.initial_usd` (100 → 40), and
+`paper_trading.notional_usd` (10 → 4) — both `config.example.yaml` and `internal/config`'s in-code
+fallback defaults updated together so a config.yaml that omits these fields still gets the correct
+value, not the old one.
+
+**Sizing rule, and why it's temporary by design**: $40 ÷ ~10 configured tokens = $4/token, sized so
+one open position per token fits the shared account at once — a deliberate placeholder rule for
+the period before `paper_trading.rl_sizing` (§14 roadmap item 5, still off) is trusted enough to
+turn on and let the model decide sizing itself from `target_exposure`/`leverage_frac`. Explicitly
+not meant to be hand-tuned further as a fixed rule; revisit only by turning on `rl_sizing`, not by
+picking a different fixed dollar amount.
+
+**`account.initial_usd` is shared across paper/demo/real by explicit decision** — paper training
+moves to the same $40 base rather than keeping its own larger balance, so paper-trading's own
+per-position sizing stays representative of what the real account can actually do once demo/real
+trading is eventually wired up (§22's scoping note: `cmd/trader` is still not built out for this).
+The existing live `paper` mode `account_equity` row (`initial_usd=100`, running equity ~$92 from
+real paper-trading history) was deliberately left untouched — a config default only seeds a
+mode's row on first creation or after a drain-to-zero reset (`GetAccountEquity`/`ApplyRealizedPnL`,
+§15.6/§15.7), so the paper account keeps its own history rather than being reset just because the
+config default changed; it will pick up the new $40 default the next time it happens to drain to
+zero and reset, not before.
+
+**`risk.min_liquidation_buffer_pct` raised 2 → 5** alongside the leverage change, covered in detail
+in a separate exchange with the operator establishing exactly what this value means (worth
+recording precisely, since it's easy to conflate with the unrelated 15% SL cap from §19.2/§23):
+`usecase.trade.go` estimates distance-to-liquidation as `100/leverage` — a price-move percentage,
+not a margin-loss percentage — and this floor rejects any live order whose estimated distance
+falls below it. At a fixed 10x leverage this distance is always exactly 10%, so a 5% floor never
+actually blocks an order at this leverage; it exists purely as an independent backstop against
+total-margin liquidation (the estimate is deliberately conservative, ignoring maintenance margin),
+sitting behind and independent of the 15% SL cap that should always close a position long before
+this point is ever reached — same "don't trust one layer alone" reasoning as the SL-cap incident
+(§23). Chose the more conservative (larger) value on the operator's explicit "pick whichever
+reduces risk" instruction once the actual mechanics were confirmed.
+
+**`cmd/strategy-tester`'s own `notional_usd`/`leverage` were deliberately left untouched** — that
+service measures raw strategy signal quality independent of the real account entirely (§18), so it
+has no reason to track the real account's sizing; its leverage already happened to be 10 already,
+coincidentally.
+
+2 existing tests updated (`TestEvaluateStrategies_RLSizingDisabledKeepsFixedSizing`,
+`RLSizingFallsBackWhenModelErrors`) to assert against `defaultPaperLeverage` rather than a
+hardcoded `"20"` literal, so a future leverage-default change doesn't silently desync the test from
+the value it's supposed to verify. 257 Go tests total, all passing after the change. Deployed to
+the server (`paper-trader` rebuilt and restarted) — verification that a freshly-opened paper order
+actually carries the new $4/10x still in progress as of this writing, see the next entry in this
+file once confirmed.

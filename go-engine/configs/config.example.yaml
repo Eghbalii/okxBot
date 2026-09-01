@@ -39,8 +39,15 @@ paper_trading:
   # Low notional, high fixed leverage (2026-08-31, explicit operator decision): the deployed
   # service targets small-account/high-leverage operation, so paper trading should exercise that
   # combination when rl_sizing is off (defaultPaperLeverage in papertrade.go carries the matching
-  # 20x). Also each order's own size/leverage line, unaffected by this default.
-  notional_usd: 10
+  # value — 10x as of 2026-09-01, capped by OKX's real-account leverage limit). Also each order's
+  # own size/leverage line, unaffected by this default.
+  #
+  # 4 = the real $40 account (account.initial_usd) divided evenly across the ~10 configured tokens,
+  # so one open position per token at a time fits the shared account (2026-09-01, explicit operator
+  # decision) — a deliberate, simple placeholder rule for the period before rl_sizing is trusted
+  # enough to turn on and let the model decide sizing itself (§14 roadmap item 5); revisit this
+  # value once that happens, don't tune it further as a fixed rule before then.
+  notional_usd: 4
   max_open_orders: 3
   # The timeframes strategies actually DECIDE on — the RL model's training cadence (CLAUDE.md §9).
   # Must be a subset of ingestion.bars above (validated at startup: a bar the ingestor isn't
@@ -119,9 +126,14 @@ paper_trading:
 # the account into per-token buckets up front. Applies to all three modes, hence the top-level
 # section rather than nesting under paper_trading.
 account:
-  # Starting balance, and what a drained paper/demo account resets back to. Real mode never
-  # auto-resets — running out there is a stop condition for a human (§15.7).
-  initial_usd: 100
+  # Lowered 100 -> 40 (2026-09-01, real-money wiring): the real account this service will trade
+  # against is funded with $40. Shared across all three modes (paper/demo/real) by explicit
+  # operator decision — paper training moves to the same $40 base rather than keeping a separate,
+  # larger paper balance, so paper-trading's own per-position sizing stays representative of what
+  # the real account can actually do. Starting balance, and what a drained paper/demo account
+  # resets back to. Real mode never auto-resets — running out there is a stop condition for a
+  # human (§15.7).
+  initial_usd: 40
   # Hard Go-side caps on the agent's sizing proposal, as FRACTIONS (0.25 = 25%), never percentages.
   # The model is never the safety boundary (§5, §15.4): at 100x leverage a single uncapped position
   # is an account-ending event, and the risk manager only guards the live path, not paper.
@@ -131,15 +143,25 @@ account:
   max_total_exposure_pct: 0.60
 
 risk:
-  # CLAUDE.md §15.4: RL agent's target leverage range is 10x-100x; min_liquidation_buffer_pct below
-  # is the real safety floor that bounds how much of this is reachable in practice.
-  max_leverage: 100
+  # Lowered 100 -> 10 (2026-09-01, explicit operator decision): OKX rejects orders above 10x
+  # leverage on the real account this service is meant to eventually trade against, so the RL
+  # agent's sizing ceiling (target_exposure/leverage_frac maps onto [1x, max_leverage]) and the
+  # live risk manager's hard clamp (risk.Manager.Approve) must both stay within what OKX will
+  # actually accept — a higher config value here would just get silently rejected order-by-order on
+  # the real account, which is worse than training/validating against the real ceiling from the
+  # start. Supersedes §15.4's original 10x-100x framing.
+  max_leverage: 10
   max_position_notional_usd: 1000
   max_daily_drawdown_pct: 5
-  # Lowered from 15 so leverage toward the 100x ceiling above is reachable at all (~1-2% buffer at
-  # 50-100x on the conservative 100/leverage estimate) — deliberate tradeoff of liquidation-distance
-  # safety margin for usable leverage range. Revisit before any real-money wiring (§14).
-  min_liquidation_buffer_pct: 2
+  # Raised 2 -> 5 (2026-09-01, real-money wiring): with max_leverage now capped at 10x (OKX's real
+  # account limit), the conservative 100/leverage distance-to-liquidation estimate is always ~10%,
+  # so a 5% floor never actually blocks a real order at this leverage — it exists purely as a final
+  # backstop against total-margin liquidation, independent of and behind the 15% SL cap
+  # (conductor.Clamps.MaxLossPct) that should always close a position long before this point is
+  # ever reached. Choosing the safer (larger) margin per explicit operator instruction, same
+  # "don't trust one layer alone" reasoning as the SL-cap incident. Was 2 when max_leverage was 100
+  # (a value chosen specifically to keep near-100x leverage reachable, which no longer applies).
+  min_liquidation_buffer_pct: 5
 
 # cmd/api: dashboard/reporting backend (CLAUDE.md §11). No auth in v1 — bind addr to a private
 # interface reachable only over the OpenVPN tunnel, never 0.0.0.0 on a public host.

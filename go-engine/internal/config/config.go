@@ -369,7 +369,9 @@ func Load(path string) (*Config, error) {
 		cfg.Trading.MinOrderUSD = decimal.NewFromInt(10)
 	}
 	if cfg.PaperTrading.NotionalUSD.IsZero() {
-		cfg.PaperTrading.NotionalUSD = decimal.NewFromInt(100)
+		// $40 real account / ~10 configured tokens = $4/token, one open position per token
+		// (2026-09-01, explicit operator decision) — see Account.InitialUSD's matching default.
+		cfg.PaperTrading.NotionalUSD = decimal.NewFromInt(4)
 	}
 	if cfg.PaperTrading.MaxOpenOrders == 0 {
 		cfg.PaperTrading.MaxOpenOrders = 3
@@ -384,9 +386,10 @@ func Load(path string) (*Config, error) {
 		cfg.PaperTrading.CandleLimit = 100
 	}
 	if cfg.Account.InitialUSD.IsZero() {
-		// CLAUDE.md §15.6: one $100 account shared across every token, replacing the earlier
-		// $10-per-token split.
-		cfg.Account.InitialUSD = decimal.NewFromInt(100)
+		// Lowered 100 -> 40 (2026-09-01, real-money wiring): the real account this service will
+		// trade against is funded with $40, shared across paper/demo/real by explicit operator
+		// decision so paper training's own sizing stays representative (CLAUDE.md §15.6).
+		cfg.Account.InitialUSD = decimal.NewFromInt(40)
 	}
 	if cfg.Account.MaxPositionPct.IsZero() {
 		// 25% of equity in any one position. Deliberately not "whatever the model asks for": at
@@ -400,12 +403,11 @@ func Load(path string) (*Config, error) {
 		cfg.Account.MaxTotalExposurePct = decimal.NewFromFloat(0.60)
 	}
 	if cfg.Risk.MaxLeverage.IsZero() {
-		// CLAUDE.md §15.4: raised from the earlier 5x default toward the RL agent's target 10x-100x
-		// range. MinLiquidationBufferPct below is what actually bounds how much of this range is
-		// reachable in practice (risk.Manager.Approve rejects any leverage whose estimated
-		// liquidation buffer falls below that floor) — the two limits do separate jobs: this is a
-		// ceiling, MinLiquidationBufferPct is the real liquidation-distance safety check.
-		cfg.Risk.MaxLeverage = decimal.NewFromInt(100)
+		// Lowered 100 -> 10 (2026-09-01, explicit operator decision): OKX rejects leverage above
+		// 10x on the real account this service will trade against, so both the RL agent's sizing
+		// ceiling and risk.Manager's hard clamp must stay within what the exchange actually
+		// accepts. Supersedes §15.4's original 10x-100x framing.
+		cfg.Risk.MaxLeverage = decimal.NewFromInt(10)
 	}
 	if cfg.Risk.MaxPositionNotionalUSD.IsZero() {
 		cfg.Risk.MaxPositionNotionalUSD = decimal.NewFromInt(1000)
@@ -414,14 +416,15 @@ func Load(path string) (*Config, error) {
 		cfg.Risk.MaxDailyDrawdownPct = decimal.NewFromInt(5)
 	}
 	if cfg.Risk.MinLiquidationBufferPct.IsZero() {
-		// Lowered from 15% so leverage toward the top of the new 100x ceiling is reachable at all
-		// (the conservative 100/leverage buffer estimate in usecase/trade.go gives ~2% buffer at
-		// 50x, ~1% at 100x) — an explicit, deliberate tradeoff of real liquidation-distance safety
-		// margin for usable leverage range, made because the RL agent's leverage choice is a
-		// learned decision under this cap, not because thin buffers are risk-free. Revisit this
-		// value carefully, especially before any real-money wiring (§14) — a 2% floor means a 2%
-		// adverse move liquidates the position outright.
-		cfg.Risk.MinLiquidationBufferPct = decimal.NewFromInt(2)
+		// Raised 2 -> 5 (2026-09-01, real-money wiring): with MaxLeverage now capped at 10x, the
+		// conservative 100/leverage distance-to-liquidation estimate is always ~10%, so a 5% floor
+		// never blocks a real order at this leverage — it's a final backstop against total-margin
+		// liquidation, independent of and behind the 15% SL cap (conductor.Clamps.MaxLossPct) that
+		// should always close a position long before this point is reached. Chose the more
+		// conservative (larger) value per explicit operator instruction, same "don't trust one
+		// layer alone" reasoning as the SL-cap incident (CLAUDE.md §23). Was 2 when MaxLeverage was
+		// 100 (chosen specifically to keep near-100x leverage reachable, no longer applicable).
+		cfg.Risk.MinLiquidationBufferPct = decimal.NewFromInt(5)
 	}
 
 	if cfg.API.Addr == "" {
