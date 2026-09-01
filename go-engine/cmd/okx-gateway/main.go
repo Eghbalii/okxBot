@@ -44,10 +44,11 @@ func main() {
 
 	limits := gatewayLimitsFromConfig(cfg)
 	svc := &service{
-		logger:  logger,
-		client:  restClient,
-		limiter: gateway.NewLimiter(limits),
-		retry:   gateway.DefaultRetryPolicy(),
+		logger:    logger,
+		client:    restClient,
+		limiter:   gateway.NewLimiter(limits),
+		retry:     gateway.DefaultRetryPolicy(),
+		simulated: cfg.OKX.Simulated,
 	}
 
 	addr := envOr("GATEWAY_ADDR", "0.0.0.0:8094")

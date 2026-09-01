@@ -31,6 +31,13 @@ type service struct {
 	client  exchangeClient
 	limiter *gateway.Limiter
 	retry   gateway.RetryPolicy
+	// simulated is this gateway's own cfg.OKX.Simulated — the ONE place real vs. demo credentials
+	// are known, now that cmd/trader no longer holds OKX credentials itself (CLAUDE.md §27.1's
+	// migration). GET /health exposes it so cmd/trader can derive its real-vs-demo mode (and the
+	// allow_real_money gate, §15.6/§15.7) from the same source the credentials actually came from,
+	// rather than from its own now-absent OKX_SIMULATED_TRADING — keeping the "mode can never
+	// disagree with the credentials in use" invariant intact across the process boundary.
+	simulated bool
 }
 
 func (s *service) routes() http.Handler {
@@ -46,7 +53,12 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	mux.HandleFunc("GET /health", s.handleHealth)
 	return mux
+}
+
+func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "simulated": s.simulated})
 }
 
 // consumerAndPriority reads the calling service's identity off the request. X-Gateway-Consumer
