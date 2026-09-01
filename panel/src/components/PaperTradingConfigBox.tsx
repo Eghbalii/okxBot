@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
-import type { PaperTradingConfig, TradingState } from '../api/types'
+import type { PaperTradingConfig, PositionMode } from '../api/types'
 import StrategyKindModal from './StrategyKindModal'
 import TokenModal from './TokenModal'
 
@@ -9,20 +9,57 @@ import TokenModal from './TokenModal'
 // only, never a decision bar).
 const DECISION_BARS = ['5m', '15m', '1H']
 
-// Control box above the Positions table (2026-09-01 request): pause/stop trading, disable one
-// signal direction, and manage active strategies/tokens/timeframes for paper trading. Every
-// control here is "edit + restart" (CLAUDE.md, matching cmd/strategy-tester's own config pattern)
-// — no live-reload, so a save always shows a "restart required" banner rather than pretending the
-// change is already in effect.
+const STATE_META: Record<string, { label: string; badge: string; dot: string }> = {
+  running: { label: 'Running', badge: 'badge-green', dot: 'var(--green)' },
+  paused: { label: 'Paused', badge: 'badge-yellow', dot: 'var(--yellow)' },
+  stopped: { label: 'Stopped', badge: 'badge-red', dot: 'var(--red)' },
+}
+
+// Trading controls, scoped to whichever mode is selected (Paper/Demo/Real). Only paper trading has
+// a real controller behind it today — cmd/trader (demo/real) predates the signal-lifecycle
+// redesign entirely (no strategy signals, no reward reporting), so this box is mode-aware in the
+// UI but only actually wires up when Paper is selected; Demo/Real show clearly as not-yet-available
+// rather than silently doing nothing when clicked.
 export default function PaperTradingConfigBox() {
+  const [mode, setMode] = useState<PositionMode>('paper')
+
+  return (
+    <div className="card config-box">
+      <div className="config-box-header">
+        <h2>Trading controls</h2>
+        <div className="mode-tabs">
+          {(['paper', 'demo', 'real'] as PositionMode[]).map((m) => (
+            <button
+              key={m}
+              className={'mode-tab' + (mode === m ? ' active' : '')}
+              onClick={() => setMode(m)}
+            >
+              {m[0].toUpperCase() + m.slice(1)}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {mode === 'paper' ? (
+        <PaperControls />
+      ) : (
+        <div className="empty-state">
+          {mode === 'demo' ? 'Demo' : 'Real'} trading isn't wired up yet — there's no controller
+          behind it to configure (see CLAUDE.md §22). These controls will appear here once it is.
+        </div>
+      )}
+    </div>
+  )
+}
+
+function PaperControls() {
   const [cfg, setCfg] = useState<PaperTradingConfig | null>(null)
-  const [tradingState, setTradingState] = useState<TradingState>('running')
   const [disableLong, setDisableLong] = useState(false)
   const [disableShort, setDisableShort] = useState(false)
   const [activeBars, setActiveBars] = useState<Set<string>>(new Set())
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [restarting, setRestarting] = useState(false)
+  const [stateChanging, setStateChanging] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [showStrategyModal, setShowStrategyModal] = useState(false)
@@ -33,7 +70,6 @@ export default function PaperTradingConfigBox() {
       .paperTradingConfig()
       .then((c) => {
         setCfg(c)
-        setTradingState(c.tradingState)
         setDisableLong(c.disableLong)
         setDisableShort(c.disableShort)
         setActiveBars(new Set(c.activeBars))
@@ -54,21 +90,44 @@ export default function PaperTradingConfigBox() {
     setDirty(true)
   }
 
-  async function save() {
-    if (tradingState === 'stopped') {
-      if (!confirm('Setting state to Stopped will close every open paper position now. Continue?')) return
+  // Pause/Stop/Resume are independent of the config form below (per explicit request: they're not
+  // config, they take effect immediately) — each is its own request + restart, not bundled into the
+  // Save button.
+  async function setTradingState(next: 'running' | 'paused' | 'stopped') {
+    if (next === 'stopped' && !confirm('Stop trading? This closes every open paper position now. New positions stay off until you resume.')) {
+      return
     }
+    setStateChanging(true)
+    setError(null)
+    try {
+      await api.savePaperTradingConfig({ tradingState: next })
+      await api.restartPaperTrader()
+      setMessage(`${STATE_META[next].label} — applying now, back within a few seconds.`)
+      setTimeout(load, 4000)
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setStateChanging(false)
+    }
+  }
+
+  // One combined action: persist the form, then restart immediately so it actually takes effect —
+  // there is no live-reload path, so a "Save" that doesn't also restart would silently do nothing
+  // until a separate manual step. Long/short/timeframe edits live here since they're config choices
+  // reviewed together, unlike the state buttons above which are one-click, no-review actions.
+  async function saveAndApply() {
     setSaving(true)
     setError(null)
     try {
       await api.savePaperTradingConfig({
-        tradingState,
         disableLong,
         disableShort,
         activeBars: [...activeBars],
       })
+      await api.restartPaperTrader()
       setDirty(false)
-      setMessage('Saved. Restart paper-trader for the changes to take effect.')
+      setMessage('Saved — applying now, back within a few seconds.')
+      setTimeout(load, 4000)
     } catch (err) {
       setError((err as Error).message)
     } finally {
@@ -76,127 +135,143 @@ export default function PaperTradingConfigBox() {
     }
   }
 
-  async function restart() {
-    if (!confirm('Restart the paper-trader service now? No other service is affected.')) return
-    setRestarting(true)
-    try {
-      await api.restartPaperTrader()
-      setMessage('Restart requested — the service will be back within a few seconds.')
-    } catch (err) {
-      setError((err as Error).message)
-    } finally {
-      setRestarting(false)
-    }
-  }
-
   async function saveActiveKinds(kinds: string[]) {
     await api.savePaperTradingConfig({ activeKinds: kinds })
-    setMessage('Saved. Restart paper-trader for the changes to take effect.')
-    load()
+    await api.restartPaperTrader()
+    setMessage('Saved — applying now, back within a few seconds.')
+    setTimeout(load, 4000)
   }
 
   async function saveDisabledInstIds(instIds: string[]) {
     await api.savePaperTradingConfig({ disabledInstIds: instIds })
-    setMessage('Saved. Restart paper-trader for the changes to take effect.')
-    load()
+    await api.restartPaperTrader()
+    setMessage('Saved — applying now, back within a few seconds.')
+    setTimeout(load, 4000)
   }
 
-  return (
-    <div className="card">
-      <h2>Paper trading controls</h2>
-      {error && <div className="error-banner">{error}</div>}
-      {!cfg && !error && <div className="text-dim">Loading…</div>}
-      {cfg && (
-        <>
-          <div className="toolbar">
-            <label className="text-dim" style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-              State
-              <select
-                value={tradingState}
-                onChange={(e) => {
-                  setTradingState(e.target.value as TradingState)
-                  setDirty(true)
-                }}
-              >
-                <option value="running">Running</option>
-                <option value="paused">Paused (no new opens)</option>
-                <option value="stopped">Stopped (closes everything)</option>
-              </select>
-            </label>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-              <input
-                type="checkbox"
-                checked={disableLong}
-                onChange={(e) => {
-                  setDisableLong(e.target.checked)
-                  setDirty(true)
-                }}
-              />
-              <span className="text-dim">Disable long signals</span>
-            </label>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-              <input
-                type="checkbox"
-                checked={disableShort}
-                onChange={(e) => {
-                  setDisableShort(e.target.checked)
-                  setDirty(true)
-                }}
-              />
-              <span className="text-dim">Disable short signals</span>
-            </label>
-          </div>
+  if (error && !cfg) return <div className="error-banner">{error}</div>
+  if (!cfg) return <div className="text-dim">Loading…</div>
 
-          <div className="toolbar" style={{ marginTop: '0.5rem' }}>
-            <span className="text-dim">Active timeframes:</span>
+  const state = cfg.tradingState
+  const meta = STATE_META[state] ?? STATE_META.running
+  const activeKindCount = cfg.activeKinds.length === 0 ? 'all' : cfg.activeKinds.length
+  const disabledTokenCount = cfg.disabledInstIds.length
+
+  return (
+    <>
+      {error && <div className="error-banner">{error}</div>}
+
+      <div className="state-row">
+        <span className={'badge ' + meta.badge}>
+          <span className="state-dot" style={{ background: meta.dot }} />
+          {meta.label}
+        </span>
+        <div className="state-actions">
+          <button
+            className={state === 'running' ? '' : 'btn-primary'}
+            onClick={() => setTradingState('running')}
+            disabled={stateChanging || state === 'running'}
+            title="Resume opening new positions"
+          >
+            Resume
+          </button>
+          <button
+            onClick={() => setTradingState('paused')}
+            disabled={stateChanging || state === 'paused' || state === 'stopped'}
+            title="No new positions; existing ones keep running"
+          >
+            Pause
+          </button>
+          <button
+            className="btn-danger"
+            onClick={() => setTradingState('stopped')}
+            disabled={stateChanging || state === 'stopped'}
+            title="Close every open position now, and stop opening new ones"
+          >
+            Stop
+          </button>
+        </div>
+      </div>
+
+      <div className="config-grid">
+        <div className="config-tile">
+          <div className="config-tile-label">Signal direction</div>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={disableLong}
+              onChange={(e) => {
+                setDisableLong(e.target.checked)
+                setDirty(true)
+              }}
+            />
+            Disable long signals
+          </label>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={disableShort}
+              onChange={(e) => {
+                setDisableShort(e.target.checked)
+                setDirty(true)
+              }}
+            />
+            Disable short signals
+          </label>
+        </div>
+
+        <div className="config-tile">
+          <div className="config-tile-label">Active timeframes</div>
+          <div className="checkbox-row-inline">
             {DECISION_BARS.map((bar) => (
-              <label key={bar} style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+              <label key={bar} className="checkbox-row">
                 <input type="checkbox" checked={activeBars.has(bar)} onChange={() => toggleBar(bar)} />
                 <span className="mono">{bar}</span>
               </label>
             ))}
-            <span className="text-dim" style={{ fontSize: '0.8rem' }}>
-              (none checked = use config.yaml's paper_trading.bars as-is)
-            </span>
           </div>
-
-          <div className="toolbar" style={{ marginTop: '0.5rem' }}>
-            <button onClick={() => setShowStrategyModal(true)}>Manage strategies…</button>
-            <button onClick={() => setShowTokenModal(true)}>Manage tokens…</button>
+          <div className="text-dim" style={{ fontSize: '0.75rem' }}>
+            None checked = use config.yaml's default bars
           </div>
+        </div>
 
-          <div className="toolbar" style={{ marginTop: '0.75rem' }}>
-            <button onClick={save} disabled={!dirty || saving}>
-              {saving ? 'Saving…' : 'Save'}
-            </button>
-            <button onClick={restart} disabled={restarting}>
-              {restarting ? 'Restarting…' : 'Restart service'}
-            </button>
+        <div className="config-tile">
+          <div className="config-tile-label">Strategies</div>
+          <div className="config-tile-value">{activeKindCount} active</div>
+          <button onClick={() => setShowStrategyModal(true)}>Manage strategies…</button>
+        </div>
+
+        <div className="config-tile">
+          <div className="config-tile-label">Tokens</div>
+          <div className="config-tile-value">
+            {disabledTokenCount === 0 ? 'all active' : `${disabledTokenCount} disabled`}
           </div>
+          <button onClick={() => setShowTokenModal(true)}>Manage tokens…</button>
+        </div>
+      </div>
 
-          {message && (
-            <div className="text-dim" style={{ marginTop: '0.5rem' }}>
-              {message}
-            </div>
-          )}
-        </>
-      )}
+      <div className="toolbar" style={{ marginTop: '0.9rem' }}>
+        <button className="btn-primary" onClick={saveAndApply} disabled={!dirty || saving}>
+          {saving ? 'Applying…' : 'Save & Apply'}
+        </button>
+        {message && <span className="text-dim">{message}</span>}
+      </div>
 
       {showStrategyModal && (
         <StrategyKindModal
-          activeKinds={cfg?.activeKinds ?? []}
+          activeKinds={cfg.activeKinds}
           onClose={() => setShowStrategyModal(false)}
           onSave={saveActiveKinds}
         />
       )}
       {showTokenModal && (
         <TokenModal
-          allInstIds={cfg?.allInstIds ?? []}
-          disabledInstIds={cfg?.disabledInstIds ?? []}
+          allInstIds={cfg.allInstIds}
+          disabledInstIds={cfg.disabledInstIds}
           onClose={() => setShowTokenModal(false)}
           onSave={saveDisabledInstIds}
         />
       )}
-    </div>
+    </>
   )
 }

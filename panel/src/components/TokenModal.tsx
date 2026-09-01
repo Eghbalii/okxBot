@@ -53,16 +53,15 @@ export default function TokenModal({
 
         <div className="text-dim" style={{ marginBottom: '0.75rem' }}>
           Unchecking a token stops it from opening new paper positions. Its existing open
-          positions (if any) keep closing normally — close one manually from the Positions table
-          if needed.
+          positions (if any) keep running to their normal close — nothing is force-closed.
         </div>
 
         {error && <div className="error-banner">{error}</div>}
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+        <div className="checkbox-grid">
           {allInstIds.length === 0 && <div className="text-dim">No tokens configured.</div>}
           {allInstIds.map((instId) => (
-            <label key={instId} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <label key={instId} className="checkbox-row">
               <input type="checkbox" checked={!disabled.has(instId)} onChange={() => toggle(instId)} />
               <span className="mono">{instId}</span>
             </label>
@@ -70,7 +69,7 @@ export default function TokenModal({
         </div>
 
         <div className="toolbar" style={{ marginTop: '1rem' }}>
-          <button onClick={save} disabled={saving}>
+          <button className="btn-primary" onClick={save} disabled={saving}>
             {saving ? 'Saving…' : 'Save'}
           </button>
           <button onClick={onClose} disabled={saving}>

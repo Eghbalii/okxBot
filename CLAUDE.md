@@ -2951,3 +2951,47 @@ remain open with their stops now correctly tightened. No position needed manual 
 
 3 new tests in `cmd/paper-trader/main_test.go` + 3 new tests in `internal/usecase/papertrade_test.go`
 — 257 Go tests total.
+
+## 24. Control-box panel fixes (2026-09-01 follow-up): mode-aware, one save action, correct checkbox defaults
+
+Operator feedback on §22's panel, addressed directly:
+
+- **"Paper trading controls" was the wrong title** — the box is now mode-aware: a Paper/Demo/Real
+  tab selector at the top (`PaperTradingConfigBox`'s new outer component), Paper showing the real
+  controls (`PaperControls`, unchanged plumbing) and Demo/Real showing an explicit "not wired up
+  yet" message rather than silently doing nothing — per explicit decision, only the UI became
+  mode-aware this pass; there is still no demo/real controller behind it (`cmd/trader` remains
+  unbuilt for this, §22).
+- **A real, wrong-default bug, not just styling**: `StrategyKindModal` inverted its own stated
+  semantics. `activeKinds` empty means "no restriction — every kind currently enabled applies
+  as-is," but the modal rendered that as **every checkbox unchecked**, which reads as "everything
+  disabled" when the true state was the opposite. Fixed to pre-check every kind when the saved
+  restriction is empty; unchecking one now correctly represents creating a restriction, and
+  checking everything back saves an empty list again rather than an explicit list of all 14 (so a
+  future 15th strategy kind isn't silently excluded by a stale snapshot). `TokenModal`'s equivalent
+  checkbox was already correct (`checked={!disabled.has(instId)}`) — only the strategy modal had
+  the bug, given consistent styling in the same pass.
+- **One save action, not two.** The operator's point stands on its own: nothing here has a live-
+  reload path, so a "Save" that only persists to Postgres without also restarting silently does
+  nothing until a separate manual step — there is no such thing as "save without restart" that
+  means anything. Save and Restart are now one `Save & Apply` button (`PaperControls.saveAndApply`,
+  and the strategy/token modals' own save handlers) that persists the patch then immediately calls
+  `restartPaperTrader`, matching how every other write in this box already behaves once you look at
+  what "save" was supposed to accomplish.
+- **Pause/Stop pulled out of the config form into their own buttons**, per explicit instruction:
+  they're operational actions independent of any config field, not something to bundle with
+  long/short/timeframe edits that get reviewed together before applying. `Resume`/`Pause`/`Stop`
+  each fire immediately (`setTradingState`), with `Stop`'s existing confirm-dialog (force-closes
+  every open position) kept since that's still the one destructive action here.
+- **Visual pass**: replaced ad-hoc inline styles with a small new CSS vocabulary in `App.css`
+  (`.config-box-header`/`.mode-tabs`/`.state-row`/`.state-dot`/`.config-grid`/`.config-tile`/
+  `.checkbox-grid`/`.checkbox-row`/`.btn-primary`/`.btn-danger`) — a status badge with a colored
+  dot for running/paused/stopped, grouped tiles for direction/timeframes/strategies/tokens instead
+  of one flat toolbar, and the stats box reuses the same `.config-tile` grid for visual consistency
+  between the two boxes rather than two different ad-hoc layouts.
+
+No Go changes in this pass — confirmed `PaperTrader.OpensDisabled`/`TradingPaused` already only
+gate `evaluateStrategies` (new opens), never `monitorOpenOrders`, matching the operator's
+instruction that disabling a token/strategy must not force-close existing positions; only the
+panel's own copy needed correcting to describe this accurately (both modals already said this,
+`TokenModal`'s logic already matched it, only `StrategyKindModal`'s checked-state was wrong).
