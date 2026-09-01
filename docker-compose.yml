@@ -165,14 +165,22 @@ services:
       # holds OKX_API_KEY/SECRET/PASSPHRASE/SIMULATED_TRADING at all (only the gateway does). Mode
       # (real vs demo) is derived from the gateway's own GET /health response, not a local env var.
       OKX_GATEWAY_URL: http://okx-gateway:8094
+      # Postgres is OPTIONAL for cmd/trader (§15.7: used only for the equity-timeline chart, a
+      # connection failure degrades to "no timeline recorded" rather than exiting) — but was
+      # previously left unset here entirely, silently falling back to config's localhost default,
+      # unreachable from inside the container. Found and fixed while verifying the gateway
+      # migration on the real server (2026-09-01): every real/demo poll was logging a Postgres
+      # connection-refused warning that a correctly-set DSN eliminates.
+      POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
     volumes:
       - ./go-engine/configs:/app/configs
-    # No redis/kafka/postgres dependency: cmd/trader's loop is REST-poll (via okx-gateway) +
-    # rl-service only (it reads none of cfg.Redis/Kafka/Postgres). Redis was listed here from
-    # before the event bus moved to Kafka (§12) and was never actually used by this service.
+    # No redis/kafka dependency: cmd/trader's loop is REST-poll (via okx-gateway) + rl-service,
+    # plus an optional Postgres connection for the equity timeline above. Redis was listed here
+    # from before the event bus moved to Kafka (§12) and was never actually used by this service.
     depends_on:
       - rl-service
       - okx-gateway
+      - timescaledb
 
   paper-trader:
     logging: *default-logging
