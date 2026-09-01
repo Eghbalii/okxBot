@@ -68,7 +68,9 @@ body {
 .app-main {
   flex: 1;
   padding: 1.5rem;
-  max-width: 1200px;
+  /* Full-width, not capped at 1200px (2026-09-01 request): the positions table has up to 16
+     columns, and a fixed cap meant they never fit without horizontal scrolling regardless of
+     browser zoom, since zooming shrinks font-size, not the cap-vs-column-count relationship. */
   width: 100%;
   margin: 0 auto;
 }
@@ -80,8 +82,8 @@ body {
   padding: 1rem 1.25rem;
   margin-bottom: 1rem;
   /* min-width:0 is required for a grid/flex child to be allowed to shrink below its content's
-     intrinsic width — without it the positions table (15 columns) forces the card wider than
-     .app-main's 1200px cap and the right-hand columns render outside the card's border. */
+     intrinsic width — without it a wide table forces the card wider than its container and the
+     right-hand columns render outside the card's border. */
   min-width: 0;
 }
 
@@ -281,6 +283,15 @@ td {
   border-bottom: 1px solid var(--border);
 }
 
+/* The positions table specifically (up to 16 columns) gets tighter horizontal padding so it fits
+   without a scrollbar on more viewport widths — other tables in the app (fewer columns) keep the
+   roomier default above. */
+.table-scroll th,
+.table-scroll td {
+  padding-left: 0.4rem;
+  padding-right: 0.4rem;
+}
+
 th {
   color: var(--text-dim);
   font-weight: 500;
@@ -291,6 +302,13 @@ th {
 
 th:hover {
   color: var(--text);
+}
+
+/* SL/TP stacked on two lines instead of side by side (2026-09-01 request) — narrower per-column
+   footprint than "123.45 / 678.90" in one line, at the cost of taller rows for that one cell. */
+.sl-tp-cell {
+  line-height: 1.3;
+  white-space: nowrap;
 }
 
 .badge {

@@ -9,7 +9,7 @@ import PaperTradingStatsBox from '../components/PaperTradingStatsBox'
 import Pagination, { DEFAULT_PAGE_SIZE } from '../components/Pagination'
 import SortableTh from '../components/SortableTh'
 import { api } from '../api/client'
-import { formatDateTime, formatUsd, pnlClass } from '../utils/format'
+import { formatDateTime, formatUsd, pnlClass, trimPrice } from '../utils/format'
 import type { CloseReason, Position, PositionMode } from '../api/types'
 
 // Sort fields the backend understands, plus the ones resolved client-side below.
@@ -215,7 +215,7 @@ export default function PositionsPage() {
     }
   }
 
-  const columnCount = 11 + (showLiveColumns ? 2 : 0) + (showClosedColumns ? 2 : 0) + (showLiveColumns ? 1 : 0)
+  const columnCount = 10 + (showLiveColumns ? 2 : 0) + (showClosedColumns ? 2 : 0) + (showLiveColumns ? 1 : 0)
 
   return (
     <div>
@@ -263,7 +263,6 @@ export default function PositionsPage() {
               <SortableTh field="inst_id" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
                 Instrument
               </SortableTh>
-              <th className="th-static">Mode</th>
               <SortableTh field="side" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
                 Side
               </SortableTh>
@@ -271,7 +270,7 @@ export default function PositionsPage() {
                 Strategy
               </SortableTh>
               <SortableTh field="bar" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                Timeframe
+                TF
               </SortableTh>
               <SortableTh field="entry" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
                 Entry
@@ -335,19 +334,17 @@ export default function PositionsPage() {
                     )}
                   </td>
                   <td>
-                    <span className="badge badge-dim">{p.Mode}</span>
-                  </td>
-                  <td>
                     <span className={'badge ' + (p.Side === 'buy' ? 'badge-green' : 'badge-red')}>
                       {p.Side === 'buy' ? 'long' : 'short'}
                     </span>
                   </td>
                   <td>{p.StrategyName || '—'}</td>
                   <td className="mono text-dim">{p.Bar || '—'}</td>
-                  <td className="mono">{p.EntryPx}</td>
-                  {showLiveColumns && <td className="mono">{p.ClosedAt ? '—' : (lastPrice ?? '—')}</td>}
-                  <td className="mono text-dim">
-                    {p.SLPx ?? '—'} / {p.TPPx ?? '—'}
+                  <td className="mono">{trimPrice(p.EntryPx)}</td>
+                  {showLiveColumns && <td className="mono">{p.ClosedAt ? '—' : trimPrice(lastPrice)}</td>}
+                  <td className="mono text-dim sl-tp-cell">
+                    <div>SL {trimPrice(p.SLPx)}</div>
+                    <div>TP {trimPrice(p.TPPx)}</div>
                   </td>
                   <td className="mono">{p.Leverage}x</td>
                   <td className="mono">${Number(p.Size).toLocaleString()}</td>
