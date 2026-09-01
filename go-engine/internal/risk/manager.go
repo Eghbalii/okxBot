@@ -59,6 +59,16 @@ func (m *Manager) Reset(dayStartEquity decimal.Decimal) {
 	m.dayStartEquity = dayStartEquity
 }
 
+// Halt trips the circuit breaker for a reason other than drawdown (CLAUDE.md §27.2 — e.g. a
+// margin-mode mismatch between what was configured and what OKX actually reports for an open
+// position). Same halted/haltReason state CheckDrawdown sets, and cleared the same way via Reset —
+// this is deliberately not a second, parallel halt mechanism, since the trading loop only needs to
+// check one thing ("am I halted, and why") regardless of which condition tripped it.
+func (m *Manager) Halt(reason string) {
+	m.halted = true
+	m.haltReason = reason
+}
+
 // CheckDrawdown updates the circuit breaker based on current equity. Call this on every
 // account-state refresh, independent of whether a new action is being evaluated.
 func (m *Manager) CheckDrawdown(currentEquity decimal.Decimal) {

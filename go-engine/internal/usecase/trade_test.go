@@ -310,3 +310,150 @@ func TestStep_ObservationFallsBackToLiveEquityWithoutConfiguredInitial(t *testin
 		t.Errorf("expected the live-equity fallback (5000), got %s", model.lastObs.AccountInitialUSD)
 	}
 }
+
+// TestStep_MarginModeMismatchHaltsTrading covers CLAUDE.md §27.2's read-back verification: a
+// configured TdMode that OKX's own reported position.MgnMode disagrees with must halt trading, not
+// be silently traded through.
+func TestStep_MarginModeMismatchHaltsTrading(t *testing.T) {
+	exchange := &fakeExchangeClient{
+		ticker: domain.Ticker{Last: dec("50000")},
+		// TdMode is "cross" (newTestTrader's default) but OKX reports isolated on the open position.
+		positions: []domain.Position{{InstID: "BTC-USDT-SWAP", Pos: dec("0.1"), Lever: dec("5"), MgnMode: "isolated"}},
+		balances:  []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
+	}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5")}}
+	riskManager := risk.NewManager(testLimits(), dec("1000"))
+	trader := newTestTrader(exchange, model, riskManager)
+
+	if err := trader.step(context.Background(), testLogger()); err != nil {
+		t.Fatalf("step returned error: %v", err)
+	}
+
+	if halted, reason := riskManager.Halted(); !halted {
+		t.Fatal("expected risk manager halted after a margin mode mismatch")
+	} else if reason == "" {
+		t.Error("expected a non-empty halt reason")
+	}
+	if len(exchange.placedOrders) != 0 || len(exchange.leverageCalls) != 0 {
+		t.Error("expected no orders/leverage calls on the step that detects the mismatch")
+	}
+
+	// A subsequent step must also be a no-op — the halt must stick, not just skip one step.
+	if err := trader.step(context.Background(), testLogger()); err != nil {
+		t.Fatalf("second step returned error: %v", err)
+	}
+	if len(exchange.placedOrders) != 0 {
+		t.Error("expected the halt to persist across steps")
+	}
+}
+
+// TestStep_MarginModeMatchDoesNotHalt confirms the check is not a false positive on the normal
+// case (configured mode matches what OKX reports).
+func TestStep_MarginModeMatchDoesNotHalt(t *testing.T) {
+	exchange := &fakeExchangeClient{
+		ticker:    domain.Ticker{Last: dec("50000")},
+		positions: []domain.Position{{InstID: "BTC-USDT-SWAP", Pos: dec("0.1"), Lever: dec("5"), MgnMode: "cross"}},
+		balances:  []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
+	}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0"), LeverageFrac: dec("0.5")}}
+	riskManager := risk.NewManager(testLimits(), dec("1000"))
+	trader := newTestTrader(exchange, model, riskManager)
+
+	if err := trader.step(context.Background(), testLogger()); err != nil {
+		t.Fatalf("step returned error: %v", err)
+	}
+	if halted, reason := riskManager.Halted(); halted {
+		t.Fatalf("expected no halt when margin mode matches, got halted with reason %q", reason)
+	}
+}
+
+// TestStep_FlatPositionSkipsMarginModeCheck confirms a flat (no open position) response never
+// trips the check — MgnMode on an empty position carries no information to compare against, and
+// treating it as a mismatch would halt trading before any position even exists.
+func TestStep_FlatPositionSkipsMarginModeCheck(t *testing.T) {
+	exchange := &fakeExchangeClient{
+		ticker:    domain.Ticker{Last: dec("50000")},
+		positions: []domain.Position{{InstID: "BTC-USDT-SWAP", Pos: dec("0"), Lever: dec("0"), MgnMode: ""}},
+		balances:  []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
+	}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5")}}
+	riskManager := risk.NewManager(testLimits(), dec("1000"))
+	trader := newTestTrader(exchange, model, riskManager)
+
+	if err := trader.step(context.Background(), testLogger()); err != nil {
+		t.Fatalf("step returned error: %v", err)
+	}
+	if halted, reason := riskManager.Halted(); halted {
+		t.Fatalf("expected no halt on a flat position, got halted with reason %q", reason)
+	}
+}
+
+// TestStep_LiquidationBufferCrossCheckTightensEstimate covers §27.2's cross-check: when OKX's own
+// reported LiqPx/MarkPx implies a narrower buffer than the rough 100/leverage estimate, Approve
+// must see the tighter (real) number — an oversized position that the rough estimate alone would
+// have approved must now be rejected.
+func TestStep_LiquidationBufferCrossCheckTightensEstimate(t *testing.T) {
+	exchange := &fakeExchangeClient{
+		ticker: domain.Ticker{Last: dec("50000")},
+		// leverageFrac=1, MaxLeverage=5 => targetLeverage=5 => rough estimate = 100/5 = 20%, which
+		// alone would clear MinLiquidationBufferPct=15. But OKX reports MarkPx=50000, LiqPx=48000:
+		// real buffer = (50000-48000)/50000*100 = 4%, well below the 15% floor.
+		positions: []domain.Position{{
+			InstID: "BTC-USDT-SWAP", Pos: dec("0.1"), Lever: dec("5"), MgnMode: "cross",
+			MarkPx: dec("50000"), LiqPx: dec("48000"),
+		}},
+		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
+	}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("1")}}
+	limits := risk.Limits{
+		MaxLeverage: dec("5"), MaxPositionNotionalUSD: dec("1000"),
+		MaxDailyDrawdownPct: dec("50"), MinLiquidationBufferPct: dec("15"),
+	}
+	riskManager := risk.NewManager(limits, dec("1000"))
+	trader := newTestTrader(exchange, model, riskManager)
+
+	if err := trader.step(context.Background(), testLogger()); err != nil {
+		t.Fatalf("step returned error: %v", err)
+	}
+
+	if len(exchange.leverageCalls) != 0 {
+		t.Error("expected the real (tighter) liquidation buffer to reject the action, but SetLeverage was called")
+	}
+	if len(exchange.placedOrders) != 0 {
+		t.Error("expected no order placed when the real liquidation buffer rejects the action")
+	}
+}
+
+// TestStep_LiquidationBufferCrossCheckNeverLoosens confirms the cross-check only ever tightens —
+// a real buffer WIDER than the rough estimate must not be used to approve an action the rough
+// estimate alone would have rejected.
+func TestStep_LiquidationBufferCrossCheckNeverLoosens(t *testing.T) {
+	exchange := &fakeExchangeClient{
+		ticker: domain.Ticker{Last: dec("50000")},
+		// Rough estimate at targetLeverage=20 (MaxLeverage=20, leverageFrac=1) = 100/20 = 5%, below
+		// MinLiquidationBufferPct=15 and would be rejected on the rough estimate alone. OKX reports
+		// a real buffer of 30% here (MarkPx=50000, LiqPx=35000) — wider than the estimate. The
+		// mismatch itself is unrealistic in practice, but the point is this must NOT flip the
+		// action to approved; the tighter number always wins.
+		positions: []domain.Position{{
+			InstID: "BTC-USDT-SWAP", Pos: dec("0.1"), Lever: dec("20"), MgnMode: "cross",
+			MarkPx: dec("50000"), LiqPx: dec("35000"),
+		}},
+		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
+	}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("1")}}
+	limits := risk.Limits{
+		MaxLeverage: dec("20"), MaxPositionNotionalUSD: dec("1000"),
+		MaxDailyDrawdownPct: dec("50"), MinLiquidationBufferPct: dec("15"),
+	}
+	riskManager := risk.NewManager(limits, dec("1000"))
+	trader := newTestTrader(exchange, model, riskManager)
+
+	if err := trader.step(context.Background(), testLogger()); err != nil {
+		t.Fatalf("step returned error: %v", err)
+	}
+
+	if len(exchange.leverageCalls) != 0 {
+		t.Error("expected the rough estimate's rejection to hold even though the real buffer is wider")
+	}
+}

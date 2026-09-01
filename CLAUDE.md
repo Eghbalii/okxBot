@@ -3386,16 +3386,35 @@ Concretely:
       during this verification: `trader`'s compose service never set `POSTGRES_DSN`, silently
       falling back to an unreachable `localhost` default every poll instead of recording the
       equity timeline (§15.7) — unrelated to this migration, fixed alongside it.
-  - [ ] Still to migrate, independently: `paper-trader`, `ingestor`, `strategy-tester`,
-        `strategy-optimizer` — each still builds its own `rest.Client` directly.
-- [ ] `configs/config.yaml`/`config.example.yaml`/`internal/config` default: `td_mode` →
-      `isolated` for real trading — DONE in `config.example.yaml` only; the server's real
-      `config.yaml` deliberately LEFT AT `cross` per explicit operator decision (2026-09-01: wait
-      until the full real-trading chain, incl. margin-mode read-back verification below, is
-      ready before touching live trading config). Margin-mode read-back verification against
-      `Position.MgnMode` with a halt on mismatch is NOT YET implemented (§27.2).
-- [ ] Revisit `risk.Manager`'s liquidation-buffer estimate against OKX's own reported `LiqPx`
-      rather than the `100/leverage` approximation alone (§27.2).
+  - [x] `strategy-tester`/`strategy-optimizer` migrated to `gatewayclient` (their only OKX call
+        was read-only `GetCandles` seeding, no gateway priority). `paper-trader` needed no gateway
+        migration at all — its only OKX REST dependency was the `-backfill` flag, which was
+        removed from the codebase entirely (2026-09-01, explicit repeated operator instruction:
+        the history-candles endpoint must never be called again), leaving it with zero REST
+        dependency. `ingestor` was never in scope — it only uses `internal/okx/ws` (public
+        WebSocket), never REST. All four items resolved; nothing left to migrate.
+- [x] Margin-mode read-back verification (§27.2): `Trader.step` now compares OKX's own reported
+      `Position.MgnMode` (already fetched every poll via `GetPositions`, previously never
+      consulted) against the configured `TdMode`, for an existing position only — halts trading
+      via a new `risk.Manager.Halt(reason)` (the same halted/haltReason state `CheckDrawdown`
+      trips, not a second parallel mechanism) on any mismatch, rather than silently trading
+      through a margin mode that didn't actually take effect. 3 new tests (mismatch halts and the
+      halt persists across steps; a match doesn't false-positive; a flat/empty position is
+      correctly skipped rather than treated as a mismatch).
+  - Still open: `configs/config.yaml`/`config.example.yaml`/`internal/config` default `td_mode` →
+    `isolated` — DONE in `config.example.yaml` only; the server's real `config.yaml` deliberately
+    LEFT AT `cross` per explicit operator decision (2026-09-01: wait until the full real-trading
+    chain — the conductor rebuild below — is ready before touching live trading config).
+- [x] Liquidation-buffer cross-check against OKX's own reported `LiqPx`/`MarkPx` (§27.2): `Trader.
+      execute` now compares the rough `100/leverage` estimate against the real distance implied by
+      the position's actual `LiqPx`/`MarkPx` (both already fetched, previously unused for this),
+      and uses whichever is TIGHTER — the cross-check can only make `risk.Manager.Approve`'s check
+      more conservative, never less, so a real distance wider than the estimate is deliberately
+      ignored (matches the §19.2/§19.3 "never let a cross-check loosen a safety margin" pattern).
+      Only applied when a position already exists — OKX has no `LiqPx` to report before one is
+      open. 2 new tests: a real buffer narrower than the estimate correctly rejects an action the
+      rough estimate alone would have approved; a real buffer wider than the estimate does NOT
+      flip a rough-estimate rejection into an approval.
 - [ ] Bring `cmd/trader` onto the strategy-signal + `conductor.SignalConductor` lifecycle (the
       real scope behind "no forking for real trading," §27.3) — one position per token per side,
       model edits SL/TP in place, opposite-side signals while a position is open are ignored

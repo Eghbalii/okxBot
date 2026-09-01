@@ -105,6 +105,23 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 			break
 		}
 	}
+
+	// CLAUDE.md §27.2: verify OKX actually applied the configured margin mode, rather than sending
+	// TdMode on every request and never checking what came back — a config value that silently
+	// didn't take effect (a stale position from before a config change, an OKX-side default, a
+	// typo) must halt trading, not be traded through unnoticed. Only meaningful once a position
+	// actually exists — pos.MgnMode on a flat/empty position response carries no information to
+	// check against. Uses the SAME halt mechanism as the drawdown circuit breaker (risk.Manager.
+	// Halt), not a separate flag, so the trading loop only ever needs to ask "am I halted."
+	if !pos.Pos.IsZero() && pos.MgnMode != "" && pos.MgnMode != t.TdMode {
+		t.RiskManager.Halt(fmt.Sprintf(
+			"margin mode mismatch for %s: configured %q but OKX reports %q on the open position",
+			t.InstID, t.TdMode, pos.MgnMode))
+		logger.Error("margin mode mismatch, halting trading", "instId", t.InstID,
+			"configured", t.TdMode, "reported", pos.MgnMode)
+		return nil
+	}
+
 	posSize := pos.Pos
 	lever := pos.Lever
 	// OKX's own uplRatio is already leverage-adjusted (unrealized PnL / initial margin), matching
@@ -225,6 +242,26 @@ func (t *Trader) execute(
 	liqBufferPct := decimal.Zero
 	if targetLeverage.IsPositive() {
 		liqBufferPct = decimal.NewFromInt(100).Div(targetLeverage)
+	}
+
+	// CLAUDE.md §27.2/§27.7: cross-check the rough estimate above against OKX's OWN reported
+	// LiqPx/MarkPx for the position as it stands BEFORE this action — already fetched via
+	// GetPositions every step, previously never consulted here. Only meaningful for an existing
+	// position (a brand-new position has no LiqPx yet; OKX only populates it once one is open), and
+	// deliberately only ever TIGHTENS the buffer used for Approve, never loosens it — a real
+	// exchange-reported distance narrower than the rough estimate means the estimate is currently
+	// wrong in the unsafe direction (underestimating risk, not overestimating it), which is exactly
+	// the case this check exists to catch. The reverse (real buffer wider than the estimate) is
+	// left alone: trusting the more conservative number in either direction, same "never let a
+	// cross-check loosen a safety margin" pattern as the SL-cap layering (§19.2/§19.3).
+	if !posSize.IsZero() && pos.MarkPx.IsPositive() && pos.LiqPx.IsPositive() {
+		realBufferPct := pos.MarkPx.Sub(pos.LiqPx).Abs().Div(pos.MarkPx).Mul(decimal.NewFromInt(100))
+		if realBufferPct.LessThan(liqBufferPct) {
+			logger.Warn("liquidation buffer estimate was optimistic; using OKX's own reported distance instead",
+				"instId", t.InstID, "estimatedPct", liqBufferPct.StringFixed(2), "realPct", realBufferPct.StringFixed(2),
+				"markPx", pos.MarkPx, "liqPx", pos.LiqPx)
+			liqBufferPct = realBufferPct
+		}
 	}
 
 	approved, err := t.RiskManager.Approve(risk.ProposedAction{
