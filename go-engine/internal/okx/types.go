@@ -95,6 +95,25 @@ func (r OrderResult) ToDomain() domain.OrderResult {
 	return domain.OrderResult{OrdID: r.OrdID, ClOrdID: r.ClOrdID, SCode: r.SCode, SMsg: r.SMsg}
 }
 
+// OrderStatus mirrors a single entry of the GET /api/v5/trade/order response data array.
+type OrderStatus struct {
+	InstID    string          `json:"instId"`
+	OrdID     string          `json:"ordId"`
+	ClOrdID   string          `json:"clOrdId"`
+	State     string          `json:"state"` // "live", "partially_filled", "filled", "canceled"
+	AvgPx     decimal.Decimal `json:"avgPx"`
+	AccFillSz decimal.Decimal `json:"accFillSz"`
+	Sz        decimal.Decimal `json:"sz"`
+}
+
+// ToDomain converts an OrderStatus to its domain representation.
+func (s OrderStatus) ToDomain() domain.OrderStatus {
+	return domain.OrderStatus{
+		InstID: s.InstID, OrdID: s.OrdID, ClOrdID: s.ClOrdID, State: s.State,
+		AvgPx: s.AvgPx, AccFillSz: s.AccFillSz, Sz: s.Sz,
+	}
+}
+
 // SetLeverageRequest is the payload for POST /api/v5/account/set-leverage.
 type SetLeverageRequest struct {
 	InstID  string          `json:"instId"`

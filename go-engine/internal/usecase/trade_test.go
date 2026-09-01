@@ -47,6 +47,12 @@ func (f *fakeExchangeClient) SetLeverage(req domain.LeverageChange) error {
 	f.leverageCalls = append(f.leverageCalls, req)
 	return f.setLeverageErr
 }
+func (f *fakeExchangeClient) CancelOrder(instID, ordID string) error {
+	return nil
+}
+func (f *fakeExchangeClient) GetOrder(instID, ordID string) (domain.OrderStatus, error) {
+	return domain.OrderStatus{InstID: instID, OrdID: ordID, State: "filled"}, nil
+}
 
 // fakeModelClient is a hand-rolled port.ModelClient returning a configured Action.
 type fakeModelClient struct {
