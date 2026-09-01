@@ -5,10 +5,9 @@
 // working unchanged — the rate limiting/priority/retry logic all lives behind the gateway, not
 // here.
 //
-// Deliberately does NOT expose GetHistoryCandles/backfill — this client is scoped to exactly the
-// endpoints cmd/okx-gateway proxies (ticker/positions/balance/candles/order/leverage), the same
-// "narrow port, not the kitchen sink" pattern port.HistoryCandleFetcher already uses to keep
-// backfill's read-only candle paging separate from trade/leverage access.
+// Deliberately does NOT expose GetHistoryCandles — the candle-backfill feature that endpoint
+// served was removed from the codebase entirely (2026-09-01, explicit operator instruction: that
+// OKX endpoint must never be called again), and neither cmd/okx-gateway nor this client proxy it.
 package gatewayclient
 
 import (

@@ -14,7 +14,6 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
-	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )
 
 // Server holds the dependencies cmd/api's handlers need.
@@ -40,16 +39,12 @@ type Server struct {
 	// balance than the engine actually trades against.
 	AccountInitialUSD decimal.Decimal
 
-	// Backfill loads historical candles on demand (CLAUDE.md §15.8), so warm-start training has
-	// real market history without waiting days for the live ingestor to accumulate it. Nil when
-	// cmd/api runs without exchange credentials — the panel backend is otherwise read-only, so
-	// having no exchange client is a valid configuration, and the endpoint reports that rather
-	// than failing.
-	Backfill *usecase.Backfill
-	// BackfillInstIDs/BackfillBars are the defaults used when a backfill request omits them,
-	// mirroring what the trading services are configured to run.
-	BackfillInstIDs []string
-	BackfillBars    []string
+	// AllInstIDs is the full configured instrument roster, used as GET /api/paper-trading/config's
+	// AllInstIDs field. Was named BackfillInstIDs (and paired with a now-removed BackfillBars)
+	// before the candle backfill feature itself (POST /api/candles/backfill, usecase.Backfill) was
+	// removed entirely (2026-09-01, explicit operator instruction: that OKX endpoint must never be
+	// called) — renamed since it now has nothing to do with backfill.
+	AllInstIDs []string
 
 	// hub fans out real-time paper-order open/close events to connected panel WebSocket clients
 	// (CLAUDE.md §11.4). Lazily initialized by Routes/Hub so callers never need to construct it
@@ -118,7 +113,6 @@ func (s *Server) Routes() http.Handler {
 	// CLAUDE.md §16 point 6: backs the Strategies page's price-line + parameter-change-marker
 	// chart — candles for the price line, param-changes for the vertical markers.
 	mux.HandleFunc("GET /api/candles", s.handleListCandles)
-	mux.HandleFunc("POST /api/candles/backfill", s.handleBackfillCandles)
 	mux.HandleFunc("GET /api/strategies/{id}/param-changes", s.handleListParamChanges)
 
 	// Independent strategy-tester tab (2026-08-30 request): proxied through, same access-control

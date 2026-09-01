@@ -17,10 +17,8 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/api"
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
-	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
-	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )
 
 // tickEvent mirrors usecase.tickEvent's decode of the raw OKX tickers payload (CLAUDE.md §12) —
@@ -85,17 +83,12 @@ func main() {
 		// engine never actually traded against.
 		AccountInitialUSD: cfg.Account.InitialUSD,
 
-		// Candle backfill (CLAUDE.md §15.8) needs only read access to market data, so it takes the
-		// narrow HistoryCandleFetcher port rather than the full ExchangeClient — cmd/api must not
-		// be able to place an order. Public market endpoints need no credentials, so this works
-		// even where OKX keys aren't configured.
-		Backfill: &usecase.Backfill{
-			Exchange: rest.New(cfg.OKX.RESTBaseURL, cfg.OKX.APIKey, cfg.OKX.APISecret, cfg.OKX.APIPassphrase, cfg.OKX.Simulated),
-			Repo:     repo,
-			Logger:   logger,
-		},
-		BackfillInstIDs: cfg.Trading.InstIDs,
-		BackfillBars:    cfg.PaperTrading.Bars,
+		// The full configured instrument roster, used by GET /api/paper-trading/config's
+		// AllInstIDs (the panel's token-manage modal). Was BackfillInstIDs (paired with a
+		// now-removed BackfillBars/usecase.Backfill) before the candle backfill feature was
+		// removed entirely (2026-09-01, explicit operator instruction: that OKX endpoint must
+		// never be called).
+		AllInstIDs: cfg.Trading.InstIDs,
 	}
 	routes := srv.Routes() // must be called before Hub() usage below so the same *wsHub backs both
 

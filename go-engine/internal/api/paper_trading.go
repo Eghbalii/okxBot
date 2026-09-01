@@ -106,8 +106,8 @@ type paperTradingConfigView struct {
 	DisabledInstIDs []string `json:"disabledInstIds"`
 	ActiveBars      []string `json:"activeBars"`
 	// AllInstIDs is the full configured trading.inst_ids roster (not itself part of the saved
-	// config; reuses Server.BackfillInstIDs, which already carries the same list) — lets the
-	// panel's token-manage modal know what tokens exist to toggle, without a second endpoint.
+	// config; reuses Server.AllInstIDs, which already carries the same list) — lets the panel's
+	// token-manage modal know what tokens exist to toggle, without a second endpoint.
 	AllInstIDs []string `json:"allInstIds"`
 }
 
@@ -128,7 +128,7 @@ func (s *Server) handleGetPaperTradingConfig(w http.ResponseWriter, r *http.Requ
 		ActiveKinds:     c.ActiveKinds,
 		DisabledInstIDs: c.DisabledInstIDs,
 		ActiveBars:      c.ActiveBars,
-		AllInstIDs:      s.BackfillInstIDs,
+		AllInstIDs:      s.AllInstIDs,
 	})
 }
 

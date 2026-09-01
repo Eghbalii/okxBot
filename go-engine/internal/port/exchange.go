@@ -1,8 +1,6 @@
 package port
 
 import (
-	"time"
-
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 )
 
@@ -25,16 +23,4 @@ type ExchangeClient interface {
 	// §27.5/§27.6) — required to distinguish live/partially_filled/filled/canceled rather than
 	// trusting PlaceOrder's acceptance response or this system's own bookkeeping alone.
 	GetOrder(instID, ordID string) (domain.OrderStatus, error)
-}
-
-// HistoryCandleFetcher is the narrow slice of exchange access a candle backfill needs: paginated
-// reads of older bars. Deliberately separate from ExchangeClient so usecase.Backfill cannot reach
-// order placement or leverage changes — it is a read-only data-loading job, and the type system
-// should say so rather than relying on the implementation to be careful.
-type HistoryCandleFetcher interface {
-	// GetHistoryCandles returns up to `limit` candles strictly older than `before` (a zero time
-	// starts from the most recent), NEWEST FIRST. limit<=0 requests the adapter's maximum page
-	// size. An empty result means no further history is available, which is a normal end
-	// condition rather than an error.
-	GetHistoryCandles(instID, bar string, before time.Time, limit int) ([]domain.Candle, error)
 }

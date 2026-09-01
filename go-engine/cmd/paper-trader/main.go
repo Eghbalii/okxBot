@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -18,7 +17,6 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
-	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/rlclient"
@@ -28,19 +26,6 @@ import (
 )
 
 func main() {
-	// -backfill loads historical candles and exits, without starting the trading loop. Warm-start
-	// training (CLAUDE.md §15.8) rolls out against real candle history from Postgres, and a fresh
-	// database has none — waiting days for the live ingestor to accumulate it is unnecessary when
-	// the exchange will serve it directly. Run this once before the first warm-start.
-	//
-	// A flag on this binary rather than a separate command: it already has the exchange client,
-	// the repository, and the instrument/bar configuration wired up, and a new binary would need
-	// its own Dockerfile and compose entry to do the same job.
-	backfillOnly := flag.Bool("backfill", false, "fetch historical candles into Postgres, then exit")
-	backfillCandles := flag.Int("backfill-candles", 0,
-		"candles to fetch per instrument+timeframe (0 = default); sized in candles, not days, because training steps one candle at a time")
-	flag.Parse()
-
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
 	cfg, err := config.Load(os.Getenv("CONFIG_PATH"))
@@ -67,13 +52,6 @@ func main() {
 	if err := repo.Migrate(ctx); err != nil {
 		logger.Error("failed to run migrations", "error", err)
 		os.Exit(1)
-	}
-
-	restClient := rest.New(cfg.OKX.RESTBaseURL, cfg.OKX.APIKey, cfg.OKX.APISecret, cfg.OKX.APIPassphrase, cfg.OKX.Simulated)
-
-	if *backfillOnly {
-		runBackfill(ctx, cfg, repo, restClient, *backfillCandles, logger)
-		return
 	}
 
 	logger.Info("starting paper trader", "instIds", cfg.Trading.InstIDs)
@@ -369,40 +347,4 @@ func loadStrategyAssignments(ctx context.Context, repo *postgres.Repository, ins
 		out = append(out, usecase.StrategyAssignment{Bar: a.Bar, Strategy: s, StrategyID: a.StrategyID, Kind: cfg.Kind})
 	}
 	return out, nil
-}
-
-// runBackfill loads historical candles and reports what landed per instrument/timeframe. Exits
-// non-zero only if nothing at all was fetched: a single delisted instrument or a timeframe with
-// less history than requested is an expected partial result, not a failed run.
-func runBackfill(ctx context.Context, cfg *config.Config, repo port.Repository, exchange port.HistoryCandleFetcher, target int, logger *slog.Logger) {
-	bf := &usecase.Backfill{Exchange: exchange, Repo: repo, Logger: logger}
-
-	logger.Info("starting candle backfill",
-		"instIds", cfg.Trading.InstIDs, "bars", cfg.PaperTrading.Bars, "targetCandles", target)
-
-	results, err := bf.Run(ctx, usecase.BackfillRequest{
-		InstIDs:       cfg.Trading.InstIDs,
-		Bars:          cfg.PaperTrading.Bars,
-		TargetCandles: target,
-	})
-	if err != nil {
-		logger.Error("backfill interrupted", "error", err)
-	}
-
-	total := 0
-	for _, r := range results {
-		total += r.Stored
-		if r.Error != "" {
-			logger.Warn("backfill pair failed", "instId", r.InstID, "bar", r.Bar, "error", r.Error)
-			continue
-		}
-		logger.Info("backfill pair stored", "instId", r.InstID, "bar", r.Bar,
-			"stored", r.Stored, "oldest", r.Oldest, "newest", r.Newest)
-	}
-
-	logger.Info("backfill complete", "totalStored", total, "pairs", len(results))
-	if total == 0 {
-		logger.Error("backfill stored no candles; warm-start training has nothing to roll out against")
-		os.Exit(1)
-	}
 }

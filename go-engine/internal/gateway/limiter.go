@@ -9,9 +9,9 @@
 // local, non-endpoint-aware concurrency cap (rest.Client's maxConcurrentRequests=3) — nothing
 // coordinates the actual OKX-side rate-limit budget across processes. This package is the
 // coordination point: real trading (cmd/trader) must never be delayed by a burst of
-// paper-trading/backfill/optimizer traffic, so admission is decided per (consumer, endpoint
-// class) token bucket, with the trader consumer's bucket for trade-critical classes always
-// checked and refilled ahead of any other consumer contending for the same OKX-side limit.
+// paper-trading/optimizer traffic, so admission is decided per (consumer, endpoint class) token
+// bucket, with the trader consumer's bucket for trade-critical classes always checked and
+// refilled ahead of any other consumer contending for the same OKX-side limit.
 package gateway
 
 import (
@@ -78,11 +78,13 @@ func DefaultLimits() map[EndpointClass]ClassLimit {
 		// that cadence.
 		ClassAccount: {Capacity: 10, Refill: 10, Interval: 2 * time.Second},
 		// Market data (candles/tickers/instruments) is the highest-volume, least risk-sensitive
-		// class — multiple services seed/backfill candle windows concurrently (CLAUDE.md §14's
-		// history-candles incident happened here specifically), so this bucket is sized to absorb
-		// bursts without starving the trade-critical classes above, which have entirely separate
-		// buckets and therefore cannot be starved BY market-data traffic regardless of this
-		// number.
+		// class — multiple services seeding candle windows concurrently once caused a real
+		// incident (CLAUDE.md §14's history-candles concurrency bug; that endpoint/feature has
+		// since been removed entirely per explicit operator instruction, but the class sizing
+		// rationale still applies to whatever market-data traffic exists), so this bucket is sized
+		// to absorb bursts without starving the trade-critical classes above, which have entirely
+		// separate buckets and therefore cannot be starved BY market-data traffic regardless of
+		// this number.
 		ClassMarket: {Capacity: 20, Refill: 20, Interval: 2 * time.Second},
 	}
 }
