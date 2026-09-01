@@ -3362,33 +3362,59 @@ Concretely:
 
 ### 27.7 Implementation checklist (ordered; update as work progresses)
 
-- [ ] `cmd/okx-gateway`: new service, owns real OKX credentials, per-consumer/per-endpoint-class
-      token-bucket rate limiting with `cmd/trader` prioritized, retry/backoff on 429/`50011`,
-      Prometheus metrics. Verify exact OKX rate-limit numbers against the live docs before
-      shipping (§27.1) — do not trust this document's numbers.
-- [ ] Migrate `cmd/trader` to call the gateway first; verify against real OKX; then migrate
-      `paper-trader`, `ingestor`, `strategy-tester`, `strategy-optimizer` independently.
+- [x] `cmd/okx-gateway`: new service, per-(consumer, endpoint-class) token-bucket rate limiting
+      (`internal/gateway.Limiter`) with strict priority for the literal consumer `"trader"`,
+      full-jitter exponential backoff retry on OKX 429/`50011`/`50061`
+      (`internal/gateway.RetryPolicy`), Prometheus metrics endpoint. Proxies GetTicker/
+      GetPositions/GetBalance/GetCandles/PlaceOrder/CancelOrder/GetOrder/SetLeverage/Health. Rate
+      limit numbers in `gateway.DefaultLimits()`/`config.example.yaml`'s `gateway.*` section are
+      STILL EXPLICITLY UNVERIFIED against OKX's live docs — do not trust them, re-check before
+      any high-volume real trading.
+  - Order-status/cancel gap this closed: `domain.OrderStatus` added; `GET /api/v5/trade/order`
+    wired on `rest.Client`; `CancelOrder` (previously implemented but unreachable/dead code) and
+    the new `GetOrder` both added to `port.ExchangeClient` (§27.5's domain gap).
+- [x] Migrate `cmd/trader` to call the gateway first — done and verified against real OKX
+      (2026-09-01): `internal/gatewayclient.Client` implements `port.ExchangeClient` over HTTP to
+      the gateway; `cmd/trader` no longer holds `OKX_API_KEY`/`SECRET`/`PASSPHRASE` at all. Real
+      vs. demo mode moved to a NEW single source of truth — `GET /health` on the gateway (`{ok,
+      simulated}`) — since credentials moved to a different process; `cmd/trader` refuses to
+      start if it can't reach the gateway. Deployed and tested live on the server: gateway
+      correctly proxied a real `BTC-USDT-SWAP` ticker from OKX; `trader` correctly resolved
+      `mode=demo` from the gateway and correctly refused to proceed without real credentials
+      (OKX's own `code=50103`, round-tripped through the gateway intact), then stopped cleanly at
+      the `on-failure:5` cap — no infinite crash loop. Found and fixed a genuine pre-existing bug
+      during this verification: `trader`'s compose service never set `POSTGRES_DSN`, silently
+      falling back to an unreachable `localhost` default every poll instead of recording the
+      equity timeline (§15.7) — unrelated to this migration, fixed alongside it.
+  - [ ] Still to migrate, independently: `paper-trader`, `ingestor`, `strategy-tester`,
+        `strategy-optimizer` — each still builds its own `rest.Client` directly.
 - [ ] `configs/config.yaml`/`config.example.yaml`/`internal/config` default: `td_mode` →
-      `isolated` for real trading; add margin-mode read-back verification against
-      `Position.MgnMode` with a halt on mismatch (§27.2).
+      `isolated` for real trading — DONE in `config.example.yaml` only; the server's real
+      `config.yaml` deliberately LEFT AT `cross` per explicit operator decision (2026-09-01: wait
+      until the full real-trading chain, incl. margin-mode read-back verification below, is
+      ready before touching live trading config). Margin-mode read-back verification against
+      `Position.MgnMode` with a halt on mismatch is NOT YET implemented (§27.2).
 - [ ] Revisit `risk.Manager`'s liquidation-buffer estimate against OKX's own reported `LiqPx`
       rather than the `100/leverage` approximation alone (§27.2).
 - [ ] Bring `cmd/trader` onto the strategy-signal + `conductor.SignalConductor` lifecycle (the
       real scope behind "no forking for real trading," §27.3) — one position per token per side,
       model edits SL/TP in place, opposite-side signals while a position is open are ignored
       (routed as conductor `update`, never a flip) until the model itself closes the position.
+      NOT STARTED — `cmd/trader` still runs its original delta-notional-rebalance loop with no
+      strategy signals or conductor involvement at all.
 - [ ] New append-only real-order-adjustment log (table TBD, `real_order_adjustments` working
       name) — every SL/TP edit its own row with a timestamp, never overwritten in place (§27.3).
 - [ ] Panel: order-detail modal for real orders showing the full chronological adjustment
       history, not just latest SL/TP (§27.3).
-- [ ] Add `GET /api/v5/trade/order` (order status) to `rest.Client` + `port.ExchangeClient` +
-      route through the gateway in the trader's priority class; add `CancelOrder` to
-      `port.ExchangeClient` (already implemented on `rest.Client`, currently unreachable/dead
-      code) (§27.5).
-- [ ] New `domain.Order`/extended `OrderResult` carrying OKX's `state`/`avgPx`/`accFillSz`
-      (§27.5).
-- [ ] `trading.order_fill_timeout_sec` config (default 60) + fill-or-cancel logic: cancel on
-      timeout, no synthetic retry/re-pricing, wait for the model's next real signal (§27.5).
+- [x] `GET /api/v5/trade/order` (order status) added to `rest.Client` + `port.ExchangeClient` +
+      routed through the gateway (`ClassAccount`, a read not a mutating trade action); `CancelOrder`
+      added to `port.ExchangeClient` (§27.5).
+- [x] `domain.OrderStatus` added, carrying OKX's `state`/`avgPx`/`accFillSz`/`sz` (§27.5). Not yet
+      consumed by any fill-or-cancel loop — see the next item.
+- [x] `trading_fill_timeout.order_fill_timeout_sec` config added (default 60) — but the actual
+      fill-or-cancel LOGIC (poll `GetOrder` after `PlaceOrder`, cancel on timeout, no
+      retry/re-price) is NOT YET wired into `cmd/trader`'s execute path. Config exists, behavior
+      doesn't yet (§27.5).
 - [ ] Handle a partial fill within the timeout window as a real smaller-than-intended position,
       not left ambiguous (§27.5).
 - [ ] Position-state reconciliation: compare each poll's `GetPositions` response against this
@@ -3396,7 +3422,10 @@ Concretely:
       overwriting (§27.6).
 - [ ] Confirm `account_equity_history` is actually being written for `real` mode once live
       trading starts — don't assume the existing `cmd/trader` equity-recording code (§15.7) was
-      ever exercised against a real account before now (§27.4).
+      ever exercised against a real account before now (§27.4). Related, found 2026-09-01: the
+      `trader` compose service's missing `POSTGRES_DSN` (now fixed) meant this had never actually
+      run successfully even in demo mode either — the whole equity-timeline write path was
+      silently failing every poll until that fix landed.
 - [ ] (Stretch, not a go-live blocker) OKX private WebSocket client
       (`wss://ws.okx.com:8443/ws/v5/private`) for lower-latency balance/position/order pushes,
       complementing REST polling/reconciliation rather than replacing it (§27.4/§27.6).
