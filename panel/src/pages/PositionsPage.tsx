@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { usePolling } from '../hooks/usePolling'
 import { usePositionAlerts } from '../hooks/usePositionAlerts'
 import { usePositionEvents } from '../hooks/usePositionEvents'
@@ -12,20 +12,13 @@ import { api } from '../api/client'
 import { formatDateTime, formatUsd, pnlClass, trimPrice } from '../utils/format'
 import type { CloseReason, Position, PositionMode } from '../api/types'
 
-// Sort fields the backend understands, plus the ones resolved client-side below.
-type SortField =
-  | 'opened_at'
-  | 'closed_at'
-  | 'pnl'
-  | 'inst_id'
-  | 'side'
-  | 'strategy'
-  | 'bar'
-  | 'entry'
-  | 'leverage'
-  | 'size'
-  | 'reason'
-  | 'id'
+// Sortable columns are limited to what Postgres can ORDER BY directly (internal/postgres's
+// positionSortColumns) since sorting/paging moved server-side 2026-09-02 — closed positions grew
+// into the hundreds and fetching every row to sort/paginate client-side had become a genuinely
+// slow query and a multi-MB payload on every 5s poll. Columns like strategy/side/leverage that
+// have no backing SQL column are no longer sortable (they'd need a full client-side fetch to sort,
+// which is exactly the thing being removed).
+type SortField = 'opened_at' | 'closed_at' | 'pnl' | 'inst_id'
 type OpenFilter = 'all' | 'open' | 'closed'
 
 function closeReasonBadge(reason: CloseReason | null) {
@@ -56,48 +49,17 @@ function unrealizedPnL(p: Position, lastPrice: string | undefined): { pct: numbe
   return { pct, usd }
 }
 
-// The value a row sorts by for a given column. Returned as number|string so the comparator
-// can stay generic; nulls sort last regardless of direction.
-function sortValue(p: Position, field: SortField, live: number | null): number | string | null {
-  switch (field) {
-    case 'id':
-      return p.ID
-    case 'inst_id':
-      return p.InstID
-    case 'side':
-      return p.Side
-    case 'strategy':
-      return p.StrategyName || ''
-    case 'bar':
-      return p.Bar || ''
-    case 'entry':
-      return Number(p.EntryPx)
-    case 'leverage':
-      return Number(p.Leverage)
-    case 'size':
-      return Number(p.Size)
-    case 'reason':
-      return p.CloseReason ?? ''
-    case 'opened_at':
-      return new Date(p.OpenedAt).getTime()
-    case 'closed_at':
-      return p.ClosedAt ? new Date(p.ClosedAt).getTime() : null
-    case 'pnl':
-      // Closed rows sort on realized PnL; open rows on their live unrealized value, so one
-      // click orders the column the user is actually looking at rather than half of it.
-      return p.RealizedPnL !== null ? Number(p.RealizedPnL) : live
-    default:
-      return null
-  }
-}
-
 export default function PositionsPage() {
   const [mode, setMode] = useState<PositionMode | 'all'>('all')
   const [instId, setInstId] = useState('')
   // Defaults to open-only: the panel's job is to show real open positions, not the full historical
   // log — closed trades are still one click away via the filter.
   const [openFilter, setOpenFilter] = useState<OpenFilter>('open')
-  const [sortBy, setSortBy] = useState<SortField>('opened_at')
+  // Default sort depends on which view is active: an open-only view has no closed_at to sort by
+  // (always NULL), so opened_at is the meaningful default there, while a closed/all view's most
+  // useful default is "most recently closed first" — closed_at is also the axis the query itself
+  // is now indexed/ordered by server-side (internal/postgres's default when SortBy is unset).
+  const [sortBy, setSortByRaw] = useState<SortField>('opened_at')
   const [sortDesc, setSortDesc] = useState(true)
   const [alertsEnabled, setAlertsEnabled] = useState(true)
   const [wsRefreshCount, setWsRefreshCount] = useState(0)
@@ -109,17 +71,36 @@ export default function PositionsPage() {
   const showLiveColumns = openFilter !== 'closed'
   const [closingId, setClosingId] = useState<number | null>(null)
 
+  // Switching into a closed/all view re-defaults the sort to closed_at (only if the user hasn't
+  // picked a sort explicitly since — tracked via a ref so this doesn't fight a manual column
+  // click). Switching back to open-only re-defaults to opened_at, since closed_at is meaningless
+  // (always NULL) there.
+  const userPickedSort = useRef(false)
+  useEffect(() => {
+    if (userPickedSort.current) return
+    setSortByRaw(openFilter === 'open' ? 'opened_at' : 'closed_at')
+  }, [openFilter, userPickedSort])
+
+  // Server-side sort/page (2026-09-02): closed positions grew into the hundreds, and fetching
+  // every row on every 5s poll to sort/paginate client-side had become a genuinely slow query and
+  // a multi-MB payload. Any change to filter/sort/page now triggers a fresh, bounded query instead.
   const { data, error } = usePolling(
     () =>
       api.listPositions({
         mode: mode === 'all' ? undefined : mode,
         instId: instId || undefined,
         open: openFilter === 'all' ? undefined : openFilter === 'open',
+        sortBy,
+        sortDesc,
+        page,
+        pageSize,
       }),
     5_000,
-    [mode, instId, openFilter],
+    [mode, instId, openFilter, sortBy, sortDesc, page, pageSize],
     wsRefreshCount,
   )
+  const rows = data?.items ?? null
+  const total = data?.total ?? 0
 
   // CLAUDE.md §11.4/§12: cmd/api pushes a message over WebSocket the moment a paper order
   // opens/closes; rather than that event carrying full position detail, it just triggers an
@@ -128,71 +109,35 @@ export default function PositionsPage() {
   // consistency check independent of the socket's connection state.
   usePositionEvents(() => setWsRefreshCount((c) => c + 1), true)
 
-  usePositionAlerts(data, alertsEnabled)
+  usePositionAlerts(rows, alertsEnabled)
 
   const livePrices = usePriceStream(showLiveColumns)
 
   // Resolved from the current poll's data rather than held in state, so an open modal keeps showing
   // fresh values (live PnL, a close that just landed) instead of a snapshot frozen at click time.
-  const detailPosition = detailOrderId === null ? null : (data?.find((p) => p.ID === detailOrderId) ?? null)
+  const detailPosition = detailOrderId === null ? null : (rows?.find((p) => p.ID === detailOrderId) ?? null)
 
-  // A baseline order counts as "updated" if some other row in this same response is a fork of it
+  // A baseline order counts as "updated" if some other row in this same PAGE is a fork of it
   // (CLAUDE.md §15.4/§15.12: the RL controller never edits SL/TP in place, it creates a linked
-  // 'rl_adjusted' copy instead) — derived client-side from ParentOrderID rather than a new backend
-  // field, since the panel already receives every row needed to compute this.
-  const updatedOrderIds = useMemo(() => {
-    const ids = new Set<number>()
-    for (const p of data ?? []) {
-      if (p.ParentOrderID != null) ids.add(p.ParentOrderID)
-    }
-    return ids
-  }, [data])
-
-  // Sorting is done client-side so every column is sortable, including the ones the backend has
-  // no ORDER BY for (live PnL, strategy name) and the ones it would need a join to order by.
-  const sorted = useMemo(() => {
-    const rows = [...(data ?? [])]
-    const dir = sortDesc ? -1 : 1
-    rows.sort((a, b) => {
-      const av = sortValue(a, sortBy, unrealizedPnL(a, livePrices[a.InstID])?.usd ?? null)
-      const bv = sortValue(b, sortBy, unrealizedPnL(b, livePrices[b.InstID])?.usd ?? null)
-      // Nulls always sink to the bottom, so flipping direction never fills the first page
-      // with rows that have no value for the sorted column.
-      if (av == null && bv == null) return 0
-      if (av == null) return 1
-      if (bv == null) return -1
-      if (typeof av === 'string' || typeof bv === 'string') {
-        return String(av).localeCompare(String(bv)) * dir
-      }
-      return (av - bv) * dir
-    })
-    return rows
-  }, [data, sortBy, sortDesc, livePrices])
-
-  const total = sorted.length
-  const pageCount = Math.max(1, Math.ceil(total / pageSize))
-  // Clamp rather than reset: a row closing while the user is on the last page shouldn't bounce
-  // them back to page 1, but the page must not point past the end of a shrunken list either.
-  const safePage = Math.min(page, pageCount - 1)
-  const visible = useMemo(
-    () => sorted.slice(safePage * pageSize, safePage * pageSize + pageSize),
-    [sorted, safePage, pageSize],
-  )
-
-  useEffect(() => {
-    if (safePage !== page) setPage(safePage)
-  }, [safePage, page])
+  // 'rl_adjusted' copy instead) — derived client-side from ParentOrderID. Only sees forks within
+  // the current page now that fetching is paginated, which is an accepted trade-off of the same
+  // change: this was never a global computation the panel could afford to keep unbounded either.
+  const updatedOrderIds = new Set<number>()
+  for (const p of rows ?? []) {
+    if (p.ParentOrderID != null) updatedOrderIds.add(p.ParentOrderID)
+  }
 
   // Any change to what is being listed starts again from the first page.
   useEffect(() => {
     setPage(0)
-  }, [mode, instId, openFilter, pageSize])
+  }, [mode, instId, openFilter, pageSize, sortBy, sortDesc])
 
   function toggleSort(field: SortField) {
+    userPickedSort.current = true
     if (sortBy === field) {
       setSortDesc((d) => !d)
     } else {
-      setSortBy(field)
+      setSortByRaw(field)
       setSortDesc(true)
     }
     setPage(0)
@@ -257,34 +202,24 @@ export default function PositionsPage() {
         <table>
           <thead>
             <tr>
-              <SortableTh field="id" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                ID
-              </SortableTh>
+              {/* ID/side/strategy/bar/entry/leverage/size have no backing SQL column to ORDER BY
+                  server-side, so they're no longer sortable (CLAUDE.md §11.4's pagination-moved-
+                  server-side change, 2026-09-02) — sorting them would require fetching every row
+                  again, exactly what moving pagination server-side was meant to stop. */}
+              <th className="th-static">ID</th>
               <SortableTh field="inst_id" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
                 Instrument
               </SortableTh>
-              <SortableTh field="side" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                Side
-              </SortableTh>
-              <SortableTh field="strategy" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                Strategy
-              </SortableTh>
-              <SortableTh field="bar" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                TF
-              </SortableTh>
-              <SortableTh field="entry" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                Entry
-              </SortableTh>
+              <th className="th-static">Side</th>
+              <th className="th-static">Strategy</th>
+              <th className="th-static">TF</th>
+              <th className="th-static">Entry</th>
               {/* Current price is meaningless for a finished trade — its outcome is already
                   settled — so the live columns only appear where an open position can exist. */}
               {showLiveColumns && <th className="th-static">Last</th>}
               <th className="th-static">SL / TP</th>
-              <SortableTh field="leverage" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                Leverage
-              </SortableTh>
-              <SortableTh field="size" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                Entry Volume
-              </SortableTh>
+              <th className="th-static">Leverage</th>
+              <th className="th-static">Entry Volume</th>
               <SortableTh field="opened_at" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
                 Opened
               </SortableTh>
@@ -295,11 +230,7 @@ export default function PositionsPage() {
                   Closed
                 </SortableTh>
               )}
-              {showClosedColumns && (
-                <SortableTh field="reason" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                  Reason
-                </SortableTh>
-              )}
+              {showClosedColumns && <th className="th-static">Reason</th>}
               <SortableTh field="pnl" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
                 PnL
               </SortableTh>
@@ -308,7 +239,7 @@ export default function PositionsPage() {
             </tr>
           </thead>
           <tbody>
-            {visible.map((p: Position) => {
+            {(rows ?? []).map((p: Position) => {
               const lastPrice = livePrices[p.InstID]
               const live = unrealizedPnL(p, lastPrice)
               const isFork = p.Variant === 'rl_adjusted'
@@ -394,7 +325,7 @@ export default function PositionsPage() {
         </table>
         </div>
         <Pagination
-          page={safePage}
+          page={page}
           pageSize={pageSize}
           total={total}
           onPageChange={setPage}

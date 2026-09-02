@@ -103,12 +103,17 @@ export const api = {
     request<void>(`/assignments/${id}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
   deleteAssignment: (id: number) => request<void>(`/assignments/${id}`, { method: 'DELETE' }),
 
+  // Paged server-side since 2026-09-02: closed positions grew into the hundreds and fetching every
+  // row on every 5s poll (then sorting/paginating client-side) had become a genuinely slow query
+  // and a multi-MB payload. page is 0-indexed; pageSize defaults server-side if omitted.
   listPositions: (opts?: {
     mode?: PositionMode
     instId?: string
     open?: boolean
     sortBy?: 'opened_at' | 'closed_at' | 'pnl' | 'inst_id'
     sortDesc?: boolean
+    page?: number
+    pageSize?: number
   }) => {
     const params = new URLSearchParams()
     if (opts?.mode) params.set('mode', opts.mode)
@@ -116,7 +121,12 @@ export const api = {
     if (opts?.open !== undefined) params.set('open', String(opts.open))
     if (opts?.sortBy) params.set('sortBy', opts.sortBy)
     if (opts?.sortDesc) params.set('sortDesc', 'true')
-    return requestList<Position>(`/positions?${params}`)
+    if (opts?.page !== undefined) params.set('page', String(opts.page))
+    if (opts?.pageSize !== undefined) params.set('pageSize', String(opts.pageSize))
+    return request<{ items: Position[] | null; total: number }>(`/positions?${params}`).then((r) => ({
+      items: r.items ?? [],
+      total: r.total,
+    }))
   },
   // Manual close from the panel (2026-08-31): flags the order for PaperTrader to close on its
   // next tick, close_reason='manual', reported to the model as closed_early. Paper mode only.

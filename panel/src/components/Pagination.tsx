@@ -1,9 +1,11 @@
 export const PAGE_SIZE_OPTIONS = [20, 50, 100, 200]
 export const DEFAULT_PAGE_SIZE = 20
 
-// Client-side pagination over an already-fetched list. The positions endpoint returns the
-// full filtered set, so paging here avoids a round-trip per page and keeps the existing
-// 5s poll + WebSocket refresh path unchanged.
+// Renders the page controls; the fetch itself is server-side paginated (CLAUDE.md §11.4,
+// 2026-09-02 — the positions endpoint takes page/pageSize and returns just that page plus a
+// total count, since fetching every row to paginate client-side had become a slow query and a
+// multi-MB payload once closed positions numbered in the hundreds). onPageChange/onPageSizeChange
+// just update state the caller's fetch depends on.
 export default function Pagination({
   page,
   pageSize,

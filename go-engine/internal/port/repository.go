@@ -65,14 +65,23 @@ type StrategyStats struct {
 	LastActivity *time.Time
 }
 
-// PositionFilter selects/sorts positions across trading modes for the panel (CLAUDE.md §11.4).
+// PositionFilter selects/sorts/pages positions across trading modes for the panel (CLAUDE.md
+// §11.4). Limit/Offset were added 2026-09-02: the panel used to fetch every matching row on every
+// 5s poll and paginate/sort client-side, which became a genuinely slow query and a multi-MB
+// payload once closed positions numbered in the hundreds (each row carries FeaturesJSON, the full
+// decision-time observation, averaging ~3.8KB). Now capped server-side to one page at a time.
 type PositionFilter struct {
 	Mode   string // "paper", "demo", "real", or "" for all
 	InstID string // "" for all
 	Open   *bool  // nil = both open and closed
-	// SortBy: "opened_at" (default), "closed_at", "pnl", "inst_id". SortDesc reverses order.
+	// SortBy: "opened_at", "closed_at" (default), "pnl", "inst_id". SortDesc reverses order.
 	SortBy   string
 	SortDesc bool
+	// Limit caps the number of rows returned; <= 0 means no cap (used by callers that need the
+	// full set, e.g. handlePaperTradingStats' open-position count). Offset is rows to skip,
+	// applied only when Limit > 0.
+	Limit  int
+	Offset int
 }
 
 // PaperOrder is a virtual (forward-test) trade opened by the Paper Trading Engine (CLAUDE.md §8).
@@ -271,8 +280,12 @@ type Repository interface {
 	// (CLAUDE.md §15.11). Both are written together since they move as one high-water pair.
 	UpdatePaperOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error
 	// ListPositions returns positions (open and/or closed) across trading modes for the panel
-	// (CLAUDE.md §11.4), filtered/sorted per f.
+	// (CLAUDE.md §11.4), filtered/sorted/paged per f.
 	ListPositions(ctx context.Context, f PositionFilter) ([]PaperOrder, error)
+	// CountPositions returns how many rows f's Mode/InstID/Open filters match, ignoring
+	// SortBy/Limit/Offset — what the panel's pagination control needs to know the total page
+	// count, without pulling every row back just to len() it.
+	CountPositions(ctx context.Context, f PositionFilter) (int, error)
 
 	// GetAccountEquity returns mode's current balance row, creating it (seeded at initialUSD, with
 	// a reason="seed" history point) if it doesn't exist yet — CLAUDE.md §15.6.

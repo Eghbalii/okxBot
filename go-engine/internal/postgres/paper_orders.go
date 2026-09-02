@@ -108,18 +108,27 @@ func (r *Repository) RequestManualClose(ctx context.Context, id int64) error {
 }
 
 // positionSortColumns maps PositionFilter.SortBy to a safe, allowlisted SQL column/expression —
-// never interpolate the caller-provided SortBy string directly into the query.
+// never interpolate the caller-provided SortBy string directly into the query. Default changed to
+// closed_at (2026-09-02): a closed-position query is what actually got slow as the table grew,
+// and the panel's own default view for that filter is "most recently closed first" — opened_at
+// was never the interesting axis there.
 var positionSortColumns = map[string]string{
-	"":          "opened_at",
+	"":          "closed_at",
 	"opened_at": "opened_at",
 	"closed_at": "closed_at",
 	"pnl":       "realized_pnl",
 	"inst_id":   "inst_id",
 }
 
-// ListPositions returns positions across trading modes for the panel (CLAUDE.md §11.4), filtered
-// and sorted per f. Backs paper trading today; demo/real rows land in the same table (mode
+// ListPositions returns positions across trading modes for the panel (CLAUDE.md §11.4), filtered,
+// sorted, and paged per f. Backs paper trading today; demo/real rows land in the same table (mode
 // column) once cmd/trader writes them, so this query needs no changes when that lands.
+//
+// f.Limit/Offset (added 2026-09-02): with closed positions numbering in the hundreds, the panel's
+// old unbounded fetch-everything-then-paginate-client-side approach became a genuinely slow query
+// and a multi-MB payload (FeaturesJSON alone averages ~3.8KB/row) on every 5s poll. Limit<=0 keeps
+// the old unbounded behavior for callers that need the full set (e.g. an open-positions-only scan,
+// which is a small row count regardless).
 func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) ([]port.PaperOrder, error) {
 	col, ok := positionSortColumns[f.SortBy]
 	if !ok {
@@ -147,11 +156,13 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 			AND ($3::boolean IS NULL OR (po.closed_at IS NULL) = $3)
 		ORDER BY ` + orderClause
 
-	var openParam *bool
-	if f.Open != nil {
-		openParam = f.Open
+	args := []any{f.Mode, f.InstID, f.Open}
+	if f.Limit > 0 {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, f.Limit, f.Offset)
 	}
-	rows, err := r.pool.Query(ctx, query, f.Mode, f.InstID, openParam)
+
+	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list positions: %w", err)
 	}
@@ -172,6 +183,23 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// CountPositions returns how many rows f's Mode/InstID/Open filters match — what the panel's
+// pagination control needs to compute total page count without pulling every row back.
+func (r *Repository) CountPositions(ctx context.Context, f port.PositionFilter) (int, error) {
+	var count int
+	err := r.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM paper_orders po
+		WHERE ($1 = '' OR po.mode = $1)
+			AND ($2 = '' OR po.inst_id = $2)
+			AND ($3::boolean IS NULL OR (po.closed_at IS NULL) = $3)
+	`, f.Mode, f.InstID, f.Open).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count positions: %w", err)
+	}
+	return count, nil
 }
 
 // UpdatePaperOrderPnLExtremes advances an open order's peak/trough unrealized PnL (CLAUDE.md

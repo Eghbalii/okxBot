@@ -96,6 +96,9 @@ func (r *fakeRepository) StrategyStatsFor(ctx context.Context, strategyID int64)
 func (r *fakeRepository) ListPositions(ctx context.Context, f port.PositionFilter) ([]port.PaperOrder, error) {
 	return nil, nil
 }
+func (r *fakeRepository) CountPositions(ctx context.Context, f port.PositionFilter) (int, error) {
+	return 0, nil
+}
 func (r *fakeRepository) OpenPaperOrder(ctx context.Context, o port.PaperOrder) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

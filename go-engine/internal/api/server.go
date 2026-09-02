@@ -424,8 +424,27 @@ func (s *Server) handleDeleteAssignment(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// defaultPositionsPageSize/maxPositionsPageSize bound handleListPositions' pageSize query param —
+// added 2026-09-02 alongside server-side pagination (CLAUDE.md §11.4): with closed positions
+// numbering in the hundreds, fetching every row on every 5s poll had become a genuinely slow query
+// and a multi-MB payload, so the panel now asks for one page at a time. maxPositionsPageSize is a
+// hard ceiling so a malformed/oversized pageSize can't silently reintroduce the unbounded fetch.
+const (
+	defaultPositionsPageSize = 50
+	maxPositionsPageSize     = 200
+)
+
+// positionsListResponse wraps the page plus the total row count the filter matches, so the panel's
+// pagination control knows how many pages exist without a second request.
+type positionsListResponse struct {
+	Items []port.PaperOrder `json:"items"`
+	Total int               `json:"total"`
+}
+
 // handleListPositions serves the positions panel (CLAUDE.md §11.4): filterable by mode
-// (paper/demo/real), instrument, open/closed, sortable by opened_at/closed_at/pnl/inst_id.
+// (paper/demo/real), instrument, open/closed, sortable by opened_at/closed_at/pnl/inst_id, and
+// paged via page/pageSize (page is 0-indexed; pageSize defaults to defaultPositionsPageSize,
+// capped at maxPositionsPageSize).
 func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	filter := port.PositionFilter{
@@ -439,12 +458,35 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 		filter.Open = &open
 	}
 
+	pageSize := defaultPositionsPageSize
+	if v := q.Get("pageSize"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			pageSize = n
+		}
+	}
+	if pageSize > maxPositionsPageSize {
+		pageSize = maxPositionsPageSize
+	}
+	page := 0
+	if v := q.Get("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			page = n
+		}
+	}
+	filter.Limit = pageSize
+	filter.Offset = page * pageSize
+
 	list, err := s.Repo.ListPositions(r.Context(), filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	total, err := s.Repo.CountPositions(r.Context(), filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, positionsListResponse{Items: list, Total: total})
 }
 
 // handleClosePosition lets the panel close an open paper position by hand (2026-08-31 request).
