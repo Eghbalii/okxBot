@@ -55,9 +55,13 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      # Time-based retention (24h) is Kafka's equivalent of the old Redis Streams MAXLEN~100k cap —
-      # there's no per-topic override here, just the broker default, which is fine at this scale.
-      KAFKA_LOG_RETENTION_HOURS: 24
+      # Time-based retention is Kafka's equivalent of the old Redis Streams MAXLEN~100k cap — a
+      # safety window so a consumer that falls behind (crash/restart) can catch up without losing
+      # messages, not an archive. Lowered 24h -> 6h (2026-09-02): every consumer group here reads
+      # near-real-time, so 6h of buffer is ample slack, and it cuts steady-state Kafka disk usage
+      # roughly 4x — this was the single largest disk consumer on the box (CLAUDE.md's own
+      # resource-scaling discussion). There's no per-topic override here, just the broker default.
+      KAFKA_LOG_RETENTION_HOURS: 6
     ports:
       - "9094:9094" # host-reachable listener, for local dev tooling outside compose
     volumes:
