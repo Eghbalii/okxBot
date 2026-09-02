@@ -107,8 +107,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/account", s.handleGetAccount)
 	mux.HandleFunc("GET /api/account/history", s.handleAccountHistory)
 
-	mux.HandleFunc("GET /api/sltp-adjustments/stats", s.handleSLTPAdjustmentStats)
-	mux.HandleFunc("GET /api/sltp-adjustments/pairs", s.handleListSLTPAdjustmentPairs)
+	// CLAUDE.md §15.4/§15.12 revision, 2026-09-02: backs the order-detail modal's adjustment
+	// history table — replaces the old baseline-vs-rl_adjusted A/B comparison, which had no data
+	// once the SL/TP-adjust mechanic stopped forking orders.
+	mux.HandleFunc("GET /api/positions/{id}/adjustments", s.handleListPaperOrderAdjustments)
 
 	// CLAUDE.md §16 point 6: backs the Strategies page's price-line + parameter-change-marker
 	// chart — candles for the price line, param-changes for the vertical markers.
@@ -465,38 +467,21 @@ func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
 
-// handleSLTPAdjustmentStats serves the baseline-vs-rl_adjusted A/B comparison (CLAUDE.md §15.4):
-// aggregate win-rate/PnL for each variant, optionally filtered to one instrument and/or a lower
-// bound on when the baseline order was opened (e.g. "the last week").
-func (s *Server) handleSLTPAdjustmentStats(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	since := time.Time{}
-	if v := q.Get("since"); v != "" {
-		parsed, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid since (want RFC3339): "+err.Error())
-			return
-		}
-		since = parsed
+// handleListPaperOrderAdjustments serves an order's in-trade SL/TP adjustment history (CLAUDE.md
+// §15.4/§15.12 revision, 2026-09-02) — the audit trail the order-detail modal shows on click,
+// replacing the old baseline-vs-rl_adjusted A/B comparison.
+func (s *Server) handleListPaperOrderAdjustments(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt64(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
-
-	stats, err := s.Repo.SLTPAdjustmentStats(r.Context(), q.Get("instId"), since)
+	adjustments, err := s.Repo.ListPaperOrderAdjustments(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, stats)
-}
-
-// handleListSLTPAdjustmentPairs serves trade-level detail behind handleSLTPAdjustmentStats's
-// aggregate — every baseline/rl_adjusted pair, most-recently-opened first (CLAUDE.md §15.4).
-func (s *Server) handleListSLTPAdjustmentPairs(w http.ResponseWriter, r *http.Request) {
-	pairs, err := s.Repo.ListSLTPAdjustmentPairs(r.Context(), r.URL.Query().Get("instId"))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, pairs)
+	writeJSON(w, http.StatusOK, adjustments)
 }
 
 // handleListCandles serves a plain recent-history read of the durable candles hypertable

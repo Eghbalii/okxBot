@@ -83,9 +83,8 @@ type PaperOrder struct {
 	// Bar is the decision timeframe the signal that opened this order fired on (e.g. "5m", "1H").
 	// Captured at open time rather than reconstructed from strategy_assignments afterward, since
 	// one strategy can be assigned to several bars for the same instrument (CLAUDE.md §9) and the
-	// assignment table alone can't say which bar THIS particular order came from. A shadow fork
-	// (Variant="rl_adjusted") inherits its parent's bar. Empty for orders opened before this field
-	// existed.
+	// assignment table alone can't say which bar THIS particular order came from. Empty for orders
+	// opened before this field existed.
 	Bar          string
 	Side         string // "buy" or "sell"
 	EntryPx      decimal.Decimal
@@ -110,14 +109,13 @@ type PaperOrder struct {
 	PnLMaxPct decimal.Decimal
 	PnLMinPct decimal.Decimal
 
-	// ParentOrderID/Variant implement the SL/TP shadow-fork mechanic (CLAUDE.md §15.4): when the RL
-	// agent proposes an in-trade SL/TP adjustment, the original order (Variant="baseline",
-	// ParentOrderID=nil) is never edited — a linked fork (Variant="rl_adjusted", ParentOrderID set
-	// to the original's ID) carries the adjustment instead, and both are monitored to completion
-	// for later comparison. A fork is tracking-only: it must never be double-counted toward a
-	// token's budget/reward (§15.6/§15.7) — callers filter to Variant="baseline" for that.
+	// ParentOrderID/Variant are what remains of the SL/TP shadow-fork mechanic (CLAUDE.md §15.4),
+	// removed 2026-09-02 in favor of the RL agent editing an order's SL/TP in place
+	// (RecordPaperOrderAdjustment is the audit trail that replaces the fork). Every order is now
+	// Variant="baseline"/ParentOrderID=nil going forward; the columns and this Go-side pair stay
+	// only so historical rows from before the change still scan correctly.
 	ParentOrderID *int64
-	Variant       string // "baseline" (default) or "rl_adjusted"
+	Variant       string // "baseline" (default); "rl_adjusted" only appears in historical rows
 
 	// StrategyName is joined in by ListPositions for display (CLAUDE.md §11.4's positions panel) —
 	// not a stored column, and not populated by OpenPaperOrder/ListOpenPaperOrders. Empty when
@@ -128,27 +126,6 @@ type PaperOrder struct {
 	// request) and checked by PaperTrader.monitorOpenOrders on its next tick — cmd/api runs in a
 	// separate process and cannot run the real close path itself, so this is intent, not a close.
 	ManualCloseRequested bool
-}
-
-// VariantStats summarizes one SL/TP-adjustment variant's closed-trade track record for the
-// baseline-vs-rl_adjusted comparison (CLAUDE.md §15.4) — one of these per variant, so the caller
-// can put them side by side.
-type VariantStats struct {
-	Variant     string // "baseline" or "rl_adjusted"
-	ClosedCount int64
-	Wins        int64 // close_reason = 'tp'
-	Losses      int64 // close_reason = 'sl'
-	RealizedPnL decimal.Decimal
-}
-
-// SLTPAdjustmentPair links one baseline order to its rl_adjusted fork (CLAUDE.md §15.4) for
-// trade-level (not just aggregate) comparison — e.g. a panel table of "this specific decision
-// helped/hurt."  Either side may still be open (ClosedAt/RealizedPnL nil) if the pair hasn't
-// resolved yet.
-type SLTPAdjustmentPair struct {
-	InstID          string
-	BaselineOrder   PaperOrder
-	RLAdjustedOrder PaperOrder
 }
 
 // AccountEquity is one trading mode's shared running balance (CLAUDE.md §15.6, revised
@@ -223,6 +200,20 @@ type ParamChange struct {
 	CreatedAt  time.Time
 }
 
+// PaperOrderAdjustment is one row of a paper order's in-trade SL/TP adjustment history (CLAUDE.md
+// §15.4/§15.12 revision, 2026-09-02): the RL SL/TP-adjust mechanic edits the order's SL/TP in
+// place rather than forking, and each field it moves gets its own append-only row here so a
+// click on the order in the panel can show exactly what changed and when.
+type PaperOrderAdjustment struct {
+	ID        int64
+	OrderID   int64
+	Field     string // "sl" or "tp"
+	OldValue  *decimal.Decimal
+	NewValue  *decimal.Decimal
+	Source    string // "model", "optimizer", or "manual"
+	CreatedAt time.Time
+}
+
 // Repository is the persistence port. internal/postgres implements this.
 type Repository interface {
 	SaveCandle(ctx context.Context, c Candle) error
@@ -256,16 +247,11 @@ type Repository interface {
 	// UpdatePaperOrderSLTP applies an in-trade SL/TP adjustment to an open order (CLAUDE.md §15.4).
 	// Callers MUST have already run the proposed new prices through the ratchet clamp
 	// (usecase.RatchetSLTP) before calling this — the repository does not re-validate the ratchet
-	// constraint itself. Deprecated for RL-driven adjustments as of the shadow-fork mechanic below
-	// (kept for any future non-forking/manual SL-TP edit path); the RL loop calls
-	// ForkPaperOrderWithSLTP instead.
+	// constraint itself. This is now the ONLY path the RL SL/TP-adjust mechanic uses (2026-09-02
+	// revision): it used to fork the order instead of editing it, but fork volume grew large
+	// enough to distort per-strategy stats, so the mechanic now edits the one real order directly
+	// and RecordPaperOrderAdjustment (below) is the audit trail that replaces the fork.
 	UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error
-	// ForkPaperOrderWithSLTP implements the SL/TP shadow-fork mechanic (CLAUDE.md §15.4): creates a
-	// new PaperOrder row cloned from the still-open order at parentID (same inst_id/side/entry_px/
-	// strategy_id/size/leverage/opened_at) but with slPx/tpPx applied and Variant="rl_adjusted",
-	// ParentOrderID=parentID. The parent order itself is left untouched. Returns the new fork's id.
-	// Callers MUST have already run slPx/tpPx through the ratchet clamp (usecase.RatchetSLTP).
-	ForkPaperOrderWithSLTP(ctx context.Context, parentID int64, slPx, tpPx *decimal.Decimal) (int64, error)
 	ListOpenPaperOrders(ctx context.Context, instID string) ([]PaperOrder, error)
 	// RequestManualClose flags an open order for the panel's manual close button (2026-08-31
 	// request). cmd/api runs in a separate process from the PaperTrader that owns this order's
@@ -302,17 +288,16 @@ type Repository interface {
 	// oldest-first for direct plotting. A zero since means no lower bound; limit<=0 means no cap.
 	ListEquityHistory(ctx context.Context, mode string, since time.Time, limit int) ([]EquityPoint, error)
 
-	// SLTPAdjustmentStats aggregates CLOSED baseline vs. rl_adjusted trades into one VariantStats
-	// per variant (CLAUDE.md §15.4's A/B comparison) — instID/since filter the underlying
-	// paper_orders; instID="" means all instruments, since=zero time means no lower bound. Only
-	// baseline orders that actually have an rl_adjusted fork are counted on the "baseline" side, so
-	// the comparison is apples-to-apples (a baseline order nobody ever proposed adjusting isn't
-	// counted as evidence either way).
-	SLTPAdjustmentStats(ctx context.Context, instID string, since time.Time) ([]VariantStats, error)
-	// ListSLTPAdjustmentPairs returns every baseline/rl_adjusted pair for instID (or all
-	// instruments if ""), most-recently-opened first, for trade-level (not just aggregate)
-	// review — CLAUDE.md §15.4.
-	ListSLTPAdjustmentPairs(ctx context.Context, instID string) ([]SLTPAdjustmentPair, error)
+	// RecordPaperOrderAdjustment appends one entry to an order's in-trade SL/TP adjustment history
+	// (CLAUDE.md §15.4/§15.12 revision, 2026-09-02) — replaces the old shadow-fork mechanic's
+	// implicit "look at the fork's levels" comparison with an explicit, append-only log so a click
+	// on the order in the panel can show exactly what changed, when, and by whom (model, the
+	// strategy-optimizer, or a manual edit). oldValue/newValue are nil-able since a field can be
+	// set from nothing (first adjustment) or unset (not expected today, but the column allows it).
+	RecordPaperOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error
+	// ListPaperOrderAdjustments returns orderID's adjustment history, oldest first — the shape the
+	// panel's order-detail modal consumes to render a chronological change table.
+	ListPaperOrderAdjustments(ctx context.Context, orderID int64) ([]PaperOrderAdjustment, error)
 
 	// RecordParamChange appends one entry to a strategy's durable parameter-change timeline
 	// (CLAUDE.md §16, §16.3 step 5) — called both by cmd/strategy-optimizer after persisting a

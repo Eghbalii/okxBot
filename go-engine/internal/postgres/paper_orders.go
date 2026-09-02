@@ -31,24 +31,6 @@ func (r *Repository) OpenPaperOrder(ctx context.Context, o port.PaperOrder) (int
 	return id, nil
 }
 
-// ForkPaperOrderWithSLTP implements the SL/TP shadow-fork mechanic (CLAUDE.md §15.4): clones the
-// still-open order at parentID with slPx/tpPx applied, tagged as an "rl_adjusted" variant linked
-// back to its parent. The parent row is untouched by this call.
-func (r *Repository) ForkPaperOrderWithSLTP(ctx context.Context, parentID int64, slPx, tpPx *decimal.Decimal) (int64, error) {
-	var id int64
-	err := r.pool.QueryRow(ctx, `
-		INSERT INTO paper_orders (inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, features_json, mode, parent_order_id, variant, opened_at, bar)
-		SELECT inst_id, strategy_id, side, entry_px, $2, $3, size, leverage, features_json, mode, id, 'rl_adjusted', opened_at, bar
-		FROM paper_orders
-		WHERE id = $1 AND closed_at IS NULL
-		RETURNING id
-	`, parentID, slPx, tpPx).Scan(&id)
-	if err != nil {
-		return 0, fmt.Errorf("fork paper order %d with adjusted SL/TP: %w", parentID, err)
-	}
-	return id, nil
-}
-
 // ClosePaperOrder marks a virtual trade closed with its realized outcome.
 func (r *Repository) ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error {
 	_, err := r.pool.Exec(ctx, `

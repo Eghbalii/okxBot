@@ -1,19 +1,18 @@
 import type {
   Candle,
   ModelStatus,
+  PaperOrderAdjustment,
   PaperTradingConfig,
   PaperTradingStats,
   ParamChange,
   Position,
   PositionMode,
-  SLTPAdjustmentPair,
   StrategyAssignment,
   StrategyConfig,
   StrategyStats,
   TesterConfig,
   TesterVersion,
   TesterVersionDetail,
-  VariantStats,
 } from './types'
 
 // Same-origin in production (the panel is served from behind the OpenVPN-only cmd/api host, per
@@ -124,19 +123,11 @@ export const api = {
   closePosition: (id: number) =>
     request<{ ok: boolean }>(`/positions/${id}/close`, { method: 'POST' }),
 
-  // Baseline-vs-rl_adjusted A/B comparison (CLAUDE.md §15.4). `since` is an RFC3339 timestamp
-  // (e.g. `new Date(Date.now() - 7*86400e3).toISOString()` for "the last week").
-  sltpAdjustmentStats: (opts?: { instId?: string; since?: string }) => {
-    const params = new URLSearchParams()
-    if (opts?.instId) params.set('instId', opts.instId)
-    if (opts?.since) params.set('since', opts.since)
-    return requestList<VariantStats>(`/sltp-adjustments/stats?${params}`)
-  },
-  sltpAdjustmentPairs: (opts?: { instId?: string }) => {
-    const params = new URLSearchParams()
-    if (opts?.instId) params.set('instId', opts.instId)
-    return requestList<SLTPAdjustmentPair>(`/sltp-adjustments/pairs?${params}`)
-  },
+  // An order's in-trade SL/TP adjustment history (CLAUDE.md §15.4/§15.12 revision, 2026-09-02) —
+  // replaces the old baseline-vs-rl_adjusted A/B comparison now that the RL mechanic edits the
+  // order in place instead of forking it.
+  paperOrderAdjustments: (orderId: number) =>
+    requestList<PaperOrderAdjustment>(`/positions/${orderId}/adjustments`),
 
   // Candles + param-changes back the Strategies page's price-chart marker overlay (CLAUDE.md
   // §16): candles draw the price line, param-changes draw the vertical "params changed here"

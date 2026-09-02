@@ -168,7 +168,7 @@ func (e *PaperTrader) runUpdates(ctx context.Context, bar string, price decimal.
 			e.closeEarly(ctx, o, price, logger)
 		case domain.ActionUpdate:
 			metrics.ModelUpdateDecisionsTotal.WithLabelValues(e.InstID, "update").Inc()
-			e.applyAdjustment(ctx, o, action, price, open, logger)
+			e.applyAdjustment(ctx, o, action, price, logger)
 		default:
 			// ActionNone, or anything the model emitted that has no meaning for an update — leave
 			// the position alone. Treating an unrecognized action as "do nothing" is the safe
@@ -178,28 +178,13 @@ func (e *PaperTrader) runUpdates(ctx context.Context, bar string, price decimal.
 	}
 }
 
-// applyAdjustment turns the model's proposed SL/TP levels into a shadow fork (CLAUDE.md §15.4):
-// the original order is never edited, so what the un-adjusted trade would have done stays
-// observable. Both run to completion and are compared afterward.
-func (e *PaperTrader) applyAdjustment(ctx context.Context, o port.PaperOrder, action *domain.Action, price decimal.Decimal, open []port.PaperOrder, logger *slog.Logger) {
-	if o.Variant == "rl_adjusted" {
-		return // no fork-of-a-fork; see runUpdates
-	}
-
-	// At most ONE fork per baseline. §15.4's mechanic is a same-entry A/B — one un-adjusted
-	// control against one adjusted variant — and a second fork of the same parent makes that
-	// comparison meaningless: there is no longer a single "the adjusted trade" to compare against.
-	// Every subsequent adjustment therefore EDITS the existing fork rather than branching again.
-	//
-	// Observed 2026-08-29: 49 forks across only 12 baselines, one parent carrying 8 of them
-	// (HYPE-USDT-SWAP order 51). Each fork is itself an open position that draws its own update
-	// calls, so the branching compounds: more forks produce more adjustments produce more forks.
-	// The guard above only stopped a fork from forking, never a baseline from being forked twice.
-	if existing := forkOf(o.ID, open); existing != nil {
-		e.updateFork(ctx, o, *existing, action, price, logger)
-		return
-	}
-
+// applyAdjustment applies the model's proposed SL/TP levels directly to the order (CLAUDE.md
+// §15.4/§15.12 revision, 2026-09-02). This used to fork the order instead of editing it — a
+// same-entry A/B mechanic — but fork volume grew large enough to distort per-strategy stats and
+// made a single adjustment hard to tell from a duplicate. Every SL/TP move is now applied in
+// place and logged as its own row via RecordPaperOrderAdjustment, which is the audit trail a
+// click on the order in the panel reads instead of a fork-vs-baseline comparison.
+func (e *PaperTrader) applyAdjustment(ctx context.Context, o port.PaperOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
 	// The model sets levels (§15.11) while the ratchet reasons in relative moves, so convert here.
 	slAdjust := levelAdjustPct(o.SLPx, action.SLPx, price)
 	tpAdjust := levelAdjustPct(o.TPPx, action.TPPx, price)
@@ -209,52 +194,29 @@ func (e *PaperTrader) applyAdjustment(ctx context.Context, o port.PaperOrder, ac
 
 	newSL, newTP := RatchetSLTP(o, price, slAdjust, tpAdjust)
 	if samePriceOrNil(newSL, o.SLPx) && samePriceOrNil(newTP, o.TPPx) {
-		return // the ratchet rejected the proposal entirely; nothing to fork
+		return // the ratchet rejected the proposal entirely; nothing to apply
 	}
 
-	forkID, err := e.Repo.ForkPaperOrderWithSLTP(ctx, o.ID, newSL, newTP)
-	if err != nil {
-		logger.Warn("lifecycle: fork failed", "instId", e.InstID, "orderId", o.ID, "error", err)
+	if err := e.Repo.UpdatePaperOrderSLTP(ctx, o.ID, newSL, newTP); err != nil {
+		logger.Warn("lifecycle: sl/tp update failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 		return
 	}
-	logger.Info("lifecycle: sl/tp adjustment forked", "instId", e.InstID,
-		"parentId", o.ID, "forkId", forkID, "newSL", newSL, "newTP", newTP)
-}
 
-// forkOf returns the open rl_adjusted child of parentID, or nil when it has none.
-func forkOf(parentID int64, open []port.PaperOrder) *port.PaperOrder {
-	for i := range open {
-		o := &open[i]
-		if o.Variant == "rl_adjusted" && o.ParentOrderID != nil && *o.ParentOrderID == parentID {
-			return o
+	// Only log a row for the field(s) that actually moved — a proposal touching just SL (or just
+	// TP) shouldn't manufacture a no-op history entry for the other.
+	if !samePriceOrNil(newSL, o.SLPx) {
+		if err := e.Repo.RecordPaperOrderAdjustment(ctx, o.ID, "sl", o.SLPx, newSL, "model"); err != nil {
+			logger.Warn("lifecycle: record sl adjustment failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 		}
 	}
-	return nil
-}
-
-// updateFork applies a further adjustment to a baseline's existing fork, in place. The ratchet is
-// evaluated against the FORK's current levels, not the baseline's: the fork is what actually
-// carries the adjusted stop, so measuring the move from the baseline would let a level that has
-// already been tightened be re-proposed as if it were still at its original distance, quietly
-// undoing the ratchet's only-tighten guarantee.
-func (e *PaperTrader) updateFork(ctx context.Context, baseline, fork port.PaperOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
-	slAdjust := levelAdjustPct(fork.SLPx, action.SLPx, price)
-	tpAdjust := levelAdjustPct(fork.TPPx, action.TPPx, price)
-	if slAdjust.IsZero() && tpAdjust.IsZero() {
-		return
+	if !samePriceOrNil(newTP, o.TPPx) {
+		if err := e.Repo.RecordPaperOrderAdjustment(ctx, o.ID, "tp", o.TPPx, newTP, "model"); err != nil {
+			logger.Warn("lifecycle: record tp adjustment failed", "instId", e.InstID, "orderId", o.ID, "error", err)
+		}
 	}
 
-	newSL, newTP := RatchetSLTP(fork, price, slAdjust, tpAdjust)
-	if samePriceOrNil(newSL, fork.SLPx) && samePriceOrNil(newTP, fork.TPPx) {
-		return // the ratchet rejected the proposal entirely
-	}
-
-	if err := e.Repo.UpdatePaperOrderSLTP(ctx, fork.ID, newSL, newTP); err != nil {
-		logger.Warn("lifecycle: fork update failed", "instId", e.InstID, "forkId", fork.ID, "error", err)
-		return
-	}
-	logger.Info("lifecycle: sl/tp adjustment applied to existing fork", "instId", e.InstID,
-		"parentId", baseline.ID, "forkId", fork.ID, "newSL", newSL, "newTP", newTP)
+	logger.Info("lifecycle: sl/tp adjustment applied", "instId", e.InstID,
+		"orderId", o.ID, "newSL", newSL, "newTP", newTP)
 }
 
 // closeEarly closes a position at the live price because the model asked to (CLAUDE.md §15.12).

@@ -1,4 +1,6 @@
-import type { Position } from '../api/types'
+import { useEffect, useState } from 'react'
+import { api } from '../api/client'
+import type { PaperOrderAdjustment, Position } from '../api/types'
 
 // The decision-time observation persisted on the order (CLAUDE.md §15.3) — what the model was
 // ASKED. Only the fields this view compares are typed; the rest of the payload is ignored.
@@ -63,6 +65,60 @@ function Row({ label, strategy, model }: { label: string; strategy: string; mode
         {model}
       </td>
     </tr>
+  )
+}
+
+// Chronological table of every in-trade SL/TP move made on this order (CLAUDE.md §15.4/§15.12
+// revision, 2026-09-02) — replaces the old baseline-vs-rl_adjusted A/B comparison now that the RL
+// mechanic edits the order in place instead of forking it.
+function AdjustmentHistory({ orderId }: { orderId: number }) {
+  const [adjustments, setAdjustments] = useState<PaperOrderAdjustment[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    api
+      .paperOrderAdjustments(orderId)
+      .then((rows) => {
+        if (!cancelled) setAdjustments(rows)
+      })
+      .catch((err) => {
+        if (!cancelled) setError((err as Error).message)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [orderId])
+
+  if (error) return <div className="error-banner">Failed to load adjustment history: {error}</div>
+  if (adjustments === null) return <div className="text-dim">Loading adjustment history…</div>
+  if (adjustments.length === 0) {
+    return <div className="text-dim">No in-trade SL/TP adjustments have been made on this order.</div>
+  }
+
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>When</th>
+          <th>Field</th>
+          <th>Old → new</th>
+          <th>Source</th>
+        </tr>
+      </thead>
+      <tbody>
+        {adjustments.map((a) => (
+          <tr key={a.ID}>
+            <td className="mono">{new Date(a.CreatedAt).toLocaleString()}</td>
+            <td>{a.Field.toUpperCase()}</td>
+            <td className="mono">
+              {fmt(a.OldValue)} → {fmt(a.NewValue)}
+            </td>
+            <td>{a.Source}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   )
 }
 
@@ -145,10 +201,8 @@ export default function OrderDetailModal({
             )}
           </span>
         </div>
-        <div className="stat-row">
-          <span className="text-dim">Variant</span>
-          <span className="mono">{position.Variant || 'baseline'}</span>
-        </div>
+        <h3 style={{ marginTop: '1rem' }}>Adjustment history</h3>
+        <AdjustmentHistory orderId={position.ID} />
       </div>
     </div>
   )

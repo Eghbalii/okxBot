@@ -50,9 +50,10 @@ export interface Position {
   ClosePx: string | null
   RealizedPnL: string | null
   Mode: PositionMode
-  // ParentOrderID/Variant implement the SL/TP shadow-fork mechanic (CLAUDE.md §15.4): a
-  // 'rl_adjusted' row is a linked copy of its 'baseline' parent carrying an RL-proposed SL/TP
-  // adjustment, tracked to completion for later comparison rather than editing the parent in place.
+  // ParentOrderID/Variant are what remains of the SL/TP shadow-fork mechanic (CLAUDE.md §15.4),
+  // removed 2026-09-02 in favor of the RL agent editing an order's SL/TP in place — every order is
+  // now Variant='baseline'/ParentOrderID=null going forward; 'rl_adjusted' only appears on
+  // historical rows from before the change.
   ParentOrderID: number | null
   Variant: 'baseline' | 'rl_adjusted' | ''
   // Bar is the decision timeframe the signal that opened this order fired on (e.g. "5m", "1H").
@@ -66,19 +67,17 @@ export interface Position {
   FeaturesJSON: unknown
 }
 
-// VariantStats/SLTPAdjustmentPair back the baseline-vs-rl_adjusted A/B comparison (CLAUDE.md §15.4).
-export interface VariantStats {
-  Variant: 'baseline' | 'rl_adjusted'
-  ClosedCount: number
-  Wins: number
-  Losses: number
-  RealizedPnL: string
-}
-
-export interface SLTPAdjustmentPair {
-  InstID: string
-  BaselineOrder: Position
-  RLAdjustedOrder: Position
+// PaperOrderAdjustment is one row of an order's in-trade SL/TP adjustment history (CLAUDE.md
+// §15.4/§15.12 revision, 2026-09-02) — the audit trail that replaced the shadow-fork mechanic's
+// implicit fork-vs-baseline comparison; the order-detail modal renders these as a change table.
+export interface PaperOrderAdjustment {
+  ID: number
+  OrderID: number
+  Field: 'sl' | 'tp'
+  OldValue: string | null
+  NewValue: string | null
+  Source: 'model' | 'optimizer' | 'manual'
+  CreatedAt: string
 }
 
 export interface RLHealth {

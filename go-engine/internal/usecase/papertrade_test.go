@@ -28,6 +28,7 @@ type fakeRepository struct {
 	accounts           map[string]port.AccountEquity
 	equityPoints       []port.EquityPoint
 	paramChanges       []port.ParamChange
+	orderAdjustments   []port.PaperOrderAdjustment
 	paperTradingConfig *port.PaperTradingConfig
 }
 
@@ -192,22 +193,25 @@ func (r *fakeRepository) UpdatePaperOrderSLTP(ctx context.Context, id int64, slP
 	r.orders[id] = o
 	return nil
 }
-func (r *fakeRepository) ForkPaperOrderWithSLTP(ctx context.Context, parentID int64, slPx, tpPx *decimal.Decimal) (int64, error) {
+func (r *fakeRepository) RecordPaperOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	parent, ok := r.orders[parentID]
-	if !ok || parent.ClosedAt != nil {
-		return 0, fmt.Errorf("fork: parent order %d not open", parentID)
-	}
 	r.nextID++
-	fork := parent
-	fork.ID = r.nextID
-	fork.SLPx = slPx
-	fork.TPPx = tpPx
-	fork.ParentOrderID = &parentID
-	fork.Variant = "rl_adjusted"
-	r.orders[fork.ID] = fork
-	return fork.ID, nil
+	r.orderAdjustments = append(r.orderAdjustments, port.PaperOrderAdjustment{
+		ID: r.nextID, OrderID: orderID, Field: field, OldValue: oldValue, NewValue: newValue, Source: source,
+	})
+	return nil
+}
+func (r *fakeRepository) ListPaperOrderAdjustments(ctx context.Context, orderID int64) ([]port.PaperOrderAdjustment, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []port.PaperOrderAdjustment
+	for _, a := range r.orderAdjustments {
+		if a.OrderID == orderID {
+			out = append(out, a)
+		}
+	}
+	return out, nil
 }
 func (r *fakeRepository) UpdatePaperOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error {
 	r.mu.Lock()
@@ -281,64 +285,6 @@ func (r *fakeRepository) ListEquityHistory(ctx context.Context, mode string, sin
 	return out, nil
 }
 
-func (r *fakeRepository) SLTPAdjustmentStats(ctx context.Context, instID string, since time.Time) ([]port.VariantStats, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	adjustedBaselineIDs := make(map[int64]bool)
-	for _, o := range r.orders {
-		if o.Variant == "rl_adjusted" && o.ParentOrderID != nil {
-			if b, ok := r.orders[*o.ParentOrderID]; ok && (instID == "" || b.InstID == instID) && !b.OpenedAt.Before(since) {
-				adjustedBaselineIDs[*o.ParentOrderID] = true
-			}
-		}
-	}
-
-	baseline := port.VariantStats{Variant: "baseline", RealizedPnL: decimal.Zero}
-	adjusted := port.VariantStats{Variant: "rl_adjusted", RealizedPnL: decimal.Zero}
-	for _, o := range r.orders {
-		if o.Variant == "baseline" || o.Variant == "" {
-			if !adjustedBaselineIDs[o.ID] {
-				continue
-			}
-			accumulateVariantStats(&baseline, o)
-		} else if o.Variant == "rl_adjusted" && o.ParentOrderID != nil && adjustedBaselineIDs[*o.ParentOrderID] {
-			accumulateVariantStats(&adjusted, o)
-		}
-	}
-	return []port.VariantStats{baseline, adjusted}, nil
-}
-func accumulateVariantStats(vs *port.VariantStats, o port.PaperOrder) {
-	if o.ClosedAt == nil {
-		return
-	}
-	vs.ClosedCount++
-	if o.CloseReason != nil && *o.CloseReason == "tp" {
-		vs.Wins++
-	}
-	if o.CloseReason != nil && *o.CloseReason == "sl" {
-		vs.Losses++
-	}
-	if o.RealizedPnL != nil {
-		vs.RealizedPnL = vs.RealizedPnL.Add(*o.RealizedPnL)
-	}
-}
-func (r *fakeRepository) ListSLTPAdjustmentPairs(ctx context.Context, instID string) ([]port.SLTPAdjustmentPair, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	var out []port.SLTPAdjustmentPair
-	for _, o := range r.orders {
-		if o.Variant != "rl_adjusted" || o.ParentOrderID == nil {
-			continue
-		}
-		b, ok := r.orders[*o.ParentOrderID]
-		if !ok || (instID != "" && b.InstID != instID) {
-			continue
-		}
-		out = append(out, port.SLTPAdjustmentPair{InstID: b.InstID, BaselineOrder: b, RLAdjustedOrder: o})
-	}
-	return out, nil
-}
 func (r *fakeRepository) ListOpenPaperOrders(ctx context.Context, instID string) ([]port.PaperOrder, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1154,7 +1100,7 @@ func (f *fakeModelClientRL) Predict(ctx context.Context, obs domain.Observation)
 	return &a, nil
 }
 
-func TestRunUpdates_ForksOnNonZeroAdjustment(t *testing.T) {
+func TestRunUpdates_AppliesAdjustmentInPlace(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
 	pt.candles = map[string][]domain.Candle{"1m": {
@@ -1181,40 +1127,33 @@ func TestRunUpdates_ForksOnNonZeroAdjustment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list open orders: %v", err)
 	}
-	if len(orders) != 2 {
-		t.Fatalf("expected baseline + 1 fork = 2 open orders, got %d", len(orders))
+	if len(orders) != 1 {
+		t.Fatalf("expected the adjustment to edit the existing order in place, not create a new one — got %d open orders", len(orders))
 	}
-
-	var baseline, fork *port.PaperOrder
-	for i := range orders {
-		o := orders[i]
-		if o.ID == id {
-			baseline = &o
-		} else {
-			fork = &o
-		}
-	}
-	if baseline == nil || fork == nil {
-		t.Fatalf("expected to find both baseline (id=%d) and a fork among %+v", id, orders)
-	}
-	if !baseline.SLPx.Equal(sl) || !baseline.TPPx.Equal(tp) {
-		t.Errorf("expected baseline order's SL/TP untouched, got sl=%s tp=%s", baseline.SLPx, baseline.TPPx)
-	}
-	if fork.Variant != "rl_adjusted" || fork.ParentOrderID == nil || *fork.ParentOrderID != id {
-		t.Errorf("expected fork tagged rl_adjusted with parent %d, got variant=%s parent=%v", id, fork.Variant, fork.ParentOrderID)
+	edited := orders[0]
+	if edited.ID != id {
+		t.Fatalf("expected the same order id %d to remain, got %d", id, edited.ID)
 	}
 	// SL should have tightened (moved up from 95, toward locking profit at price 105).
-	if !fork.SLPx.GreaterThan(sl) {
-		t.Errorf("expected fork's SL to have tightened above %s, got %s", sl, fork.SLPx)
+	if !edited.SLPx.GreaterThan(sl) {
+		t.Errorf("expected SL to have tightened above %s, got %s", sl, edited.SLPx)
+	}
+
+	adjustments, err := repo.ListPaperOrderAdjustments(context.Background(), id)
+	if err != nil {
+		t.Fatalf("list adjustments: %v", err)
+	}
+	if len(adjustments) == 0 {
+		t.Fatalf("expected at least one adjustment row to be recorded")
+	}
+	for _, a := range adjustments {
+		if a.Source != "model" {
+			t.Errorf("expected adjustment source=model, got %q", a.Source)
+		}
 	}
 }
 
-// A baseline gets at most ONE fork: §15.4's mechanic is a same-entry A/B, one control against one
-// adjusted variant, and a second fork of the same parent destroys that comparison. Observed
-// 2026-08-29 as 49 forks across only 12 baselines — HYPE-USDT-SWAP order 51 alone had 8, since
-// each fork is itself an open position drawing its own update calls, so the branching compounded.
-// Further adjustments must EDIT the existing fork instead.
-func TestRunUpdates_SecondAdjustmentEditsForkInsteadOfBranching(t *testing.T) {
+func TestRunUpdates_RepeatedAdjustmentsAllApplyToSameOrder(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
 	pt.candles = map[string][]domain.Candle{"1m": {
@@ -1231,7 +1170,8 @@ func TestRunUpdates_SecondAdjustmentEditsForkInsteadOfBranching(t *testing.T) {
 		t.Fatalf("open baseline order: %v", err)
 	}
 
-	// Three adjustment rounds, each proposing a tighter stop than the last.
+	// Three adjustment rounds, each proposing a tighter stop than the last — all must apply to the
+	// same order id, never spawn a new one (CLAUDE.md's 2026-09-02 revision away from shadow forks).
 	for i, proposed := range []string{"97", "99", "101"} {
 		model.action = domain.Action{Action: domain.ActionUpdate, SLPx: dec(proposed), TPPx: dec("108")}
 		pt.lifecycle = nil // clear the conductor's per-order update cadence so each round fires
@@ -1239,36 +1179,31 @@ func TestRunUpdates_SecondAdjustmentEditsForkInsteadOfBranching(t *testing.T) {
 		pt.runUpdates(context.Background(), "1m", dec("105"), testLogger())
 
 		orders, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
-		forks := 0
-		for _, o := range orders {
-			if o.Variant == "rl_adjusted" {
-				forks++
-			}
+		if len(orders) != 1 {
+			t.Fatalf("round %d: expected exactly 1 open order, got %d", i+1, len(orders))
 		}
-		if forks > 1 {
-			t.Fatalf("round %d: expected at most 1 fork per baseline, got %d", i+1, forks)
+		if orders[0].ID != baselineID {
+			t.Fatalf("round %d: expected order id to stay %d, got %d", i+1, baselineID, orders[0].ID)
 		}
 	}
 
-	orders, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
-	if len(orders) != 2 {
-		t.Fatalf("expected baseline + exactly 1 fork = 2 orders, got %d", len(orders))
+	adjustments, err := repo.ListPaperOrderAdjustments(context.Background(), baselineID)
+	if err != nil {
+		t.Fatalf("list adjustments: %v", err)
 	}
-	for _, o := range orders {
-		if o.ID == baselineID && (!o.SLPx.Equal(sl) || !o.TPPx.Equal(tp)) {
-			t.Errorf("baseline must stay untouched, got sl=%s tp=%s", o.SLPx, o.TPPx)
-		}
+	if len(adjustments) < 3 {
+		t.Errorf("expected at least 3 recorded SL adjustment rows (one per round), got %d", len(adjustments))
 	}
 }
 
-func TestRunUpdates_NoOpActionDoesNotFork(t *testing.T) {
+func TestRunUpdates_NoOpActionDoesNotChangeOrder(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
 	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
 	pt.Model = &fakeModelClientRL{action: domain.Action{}} // zero adjustment, matches the no-op fail-safe
 
 	sl := dec("95")
-	_, err := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+	id, err := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
 		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, Size: dec("100"), Leverage: dec("1"),
 	})
 	if err != nil {
@@ -1282,7 +1217,15 @@ func TestRunUpdates_NoOpActionDoesNotFork(t *testing.T) {
 		t.Fatalf("list open orders: %v", err)
 	}
 	if len(orders) != 1 {
-		t.Errorf("expected no fork for a zero-adjustment action, got %d open orders", len(orders))
+		t.Errorf("expected no new order for a zero-adjustment action, got %d open orders", len(orders))
+	}
+
+	adjustments, err := repo.ListPaperOrderAdjustments(context.Background(), id)
+	if err != nil {
+		t.Fatalf("list adjustments: %v", err)
+	}
+	if len(adjustments) != 0 {
+		t.Errorf("expected no adjustment rows recorded for a zero-adjustment action, got %d", len(adjustments))
 	}
 }
 
@@ -1361,94 +1304,41 @@ func TestHandleTick_RLAdjustThrottled(t *testing.T) {
 	}
 }
 
-func TestSLTPAdjustmentStats_AggregatesPairedTradesOnly(t *testing.T) {
+// TestPaperOrderAdjustments_RecordAndListRoundTrip covers the fake's implementation of the
+// adjustment-log methods directly (CLAUDE.md §15.4/§15.12 revision, 2026-09-02) — the repository
+// contract TestRunUpdates_AppliesAdjustmentInPlace exercises indirectly through the lifecycle.
+func TestPaperOrderAdjustments_RecordAndListRoundTrip(t *testing.T) {
 	repo := newFakeRepository()
 	ctx := context.Background()
 
-	// Baseline #1: has a fork, both closed. Baseline wins (tp), fork loses (sl). The fork must be
-	// created (ForkPaperOrderWithSLTP requires an open parent) BEFORE the baseline is closed.
-	closedAt1 := time.Now()
-	pnl1 := dec("5")
-	tpReason := "tp"
-	baseline1ID, _ := repo.OpenPaperOrder(ctx, port.PaperOrder{InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), Variant: "baseline"})
+	orderID, _ := repo.OpenPaperOrder(ctx, port.PaperOrder{InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100")})
+	otherID, _ := repo.OpenPaperOrder(ctx, port.PaperOrder{InstID: "ETH-USDT-SWAP", Side: "buy", EntryPx: dec("100")})
 
-	forkPnl1 := dec("-2")
-	slReason := "sl"
-	fork1ID, err := repo.ForkPaperOrderWithSLTP(ctx, baseline1ID, ptr(dec("95")), ptr(dec("110")))
+	old, new1 := ptr(dec("95")), ptr(dec("97"))
+	if err := repo.RecordPaperOrderAdjustment(ctx, orderID, "sl", old, new1, "model"); err != nil {
+		t.Fatalf("record sl adjustment: %v", err)
+	}
+	old2, new2 := ptr(dec("110")), ptr(dec("108"))
+	if err := repo.RecordPaperOrderAdjustment(ctx, orderID, "tp", old2, new2, "model"); err != nil {
+		t.Fatalf("record tp adjustment: %v", err)
+	}
+	// An adjustment on an unrelated order must not show up in orderID's history.
+	if err := repo.RecordPaperOrderAdjustment(ctx, otherID, "sl", ptr(dec("50")), ptr(dec("52")), "model"); err != nil {
+		t.Fatalf("record unrelated adjustment: %v", err)
+	}
+
+	adjustments, err := repo.ListPaperOrderAdjustments(ctx, orderID)
 	if err != nil {
-		t.Fatalf("fork baseline1: %v", err)
+		t.Fatalf("list adjustments: %v", err)
 	}
-	repo.mu.Lock()
-	f1 := repo.orders[fork1ID]
-	f1.ClosedAt = &closedAt1
-	f1.CloseReason = &slReason
-	f1.RealizedPnL = &forkPnl1
-	repo.orders[fork1ID] = f1
-	repo.mu.Unlock()
-
-	repo.mu.Lock()
-	b1 := repo.orders[baseline1ID]
-	b1.ClosedAt = &closedAt1
-	b1.CloseReason = &tpReason
-	b1.RealizedPnL = &pnl1
-	repo.orders[baseline1ID] = b1
-	repo.mu.Unlock()
-
-	// Baseline #2: no fork at all — must be excluded entirely from the comparison.
-	pnl2 := dec("100")
-	baseline2ID, _ := repo.OpenPaperOrder(ctx, port.PaperOrder{InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), Variant: "baseline"})
-	repo.mu.Lock()
-	b2 := repo.orders[baseline2ID]
-	b2.ClosedAt = &closedAt1
-	b2.CloseReason = &tpReason
-	b2.RealizedPnL = &pnl2
-	repo.orders[baseline2ID] = b2
-	repo.mu.Unlock()
-
-	stats, err := repo.SLTPAdjustmentStats(ctx, "", time.Time{})
-	if err != nil {
-		t.Fatalf("SLTPAdjustmentStats: %v", err)
+	if len(adjustments) != 2 {
+		t.Fatalf("expected exactly 2 adjustments for orderID, got %d", len(adjustments))
 	}
-	if len(stats) != 2 {
-		t.Fatalf("expected 2 variant rows, got %d", len(stats))
+	if adjustments[0].Field != "sl" || !adjustments[0].NewValue.Equal(dec("97")) {
+		t.Errorf("expected first adjustment field=sl new=97, got field=%s new=%v", adjustments[0].Field, adjustments[0].NewValue)
 	}
-
-	var baseline, adjusted port.VariantStats
-	for _, s := range stats {
-		if s.Variant == "baseline" {
-			baseline = s
-		} else {
-			adjusted = s
-		}
-	}
-
-	if baseline.ClosedCount != 1 || baseline.Wins != 1 || !baseline.RealizedPnL.Equal(dec("5")) {
-		t.Errorf("expected baseline{closed=1,wins=1,pnl=5} (baseline2 excluded, no fork), got %+v", baseline)
-	}
-	if adjusted.ClosedCount != 1 || adjusted.Losses != 1 || !adjusted.RealizedPnL.Equal(dec("-2")) {
-		t.Errorf("expected rl_adjusted{closed=1,losses=1,pnl=-2}, got %+v", adjusted)
-	}
-}
-
-func TestListSLTPAdjustmentPairs_ReturnsLinkedPairsOnly(t *testing.T) {
-	repo := newFakeRepository()
-	ctx := context.Background()
-
-	baselineID, _ := repo.OpenPaperOrder(ctx, port.PaperOrder{InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), Variant: "baseline"})
-	forkID, _ := repo.ForkPaperOrderWithSLTP(ctx, baselineID, ptr(dec("95")), ptr(dec("110")))
-	// An unrelated unpaired baseline order should not show up as a pair.
-	_, _ = repo.OpenPaperOrder(ctx, port.PaperOrder{InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), Variant: "baseline"})
-
-	pairs, err := repo.ListSLTPAdjustmentPairs(ctx, "BTC-USDT-SWAP")
-	if err != nil {
-		t.Fatalf("ListSLTPAdjustmentPairs: %v", err)
-	}
-	if len(pairs) != 1 {
-		t.Fatalf("expected exactly 1 pair, got %d", len(pairs))
-	}
-	if pairs[0].BaselineOrder.ID != baselineID || pairs[0].RLAdjustedOrder.ID != forkID {
-		t.Errorf("expected pair baseline=%d fork=%d, got baseline=%d fork=%d",
-			baselineID, forkID, pairs[0].BaselineOrder.ID, pairs[0].RLAdjustedOrder.ID)
+	if adjustments[1].Field != "tp" || !adjustments[1].NewValue.Equal(dec("108")) {
+		t.Errorf("expected second adjustment field=tp new=108, got field=%s new=%v", adjustments[1].Field, adjustments[1].NewValue)
 	}
 }
 
