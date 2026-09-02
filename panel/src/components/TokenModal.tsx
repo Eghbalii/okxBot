@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { tokenSymbol } from '../utils/format'
 
 // Per-token active/inactive toggle for paper trading (2026-09-01 request): a disabled token stops
 // opening NEW positions (checked in evaluateStrategies via PaperTrader.OpensDisabled) but any of
@@ -61,9 +62,9 @@ export default function TokenModal({
         <div className="checkbox-grid">
           {allInstIds.length === 0 && <div className="text-dim">No tokens configured.</div>}
           {allInstIds.map((instId) => (
-            <label key={instId} className="checkbox-row">
+            <label key={instId} className="checkbox-row" title={instId}>
               <input type="checkbox" checked={!disabled.has(instId)} onChange={() => toggle(instId)} />
-              <span className="mono">{instId}</span>
+              <span className="mono">{tokenSymbol(instId)}</span>
             </label>
           ))}
         </div>

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api/client'
-import { pnlClass } from '../utils/format'
+import { pnlClass, tokenSymbol } from '../utils/format'
 import type { TesterConfig, TesterVersion, TesterVersionDetail } from '../api/types'
 
 // Diffs two versions' config objects down to only the keys that actually changed, for the
@@ -225,7 +225,7 @@ function ConfigPanel() {
       )}
       {cfg && (
         <div className="text-dim" style={{ marginTop: '0.5rem' }}>
-          Instruments: {cfg.instIds.join(', ') || '—'}
+          Instruments: {cfg.instIds.map(tokenSymbol).join(', ') || '—'}
         </div>
       )}
       {message && <div className="text-dim" style={{ marginTop: '0.5rem' }}>{message}</div>}

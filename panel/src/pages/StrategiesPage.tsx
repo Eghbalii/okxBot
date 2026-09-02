@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import ParamChangeChart from '../components/ParamChangeChart'
-import { formatUsd, pnlClass } from '../utils/format'
+import { formatUsd, pnlClass, tokenSymbol } from '../utils/format'
 import type { StrategyAssignment, StrategyConfig, StrategyStats } from '../api/types'
 
 // Wins/Losses come from the backend as "closed with positive realized PnL" vs. non-positive
@@ -231,7 +231,7 @@ function ChartPanel({
         >
           {assignments.map((a) => (
             <option key={a.ID} value={a.ID}>
-              {nameFor(a.StrategyID)} — {a.InstID} / {a.Bar}
+              {nameFor(a.StrategyID)} — {tokenSymbol(a.InstID)} / {a.Bar}
             </option>
           ))}
         </select>

@@ -9,7 +9,7 @@ import PaperTradingStatsBox from '../components/PaperTradingStatsBox'
 import Pagination, { DEFAULT_PAGE_SIZE } from '../components/Pagination'
 import SortableTh from '../components/SortableTh'
 import { api } from '../api/client'
-import { formatDateTime, formatUsd, pnlClass, trimPrice } from '../utils/format'
+import { formatDateTime, formatUsd, pnlClass, tokenSymbol, trimPrice } from '../utils/format'
 import type { CloseReason, Position, PositionMode } from '../api/types'
 
 // Sortable columns are limited to what Postgres can ORDER BY directly (internal/postgres's
@@ -148,7 +148,7 @@ export default function PositionsPage() {
   // so this only requests it, then triggers the same immediate refetch the WebSocket bridge uses
   // rather than waiting for the 5s poll to notice the position disappeared.
   async function closePosition(p: Position) {
-    if (!confirm(`Close ${p.InstID} #${p.ID} now at the live price? Reason will be recorded as "manual".`)) return
+    if (!confirm(`Close ${tokenSymbol(p.InstID)} #${p.ID} now at the live price? Reason will be recorded as "manual".`)) return
     setClosingId(p.ID)
     try {
       await api.closePosition(p.ID)
@@ -256,8 +256,8 @@ export default function PositionsPage() {
                       #{p.ID}
                     </button>
                   </td>
-                  <td>
-                    {p.InstID}
+                  <td title={p.InstID}>
+                    {tokenSymbol(p.InstID)}
                     {isFork && (
                       <span className="badge badge-dim" style={{ marginLeft: '0.4rem' }} title="RL shadow-fork: tracking-only copy comparing an adjusted SL/TP against its baseline parent">
                         fork

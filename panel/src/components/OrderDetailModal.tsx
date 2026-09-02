@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import type { PaperOrderAdjustment, Position } from '../api/types'
+import { tokenSymbol } from '../utils/format'
 
 // The decision-time observation persisted on the order (CLAUDE.md §15.3) — what the model was
 // ASKED. Only the fields this view compares are typed; the rest of the payload is ignored.
@@ -142,7 +143,7 @@ export default function OrderDetailModal({
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <h2>
-            Order #{position.ID} — {position.InstID}{' '}
+            Order #{position.ID} — <span title={position.InstID}>{tokenSymbol(position.InstID)}</span>{' '}
             <span className="text-dim">
               {position.Bar || '—'} · {sig?.kind || position.StrategyName || '—'}
             </span>

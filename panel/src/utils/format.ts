@@ -30,6 +30,17 @@ export function pnlClass(value: number | null | undefined): string {
   return value > 0 ? 'text-green' : 'text-red'
 }
 
+// Shortens an OKX instId (e.g. "BTC-USDT-SWAP") to just its base token ("BTC") for display —
+// every instrument this project trades is a USDT-settled perpetual swap (CLAUDE.md's own trading
+// config), so the "-USDT-SWAP" suffix is constant noise, never information. Display-only: the
+// full instId is still what's sent to/received from the backend everywhere else. Anything that
+// doesn't match the expected shape (a future non-USDT/non-SWAP instrument, or a malformed value)
+// is returned unchanged rather than mangled, so an unexpected instId is still readable.
+export function tokenSymbol(instId: string | null | undefined): string {
+  if (!instId) return '—'
+  return instId.endsWith('-USDT-SWAP') ? instId.slice(0, -'-USDT-SWAP'.length) : instId
+}
+
 // Trims a price/size string to at most 4 decimal places once its magnitude is >= 1 (display only —
 // the exact NUMERIC value from Postgres, CLAUDE.md §7, is untouched; this never reaches the
 // backend). Values below 1 are left at full precision: many tokens here trade at sub-cent prices
