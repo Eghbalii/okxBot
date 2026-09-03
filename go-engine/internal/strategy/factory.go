@@ -30,6 +30,22 @@ var Factories = map[string]Factory{
 	"stoch_cross":          func() Strategy { return NewStochCross() },
 	"trend_confluence":     func() Strategy { return NewTrendConfluence() },
 	"weekly_dip_buy":       func() Strategy { return NewWeeklyDipBuy() },
+
+	// Scalp/price-action/ICT additions (CLAUDE.md §9, added 2026-09) — aimed at low timeframes
+	// (5m) per an explicit operator request for well-known scalping-style strategies, since the
+	// original 14 skew toward slower swing-style setups.
+	"vwap_reversion":      func() Strategy { return NewVWAPReversion() },
+	"bb_squeeze_breakout": func() Strategy { return NewBBSqueezeBreakout() },
+	"range_breakout":      func() Strategy { return NewRangeBreakout() },
+	"keltner_trend_scalp": func() Strategy { return NewKeltnerTrendScalp() },
+	"ict_fvg":             func() Strategy { return NewICTFairValueGap() },
+	"ict_order_block":     func() Strategy { return NewICTOrderBlock() },
+	"ict_liquidity_sweep": func() Strategy { return NewICTLiquiditySweep() },
+	"engulfing_reversal":  func() Strategy { return NewEngulfingReversal() },
+	"inside_bar_breakout": func() Strategy { return NewInsideBarBreakout() },
+	"macd_momentum":       func() Strategy { return NewMACDMomentum() },
+	"volume_breakout":     func() Strategy { return NewVolumeBreakout() },
+	"ema_ribbon_pullback": func() Strategy { return NewEMARibbonPullback() },
 }
 
 // FromConfig builds a live Strategy for kind, applying config as WithParams overrides (config is

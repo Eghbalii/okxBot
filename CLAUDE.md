@@ -3738,3 +3738,74 @@ endpoint, §27's plan §3b) updated to stop citing the removed per-step cap as a
 unclamped — that endpoint was always unclamped for a different, still-valid reason (a human
 operator acting directly is trusted, full stop), so its behavior didn't change here, only the
 comment's accuracy.
+
+## 30. Twelve new scalp/ICT/price-action strategies added (2026-09-03)
+
+Explicit operator request: existing strategies were producing too many SL-closed positions with
+weak profits, and most were built for swing-style setups rather than the 5m scalping the operator
+actually wants to run. Rather than tune the existing 14 (that work is intentionally deferred —
+`cmd/strategy-tester`'s optimizer loop is known-broken per §21 and the operator explicitly declined
+to touch it this round, judging its auto-generated parameter changes as low-quality and not
+grounded in real strategy knowledge), added 12 new well-known strategies as plain `strategy.Kind`
+registrations in `strategy.Factories` — pure additions, zero risk to the existing 14 (§9's registry
+pattern is exactly built for this). Optimization/review cadence for these, per the operator: manual
+only ("هروقت خودت بگی") — no scheduled job, no automatic re-tuning.
+
+All 12 live in `go-engine/internal/strategy/`, follow every existing convention (`ParamSpec`/
+`WithParams`/`resetState()` beside stateful fields, structural price levels via `EntryPx`/`SLPx`/
+`TPPx` where the strategy genuinely computes one per §16.8's audit, percentage-only where it
+doesn't), and are covered by the existing `TestWithParams_DoesNotCarryAccumulatedState` (which
+iterates every `Factories` entry automatically, §16.8's own regression test) — 356 Go tests total
+after this addition (was 344, §29). New indicator helpers added to `indicators.go`: `StdDev`,
+`BollingerBands`, `SessionVWAP` (rolling, not calendar-session-anchored — this codebase's candle
+windows aren't segmented by exchange session boundaries), `KeltnerChannel`, `AvgVolume`.
+
+- **`vwap_reversion`** — fade a price extension away from a rolling VWAP back toward it, sized in
+  ATR units rather than a fixed percentage so the trigger distance scales with the instrument's own
+  volatility. Classic intraday mean-reversion scalp.
+- **`bb_squeeze_breakout`** — Bollinger Band width contracting to a multi-bar low (volatility
+  compression) followed by a close outside the bands trades the breakout at the start of the move
+  rather than mid-run.
+- **`range_breakout`** — Donchian-style rolling N-candle high/low breakout (the same family as
+  opening-range-breakout scalps, generalized off any fixed session). Structural stop at the
+  opposite side of the broken range.
+- **`keltner_trend_scalp`** — pullback-in-trend scalp: a short EMA trend filter plus entries on a
+  pullback to the Keltner Channel midline, stop at the channel's own far band (volatility-scaled
+  structural level). Faster/tighter cousin of the existing `dual_ma_atr`.
+- **`ict_fvg`** — ICT/Smart-Money Fair Value Gap: a 3-candle imbalance (candle 1's high below
+  candle 3's low, or the mirror) that price later trades back into is taken as a continuation entry
+  in the gap's original direction, stop at the gap's far edge.
+- **`ict_order_block`** — ICT order block: the last opposite-direction candle immediately before an
+  ATR-scaled impulse move marks a zone; price returning to that zone once is taken as continuation
+  in the impulse's direction, stop at the block's own range.
+- **`ict_liquidity_sweep`** — ICT stop-hunt/liquidity-sweep reversal: a wick beyond a recent swing
+  high/low that closes back inside the prior range on the same candle signals the breakout was a
+  sweep, not genuine continuation; enters the reversal, stop beyond the sweep's own wick. Resolves
+  within one candle, well matched to 5m.
+- **`engulfing_reversal`** — classic candlestick engulfing pattern (a full-body engulf of the prior
+  candle, opposite a short EMA trend) as a two-candle reversal, stop beyond the engulfing candle's
+  own extreme.
+- **`inside_bar_breakout`** — classic price-action inside-bar consolidation breakout: trade the
+  break of an inside bar's own high/low, stop at its opposite extreme.
+- **`macd_momentum`** — MACD histogram zero-line cross, one of the most widely used momentum-shift
+  scalp signals. Percentage SL/TP (MACD has no structural price level of its own).
+- **`volume_breakout`** — a range breakout confirmed by a volume surge (current candle's volume
+  well above its own recent average) — the standard filter against low-volume breakout fakeouts.
+- **`ema_ribbon_pullback`** — three-EMA ribbon (fast/mid/slow stacked in trend order) with entries
+  on a pullback to the middle EMA that closes back in the trend direction — a well-known scalp/
+  day-trading continuation system, buying dips in an uptrend rather than chasing highs.
+
+**Verification beyond the automated test**: the package's existing `oscillating()` test fixture
+(flat Open==Close bodies, constant Volume) is unsuitable for smoke-testing candle-body-direction or
+volume-surge logic — a throwaway test built on more realistic synthetic candles (real bodies,
+occasional volume surges) confirmed all 12 fire with sane, correctly-directioned SL levels before
+being deleted (not a permanent fixture, since the package's per-strategy tests each build their own
+targeted fixture rather than sharing one general-purpose "realistic" generator — see `levels_test.go`
+files' individual `mkCandle`/`oscillating` helpers for the existing pattern this would need to fit).
+
+**Not yet assigned to any token/timeframe** — these are registered kinds only, per §11.3's model
+(a strategy exists as a locked origin row the moment `strategy.SeedOrigins` runs, but doesn't affect
+any live trading until a sub-strategy is cloned from it and given a `strategy_assignments` row for a
+specific token+bar). Assigning several of these to the 5m bar across the current token roster, and
+judging them from real paper-trading closes, is the natural next step — deferred here since it's an
+operational/assignment action (via the panel or `POST /api/strategies`), not a code change.

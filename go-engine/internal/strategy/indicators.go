@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/shopspring/decimal"
 )
@@ -160,4 +161,90 @@ func Lowest(candles []Candle, period int) (decimal.Decimal, error) {
 		}
 	}
 	return lowest, nil
+}
+
+// StdDev returns the population standard deviation of the last `period` closes around their own
+// SMA — the building block for Bollinger Bands.
+func StdDev(candles []Candle, period int) (decimal.Decimal, error) {
+	if len(candles) < period {
+		return decimal.Zero, errNeedMore(period, len(candles))
+	}
+	mean, err := SMA(candles, period)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	window := candles[len(candles)-period:]
+	sumSq := decimal.Zero
+	for _, c := range window {
+		d := c.Close.Sub(mean)
+		sumSq = sumSq.Add(d.Mul(d))
+	}
+	variance := sumSq.Div(decimal.NewFromInt(int64(period)))
+	f, _ := variance.Float64()
+	return decimal.NewFromFloat(math.Sqrt(f)), nil
+}
+
+// BollingerBands returns (basis, upper, lower) using an SMA basis of `period` closes and bands at
+// `mult` standard deviations.
+func BollingerBands(candles []Candle, period int, mult decimal.Decimal) (basis, upper, lower decimal.Decimal, err error) {
+	basis, err = SMA(candles, period)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, decimal.Zero, err
+	}
+	sd, err := StdDev(candles, period)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, decimal.Zero, err
+	}
+	band := sd.Mul(mult)
+	return basis, basis.Add(band), basis.Sub(band), nil
+}
+
+// SessionVWAP returns the volume-weighted average price over the last `period` candles — a
+// rolling VWAP rather than a calendar-session-anchored one, since this codebase's candle windows
+// aren't segmented by exchange session boundaries. Falls back to a plain average price when the
+// window's total volume is zero (a quiet instrument/timeframe), so callers never divide by zero.
+func SessionVWAP(candles []Candle, period int) (decimal.Decimal, error) {
+	if len(candles) < period {
+		return decimal.Zero, errNeedMore(period, len(candles))
+	}
+	window := candles[len(candles)-period:]
+	sumPV := decimal.Zero
+	sumV := decimal.Zero
+	for _, c := range window {
+		typical := c.High.Add(c.Low).Add(c.Close).Div(decimal.NewFromInt(3))
+		sumPV = sumPV.Add(typical.Mul(c.Volume))
+		sumV = sumV.Add(c.Volume)
+	}
+	if sumV.IsZero() {
+		return SMA(candles, period)
+	}
+	return sumPV.Div(sumV), nil
+}
+
+// KeltnerChannel returns (middle, upper, lower): an EMA midline of `period` closes with bands at
+// `mult` ATRs (of the same period) — a smoother, volatility-scaled alternative to Bollinger Bands.
+func KeltnerChannel(candles []Candle, period int, mult decimal.Decimal) (middle, upper, lower decimal.Decimal, err error) {
+	middle, err = EMA(candles, period)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, decimal.Zero, err
+	}
+	atr, err := ATR(candles, period)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, decimal.Zero, err
+	}
+	band := atr.Mul(mult)
+	return middle, middle.Add(band), middle.Sub(band), nil
+}
+
+// AvgVolume returns the average Volume over the last `period` candles.
+func AvgVolume(candles []Candle, period int) (decimal.Decimal, error) {
+	if len(candles) < period {
+		return decimal.Zero, errNeedMore(period, len(candles))
+	}
+	window := candles[len(candles)-period:]
+	sum := decimal.Zero
+	for _, c := range window {
+		sum = sum.Add(c.Volume)
+	}
+	return sum.Div(decimal.NewFromInt(int64(period))), nil
 }
