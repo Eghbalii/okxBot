@@ -1,6 +1,24 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 
+// The 12 scalp/ICT/price-action kinds added CLAUDE.md §30, tagged "new" in this list so they are
+// easy to spot among the original 14 while deciding which to enable — pure display, no backend
+// concept of "new" exists (a strategy row carries no added_at/version marker for this).
+const NEW_KINDS = new Set([
+  'vwap_reversion',
+  'bb_squeeze_breakout',
+  'range_breakout',
+  'keltner_trend_scalp',
+  'ict_fvg',
+  'ict_order_block',
+  'ict_liquidity_sweep',
+  'engulfing_reversal',
+  'inside_bar_breakout',
+  'macd_momentum',
+  'volume_breakout',
+  'ema_ribbon_pullback',
+])
+
 // Global per-strategy-KIND on/off switch for paper trading: applied uniformly across every token,
 // bulk-toggling strategy_assignments.enabled for every assignment of that kind — distinct from the
 // existing per-token/per-timeframe assignment granularity on the Strategies page, which stays the
@@ -92,6 +110,11 @@ export default function StrategyKindModal({
               <label key={kind} className="checkbox-row">
                 <input type="checkbox" checked={selected.has(kind)} onChange={() => toggle(kind)} />
                 <span className="mono">{kind}</span>
+                {NEW_KINDS.has(kind) && (
+                  <span className="badge badge-green" style={{ marginLeft: 6 }}>
+                    new
+                  </span>
+                )}
               </label>
             ))}
           </div>

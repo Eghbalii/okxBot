@@ -71,10 +71,18 @@ function ParamEditor({
 function StrategyRow({
   strategy,
   stats,
+  effectivelyActive,
   onChanged,
 }: {
   strategy: StrategyConfig
   stats: StrategyStats | undefined
+  // Whether this strategy row actually opens new positions right now: its own Enabled flag AND
+  // at least one enabled strategy_assignments row. A strategy can read Enabled=true here and still
+  // be fully idle — every assignment disabled by the Positions page's "active strategies" kind
+  // filter (paper_trading_config.active_kinds) — since that filter bulk-toggles
+  // strategy_assignments.enabled per kind, never the strategies table itself. Rendering Enabled
+  // alone previously showed every strategy as "enabled" regardless of that filter.
+  effectivelyActive: boolean
   onChanged: () => void
 }) {
   const [editing, setEditing] = useState(false)
@@ -104,10 +112,9 @@ function StrategyRow({
         {strategy.Name}
         {strategy.IsOrigin && <span className="badge badge-dim" style={{ marginLeft: 6 }}>origin</span>}
       </td>
-      <td className="mono">{strategy.Kind}</td>
       <td>
-        <span className={'badge ' + (strategy.Enabled ? 'badge-green' : 'badge-dim')}>
-          {strategy.Enabled ? 'enabled' : 'disabled'}
+        <span className={'badge ' + (effectivelyActive ? 'badge-green' : 'badge-dim')}>
+          {effectivelyActive ? 'active' : 'inactive'}
         </span>
       </td>
       <td>{stats?.SignalCount ?? '—'}</td>
@@ -276,6 +283,16 @@ export default function StrategiesPage() {
   const origins = strategies.filter((s) => s.IsOrigin)
   const subStrategies = strategies.filter((s) => !s.IsOrigin)
 
+  // A strategy row is effectively active only when its own Enabled flag is true AND at least one
+  // of its strategy_assignments rows is enabled — see StrategyRow's effectivelyActive doc for why
+  // Enabled alone is not the answer this column needs to give.
+  const hasEnabledAssignment = new Set(
+    assignments.filter((a) => a.Enabled).map((a) => a.StrategyID),
+  )
+  function isEffectivelyActive(s: StrategyConfig): boolean {
+    return s.Enabled && hasEnabledAssignment.has(s.ID)
+  }
+
   return (
     <div>
       {error && <div className="error-banner">{error}</div>}
@@ -286,7 +303,6 @@ export default function StrategiesPage() {
           <thead>
             <tr>
               <th className="th-static">Name</th>
-              <th className="th-static">Kind</th>
               <th className="th-static">Status</th>
               <th className="th-static">Signals</th>
               <th className="th-static">Win rate</th>
@@ -296,10 +312,22 @@ export default function StrategiesPage() {
           </thead>
           <tbody>
             {origins.map((s) => (
-              <StrategyRow key={s.ID} strategy={s} stats={stats[s.ID]} onChanged={reload} />
+              <StrategyRow
+                key={s.ID}
+                strategy={s}
+                stats={stats[s.ID]}
+                effectivelyActive={isEffectivelyActive(s)}
+                onChanged={reload}
+              />
             ))}
             {subStrategies.map((s) => (
-              <StrategyRow key={s.ID} strategy={s} stats={stats[s.ID]} onChanged={reload} />
+              <StrategyRow
+                key={s.ID}
+                strategy={s}
+                stats={stats[s.ID]}
+                effectivelyActive={isEffectivelyActive(s)}
+                onChanged={reload}
+              />
             ))}
           </tbody>
         </table>
