@@ -32,7 +32,9 @@ export interface StrategyStats {
 }
 
 export type PositionMode = 'paper' | 'demo' | 'real'
-export type CloseReason = 'sl' | 'tp' | 'manual' | 'timeout'
+// 'rl_early' is the model choosing to close a position before either SL or TP was touched
+// (CLAUDE.md §15.12's early-close action, gated behind paper_trading.rl_early_close).
+export type CloseReason = 'sl' | 'tp' | 'manual' | 'timeout' | 'rl_early'
 
 export interface Position {
   ID: number
