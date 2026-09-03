@@ -172,9 +172,10 @@ func TestApplyRealAdjustment_EditsInPlaceNoExchangeCall(t *testing.T) {
 	order := port.PaperOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, Size: dec("10"), Leverage: dec("1")}
 	repo.orders[1] = order
 
-	// Proposed SL=98 is a 3% move from the current 95 at price 100, which exceeds RatchetSLTP's
-	// single-step cap (MaxSLTPAdjustPct=2%) — the ratchet clamps it to 97 (95 + 2% of 100), same as
-	// PaperTrader.applyAdjustment would produce via the identical shared computeAdjustedLevels.
+	// Proposed SL=98 is a 3% move from the current 95 at price 100 — no per-step size cap anymore
+	// (removed 2026-09-04, explicit operator decision), so it applies in full since it's in the
+	// risk-reducing direction for a long (98 > 95), same as PaperTrader.applyAdjustment would
+	// produce via the identical shared computeAdjustedLevels.
 	action := &domain.Action{Action: domain.ActionUpdate, SLPx: dec("98")}
 	rt.applyRealAdjustment(context.Background(), order, action, dec("100"), testLogger())
 
@@ -182,8 +183,8 @@ func TestApplyRealAdjustment_EditsInPlaceNoExchangeCall(t *testing.T) {
 		t.Errorf("expected zero exchange calls for an in-place SL/TP edit, got %d", len(exchange.placedOrders))
 	}
 	updated := repo.orders[1]
-	if updated.SLPx == nil || !updated.SLPx.Equal(dec("97")) {
-		t.Errorf("expected SL ratchet-clamped to 97, got %v", updated.SLPx)
+	if updated.SLPx == nil || !updated.SLPx.Equal(dec("98")) {
+		t.Errorf("expected SL applied in full at 98 (no size cap), got %v", updated.SLPx)
 	}
 	adjustments, _ := repo.ListPaperOrderAdjustments(context.Background(), 1)
 	if len(adjustments) != 1 {

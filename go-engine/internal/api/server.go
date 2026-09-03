@@ -532,8 +532,8 @@ type adjustPositionRequest struct {
 //
 // Deliberately UNCLAMPED (explicit operator decision, 2026-09-03, after review): the model's own
 // automated edits go through conductor.Clamps.Apply (initial-placement bounds — a level on the
-// "wrong side" of entry is rejected outright) or the ratchet (in-trade moves, capped at
-// MaxSLTPAdjustPct per step, and only ever tightening). Neither fits an operator's manual action —
+// "wrong side" of entry is rejected outright) or the ratchet (in-trade SL moves, one-way-tightening
+// only — no per-step size cap since 2026-09-04). Neither fits an operator's manual action —
 // Clamps.Apply would reject exactly the case the operator explicitly asked for ("bring the stop
 // past entry into profit"), and the ratchet needs a live market price this endpoint has no reason
 // to fetch. A human operator/admin acting directly is trusted the way this codebase already trusts

@@ -6,33 +6,30 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
-// MaxSLTPAdjustPct is the largest single-step SL/TP adjustment (as a fraction of price) the RL
-// agent's SLAdjustPct/TPAdjustPct is allowed to request, independent of what the model itself
-// proposes — CLAUDE.md §15.4's "±2% per decision step" starting point. Applied before the ratchet
-// direction check below.
-var MaxSLTPAdjustPct = decimal.NewFromFloat(0.02)
-
 // RatchetSLTP computes the new SL/TP prices for an open order given the RL agent's proposed
-// adjustment percentages, enforcing the CLAUDE.md §15.4 hard constraint: an adjustment may only
-// tighten the position's risk (move SL toward locking in profit / reduce the TP distance so it's
-// easier to hit sooner), never widen it past the order's original risk budget or walk back a prior
+// adjustment percentages.
+//
+// SL is still a hard one-way ratchet (CLAUDE.md §15.4): it may only move to reduce risk (toward
+// locking in profit), never widen it past the order's original risk budget or walk back a prior
 // tightening. This is a Go-side clamp applied unconditionally — the model's own output is never
 // trusted as the safety boundary here, matching the pattern in internal/risk.
 //
-// slAdjustPct/tpAdjustPct are fractions of price (already clamped to +/-MaxSLTPAdjustPct by the
-// caller or here); positive/negative sign is interpreted relative to the position's side so the
-// caller doesn't need to reason about buy/sell asymmetry itself.
+// TP has no ratchet and no per-step size cap (removed 2026-09-04, explicit operator decision): the
+// model is free to move it either closer (locking in a nearer target) or FURTHER away (letting a
+// winning trade run for more), and to move it by any amount in one step. The only constraint left
+// is that it stays on the profitable side of entry — a "take-profit" that crosses entry would
+// realize a loss on touch, which isn't a take-profit at all.
+//
+// slAdjustPct/tpAdjustPct are fractions of price; positive/negative sign is interpreted relative
+// to the position's side so the caller doesn't need to reason about buy/sell asymmetry itself.
 func RatchetSLTP(o port.PaperOrder, currentPrice, slAdjustPct, tpAdjustPct decimal.Decimal) (newSL, newTP *decimal.Decimal) {
-	slAdjustPct = clampAbs(slAdjustPct, MaxSLTPAdjustPct)
-	tpAdjustPct = clampAbs(tpAdjustPct, MaxSLTPAdjustPct)
-
 	direction := decimal.NewFromInt(1)
 	if o.Side == "sell" {
 		direction = decimal.NewFromInt(-1)
 	}
 
 	newSL = ratchetSL(o.SLPx, direction, currentPrice, slAdjustPct)
-	newTP = ratchetTP(o.TPPx, direction, currentPrice, o.EntryPx, tpAdjustPct)
+	newTP = moveTP(o.TPPx, direction, currentPrice, o.EntryPx, tpAdjustPct)
 	return newSL, newTP
 }
 
@@ -63,43 +60,30 @@ func ratchetSL(current *decimal.Decimal, direction, price, adjustPct decimal.Dec
 	return current
 }
 
-// ratchetTP only allows moving TP closer to the current price (reducing the distance still needed
-// to hit it, i.e. "locking in" a nearer target) — never further away, which would loosen the
-// original risk/reward budget the order was opened with.
-// entry bounds the move independently of price: a take-profit that crosses the entry price is no
-// longer a take-profit, since touching it realizes a LOSS. Guarding only against the CURRENT price
-// is not enough — once price has moved against the position, "between the old TP and current
-// price" includes the whole region past entry. Observed 2026-08-29 on orders 100 and 110
-// (stoch_cross, short, entry 2.649): price rose to ~2.68, the TP ratcheted "toward price" to
-// 2.676, and both closed with close_reason='tp' and a realized PnL of -1.02.
-func ratchetTP(current *decimal.Decimal, direction, price, entry, adjustPct decimal.Decimal) *decimal.Decimal {
+// moveTP applies the model's proposed TP move with NO ratchet and NO per-step size cap (removed
+// 2026-09-04, explicit operator decision): the model may move the target closer (locking in a
+// nearer profit) or further away (letting a winning trade run for more) by any amount in one step.
+// The only guard left is that the result stays on the profitable side of entry — a "take-profit"
+// that crosses entry would realize a LOSS on touch, which isn't a take-profit at all. Guarding only
+// against the current price is not enough on its own (see the 2026-08-29 order 100/110 incident
+// this function's predecessor was built to fix), so entry is what's actually checked here.
+func moveTP(current *decimal.Decimal, direction, price, entry, adjustPct decimal.Decimal) *decimal.Decimal {
 	if current == nil {
 		return nil
 	}
 	delta := direction.Mul(adjustPct).Mul(price)
-	proposed := current.Sub(delta) // subtract: shrinking the TP distance moves TP toward price
+	proposed := current.Add(delta)
 
-	// A long's target sits above entry, a short's below. The proposal may move toward the current
-	// price but must stay on the profitable side of entry, and must not overshoot price itself
-	// (which would make it unreachable in the intended direction).
+	// A long's target must stay above entry, a short's below — either direction of movement is
+	// otherwise allowed.
 	if direction.IsPositive() {
-		if proposed.LessThan(*current) && proposed.GreaterThan(price) && proposed.GreaterThan(entry) {
+		if proposed.GreaterThan(entry) {
 			return &proposed
 		}
 		return current
 	}
-	if proposed.GreaterThan(*current) && proposed.LessThan(price) && proposed.LessThan(entry) {
+	if proposed.LessThan(entry) {
 		return &proposed
 	}
 	return current
-}
-
-func clampAbs(v, max decimal.Decimal) decimal.Decimal {
-	if v.GreaterThan(max) {
-		return max
-	}
-	if v.LessThan(max.Neg()) {
-		return max.Neg()
-	}
-	return v
 }

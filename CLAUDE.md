@@ -3683,3 +3683,58 @@ needs a check that would fail if it were absent" lesson — worth a `okxbot_kafk
 group}` gauge (set to 0 in the `Run` goroutine's own exit path) at some point, not done as part of
 this fix since the actual reported bug (silent permanent death from a transient error) is now
 structurally impossible rather than just monitored-for.
+
+## 29. Ratchet simplified: no per-step size cap, TP moves freely except across entry (2026-09-04)
+
+Prompted by the operator investigating a real trade (order 1812, ENA-USDT-SWAP) whose in-trade
+SL/TP adjustments were all clustered in the last ~19 seconds of an 85-minute-old position, right
+before it closed — not spread across the position's life the way a healthy adjustment stream
+should look. Auditing eight recent orders confirmed this was systematic, not a one-off: in every
+one, the model's first *successful* adjustment landed seconds to minutes before close, never in
+the middle of the trade. Root cause was `usecase.RatchetSLTP`'s two independent constraints
+compounding: the ±2% per-step size cap (`MaxSLTPAdjustPct`, §15.4's original design) meant an
+untrained/still-noisy policy's small, mostly-rejected proposals rarely moved SL far enough to pass
+the one-way tightening check, so *visible* adjustments only accumulated once price had moved far
+enough, which tends to be late in a trade's life. The operator did not recall specifying the 2%
+figure and, on review, asked for it to be removed outright — Claude's own choice during §15's
+original design, not a value the operator provided.
+
+**Decision**: `MaxSLTPAdjustPct` and the size clamp it enforced are **removed entirely** — the
+model's proposed SL/TP move applies at whatever magnitude it outputs, in one step, with no
+per-step ceiling. The SL side's core safety property is unchanged and explicitly kept: **SL is
+still a one-way ratchet** (`ratchetSL`, untouched) — it can only move to reduce risk (toward
+locking in profit for a long/short), never loosen past its current position or undo a prior
+tightening. That check is the one the operator explicitly said to keep ("ریسک بزرگ شدن sl رو چک
+کنیم خیلی خوبه بزار باشه").
+
+**TP changed more fundamentally, not just losing its size cap**: the old `ratchetTP` only allowed
+TP to move *closer* to the current price (a "lock in a nearer target" ratchet, mirroring the SL
+side's one-way logic) and additionally rejected any proposal that would push TP past the live
+price. Per the operator's explicit instruction — a TP moving *further away* (a bigger profit
+target) is not something to guard against, it's exactly the behavior worth letting the model
+express if it can identify a trade worth letting run — `moveTP` (renamed from `ratchetTP`) now
+applies the model's proposed TP move in **either direction**, by any magnitude, with the single
+remaining guard being the one this function's predecessor was originally built to fix (2026-08-29,
+orders 100/110): **TP may never cross the position's entry price**, in either direction, since
+touching a TP on the wrong side of entry would realize a loss rather than a profit — that would
+not be a take-profit at all. Guarding only against the live price was already known to be
+insufficient for this (once price has moved against the position, "toward price" can span the
+entire region past entry); guarding against entry directly is unaffected by price movement.
+
+**Consequence for existing open positions and training data**: no migration or backfill — this
+takes effect only for adjustments computed after the deploy. The change plausibly explains (not
+just describes) the order-1812 pattern: with the cap gone, the model's proposals should now be
+visible earlier and more often across a position's life rather than clustering right before close,
+since a proposal doesn't need to accumulate several ~2%-capped steps to become large enough to
+pass the tightening check. Whether that's actually what happens is worth checking against fresh
+trades once several have gone through this path.
+
+11 tests in `internal/usecase/sltp_ratchet_test.go` updated/added for the new semantics (both
+sides' TP now moving in either direction, two large-single-step tests replacing the old
+clamped-to-2% one, TP crossing the live price allowed, TP-crosses-entry-still-rejected re-derived
+with proposals that actually exercise the guard under the new sign convention) — 344 Go tests
+total. `internal/api/server.go`'s `handleAdjustPosition` doc comment (the manual SL/TP-edit
+endpoint, §27's plan §3b) updated to stop citing the removed per-step cap as a reason it stays
+unclamped — that endpoint was always unclamped for a different, still-valid reason (a human
+operator acting directly is trusted, full stop), so its behavior didn't change here, only the
+comment's accuracy.
