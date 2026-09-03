@@ -50,10 +50,27 @@ func TestTerminalCategory(t *testing.T) {
 	}
 }
 
-func TestShouldUpdate_FirstCallAlwaysFires(t *testing.T) {
+// The first call for an order establishes its baseline but does not itself fire (fixed
+// 2026-09-03): firing unconditionally on first sight used to be harmless when an update's answer
+// could only adjust SL/TP, but once AllowEarlyClose let the model close the position outright, a
+// tick landing ~2s after open — with nothing yet to judge — was asking "what now?" before there
+// was any "now" to speak of, and a policy converged to "close" closed the order immediately.
+func TestShouldUpdate_FirstCallDoesNotFire(t *testing.T) {
 	c := New(Config{})
-	if !c.ShouldUpdate(1, dec("0"), time.Now()) {
-		t.Fatal("first update for an unseen order should fire: there is no baseline to compare against yet")
+	if c.ShouldUpdate(1, dec("0"), time.Now()) {
+		t.Fatal("first update for an unseen order should only establish the baseline, not fire")
+	}
+}
+
+// Once a baseline exists, the very next call can still fire immediately if PnL has already moved
+// past the threshold by then — the fix only removes the guaranteed-fire on an order's first sight,
+// it does not add a minimum age before an update can ever happen.
+func TestShouldUpdate_SecondCallCanFireImmediately(t *testing.T) {
+	c := New(Config{UpdatePnLThresholdPct: dec("0.01"), UpdateMaxInterval: time.Hour})
+	now := time.Now()
+	c.ShouldUpdate(1, dec("0"), now)
+	if !c.ShouldUpdate(1, dec("0.02"), now.Add(time.Millisecond)) {
+		t.Error("a real 2% move right after the baseline was established should still fire")
 	}
 }
 
@@ -105,10 +122,15 @@ func TestShouldUpdate_IsPerOrder(t *testing.T) {
 	c := New(Config{UpdatePnLThresholdPct: dec("0.01"), UpdateMaxInterval: time.Hour})
 	now := time.Now()
 	c.ShouldUpdate(1, dec("0"), now)
+	c.ShouldUpdate(2, dec("0"), now)
 
-	// A second order has its own baseline; order 1's recent update must not suppress it.
-	if !c.ShouldUpdate(2, dec("0"), now) {
-		t.Error("a different order should have its own cadence state")
+	// Order 1 has already moved past its baseline enough to fire; order 2's independent baseline
+	// (established at the same PnL/time) must not be affected by order 1's state or firing.
+	if !c.ShouldUpdate(1, dec("0.02"), now.Add(time.Second)) {
+		t.Error("order 1 should fire on its own 2% move")
+	}
+	if c.ShouldUpdate(2, dec("0.005"), now.Add(time.Second)) {
+		t.Error("order 2's 0.5% move is below threshold and must not be affected by order 1 firing")
 	}
 }
 
@@ -147,9 +169,10 @@ func TestForget_DropsState(t *testing.T) {
 	c.Forget(1)
 
 	// After forgetting, the order looks unseen again — which is also why losing this state on a
-	// restart is harmless: the next tick simply establishes a fresh baseline.
-	if !c.ShouldUpdate(1, dec("0"), now.Add(time.Second)) {
-		t.Error("a forgotten order should be treated as unseen")
+	// restart is harmless: the next tick simply re-establishes a fresh baseline (and, per the
+	// first-call fix above, does not fire on that re-establishing call either).
+	if c.ShouldUpdate(1, dec("0"), now.Add(time.Second)) {
+		t.Error("a forgotten order should be treated as unseen, including not firing on first sight")
 	}
 }
 

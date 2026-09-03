@@ -293,6 +293,11 @@ func TestUpdate_EarlyCloseRecordsRLEarly(t *testing.T) {
 		Size: dec("100"), Leverage: dec("1"), Variant: "baseline",
 	})
 
+	// The first call only establishes the update cadence baseline (CLAUDE.md's 2026-09-03 fix —
+	// an order's first-ever update check no longer fires on sight, since that was closing brand
+	// new positions within ~1s of opening once early-close could act on the answer). The second
+	// call, once a real PnL move separates it from the baseline, is what actually reaches the model.
+	pt.runUpdates(context.Background(), "1m", dec("100"), testLogger())
 	// Price is between the levels — nothing would close this except the model's own decision.
 	pt.runUpdates(context.Background(), "1m", dec("103"), testLogger())
 
@@ -344,6 +349,7 @@ func TestUpdate_NoForkOfAFork(t *testing.T) {
 		t.Fatalf("open fork: %v", err)
 	}
 
+	pt.runUpdates(context.Background(), "1m", dec("100"), testLogger()) // establishes the baseline
 	pt.runUpdates(context.Background(), "1m", dec("103"), testLogger())
 
 	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
@@ -371,10 +377,12 @@ func TestUpdate_CadenceSuppressesRedundantCalls(t *testing.T) {
 		t.Fatalf("open order: %v", err)
 	}
 
+	// The first call only establishes the cadence baseline (CLAUDE.md's 2026-09-03 fix) and must
+	// not itself reach the model.
 	pt.runUpdates(context.Background(), "1m", dec("100"), testLogger())
 	first := len(model.categories())
-	if first != 1 {
-		t.Fatalf("first update should always fire, got %d calls", first)
+	if first != 0 {
+		t.Fatalf("an order's first update check should only establish the baseline, got %d calls", first)
 	}
 
 	// A 0.2% move is below the 1% threshold — the whole point of PnL-delta cadence is that a
@@ -407,6 +415,10 @@ func TestUpdate_CarriesSignalForward(t *testing.T) {
 	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
+
+	// The first update call establishes the cadence baseline (CLAUDE.md's 2026-09-03 fix) and
+	// does not itself reach the model.
+	pt.runUpdates(context.Background(), "1m", dec("100"), testLogger())
 
 	// Later, a price-driven update runs with no strategy firing. The retained signal must still be
 	// attached: a higher-timeframe opinion stays meaningful between its candles, and dropping it

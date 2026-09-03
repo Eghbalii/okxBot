@@ -1120,6 +1120,9 @@ func TestRunUpdates_AppliesAdjustmentInPlace(t *testing.T) {
 		t.Fatalf("open baseline order: %v", err)
 	}
 
+	// The first call only establishes the update cadence baseline (CLAUDE.md's 2026-09-03 fix —
+	// an order's first-ever update check no longer fires on sight).
+	pt.runUpdates(context.Background(), "1m", dec("100"), testLogger())
 	pt.runUpdates(context.Background(), "1m", dec("105"), testLogger())
 
 	if model.calls == 0 {
@@ -1179,6 +1182,9 @@ func TestRunUpdates_RepeatedAdjustmentsAllApplyToSameOrder(t *testing.T) {
 		model.action = domain.Action{Action: domain.ActionUpdate, SLPx: dec(proposed), TPPx: dec("108")}
 		pt.lifecycle = nil // clear the conductor's per-order update cadence so each round fires
 		pt.conductorOnce = sync.Once{}
+		// The first call after resetting the conductor only establishes that round's baseline
+		// (CLAUDE.md's 2026-09-03 fix); the second is what actually reaches the model.
+		pt.runUpdates(context.Background(), "1m", dec("100"), testLogger())
 		pt.runUpdates(context.Background(), "1m", dec("105"), testLogger())
 
 		orders, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")

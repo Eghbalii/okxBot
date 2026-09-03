@@ -200,8 +200,15 @@ const CloseReasonManual = "manual"
 // A strategy firing is the third trigger, but that path never consults this method — a real
 // opinion always reaches the model immediately and is never filtered by cadence.
 //
-// The first call for an order always returns true: a position the conductor has not seen yet has
-// no baseline to compare against, and observing it once establishes one.
+// The first call for an order establishes its baseline but does NOT fire (fixed 2026-09-03): it
+// used to return true unconditionally on first sight, on the reasoning that "no baseline exists
+// yet, so observing it once establishes one" — harmless as long as an update's answer could only
+// adjust SL/TP, but the very first tick after an order opens (~2s later on this engine's cadence)
+// has no price movement or elapsed time to judge anything from. Once AllowEarlyClose let the model
+// actually CLOSE the position on that answer, every order whose policy had converged to "close"
+// was being closed within ~1s of opening at roughly breakeven — this was invisible before because
+// the close was silently discarded, not because the question wasn't being asked. Now the first
+// call only starts the baseline clock, exactly like every later check.
 //
 // Calling this CLAIMS the slot when it returns true (it records the new baseline), so concurrent
 // callers cannot both fire for the same order — the same check-and-claim pattern as
@@ -213,7 +220,7 @@ func (c *Conductor) ShouldUpdate(orderID int64, pnlPct decimal.Decimal, now time
 	prev, seen := c.updates[orderID]
 	if !seen {
 		c.updates[orderID] = updateState{lastPnLPct: pnlPct, lastAt: now}
-		return true
+		return false
 	}
 
 	moved := pnlPct.Sub(prev.lastPnLPct).Abs().GreaterThanOrEqual(c.Cfg.pnlThreshold())
