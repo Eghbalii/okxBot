@@ -1,6 +1,10 @@
 package strategy
 
-import "github.com/shopspring/decimal"
+import (
+	"time"
+
+	"github.com/shopspring/decimal"
+)
 
 // ICTOrderBlock trades the ICT/Smart-Money "order block" concept: the last opposite-direction
 // candle immediately before a strong, decisive move (a candle whose range clears a volatility
@@ -17,12 +21,19 @@ type ICTOrderBlock struct {
 	LookbackBars   int
 	RiskReward     decimal.Decimal
 
-	hasBull  bool
-	bullLow  decimal.Decimal
-	bullHigh decimal.Decimal
-	hasBear  bool
-	bearLow  decimal.Decimal
-	bearHigh decimal.Decimal
+	// The active block, identified by the TIMESTAMP of the impulse candle that produced it — see
+	// ICTFairValueGap for why identity is required (without it the rescan re-arms an already-traded
+	// block, firing one setup repeatedly) and why it is a timestamp rather than a slice index (the
+	// caller's candle window slides once it reaches CandleWindow, so indices are not stable).
+	hasBlock  bool
+	blockBull bool
+	blockLow  decimal.Decimal
+	blockHigh decimal.Decimal
+	blockAt   time.Time
+
+	// handledAt is the blockAt of the last block traded or invalidated, so the rescan never
+	// re-arms it. Zero means nothing has been handled yet.
+	handledAt time.Time
 }
 
 func NewICTOrderBlock() *ICTOrderBlock {
@@ -65,86 +76,105 @@ func (s *ICTOrderBlock) WithParams(values map[string]decimal.Decimal) Strategy {
 }
 
 func (s *ICTOrderBlock) Evaluate(candles []Candle) (Signal, error) {
-	need := s.ATRPeriod + 2
-	if len(candles) < need {
+	if len(candles) < s.ATRPeriod+2 {
 		return Signal{Side: Hold}, nil
 	}
+	last := len(candles) - 1
+
+	// One ATR for the whole scan, computed on the current window. The previous version called ATR
+	// inside the loop against a re-sliced window per iteration, making evaluation O(lookback *
+	// window) — ~28x the cost of a comparable strategy on a 300-candle window — to gain a
+	// per-bar ATR that barely differs across the few dozen bars being scanned.
+	atr, err := ATR(candles, s.ATRPeriod)
+	if err != nil {
+		return Signal{}, err
+	}
+	if !atr.IsPositive() {
+		return Signal{Side: Hold}, nil
+	}
+	minImpulse := atr.Mul(s.ImpulseATRMult)
 
 	start := len(candles) - s.LookbackBars
-	if start < s.ATRPeriod+1 {
-		start = s.ATRPeriod + 1
+	if start < 1 {
+		start = 1 // need candles[i-1] for the block itself
 	}
-
-	// Scan for the most recent impulse candle and the opposite candle immediately before it.
-	for i := len(candles) - 1; i >= start; i-- {
-		atr, err := ATR(candles[:i+1], s.ATRPeriod)
-		if err != nil {
-			continue
+	for i := last; i >= start; i-- {
+		at := candles[i].Timestamp
+		if !at.After(s.handledAt) {
+			break // this and everything older was already traded or invalidated
 		}
-		if !atr.IsPositive() {
-			continue
+		if s.hasBlock && !at.After(s.blockAt) {
+			break // already tracking this block or an older one; leave its state alone
 		}
 		impulse := candles[i]
-		impulseRange := impulse.High.Sub(impulse.Low)
-		if impulseRange.LessThan(atr.Mul(s.ImpulseATRMult)) {
+		if impulse.High.Sub(impulse.Low).LessThan(minImpulse) {
 			continue
 		}
 		ob := candles[i-1]
-		bullish := impulse.Close.GreaterThan(impulse.Open)
-		bearish := impulse.Close.LessThan(impulse.Open)
-
-		if bullish && ob.Close.LessThan(ob.Open) {
-			s.hasBull, s.bullLow, s.bullHigh = true, ob.Low, ob.High
-			break
+		switch {
+		case impulse.Close.GreaterThan(impulse.Open) && ob.Close.LessThan(ob.Open):
+			s.hasBlock, s.blockBull, s.blockLow, s.blockHigh, s.blockAt = true, true, ob.Low, ob.High, at
+		case impulse.Close.LessThan(impulse.Open) && ob.Close.GreaterThan(ob.Open):
+			s.hasBlock, s.blockBull, s.blockLow, s.blockHigh, s.blockAt = true, false, ob.Low, ob.High, at
+		default:
+			continue
 		}
-		if bearish && ob.Close.GreaterThan(ob.Open) {
-			s.hasBear, s.bearLow, s.bearHigh = true, ob.Low, ob.High
-			break
-		}
+		break
 	}
 
-	last := candles[len(candles)-1]
+	if !s.hasBlock {
+		return Signal{Side: Hold}, nil
+	}
 
-	if s.hasBull {
-		if last.Close.LessThan(s.bullLow) {
-			s.hasBull = false
-		} else if last.Low.LessThanOrEqual(s.bullHigh) {
-			s.hasBull = false
-			risk := last.Close.Sub(s.bullLow)
+	c := candles[last]
+
+	// Only tradeable on a candle after the impulse that formed the block — the impulse candle
+	// itself necessarily overlaps the block's range (it opened where the block closed), so testing
+	// it would enter at the impulse's own extreme rather than on the return this strategy trades.
+	if !c.Timestamp.After(s.blockAt) {
+		return Signal{Side: Hold}, nil
+	}
+
+	if s.blockBull {
+		switch {
+		case c.Close.LessThan(s.blockLow):
+			s.hasBlock, s.handledAt = false, s.blockAt
+		case c.Low.LessThanOrEqual(s.blockHigh):
+			s.hasBlock, s.handledAt = false, s.blockAt
+			risk := c.Close.Sub(s.blockLow)
 			if risk.IsPositive() {
 				return Signal{
 					Side:       Buy,
 					Confidence: decimal.NewFromFloat(0.6),
-					EntryPx:    last.Close,
-					SLPx:       s.bullLow,
-					TPPx:       last.Close.Add(risk.Mul(s.RiskReward)),
-					SLPct:      risk.Div(last.Close),
-					TPPct:      risk.Div(last.Close).Mul(s.RiskReward),
+					EntryPx:    c.Close,
+					SLPx:       s.blockLow,
+					TPPx:       c.Close.Add(risk.Mul(s.RiskReward)),
+					SLPct:      risk.Div(c.Close),
+					TPPct:      risk.Div(c.Close).Mul(s.RiskReward),
 				}, nil
 			}
 		}
+		return Signal{Side: Hold}, nil
 	}
 
-	if s.hasBear {
-		if last.Close.GreaterThan(s.bearHigh) {
-			s.hasBear = false
-		} else if last.High.GreaterThanOrEqual(s.bearLow) {
-			s.hasBear = false
-			risk := s.bearHigh.Sub(last.Close)
-			if risk.IsPositive() {
-				return Signal{
-					Side:       Sell,
-					Confidence: decimal.NewFromFloat(0.6),
-					EntryPx:    last.Close,
-					SLPx:       s.bearHigh,
-					TPPx:       last.Close.Sub(risk.Mul(s.RiskReward)),
-					SLPct:      risk.Div(last.Close),
-					TPPct:      risk.Div(last.Close).Mul(s.RiskReward),
-				}, nil
-			}
+	switch {
+	case c.Close.GreaterThan(s.blockHigh):
+		s.hasBlock, s.handledAt = false, s.blockAt
+	case c.High.GreaterThanOrEqual(s.blockLow):
+		s.hasBlock, s.handledAt = false, s.blockAt
+		risk := s.blockHigh.Sub(c.Close)
+		if risk.IsPositive() {
+			return Signal{
+				Side:       Sell,
+				Confidence: decimal.NewFromFloat(0.6),
+				EntryPx:    c.Close,
+				SLPx:       s.blockHigh,
+				TPPx:       c.Close.Sub(risk.Mul(s.RiskReward)),
+				SLPct:      risk.Div(c.Close),
+				TPPct:      risk.Div(c.Close).Mul(s.RiskReward),
+			}, nil
 		}
 	}
-
 	return Signal{Side: Hold}, nil
 }
 
@@ -156,7 +186,7 @@ func (s *ICTOrderBlock) Evaluate(candles []Candle) (Signal, error) {
 // are, so adding a field means updating the reset right here rather than remembering a zeroing
 // line buried at the bottom of WithParams.
 func (s *ICTOrderBlock) resetState() {
-	s.hasBull, s.hasBear = false, false
-	s.bullLow, s.bullHigh = decimal.Zero, decimal.Zero
-	s.bearLow, s.bearHigh = decimal.Zero, decimal.Zero
+	s.hasBlock, s.blockBull = false, false
+	s.blockLow, s.blockHigh = decimal.Zero, decimal.Zero
+	s.blockAt, s.handledAt = time.Time{}, time.Time{}
 }

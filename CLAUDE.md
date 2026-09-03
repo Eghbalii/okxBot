@@ -3754,9 +3754,11 @@ only ("هروقت خودت بگی") — no scheduled job, no automatic re-tuning
 All 12 live in `go-engine/internal/strategy/`, follow every existing convention (`ParamSpec`/
 `WithParams`/`resetState()` beside stateful fields, structural price levels via `EntryPx`/`SLPx`/
 `TPPx` where the strategy genuinely computes one per §16.8's audit, percentage-only where it
-doesn't), and are covered by the existing `TestWithParams_DoesNotCarryAccumulatedState` (which
-iterates every `Factories` entry automatically, §16.8's own regression test) — 356 Go tests total
-after this addition (was 344, §29). New indicator helpers added to `indicators.go`: `StdDev`,
+doesn't). They are nominally covered by the existing `TestWithParams_DoesNotCarryAccumulatedState`
+(which iterates every `Factories` entry automatically, §16.8's own regression test) — but **that
+coverage turned out to be vacuous for several of them**, which is what let three real bugs through;
+see §30.1, and prefer the dedicated `scalp_test.go` suites as the actual guarantee. New indicator
+helpers added to `indicators.go`: `StdDev`,
 `BollingerBands`, `SessionVWAP` (rolling, not calendar-session-anchored — this codebase's candle
 windows aren't segmented by exchange session boundaries), `KeltnerChannel`, `AvgVolume`.
 
@@ -3795,13 +3797,78 @@ windows aren't segmented by exchange session boundaries), `KeltnerChannel`, `Avg
   on a pullback to the middle EMA that closes back in the trend direction — a well-known scalp/
   day-trading continuation system, buying dips in an uptrend rather than chasing highs.
 
-**Verification beyond the automated test**: the package's existing `oscillating()` test fixture
-(flat Open==Close bodies, constant Volume) is unsuitable for smoke-testing candle-body-direction or
-volume-surge logic — a throwaway test built on more realistic synthetic candles (real bodies,
-occasional volume surges) confirmed all 12 fire with sane, correctly-directioned SL levels before
-being deleted (not a permanent fixture, since the package's per-strategy tests each build their own
-targeted fixture rather than sharing one general-purpose "realistic" generator — see `levels_test.go`
-files' individual `mkCandle`/`oscillating` helpers for the existing pattern this would need to fit).
+### 30.1 Code review of the initial commit found three real bugs (2026-09-03, same day)
+
+The first version of the above (commit `4e27430`) was reviewed before being deployed anywhere, and
+three defects were found and fixed in `internal/strategy/scalp_test.go` + the three strategy files.
+All three were invisible to the test suite as it stood, which is the part worth keeping.
+
+**The review's own starting point was a false claim.** The commit asserted the new strategies were
+"covered by the existing `TestWithParams_DoesNotCarryAccumulatedState`". They were not, in any
+meaningful sense: that test drives every `Factories` kind over the package's `oscillating()`
+fixture, which builds candles with `Open == Close` (zero-height bodies), constant `Volume`, and no
+`Timestamp`. Every strategy keying off candle body direction or a volume surge returns `Hold` on
+all 400 of those candles, so the warmed-vs-fresh comparison compared `Hold` against `Hold` from
+end to end and reported PASS while exercising none of the state it exists to check. Same root
+cause as §16.8's `pmax` incident — a registered, assignable strategy can be completely inert and
+every aggregate metric still looks normal.
+
+1. **`ict_fvg` and `ict_order_block` re-armed a setup they had already traded.** Both rescan the
+   trailing window on every call, and state was keyed only on "is something armed" with no
+   identity — so re-detecting the same 3-candle triple (or the same impulse/order-block pair) on
+   the next candle silently re-armed a setup the previous call had just consumed. Measured on the
+   real code: **one gap produced 10 entry signals across 10 candles**, and one order block produced
+   8. In production each of those is a separate paper order on the same setup.
+   - Fixed by identifying a setup by the **timestamp of the candle that formed it** and refusing to
+     arm anything not strictly newer than both the currently-tracked setup and the last one handled.
+   - A timestamp rather than a slice index specifically because **the caller's candle window
+     slides** — `PaperTrader` trims to `CandleWindow` (`applyCandle`), so index 5 means a different
+     bar once the window fills, and index-based identity would have started matching the wrong
+     candle instead of failing visibly. The first version of this fix used indices and was replaced
+     after checking how the window actually behaves rather than assuming it only grows.
+   - Consequence worth knowing when writing fixtures: these two strategies now need a real
+     `Timestamp` to fire at all. A timestamp-less fixture makes every candle compare as
+     "not newer than nothing handled", so they return `Hold` forever — the safe direction to fail,
+     but it reads as a broken strategy rather than a broken fixture, which is why the new test
+     helpers set it centrally and say so.
+2. **`ict_fvg` entered on the very candle that created the gap.** The zone-return test was
+   `last.Low <= gapHigh`, where on the forming candle `last` IS c3 and `gapHigh` IS `c3.Low` — so
+   the comparison was trivially true and it entered at the top of the impulse, the worst price in
+   the setup, rather than on the pullback the strategy's own doc comment describes. Fixed by
+   requiring the evaluated candle to be strictly after the one that formed the setup (applied to
+   `ict_order_block` too, where the impulse candle necessarily overlaps its own block's range).
+3. **`macd_momentum` compared against a histogram value carried in struct state.** That is only the
+   previous *candle's* value if `Evaluate` is called exactly once per closed candle, which the
+   engine does not guarantee — a restart reseeds the window (§14) and re-evaluating the same window
+   compared a value against itself. Confirmed: the same window evaluated twice returned `buy` then
+   `""`. Both values now come from the computed series, so the signal depends only on the candles
+   passed in, and the strategy became stateless (its `resetState` was removed rather than left as a
+   no-op).
+
+**Two suspicions the review checked and dismissed rather than "fixing".** MACD's index arithmetic
+looked wrong on inspection but is correct (verified: first non-zero histogram at exactly
+`slowLen+signalLen-2`, last at `n-1`). And the per-evaluation cost, while real, is not a production
+risk — strategy evaluation is candle-close driven (`papertrade.go`'s `handleCandle`), not per-tick.
+It was still worth reducing: `ict_order_block` recomputed ATR from scratch inside its scan loop
+(O(lookback × window)), now hoisted to one ATR for the whole scan — **634µs → 40µs** per evaluation
+on a 300-candle window, ~16x. `macd_momentum` went 1651µs → 887µs by building the series once
+instead of twice; it remains the most expensive strategy in the package because three EMA series
+over the window is inherent to MACD, and that was left alone rather than over-engineered.
+
+**Tests: `internal/strategy/scalp_test.go`** (new, 405 Go tests total, was 356). Three suites over
+all 12 kinds — they fire at all on realistic data, every emitted signal is a coherent trade (stop on
+the losing side of entry, target on the winning side), and the `WithParams` state-isolation contract
+holds — each **asserting the comparison was non-vacuous**, so a strategy that silently stops firing
+fails the test rather than passing it trivially. Plus targeted tests per bug above. Fixtures are
+timestamped and have real bodies/varying volume, and drive strategies **one closed candle at a
+time** via `driveCandleByCandle`, the way the engine does; an early version of these tests passed a
+whole sequence in one call and mis-reported a correct `inside_bar_breakout` as broken.
+
+**All fixes are mutation-checked**: reverting each one individually fails the test written for it
+(the re-arm guard removal reproduces the original 10-entries-from-one-gap exactly; the forming-
+candle guard removal fails 3 tests; restoring MACD's state-carried previous fails the determinism
+test). A test that passes against both the fixed and broken code proves nothing, and several of the
+tests in this package's history were written before that was verified.
 
 **Not yet assigned to any token/timeframe** — these are registered kinds only, per §11.3's model
 (a strategy exists as a locked origin row the moment `strategy.SeedOrigins` runs, but doesn't affect

@@ -13,9 +13,6 @@ type MACDMomentum struct {
 	SignalLen int
 	SLPct     decimal.Decimal
 	TPPct     decimal.Decimal
-
-	prevHist decimal.Decimal
-	hasPrev  bool
 }
 
 func NewMACDMomentum() *MACDMomentum {
@@ -58,53 +55,57 @@ func (s *MACDMomentum) WithParams(values map[string]decimal.Decimal) Strategy {
 	if v, ok := values["tp_pct"]; ok {
 		cp.TPPct = ClampParam(specByName["tp_pct"], v)
 	}
-	cp.resetState()
+	// No resetState() call: this strategy is stateless. Both histogram values it compares are
+	// derived from the candles passed to Evaluate, so a copy has nothing to inherit.
 	return &cp
 }
 
-// macdHistSeries returns the MACD histogram (macd line minus its own EMA-smoothed signal line)
-// for every candle from the point both the slow EMA and the signal EMA are valid onward.
-func (s *MACDMomentum) macdHistSeries(candles []Candle) ([]decimal.Decimal, error) {
+// macdHist returns the MACD histogram (the MACD line minus its own EMA-smoothed signal line) for
+// the last two candles: the current bar and the one before it, which is exactly what a zero-line
+// cross needs.
+//
+// Both values come from the same computed series rather than one being carried in struct state
+// between calls. That matters for correctness as well as cost: a state-carried "previous" is only
+// the previous CANDLE's value if Evaluate is called exactly once per closed candle, and the engine
+// makes no such guarantee (a restart reseeds the window, and evaluating the same window twice
+// would compare a value against itself). Reading both from the series makes the cross depend only
+// on the candles passed in.
+func (s *MACDMomentum) macdHist(candles []Candle) (now, prev decimal.Decimal, err error) {
 	fastSeries, err := EMASeries(candles, s.FastLen)
 	if err != nil {
-		return nil, err
+		return decimal.Zero, decimal.Zero, err
 	}
 	slowSeries, err := EMASeries(candles, s.SlowLen)
 	if err != nil {
-		return nil, err
+		return decimal.Zero, decimal.Zero, err
 	}
-	macdLine := make([]Candle, len(candles))
+	// The MACD line is only defined once the slow EMA is, so the signal EMA is taken over that
+	// valid tail. EMASeries wants Candles, and only Close is read.
+	validMACD := make([]Candle, 0, len(candles)-(s.SlowLen-1))
 	for i := s.SlowLen - 1; i < len(candles); i++ {
-		macdLine[i] = Candle{Close: fastSeries[i].Sub(slowSeries[i])}
+		validMACD = append(validMACD, Candle{Close: fastSeries[i].Sub(slowSeries[i])})
 	}
-	validMACD := macdLine[s.SlowLen-1:]
 	signalSeries, err := EMASeries(validMACD, s.SignalLen)
 	if err != nil {
-		return nil, err
+		return decimal.Zero, decimal.Zero, err
 	}
-	hist := make([]decimal.Decimal, len(candles))
-	for i := s.SignalLen - 1; i < len(validMACD); i++ {
-		hist[s.SlowLen-1+i] = validMACD[i].Close.Sub(signalSeries[i])
-	}
-	return hist, nil
+	n := len(validMACD)
+	now = validMACD[n-1].Close.Sub(signalSeries[n-1])
+	prev = validMACD[n-2].Close.Sub(signalSeries[n-2])
+	return now, prev, nil
 }
 
 func (s *MACDMomentum) Evaluate(candles []Candle) (Signal, error) {
+	// One extra candle beyond the signal EMA's own warm-up, so the previous bar's histogram is
+	// defined too and a cross can actually be detected.
 	need := s.SlowLen + s.SignalLen
 	if len(candles) < need {
 		return Signal{Side: Hold}, nil
 	}
-	hist, err := s.macdHistSeries(candles)
+	histNow, prevHist, err := s.macdHist(candles)
 	if err != nil {
 		return Signal{}, err
 	}
-	histNow := hist[len(hist)-1]
-	if !s.hasPrev {
-		s.prevHist, s.hasPrev = histNow, true
-		return Signal{Side: Hold}, nil
-	}
-	prevHist := s.prevHist
-	s.prevHist = histNow
 
 	crossedUp := prevHist.LessThanOrEqual(decimal.Zero) && histNow.GreaterThan(decimal.Zero)
 	crossedDown := prevHist.GreaterThanOrEqual(decimal.Zero) && histNow.LessThan(decimal.Zero)
@@ -117,15 +118,4 @@ func (s *MACDMomentum) Evaluate(candles []Candle) (Signal, error) {
 	default:
 		return Signal{Side: Hold}, nil
 	}
-}
-
-// resetState clears accumulated evaluation state, returning the strategy to how it behaves when
-// freshly constructed. Called by WithParams, whose copy must not inherit it (see
-// Strategy.WithParams for why).
-//
-// This lives beside the state fields on purpose: it is the one place that has to know what they
-// are, so adding a field means updating the reset right here rather than remembering a zeroing
-// line buried at the bottom of WithParams.
-func (s *MACDMomentum) resetState() {
-	s.prevHist, s.hasPrev = decimal.Zero, false
 }
