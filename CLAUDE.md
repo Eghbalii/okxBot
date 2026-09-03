@@ -3486,7 +3486,31 @@ Concretely:
       one-position-per-token gate; update: in-place edit with zero exchange calls; close:
       exchange-failure-doesn't-close-DB ordering, success + terminal-call delivery; reconcile:
       exchange-flat-closes-local, untracked-position-halts, matching-state-is-a-no-op) — 320 Go
-      tests total. The manual-edit endpoint (§3b) is NOT yet started.
+      tests total.
+      Commit 6 done (2026-09-03): the manual SL/TP-edit endpoint (§3b),
+      `POST /api/positions/{id}/adjust`. Design correction made while implementing, catching a real
+      mistake in the plan's own draft: the plan originally said to run the operator's input through
+      the SAME `conductor.Clamps.Apply` the model's open-time path uses — but `Clamps.Apply` treats
+      any long SL above entry (or short SL below entry) as an incoherent "wrong side" level and
+      drops it outright, which is EXACTLY the case the operator asked this endpoint to support
+      ("bring the stop past entry into profit," their own phrase). The model's own in-trade moves
+      actually go through `RatchetSLTP` instead (a different function, needing a live market price
+      this endpoint has no reason to fetch). Asked the operator directly rather than guessing;
+      explicit answer: apply **no clamp at all** for a manual/admin edit — trust the human acting
+      directly, the same way nothing else automated in this codebase is trusted. The percentage
+      converts straight to a price via `priceFromMarginPct(entryPx, leverage, side, pct)` (signed,
+      leverage-adjusted, `pct` a whole-number percentage matching the JSON field's own convention)
+      with no further check. New `Repository.GetPaperOrder(ctx, id)` (port + `internal/postgres` +
+      fake) — no existing method could fetch a single order by id, every prior read was list-shaped.
+      Real-mode-only (400 for paper/demo), rejects an already-closed order (409), rejects an empty
+      body (400). Panel: new `AdjustPositionForm` component (`panel/src/components/`), an `Adjust`
+      button next to `Close` gated to `!p.ClosedAt && p.Mode === 'real'` — the reverse gate from
+      `Close`, which stays paper-only — new `api.adjustPosition` client method. 15 new Go tests
+      (direction/leverage math table-driven for long/short/1x/zero-leverage-fallback, the exact
+      "past entry into profit" scenario, an intentionally large unclamped move, closed/paper-mode/
+      empty-body rejection) — 335 Go tests total. `tsc -b && vite build` clean. Not yet checked in a
+      real browser against a live real position (none exists yet) — deferred to commit 9's demo
+      verification window.
 - [x] New append-only real-order-adjustment log — turned out to already exist. Commit 3
       (2026-09-03) started from the plan's §4(b) design (`real_order_adjustments`, a new table)
       but found `paper_order_adjustments` (migration `000016_paper_order_adjustments`, added

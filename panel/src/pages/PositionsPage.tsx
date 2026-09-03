@@ -3,6 +3,7 @@ import { usePolling } from '../hooks/usePolling'
 import { usePositionAlerts } from '../hooks/usePositionAlerts'
 import { usePositionEvents } from '../hooks/usePositionEvents'
 import { usePriceStream } from '../hooks/usePriceStream'
+import AdjustPositionForm from '../components/AdjustPositionForm'
 import OrderDetailModal from '../components/OrderDetailModal'
 import PaperTradingConfigBox from '../components/PaperTradingConfigBox'
 import PaperTradingStatsBox from '../components/PaperTradingStatsBox'
@@ -82,6 +83,9 @@ export default function PositionsPage() {
   const showClosedColumns = openFilter !== 'open'
   const showLiveColumns = openFilter !== 'closed'
   const [closingId, setClosingId] = useState<number | null>(null)
+  // The order id whose Adjust form is currently expanded — at most one open at a time (CLAUDE.md
+  // §27's real-trading plan §3b, 2026-09-03).
+  const [adjustingId, setAdjustingId] = useState<number | null>(null)
 
   // Switching into a closed/all view re-defaults the sort to closed_at (only if the user hasn't
   // picked a sort explicitly since — tracked via a ref so this doesn't fight a manual column
@@ -169,6 +173,25 @@ export default function PositionsPage() {
       alert(`Failed to request close: ${(err as Error).message}`)
     } finally {
       setClosingId(null)
+    }
+  }
+
+  // Manual SL/TP edit for a real position (CLAUDE.md §27's real-trading plan §3b, 2026-09-03) —
+  // purely local on the backend (no exchange call), so the new levels are visible on the very next
+  // poll rather than needing the WebSocket refresh close() uses.
+  async function submitAdjust(id: number, slPct: string, tpPct: string) {
+    const body: { slPct?: number; tpPct?: number } = {}
+    if (slPct.trim() !== '') body.slPct = Number(slPct)
+    if (tpPct.trim() !== '') body.tpPct = Number(tpPct)
+    if (body.slPct === undefined && body.tpPct === undefined) {
+      alert('Enter at least one of SL% or TP%.')
+      return
+    }
+    try {
+      await api.adjustPosition(id, body)
+      setAdjustingId(null)
+    } catch (err) {
+      alert(`Failed to adjust position: ${(err as Error).message}`)
     }
   }
 
@@ -342,11 +365,38 @@ export default function PositionsPage() {
                           {closingId === p.ID ? 'Closing…' : 'Close'}
                         </button>
                       )}
+                      {/* Real-trading-only, unlike Close above: paper positions have no exchange
+                          leg to adjust and are edited through the model only (CLAUDE.md §27's
+                          real-trading plan §3b). */}
+                      {!p.ClosedAt && p.Mode === 'real' && (
+                        <button
+                          onClick={() => setAdjustingId(adjustingId === p.ID ? null : p.ID)}
+                          title="Manually move this position's SL/TP (no exchange call, unclamped)"
+                        >
+                          Adjust
+                        </button>
+                      )}
                     </td>
                   )}
                 </tr>
               )
             })}
+            {adjustingId !== null &&
+              (() => {
+                const p = rows?.find((x) => x.ID === adjustingId)
+                if (!p) return null
+                return (
+                  <tr key={`adjust-${p.ID}`}>
+                    <td colSpan={columnCount}>
+                      <AdjustPositionForm
+                        position={p}
+                        onCancel={() => setAdjustingId(null)}
+                        onSubmit={(slPct, tpPct) => submitAdjust(p.ID, slPct, tpPct)}
+                      />
+                    </td>
+                  </tr>
+                )
+              })()}
             {total === 0 && (
               <tr>
                 <td colSpan={columnCount} className="text-dim">

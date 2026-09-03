@@ -133,6 +133,17 @@ export const api = {
   closePosition: (id: number) =>
     request<{ ok: boolean }>(`/positions/${id}/close`, { method: 'POST' }),
 
+  // Manual SL/TP edit for real positions (CLAUDE.md §27's real-trading plan §3b, 2026-09-03) —
+  // real mode only, unlike closePosition above which is paper-only today. Each percentage is
+  // SIGNED and leverage-adjusted (negative = loss side, positive = profit side, e.g. -5 on a 10x
+  // position moves that level to a 0.5% price move from entry) and is applied with NO clamp —
+  // an explicit operator/admin action is trusted directly, unlike the model's own automated edits.
+  adjustPosition: (id: number, body: { slPct?: number; tpPct?: number }) =>
+    request<{ slPx: string | null; tpPx: string | null }>(`/positions/${id}/adjust`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
   // An order's in-trade SL/TP adjustment history (CLAUDE.md §15.4/§15.12 revision, 2026-09-02) —
   // replaces the old baseline-vs-rl_adjusted A/B comparison now that the RL mechanic edits the
   // order in place instead of forking it.

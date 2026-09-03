@@ -263,6 +263,11 @@ type Repository interface {
 	// trading, CLAUDE.md §27) — the algo order's ID is not known until after this call returns
 	// (PlaceAlgoOrder happens second), so it is written separately via SetExchangeAlgoOrderID.
 	OpenPaperOrder(ctx context.Context, o PaperOrder) (int64, error)
+	// GetPaperOrder fetches a single order by id, open or closed. Used by the manual SL/TP-edit
+	// endpoint (CLAUDE.md §27.3's plan §3b) to resolve EntryPx/Leverage/Side before converting the
+	// operator's percentage input to a price — the existing list-shaped reads (ListOpenPaperOrders/
+	// ListPositions) are all the wrong shape for "fetch one order I already have the id of."
+	GetPaperOrder(ctx context.Context, id int64) (PaperOrder, error)
 	// SetExchangeAlgoOrderID records the resting SL/TP algo order's OKX-assigned ID on an already-
 	// open real order (CLAUDE.md §27.3), so it can be amended/cancelled later. Real trading only.
 	SetExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error

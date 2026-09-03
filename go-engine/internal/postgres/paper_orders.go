@@ -31,6 +31,30 @@ func (r *Repository) OpenPaperOrder(ctx context.Context, o port.PaperOrder) (int
 	return id, nil
 }
 
+// GetPaperOrder fetches a single order by id, open or closed (CLAUDE.md §27.3's plan §3b — the
+// manual SL/TP-edit endpoint needs EntryPx/Leverage/Side for one specific order, a shape none of
+// the existing list-oriented reads provide directly).
+func (r *Repository) GetPaperOrder(ctx context.Context, id int64) (port.PaperOrder, error) {
+	var o port.PaperOrder
+	var bar *string
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at,
+			closed_at, close_reason, close_px, realized_pnl, features_json, mode, parent_order_id,
+			variant, bar, pnl_max_pct, pnl_min_pct, manual_close_requested, exchange_order_id, exchange_algo_order_id
+		FROM paper_orders WHERE id = $1
+	`, id).Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size,
+		&o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx, &o.RealizedPnL,
+		&o.FeaturesJSON, &o.Mode, &o.ParentOrderID, &o.Variant, &bar, &o.PnLMaxPct, &o.PnLMinPct,
+		&o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID)
+	if err != nil {
+		return port.PaperOrder{}, fmt.Errorf("get paper order %d: %w", id, err)
+	}
+	if bar != nil {
+		o.Bar = *bar
+	}
+	return o, nil
+}
+
 // SetExchangeAlgoOrderID records the resting SL/TP algo order's OKX-assigned ID on an already-open
 // real order (CLAUDE.md §27.3) — a separate call from OpenPaperOrder because the algo order isn't
 // placed until after the entry order's row already exists.

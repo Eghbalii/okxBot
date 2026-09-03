@@ -100,6 +100,11 @@ func (s *Server) Routes() http.Handler {
 
 	mux.HandleFunc("GET /api/positions", s.handleListPositions)
 	mux.HandleFunc("POST /api/positions/{id}/close", s.handleClosePosition)
+	// Manual SL/TP edit for real positions (CLAUDE.md §27's real-trading plan §3b, 2026-09-03):
+	// real-trading-only, unlike Close above which is paper-only today — paper positions have no
+	// exchange leg to reason about, real positions have no in-process manual-close-flag mechanism
+	// to reuse (they're watched by RealTrader's own tick monitor, not PaperTrader's).
+	mux.HandleFunc("POST /api/positions/{id}/adjust", s.handleAdjustPosition)
 
 	// CLAUDE.md §15.6/§15.7: the shared account's current balance and its timeline, backing the
 	// panel's balance chart — the point of which is that a drain-and-reset that happened overnight
@@ -507,6 +512,135 @@ func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
+}
+
+// adjustPositionRequest is POST /api/positions/{id}/adjust's body — either or both fields, since
+// the model can move one or both levels in a single decision (CLAUDE.md §27's real-trading plan
+// §3b). Each value is a SIGNED percentage of margin (leverage-adjusted), matching the existing
+// 15% loss-cap convention (§19.2): negative moves the level to the loss side, positive to the
+// profit side — e.g. -5 on a 10x position means "move SL to where a touch realizes a 5% loss of
+// margin," a 0.5% price move from entry. TP is conceptually always profit-side but reuses the same
+// signed field for consistency rather than a separate always-positive one.
+type adjustPositionRequest struct {
+	SLPct *float64 `json:"slPct"`
+	TPPct *float64 `json:"tpPct"`
+}
+
+// handleAdjustPosition lets the operator move a real position's SL/TP directly from the panel
+// (CLAUDE.md §27's real-trading plan §3b, 2026-09-03) — real-trading-only, since paper positions
+// have no exchange leg to reason about and are edited through the model only.
+//
+// Deliberately UNCLAMPED (explicit operator decision, 2026-09-03, after review): the model's own
+// automated edits go through conductor.Clamps.Apply (initial-placement bounds — a level on the
+// "wrong side" of entry is rejected outright) or the ratchet (in-trade moves, capped at
+// MaxSLTPAdjustPct per step, and only ever tightening). Neither fits an operator's manual action —
+// Clamps.Apply would reject exactly the case the operator explicitly asked for ("bring the stop
+// past entry into profit"), and the ratchet needs a live market price this endpoint has no reason
+// to fetch. A human operator/admin acting directly is trusted the way this codebase already trusts
+// nothing else automated: the percentage the operator enters converts straight to a price via
+// priceFromMarginPct (entry price + leverage, no clamp), full stop.
+//
+// Writes directly: UpdatePaperOrderSLTP + RecordPaperOrderAdjustment(source="manual"). Purely
+// local, no exchange call — RealTrader's own tick-driven monitor picks up the new levels on its
+// next tick, same as it would for a model-driven change (§3a's correction: no resting exchange-
+// side order to amend).
+func (s *Server) handleAdjustPosition(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt64(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var req adjustPositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.SLPct == nil && req.TPPct == nil {
+		writeError(w, http.StatusBadRequest, "at least one of slPct/tpPct is required")
+		return
+	}
+
+	o, err := s.Repo.GetPaperOrder(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if o.ClosedAt != nil {
+		writeError(w, http.StatusConflict, "order is already closed")
+		return
+	}
+	if o.Mode != "real" {
+		writeError(w, http.StatusBadRequest, "manual SL/TP adjustment is only supported for real positions")
+		return
+	}
+	if !o.EntryPx.IsPositive() {
+		writeError(w, http.StatusInternalServerError, "order has no entry price to adjust from")
+		return
+	}
+
+	newSL, newTP := o.SLPx, o.TPPx
+	if req.SLPct != nil {
+		px := priceFromMarginPct(o.EntryPx, o.Leverage, o.Side, decimal.NewFromFloat(*req.SLPct))
+		newSL = &px
+	}
+	if req.TPPct != nil {
+		px := priceFromMarginPct(o.EntryPx, o.Leverage, o.Side, decimal.NewFromFloat(*req.TPPct))
+		newTP = &px
+	}
+
+	if err := s.Repo.UpdatePaperOrderSLTP(r.Context(), id, newSL, newTP); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if req.SLPct != nil && !samePriceOrNil(newSL, o.SLPx) {
+		if err := s.Repo.RecordPaperOrderAdjustment(r.Context(), id, "sl", o.SLPx, newSL, "manual"); err != nil {
+			s.Logger.Warn("adjust position: record sl adjustment failed", "id", id, "error", err)
+		}
+	}
+	if req.TPPct != nil && !samePriceOrNil(newTP, o.TPPx) {
+		if err := s.Repo.RecordPaperOrderAdjustment(r.Context(), id, "tp", o.TPPx, newTP, "manual"); err != nil {
+			s.Logger.Warn("adjust position: record tp adjustment failed", "id", id, "error", err)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"slPx": newSL, "tpPx": newTP})
+}
+
+// samePriceOrNil reports whether a and b are the same price, treating "both nil" as equal too —
+// used to decide whether a clamped SL/TP actually moved and is worth its own audit row.
+func samePriceOrNil(a, b *decimal.Decimal) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
+}
+
+// priceFromMarginPct converts a signed, leverage-adjusted margin percentage into an absolute
+// price, matching the existing 15% loss-cap convention (CLAUDE.md §19.2): price-distance =
+// |pct| / leverage. pct is a WHOLE-NUMBER percentage the same way the JSON field slPct/tpPct is
+// documented (e.g. -5 means "5% of margin", not the fraction -0.05) — matching the plan's own
+// example ("entering -5 on a 10x position means... a 0.5% price move from entry"). Negative pct
+// sits on the loss side of entry, positive on the profit side — independent of whether the caller
+// is placing an SL or a TP, since both are just "a price this far from entry in this direction."
+// A non-positive leverage is treated as 1x, the same defensive fallback used throughout this
+// codebase (usecase.unrealizedPnLPct, conductor.maxSLDistPctFor).
+func priceFromMarginPct(entryPx, leverage decimal.Decimal, side string, pct decimal.Decimal) decimal.Decimal {
+	lev := leverage
+	if !lev.IsPositive() {
+		lev = decimal.NewFromInt(1)
+	}
+	priceDistPct := pct.Abs().Div(decimal.NewFromInt(100)).Div(lev)
+	dist := entryPx.Mul(priceDistPct)
+
+	// A long's profit side is UP and loss side is DOWN; a short's are the reverse. XOR the two
+	// booleans directly rather than branching on each combination separately.
+	long := side != "sell"
+	profit := !pct.IsNegative()
+	if long == profit {
+		return entryPx.Add(dist)
+	}
+	return entryPx.Sub(dist)
 }
 
 // handleListPaperOrderAdjustments serves an order's in-trade SL/TP adjustment history (CLAUDE.md
