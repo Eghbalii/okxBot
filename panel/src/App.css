@@ -311,6 +311,14 @@ th:hover {
   white-space: nowrap;
 }
 
+/* PnL/Max cells are fixed at two lines (percent + dollar, or max + min) rather than wrapping
+   inline text onto a second line only when it's long enough to need it — a row's height used to
+   jump depending on whether that particular row's PnL string happened to wrap (2026-09-03 request). */
+.pnl-cell {
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
 .badge {
   display: inline-block;
   padding: 0.1rem 0.5rem;

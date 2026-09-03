@@ -44,13 +44,19 @@ function fmt(v: string | number | null | undefined): string {
   return String(v)
 }
 
-// Distance of a SL/TP level from entry, as a signed percent (negative = below entry). Shown next
-// to the raw price so a level can be read without mentally computing the distance each time.
-function pctFromEntry(level: string | number | null | undefined, entryPx: string): string {
+// Distance of a SL/TP level from entry, as a signed percent — positive means "in the direction of
+// profit for this position's side," negative means "toward loss," regardless of which raw
+// direction the price itself moves. A short's stop sits ABOVE entry (a price rise is a loss for a
+// short) and its target sits BELOW entry (a price fall is the profit) — the opposite of a long —
+// so the raw (level-entry)/entry distance has to be flipped for a sell, or a short's take-profit
+// (a genuinely profitable level) reads as negative and its stop-loss reads as positive, exactly
+// backwards from what the sign is supposed to communicate.
+function pctFromEntry(level: string | number | null | undefined, entryPx: string, side: string): string {
   const entry = Number(entryPx)
   const lvl = Number(level)
   if (!entry || level === null || level === undefined || level === '' || Number.isNaN(lvl)) return ''
-  const pct = ((lvl - entry) / entry) * 100
+  const direction = side === 'sell' ? -1 : 1
+  const pct = ((lvl - entry) / entry) * 100 * direction
   return ` (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`
 }
 
@@ -172,13 +178,13 @@ export default function OrderDetailModal({
             <Row label="Entry price" strategy={fmt(sig?.entry_px)} model={fmt(position.EntryPx)} />
             <Row
               label="Stop loss"
-              strategy={fmt(sig?.sl_px) + (sig?.sl_px ? pctFromEntry(sig.sl_px, sig?.entry_px || position.EntryPx) : '')}
-              model={fmt(position.SLPx) + (position.SLPx ? pctFromEntry(position.SLPx, position.EntryPx) : '')}
+              strategy={fmt(sig?.sl_px) + (sig?.sl_px ? pctFromEntry(sig.sl_px, sig?.entry_px || position.EntryPx, position.Side) : '')}
+              model={fmt(position.SLPx) + (position.SLPx ? pctFromEntry(position.SLPx, position.EntryPx, position.Side) : '')}
             />
             <Row
               label="Take profit"
-              strategy={fmt(sig?.tp_px) + (sig?.tp_px ? pctFromEntry(sig.tp_px, sig?.entry_px || position.EntryPx) : '')}
-              model={fmt(position.TPPx) + (position.TPPx ? pctFromEntry(position.TPPx, position.EntryPx) : '')}
+              strategy={fmt(sig?.tp_px) + (sig?.tp_px ? pctFromEntry(sig.tp_px, sig?.entry_px || position.EntryPx, position.Side) : '')}
+              model={fmt(position.TPPx) + (position.TPPx ? pctFromEntry(position.TPPx, position.EntryPx, position.Side) : '')}
             />
             <Row label="Size (USD)" strategy="—" model={fmt(position.Size)} />
             <Row label="Leverage" strategy="—" model={fmt(position.Leverage) + 'x'} />

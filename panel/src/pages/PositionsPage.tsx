@@ -160,7 +160,10 @@ export default function PositionsPage() {
     }
   }
 
-  const columnCount = 10 + (showLiveColumns ? 2 : 0) + (showClosedColumns ? 2 : 0) + (showLiveColumns ? 1 : 0)
+  // 11 always-shown columns (ID, Inst, Side, Strategy, TF, Entry, SL/TP, Leverage, Vol, Opened,
+  // PnL) plus showLiveColumns' 4 (Last, Max, Updated, the close-button column) and
+  // showClosedColumns' 2 (Closed, Reason).
+  const columnCount = 11 + (showLiveColumns ? 4 : 0) + (showClosedColumns ? 2 : 0)
 
   return (
     <div>
@@ -208,7 +211,7 @@ export default function PositionsPage() {
                   again, exactly what moving pagination server-side was meant to stop. */}
               <th className="th-static">ID</th>
               <SortableTh field="inst_id" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                Instrument
+                Inst
               </SortableTh>
               <th className="th-static">Side</th>
               <th className="th-static">Strategy</th>
@@ -219,7 +222,7 @@ export default function PositionsPage() {
               {showLiveColumns && <th className="th-static">Last</th>}
               <th className="th-static">SL / TP</th>
               <th className="th-static">Leverage</th>
-              <th className="th-static">Entry Volume</th>
+              <th className="th-static">Vol</th>
               <SortableTh field="opened_at" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
                 Opened
               </SortableTh>
@@ -234,6 +237,10 @@ export default function PositionsPage() {
               <SortableTh field="pnl" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
                 PnL
               </SortableTh>
+              {/* Peak/trough unrealized PnL this position reached while open (CLAUDE.md §15.11) —
+                  shown for closed rows too, since that's exactly what surfaces "this ran to +25%
+                  and still closed negative" without opening the order-detail modal to check. */}
+              {showLiveColumns && <th className="th-static">Max</th>}
               {showLiveColumns && <th className="th-static">Updated</th>}
               {showLiveColumns && <th className="th-static"></th>}
             </tr>
@@ -282,13 +289,28 @@ export default function PositionsPage() {
                   <td className="mono">{formatDateTime(p.OpenedAt)}</td>
                   {showClosedColumns && <td className="mono">{formatDateTime(p.ClosedAt)}</td>}
                   {showClosedColumns && <td>{closeReasonBadge(p.CloseReason)}</td>}
-                  <td className={'mono ' + pnlClass(realized ?? live?.usd ?? null)}>
-                    {realized !== null
-                      ? formatUsd(realized)
-                      : live
-                        ? `${live.pct >= 0 ? '+' : '−'}${Math.abs(live.pct).toFixed(2)}% (${formatUsd(live.usd)})`
-                        : '—'}
+                  <td className={'mono pnl-cell ' + pnlClass(realized ?? live?.usd ?? null)}>
+                    {realized !== null ? (
+                      <div>{formatUsd(realized)}</div>
+                    ) : live ? (
+                      <>
+                        <div>{`${live.pct >= 0 ? '+' : '−'}${Math.abs(live.pct).toFixed(2)}%`}</div>
+                        <div>{formatUsd(live.usd)}</div>
+                      </>
+                    ) : (
+                      '—'
+                    )}
                   </td>
+                  {showLiveColumns && (
+                    <td className="mono pnl-cell">
+                      <div className={pnlClass(Number(p.PnLMaxPct))}>
+                        {`${Number(p.PnLMaxPct) >= 0 ? '+' : ''}${(Number(p.PnLMaxPct) * 100).toFixed(2)}%`}
+                      </div>
+                      <div className={pnlClass(Number(p.PnLMinPct))}>
+                        {`${Number(p.PnLMinPct) >= 0 ? '+' : ''}${(Number(p.PnLMinPct) * 100).toFixed(2)}%`}
+                      </div>
+                    </td>
+                  )}
                   {showLiveColumns && (
                     <td>
                       {wasUpdated ? (

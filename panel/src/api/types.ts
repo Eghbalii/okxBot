@@ -63,6 +63,11 @@ export interface Position {
   Bar: string
   // StrategyName is joined in by ListPositions for display — empty when StrategyID is null.
   StrategyName: string
+  // PnLMaxPct/PnLMinPct are the peak and trough unrealized PnL this position has reached while
+  // open (fraction of margin, same scale as the live PnL% shown in the table) — CLAUDE.md §15.11.
+  // Zero-valued (not null) for a position that never updated them.
+  PnLMaxPct: string
+  PnLMinPct: string
   // FeaturesJSON is the decision-time observation actually sent to the model (CLAUDE.md §15.3),
   // stored as embedded JSON. Shape is the rl_service Observation; the order-detail view reads the
   // strategy signal out of it to compare against what the order ended up with.
