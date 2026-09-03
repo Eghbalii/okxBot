@@ -3432,8 +3432,22 @@ Concretely:
       constructions and direct `pt.candles`/`pt.candlesMu` field access would have needed changing
       for a refactor the plan intended to be low-risk and mechanical — the candle-window mutex+map
       pair stays as plain fields on each of `PaperTrader`/(future) `RealTrader`, only the LOGIC
-      operating on them is shared via free functions taking that state as parameters. `RealTrader`
-      itself, commits 2-11, and the algo-order/manual-edit machinery are NOT yet started.
+      operating on them is shared via free functions taking that state as parameters.
+      Commit 2 done (2026-09-03): `sizeFromAction` split into a thin `PaperTrader` method plus a
+      free function `sizeFromModelAction(cfg sizingConfig, ...)` parameterized by
+      `MaxLeverage`/`MaxPositionPct`/`MaxTotalExposurePct` — the sizing math itself is now callable
+      by `RealTrader` without either type embedding the other, per the plan's explicit "share the
+      literal function, not just the shape" call for position-sizing math. `applyAdjustment`'s pure
+      computation (level-adjust-pct → `RatchetSLTP` → "did anything actually change") extracted into
+      `computeAdjustedLevels(o, action, price) (newSL, newTP *decimal.Decimal, changed bool)`,
+      leaving `applyAdjustment` itself as pure IO (persist, log, record the audit row) — this is the
+      seam `RealTrader`'s in-place SL/TP edit (§3, no fork) will call into with its own IO
+      (`AmendAlgoOrder` → DB → `real_order_adjustments`) instead of paper's
+      (`UpdatePaperOrderSLTP` → `RecordPaperOrderAdjustment`). Zero behavior change: all 310
+      pre-existing tests pass unchanged, no new tests needed (both extractions are pure
+      code-motion — the same logic, reachable through the same call sites, just also callable from
+      outside `PaperTrader`). `RealTrader` itself, commits 3-11, and the algo-order/manual-edit
+      machinery are NOT yet started.
 - [ ] New append-only real-order-adjustment log (table TBD, `real_order_adjustments` working
       name) — every SL/TP edit its own row with a timestamp, never overwritten in place (§27.3).
 - [ ] Panel: order-detail modal for real orders showing the full chronological adjustment

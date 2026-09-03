@@ -185,16 +185,9 @@ func (e *PaperTrader) runUpdates(ctx context.Context, bar string, price decimal.
 // place and logged as its own row via RecordPaperOrderAdjustment, which is the audit trail a
 // click on the order in the panel reads instead of a fork-vs-baseline comparison.
 func (e *PaperTrader) applyAdjustment(ctx context.Context, o port.PaperOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
-	// The model sets levels (§15.11) while the ratchet reasons in relative moves, so convert here.
-	slAdjust := levelAdjustPct(o.SLPx, action.SLPx, price)
-	tpAdjust := levelAdjustPct(o.TPPx, action.TPPx, price)
-	if slAdjust.IsZero() && tpAdjust.IsZero() {
+	newSL, newTP, changed := computeAdjustedLevels(o, action, price)
+	if !changed {
 		return
-	}
-
-	newSL, newTP := RatchetSLTP(o, price, slAdjust, tpAdjust)
-	if samePriceOrNil(newSL, o.SLPx) && samePriceOrNil(newTP, o.TPPx) {
-		return // the ratchet rejected the proposal entirely; nothing to apply
 	}
 
 	if err := e.Repo.UpdatePaperOrderSLTP(ctx, o.ID, newSL, newTP); err != nil {

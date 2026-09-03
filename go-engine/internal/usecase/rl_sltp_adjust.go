@@ -80,20 +80,51 @@ func (e *PaperTrader) rlSizing(
 	return e.sizeFromAction(action, obs, openOrders, logger)
 }
 
-// sizeFromAction turns a model action into a position notional and leverage, applying the two hard
-// Go-side caps documented on rlSizing. Split out from rlSizing so the lifecycle's open decision
-// (which has already called the model to get the buy/sell answer) can reuse the exact same sizing
-// and capping rules without issuing a second Predict for one decision — two calls would not only
-// waste inference, they could return different answers and leave the order sized against one while
-// its levels came from the other.
+// sizingConfig is the sizing-relevant slice of PaperTrader's config, extracted so
+// sizeFromModelAction can be shared verbatim by RealTrader (CLAUDE.md §27's plan, commit 2) without
+// either type needing to embed the other. Position sizing math is the one piece of real financial
+// logic that MUST be identical between paper and real trading, so sharing the literal function is
+// the safest option, not merely the least-duplicate one.
+type sizingConfig struct {
+	InstID              string
+	MaxLeverage         decimal.Decimal
+	MaxPositionPct      decimal.Decimal
+	MaxTotalExposurePct decimal.Decimal
+}
+
+// sizeFromAction adapts PaperTrader's fields to sizeFromModelAction. Kept as a thin method so every
+// existing call site inside this package is unaffected by the extraction.
 func (e *PaperTrader) sizeFromAction(
 	action *domain.Action,
 	obs domain.Observation,
 	openOrders []port.PaperOrder,
 	logger *slog.Logger,
 ) (notional, leverage decimal.Decimal, ok bool) {
+	cfg := sizingConfig{
+		InstID:              e.InstID,
+		MaxLeverage:         e.MaxLeverage,
+		MaxPositionPct:      e.MaxPositionPct,
+		MaxTotalExposurePct: e.MaxTotalExposurePct,
+	}
+	return sizeFromModelAction(cfg, action, obs, openOrders, logger)
+}
+
+// sizeFromModelAction turns a model action into a position notional and leverage, applying the two
+// hard Go-side caps documented on rlSizing. Split out from rlSizing so the lifecycle's open decision
+// (which has already called the model to get the buy/sell answer) can reuse the exact same sizing
+// and capping rules without issuing a second Predict for one decision — two calls would not only
+// waste inference, they could return different answers and leave the order sized against one while
+// its levels came from the other. A free function (not a PaperTrader method) so RealTrader can call
+// it directly against its own sizingConfig, with zero risk of drift between the two.
+func sizeFromModelAction(
+	cfg sizingConfig,
+	action *domain.Action,
+	obs domain.Observation,
+	openOrders []port.PaperOrder,
+	logger *slog.Logger,
+) (notional, leverage decimal.Decimal, ok bool) {
 	equity := obs.AccountEquityUSD
-	if !equity.IsPositive() || !e.MaxLeverage.IsPositive() {
+	if !equity.IsPositive() || !cfg.MaxLeverage.IsPositive() {
 		return decimal.Zero, decimal.Zero, false
 	}
 
@@ -106,15 +137,15 @@ func (e *PaperTrader) sizeFromAction(
 
 	notional = equity.Mul(exposure)
 
-	if e.MaxPositionPct.IsPositive() {
-		if cap := equity.Mul(e.MaxPositionPct); notional.GreaterThan(cap) {
-			logger.Info("rl sizing: position capped", "instId", e.InstID,
-				"requested", notional, "cap", cap, "maxPositionPct", e.MaxPositionPct)
+	if cfg.MaxPositionPct.IsPositive() {
+		if cap := equity.Mul(cfg.MaxPositionPct); notional.GreaterThan(cap) {
+			logger.Info("rl sizing: position capped", "instId", cfg.InstID,
+				"requested", notional, "cap", cap, "maxPositionPct", cfg.MaxPositionPct)
 			notional = cap
 		}
 	}
 
-	if e.MaxTotalExposurePct.IsPositive() {
+	if cfg.MaxTotalExposurePct.IsPositive() {
 		var openNotional decimal.Decimal
 		for _, o := range openOrders {
 			// Forks are tracking-only shadows of their baseline parent (CLAUDE.md §15.4), not
@@ -123,16 +154,16 @@ func (e *PaperTrader) sizeFromAction(
 				openNotional = openNotional.Add(o.Size)
 			}
 		}
-		headroom := equity.Mul(e.MaxTotalExposurePct).Sub(openNotional)
+		headroom := equity.Mul(cfg.MaxTotalExposurePct).Sub(openNotional)
 		if headroom.LessThanOrEqual(decimal.Zero) {
 			logger.Info("rl sizing: total exposure ceiling reached, falling back",
-				"instId", e.InstID, "openNotional", openNotional,
-				"maxTotalExposurePct", e.MaxTotalExposurePct)
+				"instId", cfg.InstID, "openNotional", openNotional,
+				"maxTotalExposurePct", cfg.MaxTotalExposurePct)
 			return decimal.Zero, decimal.Zero, false
 		}
 		if notional.GreaterThan(headroom) {
 			logger.Info("rl sizing: position trimmed to remaining exposure headroom",
-				"instId", e.InstID, "requested", notional, "headroom", headroom)
+				"instId", cfg.InstID, "requested", notional, "headroom", headroom)
 			notional = headroom
 		}
 	}
@@ -141,9 +172,9 @@ func (e *PaperTrader) sizeFromAction(
 		return decimal.Zero, decimal.Zero, false
 	}
 
-	leverage = decimal.NewFromInt(1).Add(clampUnit(action.LeverageFrac).Mul(e.MaxLeverage.Sub(decimal.NewFromInt(1))))
+	leverage = decimal.NewFromInt(1).Add(clampUnit(action.LeverageFrac).Mul(cfg.MaxLeverage.Sub(decimal.NewFromInt(1))))
 
-	logger.Debug("rl sizing applied", "instId", e.InstID,
+	logger.Debug("rl sizing applied", "instId", cfg.InstID,
 		"equity", equity, "exposure", exposure, "notional", notional, "leverage", leverage)
 	return notional, leverage, true
 }
@@ -232,6 +263,27 @@ func levelAdjustPct(current *decimal.Decimal, proposed, price decimal.Decimal) d
 		return decimal.Zero
 	}
 	return proposed.Sub(*current).Div(price)
+}
+
+// computeAdjustedLevels is the pure half of applyAdjustment: given an order, the model's proposed
+// action, and the current price, it returns the ratchet-checked new SL/TP and whether anything
+// actually changed. Extracted as a free function (CLAUDE.md §27's plan, commit 2) so RealTrader's
+// in-place-edit update path (no shadow fork, §27.3) can reuse the exact same computation the
+// already-proven paper-trading path uses, with the IO (persisting, logging, recording the audit
+// row) left to each caller since paper and real trading write to different places.
+func computeAdjustedLevels(o port.PaperOrder, action *domain.Action, price decimal.Decimal) (newSL, newTP *decimal.Decimal, changed bool) {
+	// The model sets levels (§15.11) while the ratchet reasons in relative moves, so convert here.
+	slAdjust := levelAdjustPct(o.SLPx, action.SLPx, price)
+	tpAdjust := levelAdjustPct(o.TPPx, action.TPPx, price)
+	if slAdjust.IsZero() && tpAdjust.IsZero() {
+		return o.SLPx, o.TPPx, false
+	}
+
+	newSL, newTP = RatchetSLTP(o, price, slAdjust, tpAdjust)
+	if samePriceOrNil(newSL, o.SLPx) && samePriceOrNil(newTP, o.TPPx) {
+		return o.SLPx, o.TPPx, false // the ratchet rejected the proposal entirely; nothing to apply
+	}
+	return newSL, newTP, true
 }
 
 // positionStateOf describes an open order for the observation (CLAUDE.md §15.10). Prices are sent
