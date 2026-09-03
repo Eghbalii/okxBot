@@ -3572,14 +3572,36 @@ Concretely:
 - [x] `GET /api/v5/trade/order` (order status) added to `rest.Client` + `port.ExchangeClient` +
       routed through the gateway (`ClassAccount`, a read not a mutating trade action); `CancelOrder`
       added to `port.ExchangeClient` (§27.5).
-- [x] `domain.OrderStatus` added, carrying OKX's `state`/`avgPx`/`accFillSz`/`sz` (§27.5). Not yet
-      consumed by any fill-or-cancel loop — see the next item.
-- [x] `trading_fill_timeout.order_fill_timeout_sec` config added (default 60) — but the actual
-      fill-or-cancel LOGIC (poll `GetOrder` after `PlaceOrder`, cancel on timeout, no
-      retry/re-price) is NOT YET wired into `cmd/trader`'s execute path. Config exists, behavior
-      doesn't yet (§27.5).
-- [ ] Handle a partial fill within the timeout window as a real smaller-than-intended position,
-      not left ambiguous (§27.5).
+- [x] `domain.OrderStatus` added, carrying OKX's `state`/`avgPx`/`accFillSz`/`sz` (§27.5).
+- [x] **Fill-timeout/cancel wired into `RealTrader` (2026-09-03)**, not `cmd/trader`'s old
+      `execute()` — the old flat-rebalance `Trader` never gained this and isn't going to, since
+      `RealTrader` supersedes it (§27.3). `RealTrader.waitForFill` polls `Exchange.GetOrder` every
+      500ms until a terminal state (`filled`/`canceled`) or `FillTimeout` elapses (config
+      `trading_fill_timeout.order_fill_timeout_sec`, default 60s, wired into `cmd/trader/main.go`'s
+      `RealTrader{FillTimeout: ...}` construction), whichever first — on timeout it calls
+      `Exchange.CancelOrder` and returns, with NO automatic retry/re-price (per the operator's
+      original decision): the next real signal on its own normal cadence is what tries again.
+      Both `PlaceOrder` call sites now confirm the fill before doing anything else:
+      - **Open** (`openReal`): never filled at all → canceled, nothing persisted (the token's
+        open-position slot stays free for the next signal rather than being occupied by a phantom
+        row). **Partial fill** → recorded as a real, smaller-than-intended position: `order.Size`
+        is scaled by `AccFillSz/Sz` and `order.EntryPx` is overwritten with the confirmed `AvgPx`,
+        rather than persisting the originally-requested (unfilled) size.
+      - **Close** (`closeRealWith`, the flattening order): a flatten that doesn't fully fill is
+        deliberately NOT treated as closed — returns an error and leaves the DB row open, since a
+        partially- or un-flattened position is still real exposure on the exchange and marking it
+        closed would make the system believe it's flat when it isn't. Not split into a smaller
+        closed row either (unlike a partial open): the next tick's ordinary SL/TP/timeout check and
+        the 1-minute reconciliation poll both already handle a reduced-size still-open position
+        correctly without new bookkeeping — this only needs to not lie about the close.
+      `fakeExchangeClient` (`trade_test.go`, shared by `Trader`/`RealTrader` tests) extended with a
+      scriptable `GetOrder` response queue and `CancelOrder` call tracking; its default `PlaceOrder`
+      result now carries a non-empty `OrdID` (previously empty, which meant `waitForFill` was never
+      actually exercised by any pre-existing test — a real gap, not just an omission, since every
+      `RealTrader` open/close test up to this point silently skipped the fill-confirmation path
+      entirely). 4 new tests (immediate-fill fast path incl. `AvgPx` override, never-filled cancels
+      and opens nothing, partial-fill records the actual scaled size, unfilled flatten does NOT
+      mark closed) — 343 Go tests total, `go build`/`go vet` clean.
 - [ ] Position-state reconciliation: compare each poll's `GetPositions` response against this
       system's last-known state per position, surface/alert on drift instead of silently
       overwriting (§27.6). **Folded into the `RealTrader` build (§27.3's linked plan, corrected

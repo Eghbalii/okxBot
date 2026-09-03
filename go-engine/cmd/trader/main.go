@@ -247,6 +247,10 @@ func runRealTrader(
 			RLClamps:                clamps,
 			MaxOpenDuration:         cfg.PaperTrading.RLMaxOpenDuration,
 
+			// CLAUDE.md §27.5: bounds how long a placed order (open or the flattening close order)
+			// is given to fill before it's canceled and given up on, no retry/re-price.
+			FillTimeout: time.Duration(cfg.FillTimeout.OrderFillTimeoutSec) * time.Second,
+
 			OrderEvents: orderEventsPub,
 		}
 		delay := time.Duration(i) * engineStartStagger

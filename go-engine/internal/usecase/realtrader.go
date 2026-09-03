@@ -86,6 +86,14 @@ type RealTrader struct {
 	// comment on why this is deliberately not a tight loop. Zero falls back to the constant below.
 	ReconcileInterval time.Duration
 
+	// FillTimeout bounds how long a placed market order (open or the flattening close order) is
+	// given to fill before it's CANCELED and given up on (CLAUDE.md §27.5) — no automatic retry or
+	// re-pricing; the next real signal on its own normal cadence is what tries again. Futures market
+	// orders against a liquid perpetual are expected to fill essentially immediately, so this exists
+	// to bound the rare case where one doesn't, not as the primary fill path. Zero falls back to
+	// DefaultFillTimeout.
+	FillTimeout time.Duration
+
 	OrderEvents port.MarketDataPublisher
 
 	candlesMu sync.Mutex
@@ -109,6 +117,63 @@ func (e *RealTrader) reconcileInterval() time.Duration {
 		return e.ReconcileInterval
 	}
 	return DefaultReconcileInterval
+}
+
+// DefaultFillTimeout is RealTrader.FillTimeout's fallback when unset — 60s, matching
+// config.FillTimeout.OrderFillTimeoutSec's own default (CLAUDE.md §27.5).
+const DefaultFillTimeout = 60 * time.Second
+
+// fillPollInterval is how often waitForFill re-polls GetOrder while waiting — short relative to
+// FillTimeout since a market order against a liquid perpetual is expected to fill within one or
+// two polls; this isn't the reconciliation poll's "don't hammer the exchange" concern; it's a
+// short, bounded wait for a single order's own outcome.
+const fillPollInterval = 500 * time.Millisecond
+
+func (e *RealTrader) fillTimeout() time.Duration {
+	if e.FillTimeout > 0 {
+		return e.FillTimeout
+	}
+	return DefaultFillTimeout
+}
+
+// waitForFill polls Exchange.GetOrder for ordID until it reaches a terminal state (filled or
+// canceled) or fillTimeout() elapses, whichever comes first (CLAUDE.md §27.5). On timeout it
+// CANCELS the order and returns the status as last observed — deliberately no retry or re-price;
+// the caller (openReal/closeRealWith) is responsible for deciding what an unfilled/partially-
+// filled result means for its own path. A GetOrder error mid-poll is logged and treated as "not
+// yet terminal" rather than aborting the wait outright — a single flaky status read must not
+// abandon an order that may still be filling normally.
+func (e *RealTrader) waitForFill(ctx context.Context, ordID string, logger *slog.Logger) (domain.OrderStatus, error) {
+	deadline := time.Now().Add(e.fillTimeout())
+	var last domain.OrderStatus
+	for {
+		status, err := e.Exchange.GetOrder(e.InstID, ordID)
+		if err != nil {
+			logger.Warn("fill-timeout: get order status failed, will retry", "instId", e.InstID, "ordId", ordID, "error", err)
+		} else {
+			last = status
+			if status.IsTerminal() {
+				return last, nil
+			}
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return last, ctx.Err()
+		case <-time.After(fillPollInterval):
+		}
+	}
+
+	logger.Warn("fill-timeout: order not filled within timeout, canceling",
+		"instId", e.InstID, "ordId", ordID, "timeout", e.fillTimeout(), "lastState", last.State)
+	if err := e.Exchange.CancelOrder(e.InstID, ordID); err != nil {
+		logger.Error("fill-timeout: cancel failed", "instId", e.InstID, "ordId", ordID, "error", err)
+		return last, fmt.Errorf("order %s not filled within %s and cancel failed: %w", ordID, e.fillTimeout(), err)
+	}
+	return last, nil
 }
 
 func (e *RealTrader) accountMode() string {
@@ -411,6 +476,41 @@ func (e *RealTrader) openReal(
 		order.ExchangeOrderID = &ordID
 	}
 
+	// CLAUDE.md §27.5: confirm the fill rather than trusting PlaceOrder's acceptance response alone
+	// — a market order against a liquid perpetual is expected to fill essentially immediately, but
+	// this must not be assumed. Nothing is persisted for an order that never filled at all: there is
+	// no real position to record, and this token's open-position slot must stay free for the next
+	// signal rather than being blocked by a phantom row.
+	if order.ExchangeOrderID != nil {
+		status, err := e.waitForFill(ctx, *order.ExchangeOrderID, logger)
+		if err != nil {
+			return nil, fmt.Errorf("wait for fill: %w", err)
+		}
+		switch {
+		case status.IsFilled():
+			if status.AvgPx.IsPositive() {
+				order.EntryPx = status.AvgPx
+			}
+		case status.AccFillSz.IsPositive():
+			// Partially filled within the timeout window: a real, smaller-than-intended position
+			// exists on the exchange (canceled by waitForFill's timeout path for the remainder), so
+			// record what actually filled rather than the originally requested size — never assume
+			// the unfilled remainder will complete after the order was just canceled.
+			logger.Warn("real open: order partially filled before timeout/cancel",
+				"instId", e.InstID, "ordId", *order.ExchangeOrderID,
+				"requestedSz", sz, "filledSz", status.AccFillSz)
+			order.Size = order.Size.Mul(status.AccFillSz).Div(sz)
+			if status.AvgPx.IsPositive() {
+				order.EntryPx = status.AvgPx
+			}
+		default:
+			// Never filled at all before the timeout — canceled, nothing to record.
+			logger.Info("real open: order canceled unfilled, no position opened",
+				"instId", e.InstID, "ordId", *order.ExchangeOrderID)
+			return nil, nil
+		}
+	}
+
 	if raw, err := json.Marshal(obs); err == nil {
 		order.FeaturesJSON = raw
 	} else {
@@ -618,6 +718,26 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.PaperOrder, price
 		}
 		if result != nil && result.SCode != "0" {
 			return fmt.Errorf("flatten order rejected: sCode=%s sMsg=%s", result.SCode, result.SMsg)
+		}
+
+		// CLAUDE.md §27.5: confirm the flatten actually filled before marking the DB row closed —
+		// an unfilled or partially-filled flatten leaves real exposure still open on the exchange,
+		// and closing the DB row in that case would make the system believe a position is flat when
+		// it isn't. A partial fill here is deliberately NOT split into a smaller closed row (unlike
+		// a partial OPEN fill, which records the smaller size actually acquired): a partially-
+		// flattened position is still one open position with a reduced size, which the next tick's
+		// ordinary SL/TP/timeout check and the reconciliation poll both already handle correctly
+		// without new bookkeeping — this only needs to not lie about it being closed.
+		if result != nil && result.OrdID != "" {
+			status, err := e.waitForFill(ctx, result.OrdID, logger)
+			if err != nil {
+				return fmt.Errorf("wait for flatten fill: %w", err)
+			}
+			if !status.IsFilled() {
+				return fmt.Errorf("flatten order for %d not fully filled (state=%s, filled=%s/%s); "+
+					"position may still be open on the exchange, not marking closed",
+					o.ID, status.State, status.AccFillSz, status.Sz)
+			}
 		}
 	}
 

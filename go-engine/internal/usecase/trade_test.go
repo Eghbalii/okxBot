@@ -22,6 +22,18 @@ type fakeExchangeClient struct {
 	leverageCalls  []domain.LeverageChange
 	placeOrderErr  error
 	setLeverageErr error
+
+	// orderStatusQueue lets a test script a sequence of GetOrder responses (e.g. "live" then
+	// "filled", to exercise a fill-timeout poll loop) — each call pops the next entry; once
+	// exhausted, GetOrder falls back to orderStatus (or a default "filled" if that's also unset).
+	// getOrderErr, if set, is returned on every call regardless of the queue.
+	orderStatusQueue []domain.OrderStatus
+	orderStatus      *domain.OrderStatus
+	getOrderErr      error
+	getOrderCalls    int
+
+	cancelOrderCalls []string // ordIDs passed to CancelOrder
+	cancelOrderErr   error
 }
 
 func (f *fakeExchangeClient) GetTicker(instID string) (domain.Ticker, error) {
@@ -41,16 +53,29 @@ func (f *fakeExchangeClient) PlaceOrder(req domain.OrderRequest) (*domain.OrderR
 	if f.placeOrderErr != nil {
 		return nil, f.placeOrderErr
 	}
-	return &domain.OrderResult{SCode: "0"}, nil
+	return &domain.OrderResult{SCode: "0", OrdID: "fake-ord-id"}, nil
 }
 func (f *fakeExchangeClient) SetLeverage(req domain.LeverageChange) error {
 	f.leverageCalls = append(f.leverageCalls, req)
 	return f.setLeverageErr
 }
 func (f *fakeExchangeClient) CancelOrder(instID, ordID string) error {
-	return nil
+	f.cancelOrderCalls = append(f.cancelOrderCalls, ordID)
+	return f.cancelOrderErr
 }
 func (f *fakeExchangeClient) GetOrder(instID, ordID string) (domain.OrderStatus, error) {
+	f.getOrderCalls++
+	if f.getOrderErr != nil {
+		return domain.OrderStatus{}, f.getOrderErr
+	}
+	if len(f.orderStatusQueue) > 0 {
+		next := f.orderStatusQueue[0]
+		f.orderStatusQueue = f.orderStatusQueue[1:]
+		return next, nil
+	}
+	if f.orderStatus != nil {
+		return *f.orderStatus, nil
+	}
 	return domain.OrderStatus{InstID: instID, OrdID: ordID, State: "filled"}, nil
 }
 

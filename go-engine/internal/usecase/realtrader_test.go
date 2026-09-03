@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
@@ -334,5 +335,129 @@ func TestBuildObservation_UsesExchangeBalanceNotRepoBookkeeping(t *testing.T) {
 		t.Errorf("expected AccountEquityUSD=777 (from Exchange.GetBalance), got %s — "+
 			"a value of 42 would mean it fell back to Repo.GetAccountEquity's bookkeeping row instead",
 			obs.AccountEquityUSD)
+	}
+}
+
+// TestOpenReal_FillConfirmedImmediatelyRecordsEntryPx confirms the fast path (the expected case
+// for a market order against a liquid perpetual, CLAUDE.md §27.5): a "filled" status with an
+// AvgPx overwrites the naive candle-close entry price with the exchange's own reported fill price.
+func TestOpenReal_FillConfirmedImmediatelyRecordsEntryPx(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		balances:    []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
+		orderStatus: &domain.OrderStatus{State: "filled", AvgPx: dec("100.05"), AccFillSz: dec("1"), Sz: dec("1")},
+	}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5")}}
+	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
+	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt.FillTimeout = 50 * time.Millisecond
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+
+	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, _ := rt.openPositions(context.Background())
+	if len(open) != 1 {
+		t.Fatalf("expected 1 persisted open real position, got %d", len(open))
+	}
+	if !open[0].EntryPx.Equal(dec("100.05")) {
+		t.Errorf("expected EntryPx=100.05 (the confirmed fill price), got %s", open[0].EntryPx)
+	}
+	if len(exchange.cancelOrderCalls) != 0 {
+		t.Errorf("expected no cancel calls on an immediate fill, got %d", len(exchange.cancelOrderCalls))
+	}
+}
+
+// TestOpenReal_NeverFilledCancelsAndOpensNothing confirms the timeout path: an order that never
+// fills is canceled and NO position is persisted — the token's open-position slot stays free for
+// the next signal rather than being occupied by a phantom row (CLAUDE.md §27.5).
+func TestOpenReal_NeverFilledCancelsAndOpensNothing(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		balances:    []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
+		orderStatus: &domain.OrderStatus{State: "live", AccFillSz: dec("0"), Sz: dec("1")},
+	}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5")}}
+	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
+	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt.FillTimeout = 50 * time.Millisecond
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+
+	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	if len(exchange.cancelOrderCalls) != 1 {
+		t.Fatalf("expected exactly 1 cancel call, got %d", len(exchange.cancelOrderCalls))
+	}
+	open, _ := rt.openPositions(context.Background())
+	if len(open) != 0 {
+		t.Errorf("expected no persisted position for a never-filled order, got %d", len(open))
+	}
+}
+
+// TestOpenReal_PartialFillRecordsActualSize confirms a partial fill within the timeout window is
+// recorded as a real, smaller-than-intended position (proportional to what actually filled), not
+// left ambiguous or recorded at the originally requested size (CLAUDE.md §27.5).
+func TestOpenReal_PartialFillRecordsActualSize(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
+		// Sz here mirrors the requested contract size waitForFill observes on the final (timed-out)
+		// poll; AccFillSz is half of it, so the caller should record half the requested USD notional.
+		orderStatus: &domain.OrderStatus{State: "live", AvgPx: dec("100"), AccFillSz: dec("2.5"), Sz: dec("5")},
+	}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5")}}
+	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
+	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt.FillTimeout = 50 * time.Millisecond
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+
+	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, _ := rt.openPositions(context.Background())
+	if len(open) != 1 {
+		t.Fatalf("expected 1 persisted position (the partially-filled portion), got %d", len(open))
+	}
+	// The RL sizing pass sizes to equity(1000) * SizePct(0.5) = 500 USD notional before this fix
+	// would have applied. AccFillSz(2.5)/Sz(5) = 50% actually filled, so the persisted size must be
+	// half of whatever the requested notional was — computed independently here (not derived from
+	// open[0].Size itself, which would make the check tautological).
+	requestedNotional := dec("1000").Mul(dec("0.5"))
+	wantSize := requestedNotional.Mul(dec("0.5")) // 50% fill ratio
+	if !open[0].Size.Sub(wantSize).Abs().LessThan(dec("0.01")) {
+		t.Errorf("expected recorded size ~%s (50%% of the %s requested notional), got %s", wantSize, requestedNotional, open[0].Size)
+	}
+	if !open[0].EntryPx.Equal(dec("100")) {
+		t.Errorf("expected EntryPx=100 (the confirmed AvgPx), got %s", open[0].EntryPx)
+	}
+}
+
+// TestCloseReal_UnfilledFlattenDoesNotMarkClosed confirms the flatten leg's own fill-timeout path:
+// if the closing order doesn't fully fill, the DB row must NOT be marked closed — a partially- or
+// un-flattened position is still real exposure on the exchange (CLAUDE.md §27.5).
+func TestCloseReal_UnfilledFlattenDoesNotMarkClosed(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		orderStatus: &domain.OrderStatus{State: "live", AccFillSz: dec("0"), Sz: dec("1")},
+	}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt.FillTimeout = 50 * time.Millisecond
+
+	order := port.PaperOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+	repo.orders[1] = order
+
+	err := rt.closeReal(context.Background(), order, dec("110"), "sl", testLogger())
+	if err == nil {
+		t.Fatal("expected closeReal to return an error when the flatten order doesn't fill")
+	}
+	if repo.orders[1].ClosedAt != nil {
+		t.Error("expected the order to remain open in the DB when the flatten didn't confirm fill")
+	}
+	if len(exchange.cancelOrderCalls) != 1 {
+		t.Errorf("expected the unfilled flatten order to be canceled, got %d cancel calls", len(exchange.cancelOrderCalls))
 	}
 }
