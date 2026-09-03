@@ -3235,17 +3235,22 @@ needs a **different**, real-money-appropriate lifecycle, not a port of the fork 
   `PosMode`, already config-driven per §27's audit). No forking: when the model wants to adjust
   SL/TP on an open real position, it **edits that position's stop/target in place** — there is
   only ever one real order/position per token+side to edit, never a second parallel one.
+  **Clarified 2026-09-03 (the real-order-lifecycle plan's §3a, after an earlier draft of that plan
+  incorrectly assumed OKX conditional/algo orders): "in place" means the SAME mechanism paper
+  trading already uses — our own in-process tick monitor watches SL/TP and sends a plain market
+  order to flatten when touched, with a periodic (1-minute) reconciliation poll against OKX's own
+  `GetPositions`/`GetBalance` to catch drift. No resting conditional order is ever placed on OKX,
+  and no new `ExchangeClient` methods beyond what already exists (`PlaceOrder`/`GetPositions`/
+  `GetBalance`) are needed for this. Futures/perpetual-swap (`SWAP`) endpoints only, matching every
+  other exchange call in this codebase — no other instrument type is ever used.**
 - **Every edit is logged as its own row, not overwritten in place at the storage layer** — the
   operator's explicit requirement: "even if a stop-loss is changed 5 times on one order, all 5
   changes must be visible," each with its own timestamp. This reuses the existing
-  `strategy_param_changes` shape's *spirit* (§16.7 — an append-only change log, never an
-  in-place-only update) but needs its own table (working name `real_order_adjustments`:
-  `order_id` (FK-equivalent, referencing the real order's row/exchange `ordId`), `field`
-  (`'sl'`/`'tp'`), `old_value`, `new_value`, `changed_at`, `changed_by` (`'model'` — real trading
-  has no operator-triggered adjustments in scope for v1, but the column exists so a future manual
-  override, §20's paper-trading precedent, has somewhere to record itself distinctly from a
-  model-driven one)) — decide the exact table name/shape at implementation, but the append-only
-  requirement itself is fixed.
+  `paper_order_adjustments` table (migration `000016`, added 2026-09-02 alongside the same "edit
+  in place, don't fork" shift for paper trading's own SL/TP mechanic, §15.4/§15.12's revision note)
+  as-is — real orders live in `paper_orders` too (`mode='real'`), and that table's `source` column
+  already includes `'manual'` for a future operator override (§20's paper-trading precedent). No
+  new table needed for real trading specifically.
 - **Panel**: clicking an order's `order-id` opens the same shape of detail modal
   `OrderDetailModal` already provides for paper orders (§14 Phase 3), extended to show the full
   adjustment history for a real order as a chronological list (timestamp → field → old → new) —
@@ -3353,7 +3358,11 @@ Concretely:
   expected). Add that comparison — logged loudly, and routed through the same halt/alert path a
   margin-mode mismatch (§27.2) would use — rather than silently overwriting local state with
   whatever OKX reports and moving on, which would hide exactly the kind of drift this section
-  exists to catch.
+  exists to catch. **Cadence fixed at 1 minute, per explicit operator decision 2026-09-03** — a
+  deliberate contrast with `RealTrader`'s own SL/TP execution, which watches the live tick feed
+  in-process (§27.3's clarification) rather than waiting on this poll; the poll exists only to
+  catch drift (a manual close on OKX's own UI, a liquidation, a missed fill), not to drive the
+  trading loop itself, so it does not need — and should not have — sub-minute cadence.
 - This reconciliation is what a WebSocket-private-channel push (§27.4's stretch goal) would also
   serve, if built — the two aren't competing designs, a push channel plus periodic REST
   reconciliation is a reasonable defense-in-depth pair (matches this project's own repeated "don't
@@ -3419,9 +3428,15 @@ Concretely:
       real scope behind "no forking for real trading," §27.3) — one position per token per side,
       model edits SL/TP in place, opposite-side signals while a position is open are ignored
       (routed as conductor `update`, never a flip) until the model itself closes the position.
-      Real conditional/algo orders on OKX (not in-process monitoring) + a manual panel SL/TP-edit
-      control, per explicit operator decisions 2026-09-01 — full design in the approved plan,
-      `CLAUDE.md`-external at `/Users/rez/.claude/plans/glimmering-hopping-dahl.md`.
+      SL/TP is watched by our own in-process tick monitor — the SAME mechanism paper trading
+      already uses — plus a 1-minute reconciliation poll against OKX's own `GetPositions`/
+      `GetBalance` (§27.3/§27.6, corrected 2026-09-03: an earlier draft of the linked plan said
+      the opposite — real conditional/algo orders on OKX, no in-process monitoring — which the
+      operator does not recall requesting and rejected on being asked directly; there is no algo
+      order anywhere in this design) + a manual panel SL/TP-edit control. Futures/perpetual-swap
+      (`SWAP`) endpoints only, matching every other exchange call in this codebase. Full design in
+      the approved plan, `CLAUDE.md`-external at
+      `/Users/rez/.claude/plans/glimmering-hopping-dahl.md` (also corrected 2026-09-03).
       IN PROGRESS — commit 1 of the plan's 11-commit rollout done: `internal/usecase/tickfeed.go`
       extracts the candle/tick IO skeleton (`decodeTick`/`decodeCandle`/`applyCandle`/
       `snapshotCandles`/`seedCandlesFromRepo`/`decisionBarFor`/`barSeconds`/`parseCandleFields`)
@@ -3441,13 +3456,13 @@ Concretely:
       computation (level-adjust-pct → `RatchetSLTP` → "did anything actually change") extracted into
       `computeAdjustedLevels(o, action, price) (newSL, newTP *decimal.Decimal, changed bool)`,
       leaving `applyAdjustment` itself as pure IO (persist, log, record the audit row) — this is the
-      seam `RealTrader`'s in-place SL/TP edit (§3, no fork) will call into with its own IO
-      (`AmendAlgoOrder` → DB → `real_order_adjustments`) instead of paper's
-      (`UpdatePaperOrderSLTP` → `RecordPaperOrderAdjustment`). Zero behavior change: all 310
-      pre-existing tests pass unchanged, no new tests needed (both extractions are pure
-      code-motion — the same logic, reachable through the same call sites, just also callable from
-      outside `PaperTrader`). `RealTrader` itself, commits 3-11, and the algo-order/manual-edit
-      machinery are NOT yet started.
+      seam `RealTrader`'s in-place SL/TP edit (§3a, no fork, no exchange call — corrected
+      2026-09-03) will call into with the SAME IO paper trading uses (`UpdatePaperOrderSLTP` →
+      `RecordPaperOrderAdjustment`), since real trading's own SL/TP is watched in-process rather
+      than resting on the exchange. Zero behavior change: all 310 pre-existing tests pass
+      unchanged, no new tests needed (both extractions are pure code-motion — the same logic,
+      reachable through the same call sites, just also callable from outside `PaperTrader`).
+      `RealTrader` itself, commits 4 onward, and the manual-edit endpoint are NOT yet started.
 - [x] New append-only real-order-adjustment log — turned out to already exist. Commit 3
       (2026-09-03) started from the plan's §4(b) design (`real_order_adjustments`, a new table)
       but found `paper_order_adjustments` (migration `000016_paper_order_adjustments`, added
@@ -3458,22 +3473,26 @@ Concretely:
       CHECK already includes `'manual'` — exactly the value the plan's §3b manual-edit endpoint
       needs. `port.Repository.RecordPaperOrderAdjustment`/`ListPaperOrderAdjustments` are the
       methods the plan's §4(c) asked for, already implemented and tested. Nothing new was needed
-      here; `RealTrader`'s update/close paths (commits 5-6) call these directly with
-      `source="model"`/`"manual"`, no new plumbing.
+      here; `RealTrader`'s update/close paths call these directly with `source="model"`/`"manual"`,
+      no new plumbing.
       What genuinely didn't exist and WAS added this commit (§4(a)): `paper_orders` gained
       `exchange_order_id`/`exchange_algo_order_id` (migration
       `000017_real_order_exchange_ids`, nullable, no index — display/audit fields) and matching
       `port.PaperOrder.ExchangeOrderID`/`ExchangeAlgoOrderID` fields, wired through
       `OpenPaperOrder`'s INSERT and the `ListOpenPaperOrders`/`ListPositions` scans so a real
-      order's OKX order ID and resting algo-order ID are visible wherever a paper order already
-      is — zero new query, zero panel change needed for basic visibility. New
-      `Repository.SetExchangeAlgoOrderID(ctx, id, algoOrderID)`, a separate call from
-      `OpenPaperOrder` because the algo order (§3a) isn't placed until after the entry row already
-      exists. `fakeRepository` extended with the new method; no other fake `Repository`
+      order's OKX order ID is visible wherever a paper order already is — zero new query, zero
+      panel change needed for basic visibility. New `Repository.SetExchangeAlgoOrderID(ctx, id,
+      algoOrderID)`. `fakeRepository` extended with the new method; no other fake `Repository`
       implementation exists in the codebase. Zero behavior change to paper/demo trading — the two
       new columns are nil for every existing row and every write path except `RealTrader`'s
       (not yet built). All 310 tests pass unchanged (additive migration, no new test needed since
       nothing new is exercised yet); migration applied clean on the server.
+      **Correction, same day (§3a): `ExchangeAlgoOrderID`/`exchange_algo_order_id`/
+      `SetExchangeAlgoOrderID` anticipated an OKX conditional/algo-order design that was rejected
+      right after this commit — real trading watches SL/TP in-process instead (same mechanism as
+      paper trading), so there is no second exchange-side order to track an ID for. Left in place
+      as dead/unused (nullable, harmless) rather than reverted immediately; dropping them is
+      optional future cleanup, not blocking.**
 - [ ] Panel: order-detail modal for real orders showing the full chronological adjustment
       history, not just latest SL/TP (§27.3) — the data (`ListPaperOrderAdjustments`) is already
       served for paper orders' own adjustment history via the existing endpoint; extending the
@@ -3491,7 +3510,9 @@ Concretely:
       not left ambiguous (§27.5).
 - [ ] Position-state reconciliation: compare each poll's `GetPositions` response against this
       system's last-known state per position, surface/alert on drift instead of silently
-      overwriting (§27.6).
+      overwriting (§27.6). **Folded into the `RealTrader` build (§27.3's linked plan, corrected
+      2026-09-03) as a fixed 1-minute poll, rather than left fully deferred** — build alongside
+      `RealTrader`'s update/close paths, not as separate later work.
 - [ ] Confirm `account_equity_history` is actually being written for `real` mode once live
       trading starts — don't assume the existing `cmd/trader` equity-recording code (§15.7) was
       ever exercised against a real account before now (§27.4). Related, found 2026-09-01: the
