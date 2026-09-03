@@ -319,6 +319,14 @@ th:hover {
   white-space: nowrap;
 }
 
+/* Opened/Closed timestamps: date on one line, time on the other, same fixed-two-line treatment
+   as .pnl-cell rather than the single "03/09/2026, 05:40:11" line wrapping unpredictably
+   depending on the column's actual rendered width (2026-09-03 request). */
+.datetime-cell {
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
 .badge {
   display: inline-block;
   padding: 0.1rem 0.5rem;

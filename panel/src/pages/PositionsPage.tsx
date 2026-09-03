@@ -9,7 +9,7 @@ import PaperTradingStatsBox from '../components/PaperTradingStatsBox'
 import Pagination, { DEFAULT_PAGE_SIZE } from '../components/Pagination'
 import SortableTh from '../components/SortableTh'
 import { api } from '../api/client'
-import { formatDateTime, formatUsd, pnlClass, tokenSymbol, trimPrice } from '../utils/format'
+import { formatDateTimeLines, formatUsd, pnlClass, tokenSymbol, trimPrice } from '../utils/format'
 import type { CloseReason, Position, PositionMode } from '../api/types'
 
 // Sortable columns are limited to what Postgres can ORDER BY directly (internal/postgres's
@@ -25,6 +25,18 @@ function closeReasonBadge(reason: CloseReason | null) {
   if (!reason) return <span className="badge badge-dim">open</span>
   const cls = reason === 'tp' ? 'badge-green' : reason === 'sl' ? 'badge-red' : 'badge-dim'
   return <span className={'badge ' + cls}>{reason}</span>
+}
+
+// Date on one line, time on the other — a single "03/09/2026, 05:40:11" line was too wide for the
+// Opened/Closed columns and wrapped unpredictably depending on the column's actual rendered width.
+function DateTimeCell({ iso }: { iso: string | null | undefined }) {
+  const { date, time } = formatDateTimeLines(iso)
+  return (
+    <td className="mono datetime-cell">
+      <div>{date}</div>
+      {time && <div>{time}</div>}
+    </td>
+  )
 }
 
 // Unrealized PnL computed client-side from entry_px/size/leverage against the live streamed price
@@ -160,10 +172,10 @@ export default function PositionsPage() {
     }
   }
 
-  // 11 always-shown columns (ID, Inst, Side, Strategy, TF, Entry, SL/TP, Leverage, Vol, Opened,
-  // PnL) plus showLiveColumns' 4 (Last, Max, Updated, the close-button column) and
+  // 12 always-shown columns (ID, Inst, Side, Strategy, TF, Entry, SL/TP, Leverage, Vol, Opened,
+  // PnL, Max) plus showLiveColumns' 3 (Last, Updated, the close-button column) and
   // showClosedColumns' 2 (Closed, Reason).
-  const columnCount = 11 + (showLiveColumns ? 4 : 0) + (showClosedColumns ? 2 : 0)
+  const columnCount = 12 + (showLiveColumns ? 3 : 0) + (showClosedColumns ? 2 : 0)
 
   return (
     <div>
@@ -238,9 +250,10 @@ export default function PositionsPage() {
                 PnL
               </SortableTh>
               {/* Peak/trough unrealized PnL this position reached while open (CLAUDE.md §15.11) —
-                  shown for closed rows too, since that's exactly what surfaces "this ran to +25%
-                  and still closed negative" without opening the order-detail modal to check. */}
-              {showLiveColumns && <th className="th-static">Max</th>}
+                  unlike Last/Updated/the close button below, this is meaningful for closed rows
+                  too (it's exactly what surfaces "this ran to +25% and still closed negative"
+                  without opening the order-detail modal), so it isn't gated on showLiveColumns. */}
+              <th className="th-static">Max</th>
               {showLiveColumns && <th className="th-static">Updated</th>}
               {showLiveColumns && <th className="th-static"></th>}
             </tr>
@@ -286,8 +299,8 @@ export default function PositionsPage() {
                   </td>
                   <td className="mono">{p.Leverage}x</td>
                   <td className="mono">${Number(p.Size).toLocaleString()}</td>
-                  <td className="mono">{formatDateTime(p.OpenedAt)}</td>
-                  {showClosedColumns && <td className="mono">{formatDateTime(p.ClosedAt)}</td>}
+                  <DateTimeCell iso={p.OpenedAt} />
+                  {showClosedColumns && <DateTimeCell iso={p.ClosedAt} />}
                   {showClosedColumns && <td>{closeReasonBadge(p.CloseReason)}</td>}
                   <td className={'mono pnl-cell ' + pnlClass(realized ?? live?.usd ?? null)}>
                     {realized !== null ? (
@@ -301,16 +314,14 @@ export default function PositionsPage() {
                       '—'
                     )}
                   </td>
-                  {showLiveColumns && (
-                    <td className="mono pnl-cell">
-                      <div className={pnlClass(Number(p.PnLMaxPct))}>
-                        {`${Number(p.PnLMaxPct) >= 0 ? '+' : ''}${(Number(p.PnLMaxPct) * 100).toFixed(2)}%`}
-                      </div>
-                      <div className={pnlClass(Number(p.PnLMinPct))}>
-                        {`${Number(p.PnLMinPct) >= 0 ? '+' : ''}${(Number(p.PnLMinPct) * 100).toFixed(2)}%`}
-                      </div>
-                    </td>
-                  )}
+                  <td className="mono pnl-cell">
+                    <div className={pnlClass(Number(p.PnLMaxPct))}>
+                      {`${Number(p.PnLMaxPct) >= 0 ? '+' : ''}${(Number(p.PnLMaxPct) * 100).toFixed(2)}%`}
+                    </div>
+                    <div className={pnlClass(Number(p.PnLMinPct))}>
+                      {`${Number(p.PnLMinPct) >= 0 ? '+' : ''}${(Number(p.PnLMinPct) * 100).toFixed(2)}%`}
+                    </div>
+                  </td>
                   {showLiveColumns && (
                     <td>
                       {wasUpdated ? (

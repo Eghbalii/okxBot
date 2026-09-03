@@ -1,9 +1,11 @@
 // 24-hour time, no AM/PM. Fixed to en-GB rather than the browser locale so the format is
 // stable regardless of where the panel is opened from.
-const DATE_TIME = new Intl.DateTimeFormat('en-GB', {
+const DATE_ONLY = new Intl.DateTimeFormat('en-GB', {
   year: 'numeric',
   month: '2-digit',
   day: '2-digit',
+})
+const TIME_ONLY = new Intl.DateTimeFormat('en-GB', {
   hour: '2-digit',
   minute: '2-digit',
   second: '2-digit',
@@ -14,7 +16,17 @@ export function formatDateTime(iso: string | null | undefined): string {
   if (!iso) return '—'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return '—'
-  return DATE_TIME.format(d)
+  return `${DATE_ONLY.format(d)}, ${TIME_ONLY.format(d)}`
+}
+
+// Same value as formatDateTime, split into its date/time halves for a table cell that renders
+// them on two lines (a single "03/09/2026, 05:40:11" line was too wide for the Opened/Closed
+// columns and got line-wrapped unpredictably depending on the column's actual rendered width).
+export function formatDateTimeLines(iso: string | null | undefined): { date: string; time: string } {
+  if (!iso) return { date: '—', time: '' }
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return { date: '—', time: '' }
+  return { date: DATE_ONLY.format(d), time: TIME_ONLY.format(d) }
 }
 
 // Money is rounded for display only (the exact NUMERIC value stays in the database, CLAUDE.md §7)
