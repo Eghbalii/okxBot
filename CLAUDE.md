@@ -3462,7 +3462,31 @@ Concretely:
       than resting on the exchange. Zero behavior change: all 310 pre-existing tests pass
       unchanged, no new tests needed (both extractions are pure code-motion — the same logic,
       reachable through the same call sites, just also callable from outside `PaperTrader`).
-      `RealTrader` itself, commits 4 onward, and the manual-edit endpoint are NOT yet started.
+      Commit 4 done (2026-09-03): `internal/usecase/realtrader.go` — the new `usecase.RealTrader`
+      type, mirroring `PaperTrader`'s shape (strategy evaluation, conductor-mediated open/update/
+      close, sizing, clamps) but for real orders: one open position per token per side (no fork,
+      §27.3), SL/TP watched by its own in-process tick monitor (`monitorOpenPositions`, the same
+      mechanism `PaperTrader.monitorOpenOrders` already uses — no exchange-side algo order, per
+      §3a's correction), a real `Exchange.PlaceOrder` call on open/close, and a 1-minute
+      reconciliation poll (`reconcile`/`runReconcileLoop`) comparing `GetPositions`/`GetBalance`
+      against this process's own bookkeeping — closing a locally-stale position when the exchange
+      already shows it flat, and routing an untracked exchange-reported position through
+      `risk.Manager.Halt` rather than silently ignoring it. Reuses `sizeFromModelAction`/
+      `computeAdjustedLevels` (commit 2) and `paper_order_adjustments`/`ExchangeOrderID` (commit
+      3) directly — no new persistence needed. A real, load-bearing bug caught before it shipped:
+      `Repository.ListOpenPaperOrders` filters by `instID` only, with no `Mode` column in its
+      WHERE clause — since this deployment runs paper and (eventually) real trading against the
+      SAME instrument roster simultaneously, `RealTrader` would have seen paper trading's own open
+      orders as its own. Used `ListPositions(PositionFilter{Mode, InstID, Open})` instead
+      throughout (`openPositions`), which correctly scopes by mode. NOT yet wired into
+      `cmd/trader/main.go` (the old `Trader`/`trade.go` flat-rebalance loop still runs in
+      production) — inert by construction. `fakeRepository.ListPositions` (previously an unused
+      stub returning `nil, nil`) was implemented for real to support this, filtering by Mode/
+      InstID/Open exactly like the Postgres version. 10 new tests (open: model open/skip/no-model,
+      one-position-per-token gate; update: in-place edit with zero exchange calls; close:
+      exchange-failure-doesn't-close-DB ordering, success + terminal-call delivery; reconcile:
+      exchange-flat-closes-local, untracked-position-halts, matching-state-is-a-no-op) — 320 Go
+      tests total. The manual-edit endpoint (§3b) is NOT yet started.
 - [x] New append-only real-order-adjustment log — turned out to already exist. Commit 3
       (2026-09-03) started from the plan's §4(b) design (`real_order_adjustments`, a new table)
       but found `paper_order_adjustments` (migration `000016_paper_order_adjustments`, added

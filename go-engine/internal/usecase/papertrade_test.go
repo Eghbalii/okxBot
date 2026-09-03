@@ -94,7 +94,29 @@ func (r *fakeRepository) StrategyStatsFor(ctx context.Context, strategyID int64)
 	return port.StrategyStats{}, nil
 }
 func (r *fakeRepository) ListPositions(ctx context.Context, f port.PositionFilter) ([]port.PaperOrder, error) {
-	return nil, nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []port.PaperOrder
+	for _, o := range r.orders {
+		if f.Mode != "" && o.Mode != f.Mode {
+			continue
+		}
+		if f.InstID != "" && o.InstID != f.InstID {
+			continue
+		}
+		if f.Open != nil && (o.ClosedAt == nil) != *f.Open {
+			continue
+		}
+		out = append(out, o)
+	}
+	if f.Limit > 0 && f.Offset < len(out) {
+		end := f.Offset + f.Limit
+		if end > len(out) {
+			end = len(out)
+		}
+		out = out[f.Offset:end]
+	}
+	return out, nil
 }
 func (r *fakeRepository) CountPositions(ctx context.Context, f port.PositionFilter) (int, error) {
 	return 0, nil
