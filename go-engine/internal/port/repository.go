@@ -135,6 +135,14 @@ type PaperOrder struct {
 	// request) and checked by PaperTrader.monitorOpenOrders on its next tick — cmd/api runs in a
 	// separate process and cannot run the real close path itself, so this is intent, not a close.
 	ManualCloseRequested bool
+
+	// ExchangeOrderID/ExchangeAlgoOrderID are OKX's own order IDs for a real trade (CLAUDE.md §27,
+	// nil for paper/demo rows). ExchangeOrderID identifies the entry market order; ExchangeAlgoOrderID
+	// identifies the resting SL/TP algo/conditional order placed immediately after — needed later
+	// to amend or cancel it, since real trading edits that order in place rather than forking
+	// (§27.3). Populated only by RealTrader's open path.
+	ExchangeOrderID     *string
+	ExchangeAlgoOrderID *string
 }
 
 // AccountEquity is one trading mode's shared running balance (CLAUDE.md §15.6, revised
@@ -251,7 +259,13 @@ type Repository interface {
 	// StrategyStatsFor computes per-strategy track record from paper_orders (CLAUDE.md §11.3).
 	StrategyStatsFor(ctx context.Context, strategyID int64) (StrategyStats, error)
 
+	// OpenPaperOrder inserts o and returns its id. o.ExchangeOrderID is persisted when set (real
+	// trading, CLAUDE.md §27) — the algo order's ID is not known until after this call returns
+	// (PlaceAlgoOrder happens second), so it is written separately via SetExchangeAlgoOrderID.
 	OpenPaperOrder(ctx context.Context, o PaperOrder) (int64, error)
+	// SetExchangeAlgoOrderID records the resting SL/TP algo order's OKX-assigned ID on an already-
+	// open real order (CLAUDE.md §27.3), so it can be amended/cancelled later. Real trading only.
+	SetExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error
 	ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error
 	// UpdatePaperOrderSLTP applies an in-trade SL/TP adjustment to an open order (CLAUDE.md §15.4).
 	// Callers MUST have already run the proposed new prices through the ratchet clamp

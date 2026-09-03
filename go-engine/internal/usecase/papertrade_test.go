@@ -107,6 +107,18 @@ func (r *fakeRepository) OpenPaperOrder(ctx context.Context, o port.PaperOrder) 
 	r.orders[o.ID] = o
 	return o.ID, nil
 }
+func (r *fakeRepository) SetExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.orders[id]
+	if !ok {
+		return fmt.Errorf("order %d not found", id)
+	}
+	aid := algoOrderID
+	o.ExchangeAlgoOrderID = &aid
+	r.orders[id] = o
+	return nil
+}
 func (r *fakeRepository) ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

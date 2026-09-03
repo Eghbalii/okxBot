@@ -3448,10 +3448,36 @@ Concretely:
       code-motion — the same logic, reachable through the same call sites, just also callable from
       outside `PaperTrader`). `RealTrader` itself, commits 3-11, and the algo-order/manual-edit
       machinery are NOT yet started.
-- [ ] New append-only real-order-adjustment log (table TBD, `real_order_adjustments` working
-      name) — every SL/TP edit its own row with a timestamp, never overwritten in place (§27.3).
+- [x] New append-only real-order-adjustment log — turned out to already exist. Commit 3
+      (2026-09-03) started from the plan's §4(b) design (`real_order_adjustments`, a new table)
+      but found `paper_order_adjustments` (migration `000016_paper_order_adjustments`, added
+      2026-09-02 when the SL/TP mechanic itself moved from shadow-forking to in-place edits, see
+      §15.4/§15.12's revision note above) already IS that table byte-for-byte against the plan's
+      own spec: one row per field changed, append-only, `order_id REFERENCES paper_orders(id)`
+      (already mode-generic, so real rows need no separate table), and a `source` column whose
+      CHECK already includes `'manual'` — exactly the value the plan's §3b manual-edit endpoint
+      needs. `port.Repository.RecordPaperOrderAdjustment`/`ListPaperOrderAdjustments` are the
+      methods the plan's §4(c) asked for, already implemented and tested. Nothing new was needed
+      here; `RealTrader`'s update/close paths (commits 5-6) call these directly with
+      `source="model"`/`"manual"`, no new plumbing.
+      What genuinely didn't exist and WAS added this commit (§4(a)): `paper_orders` gained
+      `exchange_order_id`/`exchange_algo_order_id` (migration
+      `000017_real_order_exchange_ids`, nullable, no index — display/audit fields) and matching
+      `port.PaperOrder.ExchangeOrderID`/`ExchangeAlgoOrderID` fields, wired through
+      `OpenPaperOrder`'s INSERT and the `ListOpenPaperOrders`/`ListPositions` scans so a real
+      order's OKX order ID and resting algo-order ID are visible wherever a paper order already
+      is — zero new query, zero panel change needed for basic visibility. New
+      `Repository.SetExchangeAlgoOrderID(ctx, id, algoOrderID)`, a separate call from
+      `OpenPaperOrder` because the algo order (§3a) isn't placed until after the entry row already
+      exists. `fakeRepository` extended with the new method; no other fake `Repository`
+      implementation exists in the codebase. Zero behavior change to paper/demo trading — the two
+      new columns are nil for every existing row and every write path except `RealTrader`'s
+      (not yet built). All 310 tests pass unchanged (additive migration, no new test needed since
+      nothing new is exercised yet); migration applied clean on the server.
 - [ ] Panel: order-detail modal for real orders showing the full chronological adjustment
-      history, not just latest SL/TP (§27.3).
+      history, not just latest SL/TP (§27.3) — the data (`ListPaperOrderAdjustments`) is already
+      served for paper orders' own adjustment history via the existing endpoint; extending the
+      modal to real orders is a small frontend-only follow-up once real orders exist to view.
 - [x] `GET /api/v5/trade/order` (order status) added to `rest.Client` + `port.ExchangeClient` +
       routed through the gateway (`ClassAccount`, a read not a mutating trade action); `CancelOrder`
       added to `port.ExchangeClient` (§27.5).

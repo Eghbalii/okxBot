@@ -21,14 +21,27 @@ func (r *Repository) OpenPaperOrder(ctx context.Context, o port.PaperOrder) (int
 	}
 	var id int64
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO paper_orders (inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, features_json, mode, parent_order_id, variant, bar)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		INSERT INTO paper_orders (inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, features_json, mode, parent_order_id, variant, bar, exchange_order_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING id
-	`, o.InstID, o.StrategyID, o.Side, o.EntryPx, o.SLPx, o.TPPx, o.Size, o.Leverage, o.FeaturesJSON, mode, o.ParentOrderID, variant, o.Bar).Scan(&id)
+	`, o.InstID, o.StrategyID, o.Side, o.EntryPx, o.SLPx, o.TPPx, o.Size, o.Leverage, o.FeaturesJSON, mode, o.ParentOrderID, variant, o.Bar, o.ExchangeOrderID).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("open paper order for %s: %w", o.InstID, err)
 	}
 	return id, nil
+}
+
+// SetExchangeAlgoOrderID records the resting SL/TP algo order's OKX-assigned ID on an already-open
+// real order (CLAUDE.md §27.3) — a separate call from OpenPaperOrder because the algo order isn't
+// placed until after the entry order's row already exists.
+func (r *Repository) SetExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE paper_orders SET exchange_algo_order_id = $2 WHERE id = $1
+	`, id, algoOrderID)
+	if err != nil {
+		return fmt.Errorf("set exchange algo order id for paper order %d: %w", id, err)
+	}
+	return nil
 }
 
 // ClosePaperOrder marks a virtual trade closed with its realized outcome.
@@ -65,7 +78,7 @@ func (r *Repository) UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, t
 // SL/TP independently; only reward/budget attribution filters by Variant, CLAUDE.md §15.4).
 func (r *Repository) ListOpenPaperOrders(ctx context.Context, instID string) ([]port.PaperOrder, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, parent_order_id, variant, pnl_max_pct, pnl_min_pct, bar, manual_close_requested
+		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, parent_order_id, variant, pnl_max_pct, pnl_min_pct, bar, manual_close_requested, exchange_order_id, exchange_algo_order_id
 		FROM paper_orders
 		WHERE inst_id = $1 AND closed_at IS NULL
 		ORDER BY opened_at
@@ -79,7 +92,7 @@ func (r *Repository) ListOpenPaperOrders(ctx context.Context, instID string) ([]
 	for rows.Next() {
 		var o port.PaperOrder
 		var bar *string
-		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.OpenedAt, &o.FeaturesJSON, &o.ParentOrderID, &o.Variant, &o.PnLMaxPct, &o.PnLMinPct, &bar, &o.ManualCloseRequested); err != nil {
+		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.OpenedAt, &o.FeaturesJSON, &o.ParentOrderID, &o.Variant, &o.PnLMaxPct, &o.PnLMinPct, &bar, &o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID); err != nil {
 			return nil, fmt.Errorf("scan paper order: %w", err)
 		}
 		if bar != nil {
@@ -148,7 +161,8 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 	query := `
 		SELECT po.id, po.inst_id, po.strategy_id, po.side, po.entry_px, po.sl_px, po.tp_px, po.size, po.leverage,
 			po.opened_at, po.closed_at, po.close_reason, po.close_px, po.realized_pnl, po.features_json, po.mode,
-			po.parent_order_id, po.variant, po.bar, po.pnl_max_pct, po.pnl_min_pct, COALESCE(s.name, '')
+			po.parent_order_id, po.variant, po.bar, po.pnl_max_pct, po.pnl_min_pct, COALESCE(s.name, ''),
+			po.exchange_order_id, po.exchange_algo_order_id
 		FROM paper_orders po
 		LEFT JOIN strategies s ON s.id = po.strategy_id
 		WHERE ($1 = '' OR po.mode = $1)
@@ -175,7 +189,7 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx,
 			&o.Size, &o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx,
 			&o.RealizedPnL, &o.FeaturesJSON, &o.Mode, &o.ParentOrderID, &o.Variant, &bar,
-			&o.PnLMaxPct, &o.PnLMinPct, &o.StrategyName); err != nil {
+			&o.PnLMaxPct, &o.PnLMinPct, &o.StrategyName, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID); err != nil {
 			return nil, fmt.Errorf("scan position: %w", err)
 		}
 		if bar != nil {
