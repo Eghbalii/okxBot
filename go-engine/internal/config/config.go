@@ -56,6 +56,15 @@ type Config struct {
 		// OKX_SIMULATED_TRADING would make an unset env var the difference between a sandbox and
 		// real capital; going live should require saying so.
 		AllowRealMoney bool `yaml:"allow_real_money"`
+		// UseConductorLifecycle switches cmd/trader from the old flat delta-notional rebalance loop
+		// (usecase.Trader) to usecase.RealTrader — the strategy-signal + conductor-mediated
+		// lifecycle usecase.PaperTrader already runs, adapted for real orders (CLAUDE.md §27's
+		// real-trading plan, commit 8). Defaults to false/off: the old Trader remains production
+		// behavior until this is explicitly flipped, matching every other RL feature flag's
+		// "additive, never required until opted in" posture in this codebase
+		// (RLSizing/RLSLTPAdjust/etc.) — this is the riskiest commit in that plan to get wrong
+		// silently, so an explicit off-by-default flag is the safety valve.
+		UseConductorLifecycle bool `yaml:"use_conductor_lifecycle"`
 	} `yaml:"trading"`
 
 	// Ingestion controls cmd/ingestor: the always-on, broad set of candle timeframes it collects

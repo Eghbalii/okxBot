@@ -21,6 +21,13 @@ trading:
   # so, not just forgetting to set OKX_SIMULATED_TRADING. Trading mode itself is derived from that
   # env var (simulated => demo, otherwise real), so mode can never disagree with the keys in use.
   allow_real_money: false
+  # CLAUDE.md §27's real-trading plan, commit 8: switches cmd/trader from the old flat delta-
+  # notional rebalance loop to usecase.RealTrader (the strategy-signal + conductor-mediated
+  # lifecycle PaperTrader already runs, adapted for real orders — one position per token per side,
+  # SL/TP watched by its own in-process tick monitor, a 1-minute reconciliation poll against OKX).
+  # Off by default — flip only after RealTrader has been verified against demo (CLAUDE.md §27.7's
+  # checklist gates this).
+  use_conductor_lifecycle: false
 
 # CLAUDE.md §27.5, explicit operator decision (2026-09-01): a placed order not filled within this
 # window is CANCELED, and the engine does NOT re-price/retry automatically — it waits for the

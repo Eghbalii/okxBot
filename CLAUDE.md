@@ -3511,6 +3511,23 @@ Concretely:
       empty-body rejection) — 335 Go tests total. `tsc -b && vite build` clean. Not yet checked in a
       real browser against a live real position (none exists yet) — deferred to commit 9's demo
       verification window.
+      Commit 8 done (2026-09-03): `cmd/trader/main.go` now constructs `usecase.RealTrader` instead
+      of the old `Trader` when the new `trading.use_conductor_lifecycle` config flag is true
+      (defaults `false` — Go zero-value, no override logic touches it). `runRealTrader` mirrors
+      `cmd/paper-trader/main.go`'s Kafka-dispatcher and strategy-assignment wiring almost exactly
+      (own consumer-group id `"trader"` so offsets never collide with `paper-trader`'s group on the
+      same `okx.tickers`/`okx.candles.<bar>` topics), reusing `PaperTrading.Bars`/`CandleLimit`/
+      `RLClamps`/`RLUpdate*`/`RLEarlyClose`/`RLMaxOpenDuration` rather than a new real-trading
+      config section. `buildRealTraderClamps` is a deliberate separate copy of `cmd/paper-trader`'s
+      `buildRLClamps` — not a shared import — so a field dropped from one struct literal can't hide
+      behind the other already being correct, the exact incident class §23 documents; both have
+      their own regression test pair now. Postgres becomes REQUIRED only when the flag is on
+      (`RealTrader` has no "run without a database" fallback the way the old `Trader`'s equity-
+      timeline-only Postgres use does); the flag-off path's diff was confirmed minimal by direct
+      review, not just by the test suite passing — log-line wording only, no behavior change. 3 new
+      tests (clamp-mapping regression pair, default-off assertion) — 338 Go tests total, `go build`/
+      `go vet` clean. NOT yet deployed with the flag ON anywhere — gated on commit 9's demo
+      verification.
 - [x] New append-only real-order-adjustment log — turned out to already exist. Commit 3
       (2026-09-03) started from the plan's §4(b) design (`real_order_adjustments`, a new table)
       but found `paper_order_adjustments` (migration `000016_paper_order_adjustments`, added
