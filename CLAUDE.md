@@ -3876,3 +3876,143 @@ any live trading until a sub-strategy is cloned from it and given a `strategy_as
 specific token+bar). Assigning several of these to the 5m bar across the current token roster, and
 judging them from real paper-trading closes, is the natural next step — deferred here since it's an
 operational/assignment action (via the panel or `POST /api/strategies`), not a code change.
+
+## 31. A stale local `config.yaml` overwrote the server's real one during deployment (2026-09-04)
+
+Found via a real, wrong-sized position: order 1851 (ZEC-USDT-SWAP) opened at `size=100` instead of
+the configured `4` (§26). Root cause was a deployment mistake, not application code: deploying the
+12-strategy work (§30) was done by `tar czf go-engine/` on the local machine and extracting it
+directly over `/opt/okxBot/go-engine/` on the server. `go-engine/configs/config.yaml` is real,
+server-specific, and gitignored (§6) — but it still physically existed in the local working tree (a
+leftover Aug 25 dev-setup file, never the real deployed config), so the tar archive included it
+uncritically, and extracting the archive overwrote the server's real config with that stale local
+copy. The pre-deploy backup that would have made this trivially reversible was written to `/tmp` on
+the server and lost when the server was reset after an unrelated incident (§31's own build-crash,
+below) — recoverable values had to be reconstructed from this document instead of restored from a
+backup, which is the reason this incident is documented in this much detail: it is now the only
+record of what the correct values are.
+
+**Blast radius was narrower than it first looked**, because several of the fields the broken config
+was missing have safe non-zero defaults in `internal/config.Load` that a merely-absent field falls
+back to — the actual damage was confined to fields the broken file set **explicitly** to a stale
+value, which a default can't override:
+- `paper_trading.notional_usd: 100` (stale) vs. the correct `4` and `Load`'s own default of `4`
+  (§26) — this is what actually produced order 1851's oversized position. Every other field with a
+  hardcoded, non-zero-forcing default (`risk.max_leverage`, `risk.min_liquidation_buffer_pct`,
+  `account.*`, `paper_trading.rl_clamps.max_loss_pct`) was either simply absent from the broken
+  file (and therefore fine) or set to a value that was more conservative than intended, never less
+  — `max_leverage: 5` and `min_liquidation_buffer_pct: 15` in the broken file are both tighter than
+  the documented `10`/`5`, and neither actually affected paper-order leverage anyway, since paper
+  trading's fixed-sizing fallback uses a hardcoded Go constant (`defaultPaperLeverage`,
+  `papertrade.go`) independent of `risk.max_leverage` while `rl_sizing` is off.
+- `paper_trading.rl_sltp_adjust` has no such default — a `bool` field silently reads `false` when
+  absent, with nothing in `Load` correcting it the way `MaxLossPct` is (§19.2's "not opt-in" design
+  was deliberately applied to that one field, not this one). This one was genuinely dangerous in a
+  quieter way than the sizing bug: **the RL model stopped adjusting any open paper order's SL/TP
+  the moment the broken config deployed**, with no error, crash, or visible symptom anywhere — the
+  service looked completely healthy the whole time it was silently not doing part of its job.
+- `ingestion.bars`/`paper_trading.bars` in the broken file (`["1m","3m","5m","1H","4H","1D"]` /
+  `["1m"]`) were not just stale from this incident — they predate the 2026-08-28 decision (§9) to
+  standardize on `5m/15m/1H` as the decision set entirely, and the ingestion list didn't even
+  contain `15m`, which the corrected `paper_trading.bars` needs — `Config.ValidatePaperTradingBars`
+  (paper_trading.bars must be a subset of ingestion.bars) caught this immediately at startup once
+  both were corrected together, rather than letting a bar with no matching ingestion topic silently
+  produce an empty candle window.
+- **The DB-backed `paper_trading_config.active_bars` (`["5m"]`, the panel's own, currently-tighter
+  restriction to 5m-only, §22) was never touched by any of this** — it lives in Postgres, not
+  `config.yaml`, and `cmd/paper-trader/main.go` already applies it as an override on top of
+  `config.yaml`'s `paper_trading.bars` whenever it's non-empty. Restoring `paper_trading.bars` to
+  `["5m","15m","1H"]` only restores the ceiling of what the process is CAPABLE of deciding on; the
+  actual effective decision cadence stayed exactly 5m throughout, both during the incident and
+  after the fix — confirmed by reading `GET /api/paper-trading/config` before and after.
+
+**Recovery**: no copy of the correct values survived anywhere retrievable — checked the lost `/tmp`
+backup (gone), dangling Docker image layers (none matched; the only stale layers found on the box
+belonged to `rl-service`'s unrelated config, not go-engine's), and Loki (no service logs its loaded
+config at startup, so there was nothing to grep for). The corrected file was reconstructed field by
+field from this document's own dated decisions (primarily §9, §14, §19.2, §22, §26) and validated
+against `internal/config.Load` directly (a throwaway test loading the reconstructed YAML and
+asserting every field resolved to its documented value) before being deployed — not just eyeballed,
+since a config mistake here would be the same class of silent, hard-to-notice failure that caused
+this incident in the first place.
+
+**Fix, both the immediate one and the recurrence guard**: the corrected `config.yaml` was deployed
+and `paper-trader` rebuilt+restarted (config is baked into the image at build time, not volume-
+mounted, so a plain container restart alone would not have picked it up) — confirmed live within
+seconds by the model adjusting order 1851's own SL/TP again (`lifecycle: sl/tp adjustment applied`
+in the logs), which could only happen with `rl_sltp_adjust` genuinely back on. The stale local
+`go-engine/configs/config.yaml` that caused this was deleted from the local working tree entirely
+— it served no purpose (the example file is what a fresh checkout should reference) and its mere
+presence on disk, despite being gitignored, was sufficient to end up inside a naive `tar czf`. Going
+forward, deploying go-engine changes must not archive the whole local directory tree uncritically —
+either transfer only the specific changed files, or explicitly exclude `configs/config.yaml` the
+same way `panel/node_modules` and `panel/dist` are already excluded from panel deploys.
+
+Separately, the same deployment attempt first triggered a genuine resource-exhaustion incident
+(load average 23.6, ~69Mi free with no swap, SSH connections dropped/refused) by rebuilding all 5
+Go services plus the panel **concurrently** — the exact failure mode §16.10 already documented once
+for an external scan, this time self-inflicted by the deploy process itself. The server had to be
+reset by the operator to recover. Every rebuild after that reset was done one service at a time,
+with `docker builder prune -f` between each — confirmed to keep load under 2 and reclaimable build
+cache at 0 throughout six sequential single-service builds, versus the crash from building them
+together. This is now the required deployment pattern for this box, not merely a preference: it has
+caused a full outage once already (§16.10) and a second, self-inflicted one here.
+
+### 31.1 Re-enabling `rl_sltp_adjust` immediately exposed an unrelated, unbounded-TP bug
+
+Restoring `rl_sltp_adjust: true` (the actual fix above) surfaced a second, independent defect within
+seconds: order 1851's TP was adjusted 19 times in 6 minutes, each step roughly **doubling** the
+previous move's magnitude, from `936.84` down through zero to `-566552.46` — for a `ZEC-USDT-SWAP`
+sell entered at `955.96`. Order 1852 (BTC) diverged the same way in parallel, reaching `-670026.57`
+against an `81495.9` entry. Both are nonsense prices no real take-profit could ever be.
+
+**Root cause: `computeAdjustedLevels` (`rl_sltp_adjust.go`) converts the model's absolute
+`action.TPPx` into a relative adjustment (`levelAdjustPct`) before handing it to `RatchetSLTP`,
+which reapplies it as a delta** — mathematically a round trip back to `action.TPPx` with no
+information lost, so the conversion itself isn't the bug. The bug is what §29 removed: **`moveTP`
+(§29, 2026-09-04) dropped the per-step size cap on TP entirely**, on the reasoning that letting a
+winning trade's target run further away is desirable behavior, not a defect to guard against — a
+reasonable call for a *trained* policy, but this model has completed only 4 trades against SAC's own
+`learning_starts=100` threshold (confirmed via `GET /health` on rl-service, `completed_trades: 4`),
+i.e. it is still effectively producing near-random output, and `moveTP`'s only remaining guard is
+that the result stays on the profitable side of entry — a check an arbitrarily large magnitude still
+satisfies. Nothing bounds how large the move itself can be, and at a ~2-30 second re-adjustment
+cadence (`RLAdjustInterval`, §15.9) a model whose output keeps drifting further from entry each call
+compounds without limit. This is a real gap in §29's own design, not a coding mistake in the sense
+of a wrong formula — the code does exactly what that section asked for.
+
+**Immediate action**: `rl_sltp_adjust` was turned back OFF (reverted in `config.yaml`,
+`paper-trader` rebuilt+restarted a second time) the moment this was found — confirmed no other
+currently-open position was touched (`paper_order_adjustments` has zero rows for any order besides
+1851/1852 since the restart that re-enabled it). This is a **known-broken, currently-disabled**
+feature again, not merely reverted-by-accident-back-to-off — turning it on again requires fixing
+the missing TP-magnitude bound first, not just retrying.
+
+**Order 1851 and 1852's disposition**: 1851 closed naturally at its own (still-original,
+never-actually-touched-because-the-runaway-was-on-TP-not-SL) stop-loss mid-investigation, realizing
+a real, if oversized, `-$10.03` loss; 1852 was still open. Per explicit operator instruction, both
+were deleted outright from `paper_orders` (and their `paper_order_adjustments`/
+`account_equity_history` rows) rather than closed through the normal manual-close flow — a manual
+close would have recorded them as legitimate trade history with a `close_reason`/realized PnL,
+which they were never meant to be: both only existed because of the §31 config-overwrite bug in the
+first place, and both then became test subjects for a second, unrelated bug on top of that. Deleting
+`account_equity_history`'s row for 1851 does NOT retroactively corrupt the account balance — that
+table's `equity_usd` column is a running snapshot written incrementally by the live application at
+each trade close, not recomputed from history, so `account_equity`'s actual stored balance already
+reflects 1851's real loss and needed no separate correction. The only visible artifact is a $10.03
+gap in the equity **history/chart** around 21:31:57 with no corresponding row to explain it — a
+minor, accepted cosmetic gap in the audit trail versus the alternative of guessing at a "corrected"
+balance for an account that was never actually wrong.
+
+**Not yet fixed, and required before `rl_sltp_adjust` can be turned back on**: `moveTP` needs some
+bound on adjustment magnitude restored — not necessarily the old fixed ±2%-of-price-per-step cap
+§29 removed (that cap's own problems, clustering adjustments right before close, were real and
+worth solving), but something that prevents an untrained model's output from compounding toward
+infinity across repeated calls. Candidates worth considering when this is picked up: cap the
+absolute distance from entry a TP may ever reach (independent of SL's own distance), cap the
+per-call delta as a fraction of the CURRENT TP-to-entry distance rather than of live price (so the
+cap shrinks as the model's own prior moves make the position more extreme, rather than staying
+constant in raw price terms), or simply hold off enabling this flag at all until `completed_trades`
+has cleared SAC's own `learning_starts=100` by a comfortable margin — matching the exact caution
+§14's roadmap item 5 already applies to the `rl_sizing` flag, for the same underlying reason
+(an undertrained policy's output should not be trusted at full strength).
