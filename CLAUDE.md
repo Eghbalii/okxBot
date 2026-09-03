@@ -3528,6 +3528,13 @@ Concretely:
       tests (clamp-mapping regression pair, default-off assertion) — 338 Go tests total, `go build`/
       `go vet` clean. NOT yet deployed with the flag ON anywhere — gated on commit 9's demo
       verification.
+      Commit 7 done (2026-09-03): the dedicated equity-source test named in the plan's §6 — the
+      implementation landed already, as part of commits 4-5, but the isolated regression test
+      calling it out by name didn't exist yet. `TestBuildObservation_UsesExchangeBalanceNotRepoBookkeeping`
+      seeds the repo's own "real"-mode bookkeeping row at `EquityUSD=42` and the exchange at
+      `Eq=777`, then asserts `RealTrader.buildObservation`'s `AccountEquityUSD` reports 777 — a
+      guard against a future refactor accidentally falling back to (or blending with) the
+      bookkeeping row PaperTrader owns but RealTrader does not. 1 new test, 339 Go tests total.
 - [x] New append-only real-order-adjustment log — turned out to already exist. Commit 3
       (2026-09-03) started from the plan's §4(b) design (`real_order_adjustments`, a new table)
       but found `paper_order_adjustments` (migration `000016_paper_order_adjustments`, added

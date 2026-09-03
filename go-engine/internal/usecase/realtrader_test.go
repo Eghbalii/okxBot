@@ -312,3 +312,27 @@ func TestReconcile_MatchingStateIsANoOp(t *testing.T) {
 		t.Error("expected the matching position to remain open")
 	}
 }
+
+// TestBuildObservation_UsesExchangeBalanceNotRepoBookkeeping is the dedicated test CLAUDE.md §27's
+// plan §6 calls out by name: RealTrader does not own its account balance the way PaperTrader owns
+// its shared "paper" row — the exchange is ground truth. This asserts the two sources deliberately
+// DISAGREE and the observation still reports the exchange's number, not Repo.GetAccountEquity's —
+// the one spot flagged as easy to get wrong by careless reuse of PaperTrader's buildObservation.
+func TestBuildObservation_UsesExchangeBalanceNotRepoBookkeeping(t *testing.T) {
+	repo := newFakeRepository()
+	// Seed a DIFFERENT balance in the repo's own bookkeeping row than what the exchange reports —
+	// if buildObservation ever fell back to (or blended with) this, the test would catch it.
+	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("42")}
+
+	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("777")}}}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+
+	obs := rt.buildObservation(context.Background(), "1m", dec("100"), testLogger())
+
+	if !obs.AccountEquityUSD.Equal(dec("777")) {
+		t.Errorf("expected AccountEquityUSD=777 (from Exchange.GetBalance), got %s — "+
+			"a value of 42 would mean it fell back to Repo.GetAccountEquity's bookkeeping row instead",
+			obs.AccountEquityUSD)
+	}
+}
