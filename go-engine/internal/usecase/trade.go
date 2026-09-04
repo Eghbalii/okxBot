@@ -30,6 +30,15 @@ type Trader struct {
 	MinOrderUSD  decimal.Decimal
 	Logger       *slog.Logger
 
+	// ExecInstID/ExecInstType/SettleCcy mirror RealTrader's own fields (CLAUDE.md §27, 2026-09-04
+	// design): InstID is now a short internal symbol ("BTC"), never OKX's own wire-format instId,
+	// so every exchange call needs the real instId/instType/currency separately. Empty falls back
+	// to InstID directly / instType "SWAP" / currency "USDT" — the pre-2026-09-04 behavior, for a
+	// deployment whose account trades the classic SWAP product directly.
+	ExecInstID   string
+	ExecInstType string
+	SettleCcy    string
+
 	// ActiveTokens is the ordered roster the observation's token-identity one-hot is built against
 	// (CLAUDE.md §15.1/§15.3) — it must be the same roster, in the same order, that the loaded
 	// global model was trained with, since order defines each slot's index. Leaving it empty sends
@@ -48,6 +57,28 @@ type Trader struct {
 	// observation reports the exchange's equity directly — the trading loop itself never depends on
 	// it, so a database outage can't stop live trading.
 	Repo port.Repository
+}
+
+// execInstID is the instId actually sent to the exchange — ExecInstID when set, else InstID.
+func (t *Trader) execInstID() string {
+	if t.ExecInstID != "" {
+		return t.ExecInstID
+	}
+	return t.InstID
+}
+
+func (t *Trader) execInstType() string {
+	if t.ExecInstType != "" {
+		return t.ExecInstType
+	}
+	return "SWAP"
+}
+
+func (t *Trader) settleCcy() string {
+	if t.SettleCcy != "" {
+		return t.SettleCcy
+	}
+	return "USDT"
 }
 
 // Run executes the trading loop until ctx is cancelled.
@@ -73,17 +104,17 @@ func (t *Trader) Run(ctx context.Context) error {
 }
 
 func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
-	mkt, err := t.Exchange.GetTicker(t.InstID)
+	mkt, err := t.Exchange.GetTicker(t.execInstID())
 	if err != nil {
 		return fmt.Errorf("fetch ticker: %w", err)
 	}
 	mid := mkt.Last
 
-	positions, err := t.Exchange.GetPositions("SWAP")
+	positions, err := t.Exchange.GetPositions(t.execInstType())
 	if err != nil {
 		return fmt.Errorf("fetch positions: %w", err)
 	}
-	balances, err := t.Exchange.GetBalance("USDT")
+	balances, err := t.Exchange.GetBalance(t.settleCcy())
 	if err != nil {
 		return fmt.Errorf("fetch balance: %w", err)
 	}
@@ -100,7 +131,7 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 
 	var pos domain.Position
 	for _, p := range positions {
-		if p.InstID == t.InstID {
+		if p.InstID == t.execInstID() {
 			pos = p
 			break
 		}
@@ -275,7 +306,7 @@ func (t *Trader) execute(
 	}
 
 	if !approved.Leverage.Equal(currentLeverage) && approved.Leverage.IsPositive() {
-		req := domain.LeverageChange{InstID: t.InstID, Lever: approved.Leverage, MgnMode: t.TdMode}
+		req := domain.LeverageChange{InstID: t.execInstID(), Lever: approved.Leverage, MgnMode: t.TdMode}
 		if t.PosMode == "long_short" {
 			req.PosSide = posSideFor(approved.PositionNotionalUSD)
 		}
@@ -298,13 +329,23 @@ func (t *Trader) execute(
 	if deltaNotional.IsNegative() {
 		side = "sell"
 	}
-	// NOTE: sz is computed as underlying USD notional / mid price, i.e. it assumes a contract
-	// multiplier of 1. Per-instrument contract-value handling (via /api/v5/public/instruments)
-	// is not yet wired in — revisit before trading instruments with a non-1x contract value.
-	sz := deltaNotional.Abs().Div(mid)
+	// Converts through the instrument's own CtVal/LotSz (CLAUDE.md §27, found live 2026-09-04:
+	// a raw notional/price division assumes a contract multiplier of 1, which sized an order
+	// roughly 10,000x too large against this account's real X-Perp instrument). Reuses
+	// sizeToContracts/instrumentMeta-shaped logic via a direct GetInstrument call rather than
+	// caching per-call the way RealTrader does — this path polls once every PollInterval, not
+	// once per order, so the extra call is not the hot path RealTrader's sync.Once optimizes for.
+	inst, err := t.Exchange.GetInstrument(t.execInstType(), t.execInstID())
+	if err != nil {
+		return fmt.Errorf("fetch instrument metadata: %w", err)
+	}
+	sz := sizeToContracts(deltaNotional.Abs(), mid, inst)
+	if sz.IsZero() || (inst.MinSz.IsPositive() && sz.LessThan(inst.MinSz)) {
+		return nil
+	}
 
 	order := domain.OrderRequest{
-		InstID:  t.InstID,
+		InstID:  t.execInstID(),
 		TdMode:  t.TdMode,
 		Side:    side,
 		OrdType: "market",

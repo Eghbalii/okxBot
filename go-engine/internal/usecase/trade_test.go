@@ -91,7 +91,12 @@ func (f *fakeExchangeClient) GetInstrument(instType, instID string) (domain.Inst
 	if f.instrument != nil {
 		return *f.instrument, nil
 	}
-	return domain.Instrument{InstID: instID, CtVal: decimal.NewFromInt(1), LotSz: decimal.NewFromInt(1)}, nil
+	// CtVal=1, LotSz=0 (no lot-size rounding) is the TRUE no-op default: sizeToContracts skips
+	// LotSz rounding entirely when LotSz is not positive, so notional/price passes through exactly
+	// as it did before GetInstrument existed — a LotSz=1 default would silently floor any
+	// fractional-contract test scenario to zero, which is real X-Perp behavior but not what most
+	// existing tests here are set up to exercise.
+	return domain.Instrument{InstID: instID, CtVal: decimal.NewFromInt(1)}, nil
 }
 
 // fakeModelClient is a hand-rolled port.ModelClient returning a configured Action.

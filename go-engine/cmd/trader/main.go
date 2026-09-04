@@ -20,6 +20,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/gatewayclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/risk"
@@ -82,6 +83,22 @@ func main() {
 	logger.Info("trading mode resolved", "mode", mode, "gatewaySimulated", health.Simulated,
 		"useConductorLifecycle", cfg.Trading.UseConductorLifecycle)
 
+	// CLAUDE.md §27, 2026-09-04 design: trading.inst_ids are short internal symbols ("BTC"), never
+	// OKX's own wire-format instId — trading.symbol_map is the one place a symbol resolves to the
+	// real, possibly account-specific/expiry-dated instId a REAL exchange call actually needs.
+	// Resolved once, up front: an unresolvable symbol must stop this process from starting rather
+	// than silently placing/canceling/querying against an empty or wrong instId later.
+	symbolMap := okx.SymbolMap(cfg.Trading.SymbolMap)
+	execInstIDs, err := symbolMap.ResolveAll(cfg.Trading.InstIDs)
+	if err != nil {
+		logger.Error("failed to resolve trading.inst_ids against trading.symbol_map", "error", err)
+		os.Exit(1)
+	}
+	execInstIDFor := make(map[string]string, len(cfg.Trading.InstIDs))
+	for i, sym := range cfg.Trading.InstIDs {
+		execInstIDFor[sym] = execInstIDs[i]
+	}
+
 	// Postgres is OPTIONAL for the old Trader (it's used only to record the equity timeline for the
 	// panel's chart, and a database problem must never stop a live trading loop), but REQUIRED for
 	// RealTrader — it needs strategy assignments, candle history, and open-position bookkeeping the
@@ -106,7 +123,11 @@ func main() {
 		repo = pgRepo
 	}
 
-	balances, err := exchangeClient.GetBalance("USDT")
+	settleCcy := cfg.Trading.ExecSettleCcy
+	if settleCcy == "" {
+		settleCcy = "USDT"
+	}
+	balances, err := exchangeClient.GetBalance(settleCcy)
 	if err != nil {
 		logger.Error("failed to fetch initial balance", "error", err)
 		os.Exit(1)
@@ -125,7 +146,7 @@ func main() {
 	riskManager := risk.NewManager(riskLimits, startEquity)
 
 	if cfg.Trading.UseConductorLifecycle {
-		runRealTrader(ctx, logger, cfg, exchangeClient, rlClient, riskManager, pgRepo, mode)
+		runRealTrader(ctx, logger, cfg, exchangeClient, rlClient, riskManager, pgRepo, mode, execInstIDFor)
 		return
 	}
 
@@ -136,6 +157,9 @@ func main() {
 	for _, instID := range cfg.Trading.InstIDs {
 		trader := &usecase.Trader{
 			InstID:       instID,
+			ExecInstID:   execInstIDFor[instID],
+			ExecInstType: cfg.Trading.ExecInstType,
+			SettleCcy:    cfg.Trading.ExecSettleCcy,
 			Exchange:     exchangeClient,
 			Model:        rlClient,
 			RiskManager:  riskManager,
@@ -171,6 +195,7 @@ func runRealTrader(
 	riskManager *risk.Manager,
 	repo *postgres.Repository,
 	mode string,
+	execInstIDFor map[string]string,
 ) {
 	if err := strategy.SeedOrigins(ctx, repo); err != nil {
 		logger.Error("failed to seed origin strategies", "error", err)
@@ -237,12 +262,10 @@ func runRealTrader(
 			ActiveTokens:    cfg.Trading.InstIDs,
 
 			// ExecInstID/ExecInstType/SettleCcy answer "which instrument does a REAL order actually
-			// target," separate from InstID's market-data identity (CLAUDE.md §27, found live
-			// 2026-09-04: this account can only trade OKX's newer X-Perp product, not the classic
-			// SWAP instrument InstID names). Empty ExecInstIDMap[instID] leaves ExecInstID empty,
-			// which RealTrader's own execInstID() treats as "trade InstID directly" — the correct
-			// behavior for a deployment whose account CAN trade the SWAP instrument.
-			ExecInstID:   cfg.Trading.ExecInstIDMap[instID],
+			// target" — InstID is now a short internal symbol ("BTC"), never OKX's own wire-format
+			// instId (CLAUDE.md §27, 2026-09-04 design: SymbolMap is the one place a short symbol
+			// resolves to the real, expiry-dated OKX instId this account can actually trade).
+			ExecInstID:   execInstIDFor[instID],
 			ExecInstType: cfg.Trading.ExecInstType,
 			SettleCcy:    cfg.Trading.ExecSettleCcy,
 

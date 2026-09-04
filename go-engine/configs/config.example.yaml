@@ -7,8 +7,22 @@ okx:
   private_ws_url: "wss://ws.okx.com:8443/ws/v5/private"
 
 trading:
+  # Short internal symbols, NOT OKX's own instId (CLAUDE.md §27, 2026-09-04 design): this bot only
+  # trades USD-quoted perpetual futures, so every service/DB row/config entry only ever needs to
+  # say WHICH TOKEN, never OKX's full wire-format instId. symbol_map (below) is the one place a
+  # symbol resolves to a real OKX instId — the WS subscription and every REST call use it, nothing
+  # else in this codebase touches OKX's wire format at all.
   inst_ids:
-    - "BTC-USDT-SWAP"
+    - "BTC"
+    - "ETH"
+    - "SOL"
+    - "ZEC"
+    - "XRP"
+    - "DOGE"
+    - "HYPE"
+    - "TRUMP"
+    - "PEPE"
+    - "PUMP"
   poll_interval_sec: 5
   # isolated, not cross (CLAUDE.md §27.2, 2026-09-01 decision): one position's liquidation must
   # never be able to cascade into draining the margin backing every other open position on the
@@ -32,31 +46,31 @@ trading:
   # Off by default — flip only after RealTrader has been verified against demo (CLAUDE.md §27.7's
   # checklist gates this).
   use_conductor_lifecycle: false
-  # Maps each trading.inst_ids entry (market-data identity: candles/ticks/RL observation) to the
-  # DIFFERENT instId REAL ORDERS actually target on this account (CLAUDE.md §27, found live
-  # 2026-09-04). This account has NO usable margin on the classic SWAP/MARGIN/FUTURES(dated)
-  # instruments for BTC-USDT-SWAP etc. (GET /account/max-size returns maxBuy=maxSell=0 on every
-  # one tried) — it can only trade OKX's newer "X-Perp" product. Prices track the SWAP market
-  # within ~0.1% (verified across all 10 configured tokens), so market data collection against
-  # the SWAP instId remains valid; only the literal PlaceOrder/CancelOrder/GetOrder/SetLeverage
-  # calls need the mapped instId. Leave empty (the default) for any deployment whose account CAN
-  # trade the SWAP instrument directly — RealTrader then targets inst_ids verbatim.
+  # Resolves each short trading.inst_ids symbol to the real OKX instId every WS subscription/REST
+  # call actually uses (internal/okx.SymbolMap, CLAUDE.md §27, found live 2026-09-04). This
+  # account has NO usable margin on the classic SWAP/MARGIN/FUTURES(dated) instruments for
+  # BTC-USDT-SWAP etc. (GET /account/max-size returns maxBuy=maxSell=0 on every one tried) — it
+  # can only trade OKX's newer "X-Perp" product. Required: every trading.inst_ids entry must have
+  # an entry here, or the affected service refuses to start.
   #
   # X-Perp instIds carry an expiry date (e.g. "-310404") and are NOT eternal — OKX periodically
   # rolls them to a new far-dated contract. Re-verify this map against
-  # GET /api/v5/public/instruments?instType=FUTERES (grep for "_UM_XPERP") before every real-
-  # trading deployment; a stale/expired instId here fails loudly (order rejected), not silently.
-  exec_inst_id_map:
-    BTC-USDT-SWAP: "BTC-USD_UM_XPERP-310404"
-    ETH-USDT-SWAP: "ETH-USD_UM_XPERP-310404"
-    SOL-USDT-SWAP: "SOL-USD_UM_XPERP-310404"
-    ZEC-USDT-SWAP: "ZEC-USD_UM_XPERP-310530"
-    XRP-USDT-SWAP: "XRP-USD_UM_XPERP-310404"
-    DOGE-USDT-SWAP: "DOGE-USD_UM_XPERP-310404"
-    HYPE-USDT-SWAP: "HYPE-USD_UM_XPERP-310523"
-    TRUMP-USDT-SWAP: "TRUMP-USD_UM_XPERP-310704"
-    PEPE-USDT-SWAP: "PEPE-USD_UM_XPERP-310404"
-    PUMP-USDT-SWAP: "PUMP-USD_UM_XPERP-310404"
+  # GET /api/v5/public/instruments?instType=FUTURES (grep for "_UM_XPERP") before every
+  # deployment; a stale/expired instId here fails loudly (order/subscription rejected), not
+  # silently.
+  symbol_map:
+    BTC: "BTC-USD_UM_XPERP-310404"
+    ETH: "ETH-USD_UM_XPERP-310404"
+    SOL: "SOL-USD_UM_XPERP-310404"
+    ZEC: "ZEC-USD_UM_XPERP-310530"
+    XRP: "XRP-USD_UM_XPERP-310404"
+    DOGE: "DOGE-USD_UM_XPERP-310404"
+    HYPE: "HYPE-USD_UM_XPERP-310523"
+    TRUMP: "TRUMP-USD_UM_XPERP-310704"
+    PEPE: "PEPE-USD_UM_XPERP-310404"
+    PUMP: "PUMP-USD_UM_XPERP-310404"
+  # Account-wide properties of whichever product symbol_map resolves to (every X-Perp instrument
+  # on this account shares these) — separate from symbol_map because they don't vary per symbol.
   exec_inst_type: "FUTURES"  # X-Perp instruments report instType=FUTURES, not SWAP
   exec_settle_ccy: "USDC"    # this account's balance/margin currency, not USDT
 

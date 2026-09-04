@@ -45,7 +45,22 @@ type Config struct {
 	} `yaml:"rl_service"`
 
 	Trading struct {
+		// InstIDs is now a list of SHORT INTERNAL SYMBOLS ("BTC", "ETH", "DOGE", ...), not OKX's
+		// own instId strings — explicit operator design (2026-09-04, CLAUDE.md §27): this bot only
+		// trades USD-quoted perpetual futures, so every service/DB row/config entry only ever needs
+		// to say WHICH TOKEN, never OKX's full wire-format instId (which additionally varies by
+		// product — "BTC-USDT-SWAP" vs. "BTC-USD_UM_XPERP-<expiry-date>" — and, for the X-Perp
+		// product, changes over time as OKX rolls the contract's expiry). SymbolMap (below) is the
+		// one place a short symbol resolves to a real OKX instId; every other line of code in this
+		// project (candles, paper_orders, strategy_assignments, Kafka topic keys, the panel) carries
+		// the short symbol and never touches OKX's wire format at all.
 		InstIDs         []string        `yaml:"inst_ids"`
+		// SymbolMap resolves each InstIDs entry to the real OKX instId a WebSocket subscription or
+		// REST call actually needs (internal/okx.SymbolMap — see its own doc comment). Required:
+		// every configured symbol must have an entry, or the affected service refuses to start
+		// rather than silently subscribing to/calling nothing for it (the same "loud failure over
+		// a data gap that looks healthy" principle as CLAUDE.md §9's bar-casing validation).
+		SymbolMap       map[string]string `yaml:"symbol_map"`
 		PollIntervalSec int             `yaml:"poll_interval_sec"`
 		TdMode          string          `yaml:"td_mode"`       // "cross" or "isolated"
 		PosMode         string          `yaml:"pos_mode"`      // "net" or "long_short" (hedge mode)
@@ -66,22 +81,17 @@ type Config struct {
 		// silently, so an explicit off-by-default flag is the safety valve.
 		UseConductorLifecycle bool `yaml:"use_conductor_lifecycle"`
 
-		// ExecInstIDMap/ExecInstType/ExecSettleCcy answer "which OKX instrument/instType/currency
-		// does REAL ORDER PLACEMENT actually use," separately from InstIDs (which market data is
-		// collected/decided against). Found load-bearing 2026-09-04 (CLAUDE.md §27): a real account
-		// may only have usable margin on a different OKX product for the same underlying than the
-		// classic SWAP instrument this codebase's market data/observation identity uses (this
-		// project's real account trades OKX's newer "X-Perp" product, instId format
-		// "BTC-USD_UM_XPERP-<date>", instType FUTURES, settled in USDC — not BTC-USDT-SWAP/SWAP/
-		// USDT). All three are empty by default, which RealTrader's own accessor methods treat as
-		// "trade the InstID directly, instType SWAP, currency USDT" — i.e. no mapping needed at all
-		// for any deployment whose account CAN trade the SWAP instrument directly. ExecInstIDMap
-		// carries an explicit expiry-dated instId per entry (X-Perp instIds are NOT eternal — OKX
-		// rolls them to a new far-dated contract periodically) and must be re-verified/updated
-		// against a live account before each real-trading deployment, not assumed stable long-term.
-		ExecInstIDMap map[string]string `yaml:"exec_inst_id_map"`
-		ExecInstType  string            `yaml:"exec_inst_type"`
-		ExecSettleCcy string            `yaml:"exec_settle_ccy"`
+		// ExecInstType/ExecSettleCcy answer "which instType/currency does account/position/balance
+		// access use" — separate from SymbolMap because these are account-wide properties, not
+		// per-symbol ones (every X-Perp instrument on this account shares instType=FUTURES and
+		// settles in the same currency). Found load-bearing 2026-09-04 (CLAUDE.md §27): this
+		// project's real account settles in USDC under Multi-currency margin mode, and its
+		// tradeable instruments report instType=FUTURES, not the SWAP/USDT this codebase assumed
+		// pre-2026-09-04. Both empty by default (RealTrader's own accessors fall back to
+		// instType=SWAP, currency=USDT) — i.e. no override needed for a deployment whose account
+		// trades the classic SWAP product directly.
+		ExecInstType  string `yaml:"exec_inst_type"`
+		ExecSettleCcy string `yaml:"exec_settle_ccy"`
 	} `yaml:"trading"`
 
 	// Ingestion controls cmd/ingestor: the always-on, broad set of candle timeframes it collects
@@ -417,7 +427,7 @@ func Load(path string) (*Config, error) {
 	cfg.RLService.URL = envOr("RL_SERVICE_URL", "http://localhost:8000")
 
 	if len(cfg.Trading.InstIDs) == 0 {
-		cfg.Trading.InstIDs = []string{"BTC-USDT-SWAP"}
+		cfg.Trading.InstIDs = []string{"BTC"}
 	}
 	if cfg.Trading.PollIntervalSec == 0 {
 		cfg.Trading.PollIntervalSec = 5

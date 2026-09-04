@@ -2,22 +2,23 @@ package config
 
 import "testing"
 
-// TestLoad_ParsesExecInstIDMap guards the real-trading instrument mapping (CLAUDE.md §27, found
-// live 2026-09-04): trading.exec_inst_id_map/exec_inst_type/exec_settle_ccy must parse from the
-// example config exactly as documented there, since a typo here would silently leave RealTrader
-// targeting the market-data instId directly against an account that cannot trade it.
-func TestLoad_ParsesExecInstIDMap(t *testing.T) {
+// TestLoad_ParsesSymbolMap guards the real-trading instrument mapping (CLAUDE.md §27, found live
+// 2026-09-04): trading.symbol_map/exec_inst_type/exec_settle_ccy must parse from the example
+// config exactly as documented there, since a typo here would silently leave a service
+// subscribing to/calling the wrong instId, or none at all, against an account that cannot trade
+// the classic SWAP instrument.
+func TestLoad_ParsesSymbolMap(t *testing.T) {
 	cfg, err := Load("../../configs/config.example.yaml")
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
 
-	got, ok := cfg.Trading.ExecInstIDMap["BTC-USDT-SWAP"]
+	got, ok := cfg.Trading.SymbolMap["BTC"]
 	if !ok {
-		t.Fatal("exec_inst_id_map missing BTC-USDT-SWAP entry")
+		t.Fatal("symbol_map missing BTC entry")
 	}
 	if got != "BTC-USD_UM_XPERP-310404" {
-		t.Errorf("exec_inst_id_map[BTC-USDT-SWAP] = %q, want BTC-USD_UM_XPERP-310404", got)
+		t.Errorf("symbol_map[BTC] = %q, want BTC-USD_UM_XPERP-310404", got)
 	}
 	if cfg.Trading.ExecInstType != "FUTURES" {
 		t.Errorf("exec_inst_type = %q, want FUTURES", cfg.Trading.ExecInstType)
@@ -25,17 +26,25 @@ func TestLoad_ParsesExecInstIDMap(t *testing.T) {
 	if cfg.Trading.ExecSettleCcy != "USDC" {
 		t.Errorf("exec_settle_ccy = %q, want USDC", cfg.Trading.ExecSettleCcy)
 	}
+
+	// Every trading.inst_ids entry must have a symbol_map entry — a silent gap here is exactly
+	// the "channel subscribed, nothing ever arrives" failure mode CLAUDE.md §9 warns about.
+	for _, sym := range cfg.Trading.InstIDs {
+		if cfg.Trading.SymbolMap[sym] == "" {
+			t.Errorf("trading.inst_ids entry %q has no symbol_map entry", sym)
+		}
+	}
 }
 
-// TestLoad_ExecInstIDMapDefaultsToNil confirms a config that never sets exec_inst_id_map leaves it
-// nil, not some populated default — RealTrader.execInstID() must fall back to InstID in that case
-// (the correct behavior for a deployment whose account CAN trade the SWAP instrument directly).
-func TestLoad_ExecInstIDMapDefaultsToNil(t *testing.T) {
+// TestLoad_SymbolMapDefaultsToNil confirms a config that never sets symbol_map leaves it nil, not
+// some populated default — a nil map's lookups return "" cleanly, and SymbolMap.Resolve turns
+// that into a loud error rather than a silent empty-instId call.
+func TestLoad_SymbolMapDefaultsToNil(t *testing.T) {
 	c := &Config{}
-	if c.Trading.ExecInstIDMap != nil {
-		t.Errorf("expected nil ExecInstIDMap on a zero-value Config, got %v", c.Trading.ExecInstIDMap)
+	if c.Trading.SymbolMap != nil {
+		t.Errorf("expected nil SymbolMap on a zero-value Config, got %v", c.Trading.SymbolMap)
 	}
-	if c.Trading.ExecInstIDMap["anything"] != "" {
+	if c.Trading.SymbolMap["anything"] != "" {
 		t.Error("expected a lookup on a nil map to return the empty string, not panic")
 	}
 }
