@@ -51,8 +51,8 @@ type StrategyAssignment struct {
 // StrategyStats summarizes one strategy's paper-trading track record (CLAUDE.md §11.3),
 // computed from paper_orders — no separately maintained counters.
 type StrategyStats struct {
-	StrategyID   int64
-	SignalCount  int64
+	StrategyID  int64
+	SignalCount int64
 	// Wins/Losses are decided by realized PnL, not by close_reason. Counting close_reason='tp'
 	// as the win is wrong once the RL ratchet (CLAUDE.md §15.4) trails a stop into profit: a
 	// stop-loss touch then banks a GAIN. Measured on real data, 101 of 152 'sl' closes were
@@ -86,9 +86,9 @@ type PositionFilter struct {
 
 // PaperOrder is a virtual (forward-test) trade opened by the Paper Trading Engine (CLAUDE.md §8).
 type PaperOrder struct {
-	ID           int64
-	InstID       string
-	StrategyID   *int64
+	ID         int64
+	InstID     string
+	StrategyID *int64
 	// Bar is the decision timeframe the signal that opened this order fired on (e.g. "5m", "1H").
 	// Captured at open time rather than reconstructed from strategy_assignments afterward, since
 	// one strategy can be assigned to several bars for the same instrument (CLAUDE.md §9) and the
@@ -154,12 +154,23 @@ type PaperOrder struct {
 // zero" is a fact the system can act on directly, and so reset events (ResetCount/LastResetAt) stay
 // visible for training-run analysis rather than looking like unlimited free money.
 type AccountEquity struct {
-	Mode        string          // "paper", "demo", or "real"
-	InitialUSD  decimal.Decimal // configured starting balance a reset returns to
-	EquityUSD   decimal.Decimal // current running balance
-	ResetCount  int
-	LastResetAt *time.Time
-	UpdatedAt   time.Time
+	Mode       string          // "paper", "demo", or "real"
+	InitialUSD decimal.Decimal // configured starting balance a reset returns to
+	EquityUSD  decimal.Decimal // "Total Equity": running balance SINCE the last reset/cap choice
+	// AccountBalanceUSD is "Account Balance": the real, continuous running total (CLAUDE.md
+	// §31.2/§31.3). Moves by the exact same delta as EquityUSD on every trade (ApplyRealizedPnL),
+	// AND moves to the exact same new value as EquityUSD on an operator-chosen cap (SetAccountCap,
+	// which is economically a deposit/withdrawal — it changes the real balance too, not just the
+	// baseline positions size against). It is NEVER independently reset the way EquityUSD is by an
+	// automatic drain-to-zero (ApplyRealizedPnL's own reset path) — that is the one case where the
+	// two fields actually diverge: EquityUSD snaps back to InitialUSD, AccountBalanceUSD keeps
+	// recording the real (negative-going-forward) total. Outside of that one case, EquityUSD ==
+	// AccountBalanceUSD is a structural invariant, since neither field in this schema ever carries
+	// unrealized PnL.
+	AccountBalanceUSD decimal.Decimal
+	ResetCount        int
+	LastResetAt       *time.Time
+	UpdatedAt         time.Time
 }
 
 // EquityPoint is one entry in a mode's balance timeline (CLAUDE.md §15.7). Every balance change
@@ -319,6 +330,15 @@ type Repository interface {
 	// ListEquityHistory returns mode's balance timeline for the panel's chart (CLAUDE.md §15.7),
 	// oldest-first for direct plotting. A zero since means no lower bound; limit<=0 means no cap.
 	ListEquityHistory(ctx context.Context, mode string, since time.Time, limit int) ([]EquityPoint, error)
+	// SetAccountCap is an OPERATOR-TRIGGERED equivalent of the automatic drain-to-zero reset
+	// ApplyRealizedPnL already performs (CLAUDE.md §31.2): sets both InitialUSD and EquityUSD to
+	// newCapUSD, bumps ResetCount, stamps LastResetAt to now, and writes a reason="reset" history
+	// point — the exact same schema/semantics an automatic reset uses, just invoked explicitly
+	// (e.g. "I've decided to trade with $40 from this point on") rather than triggered by a drain.
+	// This is deliberately NOT a new parallel "trading cap" concept: LastResetAt is what the panel's
+	// equity chart and the dynamic per-position sizing (equity / active token count) both anchor to,
+	// so this single value is the one and only definition of "the balance since I last chose one."
+	SetAccountCap(ctx context.Context, mode string, newCapUSD decimal.Decimal) (AccountEquity, error)
 
 	// RecordPaperOrderAdjustment appends one entry to an order's in-trade SL/TP adjustment history
 	// (CLAUDE.md §15.4/§15.12 revision, 2026-09-02) — replaces the old shadow-fork mechanic's

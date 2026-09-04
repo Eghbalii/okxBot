@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { usePolling } from '../hooks/usePolling'
 import { api } from '../api/client'
 import { formatUsd, pnlClass } from '../utils/format'
@@ -18,11 +19,64 @@ function PnLTile({ label, usd, pct }: { label: string; usd: string; pct: string 
   )
 }
 
-// Stats box above the Positions table: open order count, total account equity, and 24h/1w/1month
-// realized PnL. Polls at a slower interval than the position table's own 5s poll — this data
-// doesn't need that freshness.
+// Trading-cap input, inline in its own tile: "I've decided to trade with $X from now on." Setting
+// a new cap re-baselines Total Equity (what new positions size against) without touching Account
+// Balance, the real continuous total (CLAUDE.md §31.2) — both numbers stay visible above so the
+// effect of a cap change is immediately checkable against the account's real history.
+function TradingCapTile({ onSaved }: { onSaved: () => void }) {
+  const [value, setValue] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function save() {
+    const num = Number(value)
+    if (!Number.isFinite(num) || num <= 0) {
+      setError('enter a positive number')
+      return
+    }
+    setSaving(true)
+    setError(null)
+    try {
+      await api.setAccountCap(String(num))
+      setValue('')
+      onSaved()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="config-tile">
+      <div className="config-tile-label">Set Trading Cap</div>
+      <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
+        <input
+          type="number"
+          placeholder="e.g. 40"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          style={{ width: '5.5rem' }}
+        />
+        <button className="btn-primary" onClick={save} disabled={saving}>
+          {saving ? 'Saving…' : 'Set'}
+        </button>
+      </div>
+      {error && (
+        <div className="text-dim" style={{ color: 'var(--red, #e5484d)', fontSize: '0.75rem', marginTop: '0.3rem' }}>
+          {error}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Stats box above the Positions table: open order count, Account Balance, Total Equity, and
+// 24h/1w/1month realized PnL, plus the Set Trading Cap control. Polls at a slower interval than
+// the position table's own 5s poll — this data doesn't need that freshness.
 export default function PaperTradingStatsBox() {
-  const { data, error } = usePolling(() => api.paperTradingStats(), 15_000)
+  const [refreshSignal, setRefreshSignal] = useState(0)
+  const { data, error } = usePolling(() => api.paperTradingStats(), 15_000, [], refreshSignal)
 
   return (
     <div className="card">
@@ -35,7 +89,17 @@ export default function PaperTradingStatsBox() {
             <div className="config-tile-value mono">{data.openCount}</div>
           </div>
           <div className="config-tile">
-            <div className="config-tile-label">Total Equity</div>
+            <div className="config-tile-label" title="The real, continuous running total — never reset by a trading-cap change">
+              Account Balance
+            </div>
+            <div className="config-tile-value mono">
+              {formatUsd(Number(data.accountBalanceUsd)).replace('+', '')}
+            </div>
+          </div>
+          <div className="config-tile">
+            <div className="config-tile-label" title="The balance since the last chosen trading cap — what new positions size against">
+              Total Equity
+            </div>
             <div className="config-tile-value mono">
               {formatUsd(Number(data.totalEquityUsd)).replace('+', '')}
             </div>
@@ -43,6 +107,7 @@ export default function PaperTradingStatsBox() {
           <PnLTile label="24h PnL" usd={data.pnl24hUsd} pct={data.pnl24hPct} />
           <PnLTile label="1W PnL" usd={data.pnl7dUsd} pct={data.pnl7dPct} />
           <PnLTile label="1M PnL" usd={data.pnl30dUsd} pct={data.pnl30dPct} />
+          <TradingCapTile onSaved={() => setRefreshSignal((n) => n + 1)} />
         </div>
       )}
     </div>

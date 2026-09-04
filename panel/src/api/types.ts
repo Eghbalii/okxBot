@@ -183,13 +183,31 @@ export interface TesterConfig {
 // /api/paper-trading/* routes.
 export interface PaperTradingStats {
   openCount: number
+  // "Total Equity": the balance SINCE the operator last chose a baseline via POST /api/account/cap
+  // (or the last automatic drain-to-zero reset) — what new position sizing is computed from.
   totalEquityUsd: string
+  // "Account Balance": the real, continuous running total, never reset by a baseline change
+  // (CLAUDE.md §31.2). Equal to totalEquityUsd until the account's first-ever reset, then diverges.
+  accountBalanceUsd: string
   pnl24hUsd: string
   pnl24hPct: string
   pnl7dUsd: string
   pnl7dPct: string
   pnl30dUsd: string
   pnl30dPct: string
+}
+
+// account_equity row (GET /api/account) — mirrors go-engine/internal/port.AccountEquity's JSON
+// shape (Go's default encoding/json field-name casing, i.e. capitalized, since that struct has no
+// json tags).
+export interface AccountEquity {
+  Mode: string
+  InitialUSD: string
+  EquityUSD: string
+  AccountBalanceUSD: string
+  ResetCount: number
+  LastResetAt: string | null
+  UpdatedAt: string
 }
 
 export type TradingState = 'running' | 'paused' | 'stopped'

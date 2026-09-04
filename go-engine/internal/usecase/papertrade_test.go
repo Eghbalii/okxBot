@@ -282,7 +282,7 @@ func (r *fakeRepository) GetAccountEquity(ctx context.Context, mode string, init
 	if ae, ok := r.accounts[mode]; ok {
 		return ae, nil
 	}
-	ae := port.AccountEquity{Mode: mode, InitialUSD: initialUSD, EquityUSD: initialUSD}
+	ae := port.AccountEquity{Mode: mode, InitialUSD: initialUSD, EquityUSD: initialUSD, AccountBalanceUSD: initialUSD}
 	r.accounts[mode] = ae
 	r.equityPoints = append(r.equityPoints, port.EquityPoint{Mode: mode, EquityUSD: initialUSD, Reason: "seed"})
 	return ae, nil
@@ -296,6 +296,7 @@ func (r *fakeRepository) ApplyRealizedPnL(ctx context.Context, mode string, pnl 
 		return port.AccountEquity{}, false, fmt.Errorf("apply pnl: no account row for mode %s", mode)
 	}
 	ae.EquityUSD = ae.EquityUSD.Add(pnl)
+	ae.AccountBalanceUSD = ae.AccountBalanceUSD.Add(pnl)
 	r.equityPoints = append(r.equityPoints, port.EquityPoint{
 		Mode: mode, EquityUSD: ae.EquityUSD, DeltaUSD: pnl, Reason: "trade", OrderID: orderID, InstID: instID,
 	})
@@ -314,6 +315,28 @@ func (r *fakeRepository) ApplyRealizedPnL(ctx context.Context, mode string, pnl 
 	}
 	r.accounts[mode] = ae
 	return ae, reset, nil
+}
+
+func (r *fakeRepository) SetAccountCap(ctx context.Context, mode string, newCapUSD decimal.Decimal) (port.AccountEquity, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	previous := r.accounts[mode].EquityUSD
+	ae := port.AccountEquity{
+		Mode:       mode,
+		InitialUSD: newCapUSD,
+		EquityUSD:  newCapUSD,
+		// AccountBalanceUSD moves to newCapUSD too (CLAUDE.md §31.3 correction): choosing a cap is
+		// economically a deposit/withdrawal, which changes the real balance by construction — not
+		// an independent re-baselining of EquityUSD that would leave Balance < Equity with a gap
+		// no real trade produced.
+		AccountBalanceUSD: newCapUSD,
+		ResetCount:        r.accounts[mode].ResetCount + 1,
+	}
+	r.accounts[mode] = ae
+	r.equityPoints = append(r.equityPoints, port.EquityPoint{
+		Mode: mode, EquityUSD: newCapUSD, DeltaUSD: newCapUSD.Sub(previous), Reason: "reset",
+	})
+	return ae, nil
 }
 
 func (r *fakeRepository) ListEquityHistory(ctx context.Context, mode string, since time.Time, limit int) ([]port.EquityPoint, error) {
@@ -382,12 +405,15 @@ func newTestPaperTrader(repo port.Repository, strategies []StrategyAssignment) *
 			"1m":  noopConsumer{},
 			"15m": noopConsumer{},
 		},
-		Repo:        repo,
-		NotionalUSD: dec("100"),
+		Repo: repo,
 		// Shared-account defaults (CLAUDE.md §15.6): a $1000 pool with the production caps, so
 		// sizing tests exercise the real cap arithmetic rather than an unbounded path.
+		// ActiveTokenCount: 10 keeps dynamicNotional's $1000/10 = $100 result identical to the old
+		// fixed NotionalUSD: dec("100") this replaced (CLAUDE.md §31.2), so existing tests that
+		// assert a $100 order size don't need to change just because sizing became dynamic.
 		Mode:                "paper",
 		AccountInitialUSD:   dec("1000"),
+		ActiveTokenCount:    10,
 		MaxPositionPct:      dec("0.25"),
 		MaxTotalExposurePct: dec("0.60"),
 		MaxOpenOrders:       3,
@@ -1545,6 +1571,66 @@ func TestEvaluateStrategies_RLSizingFallsBackWhenModelErrors(t *testing.T) {
 	}
 }
 
+// CLAUDE.md §31.2: with RLSizing off, a new order's fixed-path size tracks the account's CURRENT
+// equity divided by ActiveTokenCount — not a config constant — so it behaves like a real exchange
+// account (grows after a win, shrinks after a loss) rather than staying pinned to whatever number
+// was configured when the service last started.
+func TestEvaluateStrategies_DynamicSizingTracksCurrentEquity(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newSizingTestPaperTrader(repo, nil) // RLSizing left false
+	pt.ActiveTokenCount = 5
+	// Pre-seed a DIFFERENT equity than newTestPaperTrader's AccountInitialUSD default (1000), so a
+	// pass proves the live value is actually read, not the configured fallback.
+	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("250")}
+
+	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies: %v", err)
+	}
+
+	o := openedOrder(t, repo)
+	if !o.Size.Equal(dec("50")) {
+		t.Errorf("expected size = current equity 250 / 5 active tokens = 50, got %s", o.Size)
+	}
+}
+
+// The same account, but fewer active tokens (e.g. one was disabled) — the divisor changes and so
+// must the resulting size, proving ActiveTokenCount is actually load-bearing and not just read
+// once at construction and ignored.
+func TestEvaluateStrategies_DynamicSizingTracksActiveTokenCount(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newSizingTestPaperTrader(repo, nil)
+	pt.ActiveTokenCount = 2
+	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+
+	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies: %v", err)
+	}
+
+	o := openedOrder(t, repo)
+	if !o.Size.Equal(dec("500")) {
+		t.Errorf("expected size = 1000 / 2 active tokens = 500, got %s", o.Size)
+	}
+}
+
+// A drained (zero/negative) or unreadable equity must fall back to a sane magnitude
+// (AccountInitialUSD/ActiveTokenCount) rather than opening at ~$0, which would round-trip through
+// every downstream percentage/leverage calculation as noise.
+func TestEvaluateStrategies_DynamicSizingFallsBackWhenEquityNotPositive(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newSizingTestPaperTrader(repo, nil)
+	pt.ActiveTokenCount = 10
+	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("0")}
+
+	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies: %v", err)
+	}
+
+	o := openedOrder(t, repo)
+	if !o.Size.Equal(dec("100")) {
+		t.Errorf("expected fallback to AccountInitialUSD(1000)/ActiveTokenCount(10) = 100, got %s", o.Size)
+	}
+}
+
 // TestRLSizing_TotalExposureCeilingBlocksNewPosition covers the second Go-side cap (CLAUDE.md
 // §15.6): the per-position cap alone still permits enough simultaneous positions to commit the
 // whole account, so total open exposure is bounded independently.
@@ -1706,6 +1792,93 @@ func TestApplyRealizedPnL_RealModeNeverAutoResets(t *testing.T) {
 	}
 	if !acct.EquityUSD.Equal(dec("-50")) {
 		t.Errorf("expected the real balance left at -50, got %s", acct.EquityUSD)
+	}
+}
+
+// CLAUDE.md §31.2: AccountBalanceUSD (the real, continuous running total) must track the exact
+// same trade PnL as EquityUSD ("Total Equity" — the balance since the last chosen baseline) —
+// they only diverge once a reset happens, which is the whole point of having two fields.
+func TestApplyRealizedPnL_UpdatesAccountBalanceAlongsideEquity(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "paper", dec("40")); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	acct, _, err := repo.ApplyRealizedPnL(ctx, "paper", dec("-5"), nil, "BTC-USDT-SWAP")
+	if err != nil {
+		t.Fatalf("apply pnl: %v", err)
+	}
+	if !acct.EquityUSD.Equal(dec("35")) {
+		t.Errorf("EquityUSD: want 35, got %s", acct.EquityUSD)
+	}
+	if !acct.AccountBalanceUSD.Equal(dec("35")) {
+		t.Errorf("AccountBalanceUSD: want 35, got %s", acct.AccountBalanceUSD)
+	}
+}
+
+// The defect this whole redesign exists to fix: before AccountBalanceUSD existed, EquityUSD was
+// the only running total, so re-baselining it (a reset, whether automatic or operator-triggered)
+// destroyed the real cumulative history. AccountBalanceUSD must survive a SetAccountCap untouched.
+// CLAUDE.md §31.3: SetAccountCap is economically a deposit/withdrawal, so it must move
+// EquityUSD AND AccountBalanceUSD to the SAME new value together — never leave a gap between them
+// that no real trade produced. Since neither field in this schema ever carries unrealized PnL
+// (both only move on ApplyRealizedPnL, at a position's close), Balance and Equity are mathematically
+// required to stay equal outside of realized-PnL deltas; a SetAccountCap that only touched one of
+// them (the original, buggy version of this method) left Balance permanently below Equity for no
+// trading reason at all — exactly the defect a real operator caught live (Balance $6.96 vs Equity
+// $39.66 after setting a $40 cap against a $7.30 real balance).
+func TestSetAccountCap_MovesBalanceAndEquityTogether(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "paper", dec("100")); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	// Drift EquityUSD and AccountBalanceUSD together away from the seed, the way real trading
+	// would, before the operator chooses a new cap.
+	if _, _, err := repo.ApplyRealizedPnL(ctx, "paper", dec("-49"), nil, "ETH-USDT-SWAP"); err != nil {
+		t.Fatalf("apply pnl: %v", err)
+	}
+
+	acct, err := repo.SetAccountCap(ctx, "paper", dec("40"))
+	if err != nil {
+		t.Fatalf("set account cap: %v", err)
+	}
+	if !acct.EquityUSD.Equal(dec("40")) {
+		t.Errorf("EquityUSD should re-baseline to the new cap: want 40, got %s", acct.EquityUSD)
+	}
+	if !acct.InitialUSD.Equal(dec("40")) {
+		t.Errorf("InitialUSD should re-baseline to the new cap: want 40, got %s", acct.InitialUSD)
+	}
+	// A cap change is a deposit/withdrawal: it changes the real balance too, to the SAME value —
+	// regardless of what the real balance was before (51, here), never a value derived from it.
+	if !acct.AccountBalanceUSD.Equal(dec("40")) {
+		t.Errorf("AccountBalanceUSD must move to the new cap alongside EquityUSD: want 40, got %s — "+
+			"leaving it at the old value creates a gap between Balance and Equity that no real "+
+			"trade produced, which is mathematically incoherent in a schema where neither field "+
+			"ever carries unrealized PnL", acct.AccountBalanceUSD)
+	}
+	if !acct.EquityUSD.Equal(acct.AccountBalanceUSD) {
+		t.Errorf("invariant violated: EquityUSD (%s) must equal AccountBalanceUSD (%s) immediately "+
+			"after a cap change, since no PnL has been realized since", acct.EquityUSD, acct.AccountBalanceUSD)
+	}
+	if acct.ResetCount != 1 {
+		t.Errorf("ResetCount: want 1, got %d", acct.ResetCount)
+	}
+
+	// And both fields keep moving together afterward, from the SAME new baseline.
+	acct, _, err = repo.ApplyRealizedPnL(ctx, "paper", dec("10"), nil, "SOL-USDT-SWAP")
+	if err != nil {
+		t.Fatalf("apply pnl after cap: %v", err)
+	}
+	if !acct.EquityUSD.Equal(dec("50")) {
+		t.Errorf("EquityUSD after +10: want 50 (40+10), got %s", acct.EquityUSD)
+	}
+	if !acct.AccountBalanceUSD.Equal(dec("50")) {
+		t.Errorf("AccountBalanceUSD after +10: want 50 (40+10, same baseline as Equity), got %s", acct.AccountBalanceUSD)
+	}
+	if !acct.EquityUSD.Equal(acct.AccountBalanceUSD) {
+		t.Errorf("invariant violated after a trade: EquityUSD (%s) must still equal AccountBalanceUSD (%s)", acct.EquityUSD, acct.AccountBalanceUSD)
 	}
 }
 

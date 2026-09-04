@@ -1,4 +1,5 @@
 import type {
+  AccountEquity,
   Candle,
   ModelStatus,
   PaperOrderAdjustment,
@@ -207,6 +208,16 @@ export const api = {
       body: JSON.stringify(patch),
     }),
   restartPaperTrader: () => request<{ status: string }>('/paper-trading/restart', { method: 'POST' }),
+
+  // CLAUDE.md §31.2/§31.3: an explicit deposit/withdrawal bringing both "Total Equity" and the
+  // real, continuous "Account Balance" to the same new value together — takes effect immediately,
+  // no restart needed, since dynamic sizing reads the live account_equity row on every open rather
+  // than a cached value.
+  setAccountCap: (newCapUsd: string, mode: PositionMode = 'paper') =>
+    request<AccountEquity>('/account/cap', {
+      method: 'POST',
+      body: JSON.stringify({ mode, newCapUsd }),
+    }),
 }
 
 // PaperOrderEvent mirrors Go's usecase.PaperOrderEvent — the lightweight message pushed over

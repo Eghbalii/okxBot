@@ -1,9 +1,12 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 // defaultEquityHistoryLimit bounds an unqualified history read so a long-running paper account
@@ -47,6 +50,56 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, account)
 }
 
+// setAccountCapRequest is POST /api/account/cap's body.
+type setAccountCapRequest struct {
+	// Mode defaults to "paper" when omitted, same as the ?mode= query params elsewhere in this
+	// file — a body field rather than a query param since this is a mutating POST, not a GET.
+	Mode      string          `json:"mode"`
+	NewCapUSD decimal.Decimal `json:"newCapUsd"`
+}
+
+// handleSetAccountCap lets the operator explicitly DEPOSIT/WITHDRAW to bring a mode's real balance
+// to a chosen value — e.g. "I've decided to trade with $40 from this point on" (CLAUDE.md §31.2/
+// §31.3). This moves BOTH InitialUSD/EquityUSD ("Total Equity" — resets to the chosen baseline)
+// AND AccountBalanceUSD ("Account Balance" — the real continuous total) to the same new value,
+// bumps ResetCount, and writes a reason="reset" history row. Moving only EquityUSD (the first,
+// buggy version of this path) left Balance sitting below Equity by a gap no real trade produced —
+// mathematically incoherent, since this schema never carries unrealized PnL separately, so outside
+// of realized-PnL deltas the two fields must stay equal.
+//
+// Real money is NOT excluded here the way it's excluded from ApplyRealizedPnL's automatic
+// drain-to-zero reset (CLAUDE.md §15.7's real-mode carve-out) — that carve-out exists to stop an
+// AUTOMATIC top-up from ever happening to real capital after a loss. This endpoint is the opposite
+// case: an operator explicitly depositing/withdrawing on their own real account is a decision only
+// a human makes, exactly the "a human decision, not a bookkeeping event" framing §15.7 itself
+// describes for real mode — it is not a value this handler should second-guess by refusing the mode.
+func (s *Server) handleSetAccountCap(w http.ResponseWriter, r *http.Request) {
+	var req setAccountCapRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	mode := req.Mode
+	if mode == "" {
+		mode = "paper"
+	}
+	if !validModes[mode] {
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper, demo, or real): "+mode)
+		return
+	}
+	if !req.NewCapUSD.IsPositive() {
+		writeError(w, http.StatusBadRequest, "newCapUsd must be positive")
+		return
+	}
+
+	account, err := s.Repo.SetAccountCap(r.Context(), mode, req.NewCapUSD)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, account)
+}
+
 // handleAccountHistory returns one mode's balance timeline, oldest-first, for the panel's chart
 // (CLAUDE.md §15.7). Each point carries the reason it was written ("trade", "reset", "seed"), which
 // is what lets the chart mark a drain-and-reset distinctly from ordinary trade PnL.
@@ -65,6 +118,13 @@ func (s *Server) handleAccountHistory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		since = parsed
+	} else if account, err := s.Repo.GetAccountEquity(r.Context(), mode, s.AccountInitialUSD); err == nil && account.LastResetAt != nil {
+		// CLAUDE.md §31.2: with no explicit since, the chart shows the balance's story since the
+		// operator last chose a baseline (SetAccountCap) or a drain auto-reset happened — not the
+		// account's entire lifetime, which may span sizing regimes with nothing to do with the
+		// currently-chosen cap. A caller that genuinely wants the full history can still pass an
+		// explicit ?since= far enough back.
+		since = *account.LastResetAt
 	}
 
 	limit := defaultEquityHistoryLimit

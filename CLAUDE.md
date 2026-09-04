@@ -4016,3 +4016,93 @@ constant in raw price terms), or simply hold off enabling this flag at all until
 has cleared SAC's own `learning_starts=100` by a comfortable margin — matching the exact caution
 §14's roadmap item 5 already applies to the `rl_sizing` flag, for the same underlying reason
 (an undertrained policy's output should not be trusted at full strength).
+
+## 32. Account Balance vs. Total Equity, and dynamic per-position sizing (2026-09-04)
+
+Prompted directly by the §31 config-overwrite incident's fallout: after fixing that config, the
+panel's "Total Equity" number ($6-7) had nothing to do with the real $40 the operator intended to
+trade with, because `paper_trading.notional_usd` was a config constant with no memory of "how much
+capital did I actually decide to allocate." Reused the observation that a real exchange account
+has exactly this same distinction and built it properly rather than patch the symptom.
+
+### 32.1 Two numbers, not one
+
+- **Account Balance** (`account_equity.account_balance_usd`, migration `000018`): the real,
+  continuous running total since the account was first seeded. Moves by the exact same realized-PnL
+  delta as Total Equity on every trade close, and is NEVER independently reset.
+- **Total Equity** (`account_equity.equity_usd`, pre-existing column, reused rather than replaced):
+  the balance since the operator last explicitly chose a baseline. This is what new position sizing
+  computes against.
+
+Before this column existed, `equity_usd` played both roles at once — which is exactly what made
+the §31 incident's aftermath confusing: there was no way to tell "what did I actually deposit" from
+"what am I currently sizing against."
+
+### 32.2 `SetAccountCap`: reused the existing reset mechanism, not a new concept
+
+`account_equity_history.reason` already had `'trade' | 'reset' | 'seed'` — a `'reset'` row was
+already exactly the right shape for "the operator chose a new baseline," just previously only ever
+triggered automatically by `ApplyRealizedPnL`'s drain-to-zero path (§15.7). `SetAccountCap`
+(`internal/postgres/account_equity.go`) is the same mechanism triggered explicitly instead, via a
+new `POST /api/account/cap` (`{mode?, newCapUsd}`) — no restart required, since sizing reads the
+live `account_equity` row on every position open.
+
+`GET /api/account/history` now defaults `since` to the account's own `LastResetAt` when the caller
+doesn't pass one explicitly — the chart shows the story since the chosen baseline, not the account's
+entire lifetime, which may span sizing regimes with nothing to do with the current one. An explicit
+`?since=` still overrides it.
+
+### 32.3 The bug: `SetAccountCap` initially left a gap between Balance and Equity
+
+The first version of `SetAccountCap` set `equity_usd`/`initial_usd` to the new cap but left
+`account_balance_usd` untouched, reasoning (wrongly) that "Account Balance should never be touched
+by a reset." Deployed, then caught immediately by the operator: after setting a $40 cap against a
+real balance of $7.30, the panel showed Total Equity $39.66 and Account Balance $6.96 —
+**Balance sitting below Equity**, which cannot happen in a coherent model.
+
+The root cause was a category error, not an edge case: in this schema neither field ever carries
+unrealized PnL — both only move on `ApplyRealizedPnL`, at a position's close. With no open
+positions' unrealized PnL to explain a difference, **Balance and Equity are mathematically required
+to stay equal** outside of the one legitimate divergence (§15.7's automatic drain-to-zero "give it
+another chance" reset, which is deliberately fictional — the real balance stays drained/negative in
+`account_balance_usd` while `equity_usd` alone bounces back so paper trading can keep generating
+data; that reset is not a human choosing a real deposit).
+
+Choosing a trading cap is economically a **deposit or withdrawal**: it changes the real balance by
+construction, to the same new value, in the same transaction — not an independent re-baselining of
+one field. Fixed in `SetAccountCap` to write `account_balance_usd = newCapUSD` alongside
+`equity_usd`/`initial_usd`. `TestSetAccountCap_MovesBalanceAndEquityTogether` (mutation-verified:
+reverting the fix reproduces the exact reported symptom, $40 vs $51) asserts the invariant
+`EquityUSD == AccountBalanceUSD` holds immediately after a cap change and continues to hold as
+trades accumulate afterward. The live server data was corrected by calling the fixed endpoint with
+the account's own current equity value (not a manually chosen number), closing the $32.70 gap the
+buggy version had created.
+
+### 32.4 Dynamic per-position sizing replaces the fixed `notional_usd` constant
+
+`paper_trading.notional_usd` is gone from `PaperTrader` entirely. Every new position now opens at
+`CurrentEquity / ActiveTokenCount` (`PaperTrader.dynamicNotional`,
+`internal/usecase/papertrade.go`) — computed live from the account's current Total Equity on every
+open, the same way a real exchange account's position sizing tracks the account's current balance
+rather than a number fixed at deploy time: grows after a win, shrinks after a loss, and changes
+immediately when a token is enabled/disabled.
+
+`ActiveTokenCount` (how many of `trading.inst_ids` are not in `paper_trading_config.
+disabled_inst_ids`) is computed once at `cmd/paper-trader` startup and shared by every
+per-instrument `PaperTrader`, matching this service's existing "config changes need a restart"
+posture — enabling/disabling a token mid-run doesn't retroactively resize an already-open position,
+only the next one to open. A drained or unreadable equity falls back to
+`AccountInitialUSD/ActiveTokenCount` rather than opening near-$0, which would round-trip through
+every downstream percentage/leverage calculation as noise.
+
+3 new dedicated tests in `internal/usecase/papertrade_test.go` (mutation-verified) cover: sizing
+tracks live equity, sizing tracks the active-token divisor, and the not-positive-equity fallback.
+7 new tests in `internal/api/account_test.go` cover `handleSetAccountCap`'s mode defaulting/
+validation/real-mode allowance and `handleAccountHistory`'s since-defaults-to-LastResetAt behavior
+(with an explicit `?since=` still winning, and a never-reset account correctly showing full
+history rather than nothing). 417 Go tests total (was 405 after §30/§31).
+
+Panel: `PaperTradingStatsBox` gained an "Account Balance" tile alongside the existing "Total
+Equity" one, plus an inline "Set Trading Cap" number input + button that calls the new endpoint and
+immediately refetches stats — no restart button needed for this one, unlike the box's other
+controls, since the cap takes effect on the very next position open.

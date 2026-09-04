@@ -15,14 +15,20 @@ import (
 // percent — computed from the SAME account_equity/account_equity_history rows the panel's
 // (not-yet-built) balance chart would read, so there is no second source of truth for equity.
 type paperTradingStatsView struct {
-	OpenCount      int    `json:"openCount"`
-	TotalEquityUSD string `json:"totalEquityUsd"`
-	PnL24hUSD      string `json:"pnl24hUsd"`
-	PnL24hPct      string `json:"pnl24hPct"`
-	PnL7dUSD       string `json:"pnl7dUsd"`
-	PnL7dPct       string `json:"pnl7dPct"`
-	PnL30dUSD      string `json:"pnl30dUsd"`
-	PnL30dPct      string `json:"pnl30dPct"`
+	OpenCount int `json:"openCount"`
+	// TotalEquityUSD ("Total Equity") is the balance SINCE the operator last chose a baseline via
+	// POST /api/account/cap, or since the last automatic drain-to-zero reset — account_equity.
+	// equity_usd. AccountBalanceUSD ("Account Balance") is the real, continuous running total that
+	// baseline changes never touch (CLAUDE.md §31.2) — the two are equal until the first reset ever
+	// happens for this mode, then diverge.
+	TotalEquityUSD    string `json:"totalEquityUsd"`
+	AccountBalanceUSD string `json:"accountBalanceUsd"`
+	PnL24hUSD         string `json:"pnl24hUsd"`
+	PnL24hPct         string `json:"pnl24hPct"`
+	PnL7dUSD          string `json:"pnl7dUsd"`
+	PnL7dPct          string `json:"pnl7dPct"`
+	PnL30dUSD         string `json:"pnl30dUsd"`
+	PnL30dPct         string `json:"pnl30dPct"`
 }
 
 func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request) {
@@ -55,14 +61,15 @@ func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request)
 	pnl30dUSD, pnl30dPct := realizedPnLOverWindow(history, now.Add(-30*24*time.Hour))
 
 	writeJSON(w, http.StatusOK, paperTradingStatsView{
-		OpenCount:      len(positions),
-		TotalEquityUSD: account.EquityUSD.String(),
-		PnL24hUSD:      pnl24hUSD.String(),
-		PnL24hPct:      pnl24hPct.String(),
-		PnL7dUSD:       pnl7dUSD.String(),
-		PnL7dPct:       pnl7dPct.String(),
-		PnL30dUSD:      pnl30dUSD.String(),
-		PnL30dPct:      pnl30dPct.String(),
+		OpenCount:         len(positions),
+		TotalEquityUSD:    account.EquityUSD.String(),
+		AccountBalanceUSD: account.AccountBalanceUSD.String(),
+		PnL24hUSD:         pnl24hUSD.String(),
+		PnL24hPct:         pnl24hPct.String(),
+		PnL7dUSD:          pnl7dUSD.String(),
+		PnL7dPct:          pnl7dPct.String(),
+		PnL30dUSD:         pnl30dUSD.String(),
+		PnL30dPct:         pnl30dPct.String(),
 	})
 }
 

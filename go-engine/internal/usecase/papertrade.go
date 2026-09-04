@@ -53,9 +53,19 @@ type PaperTrader struct {
 	TickConsumer    port.MarketDataConsumer
 	CandleConsumers map[string]port.MarketDataConsumer // keyed by bar
 	Repo            port.Repository
-	NotionalUSD     decimal.Decimal
 	MaxOpenOrders   int
 	Logger          *slog.Logger
+
+	// ActiveTokenCount is how many tokens in the configured roster are NOT currently disabled
+	// (paper_trading_config.disabled_inst_ids) — the divisor for dynamic per-position sizing
+	// (CLAUDE.md §31.2): every new order opens at CurrentEquity/ActiveTokenCount, not a fixed
+	// config constant, so sizing tracks the account the same way a real exchange account would —
+	// grow after a win, shrink after a loss, and immediately reflect a token being enabled/disabled.
+	// Computed once at startup from the same roster/disabled-list every PaperTrader instance
+	// shares, so it is identical across all of them despite being a per-instance field. Falls back
+	// to 1 if zero/unset (defensive; main.go should never actually pass zero since the roster is
+	// never empty in practice).
+	ActiveTokenCount int
 
 	// Model/ActiveTokens/TokenBudgetUSD wire the RL agent's in-trade SL/TP adjustment pass
 	// (CLAUDE.md §15.4). Model may be nil, in which case the adjustment pass is skipped entirely —
@@ -269,6 +279,36 @@ func (e *PaperTrader) accountMode() string {
 	return e.Mode
 }
 
+// dynamicNotional is what a new position opens at when RLSizing is off: CurrentEquity /
+// ActiveTokenCount, not a fixed config constant (CLAUDE.md §31.2). This is how a real exchange
+// account actually behaves — the amount committed per position tracks the account's current
+// balance, growing after a win and shrinking after a loss, rather than staying pinned to whatever
+// number was true the day it was configured. AccountInitialUSD/ActiveTokenCount are the fallback
+// for whichever piece is unavailable, so a transient repository error or a startup
+// misconfiguration degrades to a sane order of magnitude rather than a zero-size order.
+func (e *PaperTrader) dynamicNotional(ctx context.Context, logger *slog.Logger) decimal.Decimal {
+	count := e.ActiveTokenCount
+	if count <= 0 {
+		count = 1
+	}
+	countDec := decimal.NewFromInt(int64(count))
+
+	equity := e.AccountInitialUSD
+	if acct, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), e.AccountInitialUSD); err == nil {
+		equity = acct.EquityUSD
+	} else {
+		logger.Warn("dynamic notional: get account equity failed, falling back to configured initial",
+			"mode", e.accountMode(), "error", err)
+	}
+	if !equity.IsPositive() {
+		// A drained (or unreadable) account has nothing real to size against; falling back to the
+		// configured initial keeps the order at a sane magnitude instead of opening at ~$0, which
+		// would round-trip through every downstream percentage/leverage calculation as noise.
+		equity = e.AccountInitialUSD
+	}
+	return equity.Div(countDec)
+}
+
 // Run consumes ticks/candles from the event bus until ctx is cancelled. Candle windows start
 // empty and fill in from the live feed as bars close — no REST candle-seeding at startup
 // (removed 2026-08-29: it was a real crash source at Phase B's 10-instrument scale, tripping an
@@ -437,7 +477,7 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 			continue
 		}
 
-		order := buildPaperOrder(e.InstID, price, signal, e.NotionalUSD, a.StrategyID, bar)
+		order := buildPaperOrder(e.InstID, price, signal, e.dynamicNotional(ctx, logger), a.StrategyID, bar)
 
 		// Retain this signal for carry-forward onto later price-driven update calls (CLAUDE.md
 		// §15.12): a higher-timeframe opinion stays meaningful between its candles, and dropping it

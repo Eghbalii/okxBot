@@ -111,6 +111,10 @@ func (s *Server) Routes() http.Handler {
 	// is reviewable after the fact, not only visible in logs nobody was watching.
 	mux.HandleFunc("GET /api/account", s.handleGetAccount)
 	mux.HandleFunc("GET /api/account/history", s.handleAccountHistory)
+	// CLAUDE.md §31.2: an operator explicitly re-baselining a mode's tradeable balance (e.g. "trade
+	// with $40 from now on") — the same reset mechanism ApplyRealizedPnL uses automatically on a
+	// drain, just triggered by a person instead of a drain.
+	mux.HandleFunc("POST /api/account/cap", s.handleSetAccountCap)
 
 	// CLAUDE.md §15.4/§15.12 revision, 2026-09-02: backs the order-detail modal's adjustment
 	// history table — replaces the old baseline-vs-rl_adjusted A/B comparison, which had no data

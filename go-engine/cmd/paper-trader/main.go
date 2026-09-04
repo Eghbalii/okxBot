@@ -162,6 +162,19 @@ func main() {
 	orderEventsPub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "okx.paper-order-events")
 	defer orderEventsPub.Close()
 
+	// CLAUDE.md §31.2: how many tokens actually open new positions right now — the divisor for
+	// dynamic per-position sizing (CurrentEquity / ActiveTokenCount), computed once here from the
+	// same roster/disabled-list every PaperTrader instance below shares, so it is identical across
+	// all of them despite living as a per-instance field. Recomputed only at startup, matching this
+	// service's existing "config changes need a restart" posture (§22) — enabling/disabling a token
+	// mid-run doesn't retroactively resize an order already open, only the next one to open.
+	activeTokenCount := 0
+	for _, instID := range cfg.Trading.InstIDs {
+		if !slices.Contains(ptCfg.DisabledInstIDs, instID) {
+			activeTokenCount++
+		}
+	}
+
 	errCh := make(chan error, len(cfg.Trading.InstIDs)+1+len(candleDispatchers))
 	// Staggering each instrument's engine start (rather than launching every goroutine in the same
 	// instant) spreads out seedCandles()'s REST calls — with 10 instruments x 3 bars, an
@@ -190,20 +203,20 @@ func main() {
 			InstID: instID,
 			// Every ingested bar, so the context timeframes get a maintained window (and are seeded
 			// from the database on restart) even though no strategy decides on them.
-			Bars:            candleBars,
-			CandleWindow:    cfg.PaperTrading.CandleLimit,
-			Strategies:      strategies,
-			TickConsumer:    tickDispatcher.ForInstrument(instID),
-			CandleConsumers: candleConsumers,
-			Repo:            repo,
-			NotionalUSD:     cfg.PaperTrading.NotionalUSD,
-			MaxOpenOrders:   cfg.PaperTrading.MaxOpenOrders,
-			Logger:          logger,
-			Model:           model,
-			RLSLTPAdjust:    cfg.PaperTrading.RLSLTPAdjust,
-			RLDecisionBar:   cfg.PaperTrading.RLDecisionBar,
-			RLSizing:        cfg.PaperTrading.RLSizing,
-			MaxLeverage:     cfg.Risk.MaxLeverage,
+			Bars:             candleBars,
+			CandleWindow:     cfg.PaperTrading.CandleLimit,
+			Strategies:       strategies,
+			TickConsumer:     tickDispatcher.ForInstrument(instID),
+			CandleConsumers:  candleConsumers,
+			Repo:             repo,
+			ActiveTokenCount: activeTokenCount,
+			MaxOpenOrders:    cfg.PaperTrading.MaxOpenOrders,
+			Logger:           logger,
+			Model:            model,
+			RLSLTPAdjust:     cfg.PaperTrading.RLSLTPAdjust,
+			RLDecisionBar:    cfg.PaperTrading.RLDecisionBar,
+			RLSizing:         cfg.PaperTrading.RLSizing,
+			MaxLeverage:      cfg.Risk.MaxLeverage,
 			// Signal-lifecycle conductor (CLAUDE.md §15.12): update cadence, early close, and the
 			// clamps bounding where the model may place stops/targets.
 			RLUpdatePnLThresholdPct: cfg.PaperTrading.RLUpdatePnLThresholdPct,
