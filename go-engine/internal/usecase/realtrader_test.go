@@ -393,6 +393,54 @@ func TestBuildObservation_UsesExchangeBalanceNotRepoBookkeeping(t *testing.T) {
 	}
 }
 
+// TestTradableEquity_SubtractsSafeMoney confirms the reserve is subtracted from the raw exchange
+// balance (real-trading readiness plan, 2026-09-04 operator decision: capital that must stay
+// untouched even if every open position were liquidated, since isolated margin never draws on it).
+func TestTradableEquity_SubtractsSafeMoney(t *testing.T) {
+	rt := &RealTrader{SafeMoneyUSD: dec("20")}
+	got := rt.tradableEquity(dec("40"))
+	if !got.Equal(dec("20")) {
+		t.Errorf("expected tradableEquity(40) with SafeMoneyUSD=20 to be 20, got %s", got)
+	}
+}
+
+// TestTradableEquity_FloorsAtZero confirms a balance below the reserve reports as zero equity, not
+// negative — negative would misleadingly read as a drained/liquidated account rather than merely
+// under the configured reserve.
+func TestTradableEquity_FloorsAtZero(t *testing.T) {
+	rt := &RealTrader{SafeMoneyUSD: dec("20")}
+	got := rt.tradableEquity(dec("15"))
+	if !got.IsZero() {
+		t.Errorf("expected tradableEquity(15) with SafeMoneyUSD=20 to floor at 0, got %s", got)
+	}
+}
+
+// TestTradableEquity_ZeroSafeMoneyIsIdentity confirms the default (SafeMoneyUSD unset) preserves
+// today's behavior of using the full reported balance.
+func TestTradableEquity_ZeroSafeMoneyIsIdentity(t *testing.T) {
+	rt := &RealTrader{}
+	got := rt.tradableEquity(dec("777"))
+	if !got.Equal(dec("777")) {
+		t.Errorf("expected tradableEquity(777) with no SafeMoneyUSD to be unchanged, got %s", got)
+	}
+}
+
+// TestBuildObservation_SubtractsSafeMoneyFromExchangeBalance confirms buildObservation applies the
+// reserve before the model ever sees AccountEquityUSD, so sizing can never draw against it.
+func TestBuildObservation_SubtractsSafeMoneyFromExchangeBalance(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("40")}}}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt.SafeMoneyUSD = dec("20")
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+
+	obs := rt.buildObservation(context.Background(), "1m", dec("100"), testLogger())
+
+	if !obs.AccountEquityUSD.Equal(dec("20")) {
+		t.Errorf("expected AccountEquityUSD=20 (40 exchange balance - 20 safe money), got %s", obs.AccountEquityUSD)
+	}
+}
+
 // TestOpenReal_FillConfirmedImmediatelyRecordsEntryPx confirms the fast path (the expected case
 // for a market order against a liquid perpetual, CLAUDE.md §27.5): a "filled" status with an
 // AvgPx overwrites the naive candle-close entry price with the exchange's own reported fill price,

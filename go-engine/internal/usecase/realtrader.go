@@ -82,6 +82,18 @@ type RealTrader struct {
 	ActiveTokens      []string
 	AccountInitialUSD decimal.Decimal
 
+	// SafeMoneyUSD is subtracted from the exchange's reported balance before it is ever used for
+	// sizing or recorded as this mode's equity (CLAUDE.md real-trading readiness plan, 2026-09-04
+	// operator decision) — a risk-reduction reserve the operator wants to stay untouched even if
+	// every open position were liquidated (isolated margin bounds a position's own loss to its own
+	// margin, never the whole account, so a reserve set aside this way is genuinely safe from
+	// liquidation, not just from this engine's own sizing decisions). Every real balance figure
+	// this engine produces (observation sizing, the equity timeline the panel reads) is
+	// exchange-balance-minus-SafeMoneyUSD, floored at zero so a balance below the reserve never
+	// reports as negative equity. Zero (the default) preserves today's behavior of using the full
+	// reported balance.
+	SafeMoneyUSD decimal.Decimal
+
 	// MaxLeverage/MaxPositionPct/MaxTotalExposurePct feed sizeFromModelAction (the shared free
 	// function, CLAUDE.md §27's plan commit 2) — same equity-fraction caps PaperTrader.RLSizing
 	// uses, expressed against the exchange's own reported equity here (see buildObservation) rather
@@ -296,6 +308,21 @@ func (e *RealTrader) waitForFill(ctx context.Context, ordID string, logger *slog
 		return last, fmt.Errorf("order %s not filled within %s and cancel failed: %w", ordID, e.fillTimeout(), err)
 	}
 	return last, nil
+}
+
+// tradableEquity applies SafeMoneyUSD's reserve to a raw exchange balance — the one place that
+// subtraction happens, so sizing and the recorded equity timeline can never disagree about what
+// "this mode's equity" means. Floored at zero: a balance the reserve exceeds must never report as
+// negative equity (which would read as the account being drained, not merely under the reserve).
+func (e *RealTrader) tradableEquity(rawBalance decimal.Decimal) decimal.Decimal {
+	if !e.SafeMoneyUSD.IsPositive() {
+		return rawBalance
+	}
+	tradable := rawBalance.Sub(e.SafeMoneyUSD)
+	if tradable.IsNegative() {
+		return decimal.Zero
+	}
+	return tradable
 }
 
 func (e *RealTrader) accountMode() string {
@@ -1042,12 +1069,13 @@ func (e *RealTrader) buildObservation(ctx context.Context, bar string, price dec
 
 	// Ground truth from the exchange, not GetAccountEquity's bookkeeping row — real trading does
 	// not own this number the way paper trading owns its shared account (CLAUDE.md §27's plan §6:
-	// this is the one spot flagged as easy to get wrong by careless reuse).
+	// this is the one spot flagged as easy to get wrong by careless reuse). SafeMoneyUSD's reserve
+	// is subtracted before the model ever sees this number, so sizing can never draw against it.
 	balances, err := e.Exchange.GetBalance(e.settleCcy())
 	if err != nil {
 		logger.Warn("real observation: get balance failed", "instId", e.InstID, "error", err)
 	} else if len(balances) > 0 {
-		obs.AccountEquityUSD = balances[0].Eq
+		obs.AccountEquityUSD = e.tradableEquity(balances[0].Eq)
 	}
 	obs.OpenExposureUSD = e.openExposureReal(ctx, logger)
 
@@ -1155,7 +1183,7 @@ func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
 	if balances, err := e.Exchange.GetBalance(e.settleCcy()); err != nil {
 		logger.Warn("reconcile: get balance failed", "instId", e.InstID, "error", err)
 	} else if len(balances) > 0 {
-		e.recordEquityReal(ctx, balances[0].Eq, logger)
+		e.recordEquityReal(ctx, e.tradableEquity(balances[0].Eq), logger)
 	}
 }
 

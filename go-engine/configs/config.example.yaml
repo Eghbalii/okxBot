@@ -46,6 +46,12 @@ trading:
   # Off by default — flip only after RealTrader has been verified against demo (CLAUDE.md §27.7's
   # checklist gates this).
   use_conductor_lifecycle: false
+  # Real-trading readiness plan, 2026-09-04 operator decision: a reserve subtracted from the
+  # exchange's reported real balance before RealTrader ever sizes a position or records equity for
+  # the panel — capital that must stay untouched even if every open position were liquidated,
+  # since isolated margin (td_mode below) bounds a position's own loss to its own margin, never the
+  # whole account. Zero (default) uses the full reported balance.
+  safe_money_usd: 0
   # Resolves each short trading.inst_ids symbol to the real OKX instId every WS subscription/REST
   # call actually uses (internal/okx.SymbolMap, CLAUDE.md §27, found live 2026-09-04). This
   # account has NO usable margin on the classic SWAP/MARGIN/FUTURES(dated) instruments for

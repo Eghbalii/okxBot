@@ -84,6 +84,14 @@ type Config struct {
 		// (RLSizing/RLSLTPAdjust/etc.) — this is the riskiest commit in that plan to get wrong
 		// silently, so an explicit off-by-default flag is the safety valve.
 		UseConductorLifecycle bool `yaml:"use_conductor_lifecycle"`
+		// SafeMoneyUSD is a reserve subtracted from the exchange's reported real balance before
+		// RealTrader ever sizes a position or records equity for the panel (CLAUDE.md real-trading
+		// readiness plan, 2026-09-04 operator decision) — capital the operator wants to stay
+		// untouched even if every open position were liquidated, since isolated margin (§27.2)
+		// bounds a position's own loss to its own margin, never the whole account, so money set
+		// aside this way is genuinely safe from liquidation, not just from this engine's own
+		// sizing. Zero (default) uses the full reported balance, matching pre-existing behavior.
+		SafeMoneyUSD decimal.Decimal `yaml:"safe_money_usd"`
 
 		// ExecInstType/ExecSettleCcy answer "which instType/currency does account/position/balance
 		// access use" — separate from SymbolMap because these are account-wide properties, not

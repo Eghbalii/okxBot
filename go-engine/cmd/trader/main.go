@@ -284,6 +284,7 @@ func runRealTrader(
 			SettleCcy:    cfg.Trading.ExecSettleCcy,
 
 			AccountInitialUSD:   cfg.Account.InitialUSD,
+			SafeMoneyUSD:        cfg.Trading.SafeMoneyUSD,
 			MaxLeverage:         cfg.Risk.MaxLeverage,
 			MaxPositionPct:      cfg.Account.MaxPositionPct,
 			MaxTotalExposurePct: cfg.Account.MaxTotalExposurePct,
