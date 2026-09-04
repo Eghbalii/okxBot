@@ -23,4 +23,10 @@ type ExchangeClient interface {
 	// §27.5/§27.6) — required to distinguish live/partially_filled/filled/canceled rather than
 	// trusting PlaceOrder's acceptance response or this system's own bookkeeping alone.
 	GetOrder(instID, ordID string) (domain.OrderStatus, error)
+	// GetInstrument fetches one instId's contract-shape metadata (CtVal/LotSz/MinSz) — required to
+	// convert a desired size into a valid contract count before placing a real order (CLAUDE.md
+	// §14/§27's known gap, found load-bearing 2026-09-04 against OKX's real-trading-eligible
+	// BTC-USD_UM_XPERP instrument, whose CtVal/LotSz differ sharply from the classic SWAP
+	// instruments this codebase otherwise assumes a multiplier of 1 for).
+	GetInstrument(instType, instID string) (domain.Instrument, error)
 }

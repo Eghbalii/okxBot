@@ -34,6 +34,12 @@ type fakeExchangeClient struct {
 
 	cancelOrderCalls []string // ordIDs passed to CancelOrder
 	cancelOrderErr   error
+
+	// instrument, if unset, defaults to CtVal=1/LotSz=1/MinSz=0 — a no-op multiplier matching
+	// this codebase's pre-2026-09-04 implicit assumption, so existing tests that never set this
+	// field keep computing the exact same order sizes as before GetInstrument existed.
+	instrument       *domain.Instrument
+	getInstrumentErr error
 }
 
 func (f *fakeExchangeClient) GetTicker(instID string) (domain.Ticker, error) {
@@ -77,6 +83,15 @@ func (f *fakeExchangeClient) GetOrder(instID, ordID string) (domain.OrderStatus,
 		return *f.orderStatus, nil
 	}
 	return domain.OrderStatus{InstID: instID, OrdID: ordID, State: "filled"}, nil
+}
+func (f *fakeExchangeClient) GetInstrument(instType, instID string) (domain.Instrument, error) {
+	if f.getInstrumentErr != nil {
+		return domain.Instrument{}, f.getInstrumentErr
+	}
+	if f.instrument != nil {
+		return *f.instrument, nil
+	}
+	return domain.Instrument{InstID: instID, CtVal: decimal.NewFromInt(1), LotSz: decimal.NewFromInt(1)}, nil
 }
 
 // fakeModelClient is a hand-rolled port.ModelClient returning a configured Action.

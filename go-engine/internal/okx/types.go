@@ -152,3 +152,21 @@ type SetLeverageRequest struct {
 func SetLeverageRequestFromDomain(req domain.LeverageChange) SetLeverageRequest {
 	return SetLeverageRequest{InstID: req.InstID, Lever: req.Lever, MgnMode: req.MgnMode, PosSide: req.PosSide}
 }
+
+// Instrument mirrors a single entry of the GET /api/v5/public/instruments response data array
+// (only the fields this codebase needs for order-sizing conversion, CLAUDE.md §14/§27).
+type Instrument struct {
+	InstID   string        `json:"instId"`
+	CtVal    decimalOrZero `json:"ctVal"`
+	LotSz    decimalOrZero `json:"lotSz"`
+	MinSz    decimalOrZero `json:"minSz"`
+	CtValCcy string        `json:"ctValCcy"`
+}
+
+// ToDomain converts an Instrument to its domain representation.
+func (i Instrument) ToDomain() domain.Instrument {
+	return domain.Instrument{
+		InstID: i.InstID, CtVal: i.CtVal.Decimal, LotSz: i.LotSz.Decimal, MinSz: i.MinSz.Decimal,
+		CtValCcy: i.CtValCcy,
+	}
+}

@@ -26,11 +26,13 @@ type fakeExchange struct {
 	candles     []domain.Candle
 	orderResult *domain.OrderResult
 	orderStatus domain.OrderStatus
+	instrument  domain.Instrument
 
-	placeOrderCalls  int
-	cancelOrderCalls int
-	getOrderCalls    int
-	setLeverageCalls int
+	placeOrderCalls    int
+	cancelOrderCalls   int
+	getOrderCalls      int
+	getInstrumentCalls int
+	setLeverageCalls   int
 
 	errOnCall int // if > 0, the Nth call across ALL methods fails once, then succeeds — for retry tests
 	callCount int
@@ -90,6 +92,13 @@ func (f *fakeExchange) GetOrder(instID, ordID string) (domain.OrderStatus, error
 		return domain.OrderStatus{}, err
 	}
 	return f.orderStatus, nil
+}
+func (f *fakeExchange) GetInstrument(instType, instID string) (domain.Instrument, error) {
+	f.getInstrumentCalls++
+	if err := f.maybeFail(); err != nil {
+		return domain.Instrument{}, err
+	}
+	return f.instrument, nil
 }
 
 func newTestService(fx *fakeExchange) *service {
@@ -191,6 +200,45 @@ func TestHandleGetOrder_ReturnsStatus(t *testing.T) {
 	}
 	if got.State != "filled" {
 		t.Fatalf("unexpected order status: %+v", got)
+	}
+}
+
+func TestHandleGetInstrument_ReturnsInstrument(t *testing.T) {
+	fx := &fakeExchange{instrument: domain.Instrument{
+		InstID: "BTC-USD_UM_XPERP-310404", CtVal: decimal.RequireFromString("0.0001"),
+		LotSz: decimal.NewFromInt(1), MinSz: decimal.NewFromInt(1), CtValCcy: "BTC",
+	}}
+	svc := newTestService(fx)
+
+	req := httptest.NewRequest(http.MethodGet, "/instrument?instType=FUTURES&instId=BTC-USD_UM_XPERP-310404", nil)
+	rec := httptest.NewRecorder()
+	svc.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got domain.Instrument
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !got.CtVal.Equal(decimal.RequireFromString("0.0001")) {
+		t.Fatalf("unexpected instrument: %+v", got)
+	}
+}
+
+func TestHandleGetInstrument_MissingParamsRejected(t *testing.T) {
+	fx := &fakeExchange{}
+	svc := newTestService(fx)
+
+	req := httptest.NewRequest(http.MethodGet, "/instrument?instType=FUTURES", nil)
+	rec := httptest.NewRecorder()
+	svc.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+	if fx.getInstrumentCalls != 0 {
+		t.Errorf("expected no exchange call for a rejected request, got %d", fx.getInstrumentCalls)
 	}
 }
 

@@ -24,6 +24,7 @@ type exchangeClient interface {
 	SetLeverage(req domain.LeverageChange) error
 	CancelOrder(instID, ordID string) error
 	GetOrder(instID, ordID string) (domain.OrderStatus, error)
+	GetInstrument(instType, instID string) (domain.Instrument, error)
 }
 
 type service struct {
@@ -49,6 +50,7 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("POST /order", s.handlePlaceOrder)
 	mux.HandleFunc("POST /order/cancel", s.handleCancelOrder)
 	mux.HandleFunc("GET /order", s.handleGetOrder)
+	mux.HandleFunc("GET /instrument", s.handleGetInstrument)
 	mux.HandleFunc("POST /leverage", s.handleSetLeverage)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -237,6 +239,28 @@ func (s *service) handleGetOrder(w http.ResponseWriter, r *http.Request) {
 	err := s.call(r.Context(), gateway.ClassAccount, r, func() error {
 		var innerErr error
 		result, innerErr = s.client.GetOrder(instID, ordID)
+		return innerErr
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *service) handleGetInstrument(w http.ResponseWriter, r *http.Request) {
+	instType := r.URL.Query().Get("instType")
+	instID := r.URL.Query().Get("instId")
+	if instType == "" || instID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("instType and instId are required"))
+		return
+	}
+	var result domain.Instrument
+	// ClassMarket, not ClassAccount: /public/instruments is unauthenticated market metadata, same
+	// rate-limit family as GetTicker/GetCandles.
+	err := s.call(r.Context(), gateway.ClassMarket, r, func() error {
+		var innerErr error
+		result, innerErr = s.client.GetInstrument(instType, instID)
 		return innerErr
 	})
 	if err != nil {

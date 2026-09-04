@@ -93,3 +93,22 @@ func (c *Client) GetTicker(instID string) (domain.Ticker, error) {
 	}
 	return tickers[0].ToDomain(), nil
 }
+
+// GetInstrument fetches one instId's contract-shape metadata via
+// GET /api/v5/public/instruments — an unauthenticated, unsigned endpoint (no OK-ACCESS-* headers
+// needed for /public/*), but routed through the same signed do() as every other call for
+// consistency; OKX accepts the extra signature headers on public endpoints without complaint.
+func (c *Client) GetInstrument(instType, instID string) (domain.Instrument, error) {
+	if instType == "" || instID == "" {
+		return domain.Instrument{}, fmt.Errorf("instType and instID are required")
+	}
+	path := "/api/v5/public/instruments?" + url.Values{"instType": {instType}, "instId": {instID}}.Encode()
+	var instruments []okx.Instrument
+	if err := c.do("GET", path, nil, &instruments); err != nil {
+		return domain.Instrument{}, err
+	}
+	if len(instruments) == 0 {
+		return domain.Instrument{}, fmt.Errorf("no instrument data returned for instType=%s instId=%s", instType, instID)
+	}
+	return instruments[0].ToDomain(), nil
+}

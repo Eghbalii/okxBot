@@ -166,3 +166,10 @@ func (c *Client) GetOrder(instID, ordID string) (domain.OrderStatus, error) {
 func (c *Client) SetLeverage(req domain.LeverageChange) error {
 	return c.do(context.Background(), http.MethodPost, "/leverage", req, nil)
 }
+
+func (c *Client) GetInstrument(instType, instID string) (domain.Instrument, error) {
+	var out domain.Instrument
+	path := "/instrument?" + url.Values{"instType": {instType}, "instId": {instID}}.Encode()
+	err := c.do(context.Background(), http.MethodGet, path, nil, &out)
+	return out, err
+}
