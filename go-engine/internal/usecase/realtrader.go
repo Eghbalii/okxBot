@@ -127,6 +127,34 @@ type RealTrader struct {
 	instrumentErr  error
 }
 
+// asPaperOrderView converts a RealOrder into the port.PaperOrder shape the shared pure math
+// functions (closeReason/realizedPnL/computeAdjustedLevels/positionStateOf/unrealizedPnLPct/
+// RatchetSLTP, all in papertrade.go/rl_sltp_adjust.go/sltp_ratchet.go) are typed against —
+// CLAUDE.md real-trading readiness plan, 2026-09-04's real_orders table split. Every field those
+// functions actually read (Side/EntryPx/SLPx/TPPx/Size/Leverage/OpenedAt/PnLMaxPct/PnLMinPct) has
+// an identical counterpart on RealOrder; Variant is fixed to "baseline" (a real order is never a
+// shadow fork, §27.3) so positionStateOf's IsFork always reads false, matching reality. This is
+// purely an in-memory adapter for reusing already-proven math — it is never itself persisted, and
+// paper-trading's own code path is untouched by its existence.
+func asPaperOrderView(o port.RealOrder) port.PaperOrder {
+	return port.PaperOrder{
+		ID:         o.ID,
+		InstID:     o.InstID,
+		StrategyID: o.StrategyID,
+		Bar:        o.Bar,
+		Side:       o.Side,
+		EntryPx:    o.EntryPx,
+		SLPx:       o.SLPx,
+		TPPx:       o.TPPx,
+		Size:       o.Size,
+		Leverage:   o.Leverage,
+		OpenedAt:   o.OpenedAt,
+		PnLMaxPct:  o.PnLMaxPct,
+		PnLMinPct:  o.PnLMinPct,
+		Variant:    "baseline",
+	}
+}
+
 // execInstID is the instId actually sent to the exchange — ExecInstID when set, else InstID
 // (CLAUDE.md §27's real-account finding: an account may only have usable margin on a different
 // OKX product than the one this engine's market data/observation identity uses).
@@ -381,19 +409,20 @@ func (e *RealTrader) handleCandle(ctx context.Context, bar string, data []byte, 
 	return e.evaluateStrategies(ctx, bar, c.Close, logger)
 }
 
-// openPositions returns this MODE's currently-open real positions for InstID — never
-// ListOpenPaperOrders, which is InstID-scoped only and would also return paper trading's own open
-// orders on the same instrument if paper trading happens to be running concurrently (it is, in
-// this project's actual deployment). Mode-scoped via ListPositions' filter instead.
-func (e *RealTrader) openPositions(ctx context.Context) ([]port.PaperOrder, error) {
+// openPositions returns this instrument's currently-open real positions from real_orders — its
+// own table (CLAUDE.md real-trading readiness plan, 2026-09-04), never paper_orders/ListPositions,
+// so paper trading running concurrently on the same instrument can never be mistaken for a real
+// position. ListRealPositions' f.Open=true filter already excludes still-pending orders (an
+// in-flight fill is not yet a position, per port.RealOrder.Status's doc comment).
+func (e *RealTrader) openPositions(ctx context.Context) ([]port.RealOrder, error) {
 	open := true
-	return e.Repo.ListPositions(ctx, port.PositionFilter{Mode: e.accountMode(), InstID: e.InstID, Open: &open})
+	return e.Repo.ListRealPositions(ctx, port.PositionFilter{InstID: e.InstID, Open: &open})
 }
 
-// hasOpenPosition reports whether any of open is a real position — always true for a
-// mode-filtered ListPositions result, but kept as a named check (mirroring PaperTrader's
+// hasOpenPosition reports whether any of open is a real position — always true for a non-empty
+// ListRealPositions(Open:true) result, but kept as a named check (mirroring PaperTrader's
 // hasOpenBaseline) so the "is this token occupied" question reads the same way at both call sites.
-func hasOpenPosition(open []port.PaperOrder) bool {
+func hasOpenPosition(open []port.RealOrder) bool {
 	return len(open) > 0
 }
 
@@ -475,12 +504,12 @@ func (e *RealTrader) openReal(
 	ctx context.Context,
 	obs domain.Observation,
 	signal strategy.Signal,
-	openOrders []port.PaperOrder,
+	openOrders []port.RealOrder,
 	price decimal.Decimal,
 	a StrategyAssignment,
 	bar string,
 	logger *slog.Logger,
-) (*port.PaperOrder, error) {
+) (*port.RealOrder, error) {
 	category := conductor.OpenCategory(string(signal.Side))
 	if category == "" || e.Model == nil {
 		return nil, nil
@@ -503,15 +532,29 @@ func (e *RealTrader) openReal(
 	}
 
 	cfg := sizingConfig{InstID: e.InstID, MaxLeverage: e.MaxLeverage, MaxPositionPct: e.MaxPositionPct, MaxTotalExposurePct: e.MaxTotalExposurePct}
-	notional, leverage, sized := sizeFromModelAction(cfg, action, obs, openOrders, logger)
+	openOrdersView := make([]port.PaperOrder, len(openOrders))
+	for i, o := range openOrders {
+		openOrdersView[i] = asPaperOrderView(o)
+	}
+	notional, leverage, sized := sizeFromModelAction(cfg, action, obs, openOrdersView, logger)
 	if !sized {
 		logger.Info("real open: model action not sizable, declining", "instId", e.InstID)
 		return nil, nil
 	}
 
-	order := buildPaperOrder(e.InstID, price, signal, notional, a.StrategyID, bar)
-	order.Mode = e.accountMode()
-	order.Leverage = leverage
+	paperShaped := buildPaperOrder(e.InstID, price, signal, notional, a.StrategyID, bar)
+	order := port.RealOrder{
+		InstID:     paperShaped.InstID,
+		StrategyID: paperShaped.StrategyID,
+		Bar:        paperShaped.Bar,
+		Side:       paperShaped.Side,
+		EntryPx:    paperShaped.EntryPx,
+		SLPx:       paperShaped.SLPx,
+		TPPx:       paperShaped.TPPx,
+		Size:       paperShaped.Size,
+		Leverage:   leverage,
+		Status:     "pending",
+	}
 	if levels := nonZeroLevels(action.SLPx, action.TPPx); levels.SLPx != nil || levels.TPPx != nil {
 		if levels.SLPx != nil {
 			order.SLPx = levels.SLPx
@@ -579,11 +622,29 @@ func (e *RealTrader) openReal(
 		order.ExchangeOrderID = &ordID
 	}
 
+	// Insert the pending row IMMEDIATELY after the exchange accepts the order, before waiting for
+	// its fill — CLAUDE.md real-trading readiness plan, 2026-09-04. This is the one behavior change
+	// with real product consequence: the order is now visible on the panel (status="pending") for
+	// the whole in-flight window, not only after waitForFill resolves. An insert failure here is
+	// logged and does NOT block the order — it is already live on the exchange, and losing
+	// visibility into it must never mean losing track of it entirely (the reconciliation poll would
+	// still catch a truly untracked position).
+	var localID int64
+	persisted := false
+	id, err := e.Repo.OpenRealOrder(ctx, order)
+	if err != nil {
+		logger.Error("failed to persist pending real order; continuing since the exchange order is already live",
+			"instId", e.InstID, "exchangeOrderId", order.ExchangeOrderID, "error", err)
+	} else {
+		localID = id
+		persisted = true
+		order.ID = localID
+	}
+
 	// CLAUDE.md §27.5: confirm the fill rather than trusting PlaceOrder's acceptance response alone
 	// — a market order against a liquid perpetual is expected to fill essentially immediately, but
-	// this must not be assumed. Nothing is persisted for an order that never filled at all: there is
-	// no real position to record, and this token's open-position slot must stay free for the next
-	// signal rather than being blocked by a phantom row.
+	// this must not be assumed.
+	var finalStatus string
 	if order.ExchangeOrderID != nil {
 		status, err := e.waitForFill(ctx, *order.ExchangeOrderID, logger)
 		if err != nil {
@@ -591,6 +652,7 @@ func (e *RealTrader) openReal(
 		}
 		switch {
 		case status.IsFilled():
+			finalStatus = "filled"
 			if status.AvgPx.IsPositive() {
 				order.EntryPx = status.AvgPx
 			}
@@ -599,6 +661,7 @@ func (e *RealTrader) openReal(
 			// exists on the exchange (canceled by waitForFill's timeout path for the remainder), so
 			// record what actually filled rather than the originally requested size — never assume
 			// the unfilled remainder will complete after the order was just canceled.
+			finalStatus = "partial"
 			logger.Warn("real open: order partially filled before timeout/cancel",
 				"instId", e.InstID, "ordId", *order.ExchangeOrderID,
 				"requestedSz", sz, "filledSz", status.AccFillSz)
@@ -607,11 +670,18 @@ func (e *RealTrader) openReal(
 				order.EntryPx = status.AvgPx
 			}
 		default:
-			// Never filled at all before the timeout — canceled, nothing to record.
+			// Never filled at all before the timeout — canceled. The pending row STAYS (per the
+			// plan's design: a timed-out attempt is still visible, not silently dropped) with
+			// status="canceled"; no position was opened, so the caller returns nil, nil exactly as
+			// it did before this table existed.
+			finalStatus = "canceled"
 			logger.Info("real open: order canceled unfilled, no position opened",
 				"instId", e.InstID, "ordId", *order.ExchangeOrderID)
-			return nil, nil
 		}
+	} else {
+		// No exchange order id at all (PlaceOrder returned no OrdID) — nothing to wait on; treat as
+		// filled immediately, matching the pre-fill-confirmation behavior for this edge case.
+		finalStatus = "filled"
 	}
 
 	if raw, err := json.Marshal(obs); err == nil {
@@ -620,15 +690,28 @@ func (e *RealTrader) openReal(
 		logger.Warn("failed to marshal decision-time observation", "instId", e.InstID, "error", err)
 	}
 
-	id, err := e.Repo.OpenPaperOrder(ctx, order)
-	if err != nil {
-		return nil, fmt.Errorf("persist real order: %w", err)
+	if persisted {
+		var entryPxPtr, sizePtr *decimal.Decimal
+		if finalStatus == "filled" || finalStatus == "partial" {
+			entryPxPtr, sizePtr = &order.EntryPx, &order.Size
+		}
+		if err := e.Repo.UpdateRealOrderStatus(ctx, localID, finalStatus, entryPxPtr, sizePtr); err != nil {
+			logger.Warn("failed to update real order status", "id", localID, "instId", e.InstID, "status", finalStatus, "error", err)
+		}
+		if err := e.Repo.SetRealOrderFeatures(ctx, localID, order.FeaturesJSON); err != nil {
+			logger.Warn("failed to set real order features", "id", localID, "instId", e.InstID, "error", err)
+		}
 	}
-	order.ID = id
+	order.Status = finalStatus
+
+	if finalStatus == "canceled" {
+		return nil, nil
+	}
+
 	metrics.PaperOrdersOpenedTotal.WithLabelValues(a.Kind, e.InstID, order.Side).Inc()
-	logger.Info("opened real order", "id", id, "instId", e.InstID, "side", order.Side,
-		"entry", price, "size", order.Size, "leverage", order.Leverage, "exchangeOrderId", order.ExchangeOrderID)
-	e.publishOrderEvent(ctx, "opened", id, logger)
+	logger.Info("opened real order", "id", order.ID, "instId", e.InstID, "side", order.Side,
+		"entry", order.EntryPx, "size", order.Size, "leverage", order.Leverage, "exchangeOrderId", order.ExchangeOrderID)
+	e.publishOrderEvent(ctx, "opened", order.ID, logger)
 
 	return &order, nil
 }
@@ -701,13 +784,13 @@ func (e *RealTrader) runUpdates(ctx context.Context, bar string, price decimal.D
 	now := time.Now()
 
 	for _, o := range open {
-		pnl := unrealizedPnLPct(o, price)
+		pnl := unrealizedPnLPct(asPaperOrderView(o), price)
 		if !e.conductor().ShouldUpdate(o.ID, pnl, now) {
 			continue
 		}
 
 		obs.OrderID = o.ID
-		obs.PositionState = positionStateOf(o, price)
+		obs.PositionState = positionStateOf(asPaperOrderView(o), price)
 		obs.Signal = e.carriedSignalFor(bar)
 
 		action, err := e.Model.Predict(ctx, obs)
@@ -727,26 +810,25 @@ func (e *RealTrader) runUpdates(ctx context.Context, bar string, price decimal.D
 
 // applyRealAdjustment is RealTrader's no-fork SL/TP edit: computeAdjustedLevels (the shared free
 // function, plan commit 2) is the SAME ratchet-checked computation PaperTrader.applyAdjustment
-// uses, but the IO here is real-trading-scoped (still UpdatePaperOrderSLTP/
-// RecordPaperOrderAdjustment — paper_orders/paper_order_adjustments are mode-generic tables, so no
-// new persistence is needed for real rows). No exchange call: the new levels take effect on this
+// uses, but the IO here writes to real_orders/real_order_adjustments (CLAUDE.md real-trading
+// readiness plan, 2026-09-04's table split). No exchange call: the new levels take effect on this
 // engine's own next tick via monitorOpenPositions.
-func (e *RealTrader) applyRealAdjustment(ctx context.Context, o port.PaperOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
-	newSL, newTP, changed := computeAdjustedLevels(o, action, price)
+func (e *RealTrader) applyRealAdjustment(ctx context.Context, o port.RealOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
+	newSL, newTP, changed := computeAdjustedLevels(asPaperOrderView(o), action, price)
 	if !changed {
 		return
 	}
-	if err := e.Repo.UpdatePaperOrderSLTP(ctx, o.ID, newSL, newTP); err != nil {
+	if err := e.Repo.UpdateRealOrderSLTP(ctx, o.ID, newSL, newTP); err != nil {
 		logger.Warn("real updates: sl/tp update failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 		return
 	}
 	if !samePriceOrNil(newSL, o.SLPx) {
-		if err := e.Repo.RecordPaperOrderAdjustment(ctx, o.ID, "sl", o.SLPx, newSL, "model"); err != nil {
+		if err := e.Repo.RecordRealOrderAdjustment(ctx, o.ID, "sl", o.SLPx, newSL, "model"); err != nil {
 			logger.Warn("real updates: record sl adjustment failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 		}
 	}
 	if !samePriceOrNil(newTP, o.TPPx) {
-		if err := e.Repo.RecordPaperOrderAdjustment(ctx, o.ID, "tp", o.TPPx, newTP, "model"); err != nil {
+		if err := e.Repo.RecordRealOrderAdjustment(ctx, o.ID, "tp", o.TPPx, newTP, "model"); err != nil {
 			logger.Warn("real updates: record tp adjustment failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 		}
 	}
@@ -756,7 +838,7 @@ func (e *RealTrader) applyRealAdjustment(ctx context.Context, o port.PaperOrder,
 // closeEarly closes a real position at market because the model asked to (CLAUDE.md §15.12). Same
 // RLEarlyClose gate as PaperTrader's equivalent — the one lifecycle action that destroys the
 // counterfactual.
-func (e *RealTrader) closeEarly(ctx context.Context, o port.PaperOrder, price decimal.Decimal, logger *slog.Logger) {
+func (e *RealTrader) closeEarly(ctx context.Context, o port.RealOrder, price decimal.Decimal, logger *slog.Logger) {
 	if !e.RLEarlyClose {
 		return
 	}
@@ -776,7 +858,14 @@ func (e *RealTrader) monitorOpenPositions(ctx context.Context, price decimal.Dec
 
 	now := time.Now()
 	for _, o := range open {
-		reason, hit := closeReason(o, price)
+		// A manual close request from the panel wins over everything else, same priority order as
+		// PaperTrader.monitorOpenOrders (CLAUDE.md real-trading readiness plan, 2026-09-04 — Close
+		// button wiring): the operator explicitly asked to exit right now, checked before a
+		// coincidental SL/TP touch on the same tick decides the reason instead.
+		reason, hit := conductor.CloseReasonManual, o.ManualCloseRequested
+		if !hit {
+			reason, hit = closeReason(asPaperOrderView(o), price)
+		}
 		if !hit && e.conductor().IsTimedOut(o.OpenedAt, now) {
 			reason, hit = conductor.CloseReasonTimeout, true
 		}
@@ -797,11 +886,11 @@ func (e *RealTrader) monitorOpenPositions(ctx context.Context, price decimal.Dec
 // (CLAUDE.md §27.3). If the exchange already reports the position flat (a reconciliation-poll-
 // detected close, see reconcile), skipExchange lets the flattening order be skipped since there is
 // nothing left to close on OKX's side — the DB/reward/audit consequences are identical either way.
-func (e *RealTrader) closeReal(ctx context.Context, o port.PaperOrder, price decimal.Decimal, reason string, logger *slog.Logger) error {
+func (e *RealTrader) closeReal(ctx context.Context, o port.RealOrder, price decimal.Decimal, reason string, logger *slog.Logger) error {
 	return e.closeRealWith(ctx, o, price, reason, false, logger)
 }
 
-func (e *RealTrader) closeRealWith(ctx context.Context, o port.PaperOrder, price decimal.Decimal, reason string, skipExchange bool, logger *slog.Logger) error {
+func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price decimal.Decimal, reason string, skipExchange bool, logger *slog.Logger) error {
 	if !skipExchange {
 		side := "sell"
 		if o.Side == "sell" {
@@ -849,8 +938,8 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.PaperOrder, price
 		}
 	}
 
-	pnl := realizedPnL(o, price)
-	if err := e.Repo.ClosePaperOrder(ctx, o.ID, price, reason, pnl); err != nil {
+	pnl := realizedPnL(asPaperOrderView(o), price)
+	if err := e.Repo.CloseRealOrder(ctx, o.ID, price, reason, pnl); err != nil {
 		return err
 	}
 	metrics.PaperOrdersClosedTotal.WithLabelValues(e.InstID, reason).Inc()
@@ -872,7 +961,7 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.PaperOrder, price
 
 // reportTerminalReal delivers a closed real trade's outcome to the model — same terminal-call
 // contract as PaperTrader.reportTerminal (CLAUDE.md §15.10: the close event IS the reward).
-func (e *RealTrader) reportTerminalReal(ctx context.Context, o port.PaperOrder, closePx, pnl decimal.Decimal, closeReason string, logger *slog.Logger) {
+func (e *RealTrader) reportTerminalReal(ctx context.Context, o port.RealOrder, closePx, pnl decimal.Decimal, closeReason string, logger *slog.Logger) {
 	if e.Model == nil {
 		return
 	}
@@ -884,7 +973,7 @@ func (e *RealTrader) reportTerminalReal(ctx context.Context, o port.PaperOrder, 
 	obs.Category = category
 	obs.OrderID = o.ID
 	obs.Signal = e.carriedSignalFor(e.decisionBar())
-	ps := positionStateOf(o, closePx)
+	ps := positionStateOf(asPaperOrderView(o), closePx)
 	ps.RealizedPnLUSD = pnl
 	obs.PositionState = ps
 	if _, err := e.Model.Predict(ctx, obs); err != nil {
@@ -965,12 +1054,13 @@ func (e *RealTrader) buildObservation(ctx context.Context, bar string, price dec
 	return obs
 }
 
-// openExposureReal sums the notional of every open real position across ALL tokens this mode
-// trades, mirroring PaperTrader.openExposure but scoped to Mode via ListPositions rather than
-// summing every mode's rows.
+// openExposureReal sums the notional of every open real position across ALL tokens, mirroring
+// PaperTrader.openExposure but reading real_orders (CLAUDE.md real-trading readiness plan,
+// 2026-09-04) rather than paper_orders — real trading has no per-mode filter to apply here since
+// every real_orders row already belongs to real trading by construction.
 func (e *RealTrader) openExposureReal(ctx context.Context, logger *slog.Logger) decimal.Decimal {
 	openOnly := true
-	positions, err := e.Repo.ListPositions(ctx, port.PositionFilter{Mode: e.accountMode(), Open: &openOnly})
+	positions, err := e.Repo.ListRealPositions(ctx, port.PositionFilter{Open: &openOnly})
 	if err != nil {
 		logger.Warn("real observation: list open positions failed", "mode", e.accountMode(), "error", err)
 		return decimal.Zero
