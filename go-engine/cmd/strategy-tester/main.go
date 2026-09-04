@@ -28,6 +28,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/gatewayclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx"
 	"github.com/eghbalii/okxBot/go-engine/internal/optimizer"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
@@ -123,9 +124,17 @@ func main() {
 	optimizerLoop := tester.NewOptimizerLoop(store, optimizer.NewSidecarClient(cfg.Optimizer.URL), logger)
 	go optimizerLoop.StartScheduler(ctx, cfg.Tester.Optimize.CheckInterval, kinds, svc.reloadStrategies)
 
+	// CLAUDE.md §27, 2026-09-04 design: instIDs are short internal symbols ("BTC"), resolved to
+	// real OKX instIds only for this seeding call — symbol_map is the one translation point.
 	instIDs := cfg.Tester.InstIDs
-	for _, instID := range instIDs {
-		if err := svc.seedWindow(gwClient, instID); err != nil {
+	symbolMap := okx.SymbolMap(cfg.Trading.SymbolMap)
+	execInstIDs, err := symbolMap.ResolveAll(instIDs)
+	if err != nil {
+		logger.Error("failed to resolve tester instIds against trading.symbol_map", "error", err)
+		os.Exit(1)
+	}
+	for i, instID := range instIDs {
+		if err := svc.seedWindow(gwClient, instID, execInstIDs[i]); err != nil {
 			logger.Error("failed to seed candle window", "instId", instID, "error", err)
 		}
 	}
@@ -265,18 +274,22 @@ func (s *service) instWindow(instID string) *candleWindow {
 	return w
 }
 
+// seedWindow fetches candle history for symbol (this project's short internal identity, e.g.
+// "BTC") — execInstID is the real OKX instId the GetCandles call actually needs (CLAUDE.md §27,
+// 2026-09-04 design: symbol_map resolves one to the other). The window itself stays keyed by
+// symbol, matching every candle this service receives off Kafka post-ingestor's own rewrite.
 func (s *service) seedWindow(exchange interface {
 	GetCandles(instID, bar string, limit int) ([]domain.Candle, error)
-}, instID string) error {
-	raw, err := exchange.GetCandles(instID, s.cfg.Tester.Bar, s.cfg.Tester.CandleWindow)
+}, symbol, execInstID string) error {
+	raw, err := exchange.GetCandles(execInstID, s.cfg.Tester.Bar, s.cfg.Tester.CandleWindow)
 	if err != nil {
-		return fmt.Errorf("seed candle window for %s: %w", instID, err)
+		return fmt.Errorf("seed candle window for %s (instId %s): %w", symbol, execInstID, err)
 	}
 	out := make([]domain.Candle, len(raw))
 	for i, c := range raw {
 		out[len(raw)-1-i] = c // exchange returns newest-first; strategies expect oldest-first
 	}
-	w := s.instWindow(instID)
+	w := s.instWindow(symbol)
 	w.mu.Lock()
 	w.candles = out
 	w.mu.Unlock()

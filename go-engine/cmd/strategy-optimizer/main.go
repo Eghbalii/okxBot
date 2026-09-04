@@ -28,6 +28,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/gatewayclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx"
 	"github.com/eghbalii/okxBot/go-engine/internal/optimizer"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
@@ -94,6 +95,7 @@ func main() {
 		sidecar:    sidecar,
 		store:      store,
 		logger:     logger,
+		symbolMap:  okx.SymbolMap(cfg.Trading.SymbolMap),
 		windows:    make(map[targetKey]*candleWindow),
 		activeRuns: make(map[targetKey]*optimizer.Run),
 	}
@@ -196,6 +198,11 @@ type service struct {
 	store    *optimizer.TrialStore
 	logger   *slog.Logger
 
+	// symbolMap resolves a short internal symbol ("BTC") to the real OKX instId seedWindow's
+	// GetCandles call actually needs (CLAUDE.md §27, 2026-09-04 design) — every other field/method
+	// on this type keys candle windows/trials/targets by the symbol directly.
+	symbolMap okx.SymbolMap
+
 	windowsMu sync.Mutex
 	windows   map[targetKey]*candleWindow // keyed by targetKey but only InstID matters (shared per inst)
 
@@ -217,9 +224,13 @@ func (s *service) instWindow(instID string) *candleWindow {
 }
 
 func (s *service) seedWindow(instID string) error {
-	raw, err := s.exchange.GetCandles(instID, s.cfg.Optimizer.Bar, s.runCfg.CandleWindow)
+	execInstID, err := s.symbolMap.Resolve(instID)
 	if err != nil {
-		return fmt.Errorf("seed candle window for %s: %w", instID, err)
+		return fmt.Errorf("resolve symbol for candle seeding: %w", err)
+	}
+	raw, err := s.exchange.GetCandles(execInstID, s.cfg.Optimizer.Bar, s.runCfg.CandleWindow)
+	if err != nil {
+		return fmt.Errorf("seed candle window for %s (instId %s): %w", instID, execInstID, err)
 	}
 	out := make([]domain.Candle, len(raw))
 	for i, c := range raw {
