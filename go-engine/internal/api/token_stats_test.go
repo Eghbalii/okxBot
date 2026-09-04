@@ -19,7 +19,7 @@ type tokenStatsStubRepo struct {
 	err   error
 }
 
-func (s *tokenStatsStubRepo) TokenStats24h(ctx context.Context) ([]port.TokenStats, error) {
+func (s *tokenStatsStubRepo) TokenStats24h(ctx context.Context, mode string) ([]port.TokenStats, error) {
 	return s.stats, s.err
 }
 

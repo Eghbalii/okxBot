@@ -141,7 +141,12 @@ type tokenStatsView struct {
 }
 
 func (s *Server) handleTokenStats24h(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.Repo.TokenStats24h(r.Context())
+	mode, ok := statsMode(r.URL.Query().Get("mode"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		return
+	}
+	stats, err := s.Repo.TokenStats24h(r.Context(), mode)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
@@ -203,11 +204,56 @@ func runRealTrader(
 		os.Exit(1)
 	}
 
+	// Panel control-box config for REAL mode (CLAUDE.md real-trading readiness plan, 2026-09-04) —
+	// mirrors cmd/paper-trader/main.go's identical read exactly. Before this, cmd/trader never read
+	// paper_trading_config at all, so the Real tab's Pause/Stop/disable-long/disable-short/active-
+	// strategies/active-tokens controls appeared to save successfully but had zero effect.
+	ptCfg, err := repo.GetPaperTradingConfig(ctx, "real")
+	if err != nil {
+		logger.Error("failed to load real-mode paper trading config", "error", err)
+		os.Exit(1)
+	}
+	tradingPaused := ptCfg.TradingState != "running"
+	if tradingPaused {
+		logger.Info("real trading is not in the running state", "tradingState", ptCfg.TradingState)
+	}
+	// Global per-kind "active strategies" toggle, scoped to mode=real — bulk-applied BEFORE
+	// loadRealTraderStrategyAssignments reads them below, mirroring cmd/paper-trader's own
+	// sequencing exactly. A no-op when ActiveKinds is empty (no restriction configured).
+	if err := repo.SetAssignmentsEnabledForKinds(ctx, "real", ptCfg.ActiveKinds); err != nil {
+		logger.Error("failed to apply real-mode active-strategy-kinds restriction", "error", err)
+		os.Exit(1)
+	}
+	// trading_state="stopped" force-closes every currently-open real position, once, at startup —
+	// same manual-close path and model-reward treatment as the panel's per-order Close button and
+	// PaperTrader's own equivalent sweep.
+	if ptCfg.TradingState == "stopped" {
+		openOnly := true
+		for _, instID := range cfg.Trading.InstIDs {
+			open, err := repo.ListRealPositions(ctx, port.PositionFilter{InstID: instID, Open: &openOnly})
+			if err != nil {
+				logger.Error("failed to list open real positions for stopped sweep", "instId", instID, "error", err)
+				os.Exit(1)
+			}
+			for _, o := range open {
+				if err := repo.RequestRealManualClose(ctx, o.ID); err != nil {
+					logger.Error("failed to request manual close of real order", "id", o.ID, "error", err)
+					os.Exit(1)
+				}
+			}
+		}
+		logger.Info("real trading_state=stopped: flagged open real positions for close")
+	}
+
 	// Reuses PaperTrading.Bars/CandleLimit/RLClamps/RLUpdate*/RLEarlyClose/RLMaxOpenDuration —
 	// real trading does not need its own separate bar-list or clamp config section (CLAUDE.md §27's
 	// plan §2's own note): the decision-vs-context bar split and the clamp bounds are the same
 	// question for both engines, and duplicating the config key would just risk the two drifting.
+	// active_bars overrides which timeframes strategies DECIDE on, same as PaperTrader's own field.
 	decisionBars := cfg.PaperTrading.Bars
+	if len(ptCfg.ActiveBars) > 0 {
+		decisionBars = ptCfg.ActiveBars
+	}
 	if len(decisionBars) == 0 {
 		logger.Error("paper_trading.bars is empty; RealTrader needs at least one decision bar")
 		os.Exit(1)
@@ -274,6 +320,13 @@ func runRealTrader(
 			TdMode:          cfg.Trading.TdMode,
 			PosMode:         cfg.Trading.PosMode,
 			ActiveTokens:    cfg.Trading.InstIDs,
+
+			// Panel control-box gates for real mode (CLAUDE.md real-trading readiness plan,
+			// 2026-09-04) — mirrors cmd/paper-trader's own PaperTrader construction exactly.
+			TradingPaused: tradingPaused,
+			OpensDisabled: slices.Contains(ptCfg.DisabledInstIDs, instID),
+			DisableLong:   ptCfg.DisableLong,
+			DisableShort:  ptCfg.DisableShort,
 
 			// ExecInstID/ExecInstType/SettleCcy answer "which instrument does a REAL order actually
 			// target" — InstID is now a short internal symbol ("BTC"), never OKX's own wire-format

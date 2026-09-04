@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import ParamChangeChart from '../components/ParamChangeChart'
 import { formatUsd, pnlClass, tokenSymbol, winRate } from '../utils/format'
-import type { StrategyAssignment, StrategyConfig, StrategyStats } from '../api/types'
+import type { PositionMode, StrategyAssignment, StrategyConfig, StrategyStats } from '../api/types'
 
 function ParamEditor({
   strategy,
@@ -243,6 +243,10 @@ function ChartPanel({
 }
 
 export default function StrategiesPage() {
+  // Paper and real trading each have a fully independent track record and assignment set
+  // (CLAUDE.md real-trading readiness plan, 2026-09-04) — this tab picks which one the table/
+  // chart below reflects, same pattern as the Positions page's own Paper/Real tabs.
+  const [mode, setMode] = useState<PositionMode>('paper')
   const [strategies, setStrategies] = useState<StrategyConfig[]>([])
   const [assignments, setAssignments] = useState<StrategyAssignment[]>([])
   const [stats, setStats] = useState<Record<number, StrategyStats>>({})
@@ -252,12 +256,12 @@ export default function StrategiesPage() {
     try {
       const [list, assigns] = await Promise.all([
         api.listStrategies(),
-        api.listAssignments(),
+        api.listAssignments({ mode }),
       ])
       setStrategies(list)
       setAssignments(assigns)
       const entries = await Promise.all(
-        list.map(async (s) => [s.ID, await api.strategyStats(s.ID)] as const),
+        list.map(async (s) => [s.ID, await api.strategyStats(s.ID, mode)] as const),
       )
       setStats(Object.fromEntries(entries))
       setError(null)
@@ -268,7 +272,7 @@ export default function StrategiesPage() {
 
   useEffect(() => {
     reload()
-  }, [])
+  }, [mode])
 
   const origins = strategies.filter((s) => s.IsOrigin)
   const subStrategies = strategies.filter((s) => !s.IsOrigin)
@@ -285,6 +289,18 @@ export default function StrategiesPage() {
 
   return (
     <div>
+      <div className="mode-tabs" style={{ marginBottom: '0.9rem' }}>
+        {(['paper', 'real'] as PositionMode[]).map((m) => (
+          <button
+            key={m}
+            className={'mode-tab' + (mode === m ? ' active' : '')}
+            onClick={() => setMode(m)}
+          >
+            {m[0].toUpperCase() + m.slice(1)}
+          </button>
+        ))}
+      </div>
+
       {error && <div className="error-banner">{error}</div>}
 
       <div className="card">

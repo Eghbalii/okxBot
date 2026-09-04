@@ -237,6 +237,7 @@ function TradingControls({ mode }: { mode: PositionMode }) {
 
       {showStrategyModal && (
         <StrategyKindModal
+          mode={mode}
           activeKinds={cfg.activeKinds}
           onClose={() => setShowStrategyModal(false)}
           onSave={saveActiveKinds}
@@ -244,6 +245,7 @@ function TradingControls({ mode }: { mode: PositionMode }) {
       )}
       {showTokenModal && (
         <TokenModal
+          mode={mode}
           allInstIds={cfg.allInstIds}
           disabledInstIds={cfg.disabledInstIds}
           onClose={() => setShowTokenModal(false)}

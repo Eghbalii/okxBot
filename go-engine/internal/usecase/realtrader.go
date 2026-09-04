@@ -126,6 +126,18 @@ type RealTrader struct {
 
 	OrderEvents port.MarketDataPublisher
 
+	// TradingPaused/OpensDisabled/DisableLong/DisableShort mirror PaperTrader's own panel
+	// control-box fields exactly (CLAUDE.md real-trading readiness plan, 2026-09-04) — until this
+	// was added, cmd/trader never read paper_trading_config at all, so the Real tab's Pause/Stop/
+	// disable-long/disable-short/active-strategies/active-tokens controls had zero effect on real
+	// trading despite appearing to save successfully. Existing open positions are always
+	// unaffected by any of these — only evaluateStrategies' new-open path is gated, monitoring/
+	// closing keeps running unconditionally, same reasoning as PaperTrader's own fields.
+	TradingPaused bool
+	OpensDisabled bool
+	DisableLong   bool
+	DisableShort  bool
+
 	candlesMu sync.Mutex
 	candles   map[string][]domain.Candle
 
@@ -459,6 +471,14 @@ func (e *RealTrader) evaluateStrategies(ctx context.Context, bar string, price d
 		return nil
 	}
 
+	// Panel control-box gate, mirroring PaperTrader.evaluateStrategies exactly (CLAUDE.md
+	// real-trading readiness plan, 2026-09-04): pause/stop and per-token disable both mean "open
+	// nothing new here" — existing open positions are untouched, monitorOpenPositions keeps
+	// monitoring/closing them regardless of either flag.
+	if e.TradingPaused || e.OpensDisabled {
+		return nil
+	}
+
 	// Serializes the whole read-open-then-maybe-open sequence against the other bars' consumer
 	// goroutines — same race PaperTrader.openMu guards against (CLAUDE.md §16.9).
 	e.openMu.Lock()
@@ -483,6 +503,12 @@ func (e *RealTrader) evaluateStrategies(ctx context.Context, bar string, price d
 		}
 		metrics.StrategySignalsTotal.WithLabelValues(s.Name(), e.InstID, string(signal.Side)).Inc()
 		if signal.Side == strategy.Hold {
+			continue
+		}
+		// Panel control-box long/short toggle, mirroring PaperTrader (CLAUDE.md real-trading
+		// readiness plan, 2026-09-04): the strategy still evaluates and its signal is still
+		// counted in the metric above, this only gates whether it's acted on.
+		if (e.DisableLong && signal.Side == strategy.Buy) || (e.DisableShort && signal.Side == strategy.Sell) {
 			continue
 		}
 

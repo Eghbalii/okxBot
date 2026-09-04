@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api/client'
 import SortableTh from './SortableTh'
 import { formatUsd, pnlClass, tokenSymbol } from '../utils/format'
-import type { TokenStats } from '../api/types'
+import type { PositionMode, TokenStats } from '../api/types'
 
 type SortField = 'token' | 'positions' | 'pnlUsd' | 'pnlPct'
 
@@ -31,11 +31,13 @@ function sortRows(instIds: string[], stats: Record<string, TokenStats>, sortBy: 
 // 2026-09-04: gained a sortable 24h stats table (position count + PnL$/PnL% for trades CLOSED in
 // the last 24h, CLAUDE.md) above the checkboxes, mirroring the Strategies-kind modal's own table.
 export default function TokenModal({
+  mode,
   allInstIds,
   disabledInstIds,
   onClose,
   onSave,
 }: {
+  mode: PositionMode
   allInstIds: string[]
   disabledInstIds: string[]
   onClose: () => void
@@ -50,12 +52,13 @@ export default function TokenModal({
   const [sortDesc, setSortDesc] = useState(false)
 
   useEffect(() => {
+    setStatsLoading(true)
     api
-      .tokenStats24h()
+      .tokenStats24h(mode)
       .then((rows) => setStats(Object.fromEntries(rows.map((r) => [r.instId, r]))))
       .catch((err) => setError((err as Error).message))
       .finally(() => setStatsLoading(false))
-  }, [])
+  }, [mode])
 
   function toggleSort(field: SortField) {
     if (sortBy === field) {
@@ -103,7 +106,7 @@ export default function TokenModal({
         </div>
 
         <div className="text-dim" style={{ marginBottom: '0.75rem' }}>
-          Unchecking a token stops it from opening new paper positions. Its existing open
+          Unchecking a token stops it from opening new {mode} positions. Its existing open
           positions (if any) keep running to their normal close — nothing is force-closed.
         </div>
 

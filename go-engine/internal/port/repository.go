@@ -345,13 +345,17 @@ type Repository interface {
 	SetAssignmentEnabled(ctx context.Context, id int64, enabled bool) error
 	DeleteAssignment(ctx context.Context, id int64) error
 
-	// StrategyStatsFor computes per-strategy track record from paper_orders (CLAUDE.md §11.3).
-	StrategyStatsFor(ctx context.Context, strategyID int64) (StrategyStats, error)
+	// StrategyStatsFor computes strategyID's track record for mode ("paper" or "real") — CLAUDE.md
+	// §11.3, extended to real trading by the real-trading readiness plan (2026-09-04): paper and
+	// real trading each have their own completely independent track record, sourced from
+	// paper_orders or real_orders respectively (real_orders has no "variant" column to filter by,
+	// unlike paper_orders' baseline/rl_adjusted split — every real_orders row already counts).
+	StrategyStatsFor(ctx context.Context, strategyID int64, mode string) (StrategyStats, error)
 
-	// TokenStats24h computes each active token's last-24h paper-trading activity (position count,
-	// PnL$, PnL%) for the panel's "Manage tokens" modal — one row per inst_id that has at least
-	// one baseline trade closed in the window.
-	TokenStats24h(ctx context.Context) ([]TokenStats, error)
+	// TokenStats24h computes each active token's last-24h activity (position count, PnL$, PnL%)
+	// for mode ("paper" or "real") — backs the panel's "Manage tokens" modal, one row per inst_id
+	// that has at least one trade closed in the window for that mode.
+	TokenStats24h(ctx context.Context, mode string) ([]TokenStats, error)
 
 	// OpenPaperOrder inserts o and returns its id. o.ExchangeOrderID is persisted when set (real
 	// trading, CLAUDE.md §27) — the algo order's ID is not known until after this call returns

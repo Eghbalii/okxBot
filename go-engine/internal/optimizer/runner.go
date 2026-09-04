@@ -456,7 +456,7 @@ func (r *Run) currentBaseline(ctx context.Context) (Baseline, int64, error) {
 		return Baseline{}, originID, nil
 	}
 
-	stats, err := r.repo.StrategyStatsFor(ctx, assignedStrategyID)
+	stats, err := r.repo.StrategyStatsFor(ctx, assignedStrategyID, "paper")
 	if err != nil {
 		return Baseline{}, originID, fmt.Errorf("stats for baseline strategy %d: %w", assignedStrategyID, err)
 	}

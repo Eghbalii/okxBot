@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api/client'
 import SortableTh from './SortableTh'
 import { formatUsd, pnlClass, winRate } from '../utils/format'
-import type { StrategyConfig, StrategyStats } from '../api/types'
+import type { PositionMode, StrategyConfig, StrategyStats } from '../api/types'
 
 // The 12 scalp/ICT/price-action kinds added CLAUDE.md §30, tagged "new" in this list so they are
 // easy to spot among the original 14 while deciding which to enable — pure display, no backend
@@ -86,10 +86,12 @@ function sortRows(rows: KindRow[], sortBy: SortField, sortDesc: boolean): KindRo
 // true. Unchecking is what actually creates a restriction; checking everything back is equivalent
 // to clearing it, handled below by treating "all checked" as saving an empty list.
 export default function StrategyKindModal({
+  mode,
   activeKinds,
   onClose,
   onSave,
 }: {
+  mode: PositionMode
   activeKinds: string[]
   onClose: () => void
   onSave: (kinds: string[]) => Promise<void>
@@ -113,14 +115,14 @@ export default function StrategyKindModal({
         // pre-check all of them rather than leaving the list looking fully disabled.
         setSelected((prev) => (activeKinds.length === 0 ? new Set(kinds) : prev))
         const entries = await Promise.all(
-          rows.map(async (s) => [s.ID, await api.strategyStats(s.ID)] as const),
+          rows.map(async (s) => [s.ID, await api.strategyStats(s.ID, mode)] as const),
         )
         setStats(Object.fromEntries(entries))
       })
       .catch((err) => setError((err as Error).message))
       .finally(() => setLoading(false))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [mode])
 
   function toggleSort(field: SortField) {
     if (sortBy === field) {
@@ -170,7 +172,7 @@ export default function StrategyKindModal({
         </div>
 
         <div className="text-dim" style={{ marginBottom: '0.75rem' }}>
-          Only checked strategy kinds open new paper positions, across every token. Unchecking a
+          Only checked strategy kinds open new {mode} positions, across every token. Unchecking a
           kind stops it from opening new positions — any of its existing open positions keep
           running to their normal close, nothing is force-closed.
         </div>

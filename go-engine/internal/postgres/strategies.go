@@ -185,23 +185,43 @@ func (r *Repository) DeleteAssignment(ctx context.Context, id int64) error {
 // several 'rl_adjusted' rows (CLAUDE.md §16.9's fork-count incident), and those forks are the
 // same underlying signal monitored a second time, not independent evidence of the strategy's
 // quality — counting them here would let fork volume dilute/skew a strategy's real track record.
-func (r *Repository) StrategyStatsFor(ctx context.Context, strategyID int64) (port.StrategyStats, error) {
+// StrategyStatsFor computes strategyID's track record for mode, sourced from paper_orders
+// (filtered to variant='baseline', excluding shadow forks) or real_orders (no variant column at
+// all — real trading has no forking, §27.3, so every row already counts) depending on mode.
+func (r *Repository) StrategyStatsFor(ctx context.Context, strategyID int64, mode string) (port.StrategyStats, error) {
 	stats := port.StrategyStats{StrategyID: strategyID}
-	err := r.pool.QueryRow(ctx, `
-		SELECT
-			count(*),
-			count(*) FILTER (WHERE closed_at IS NOT NULL AND realized_pnl > 0),
-			count(*) FILTER (WHERE closed_at IS NOT NULL AND realized_pnl <= 0),
-			count(*) FILTER (WHERE closed_at IS NULL),
-			coalesce(sum(realized_pnl), 0),
-			min(opened_at),
-			max(coalesce(closed_at, opened_at))
-		FROM paper_orders
-		WHERE strategy_id = $1 AND variant = 'baseline'
-	`, strategyID).Scan(&stats.SignalCount, &stats.Wins, &stats.Losses, &stats.OpenCount,
+	var query string
+	if mode == "real" {
+		query = `
+			SELECT
+				count(*),
+				count(*) FILTER (WHERE closed_at IS NOT NULL AND realized_pnl > 0),
+				count(*) FILTER (WHERE closed_at IS NOT NULL AND realized_pnl <= 0),
+				count(*) FILTER (WHERE closed_at IS NULL),
+				coalesce(sum(realized_pnl), 0),
+				min(opened_at),
+				max(coalesce(closed_at, opened_at))
+			FROM real_orders
+			WHERE strategy_id = $1
+		`
+	} else {
+		query = `
+			SELECT
+				count(*),
+				count(*) FILTER (WHERE closed_at IS NOT NULL AND realized_pnl > 0),
+				count(*) FILTER (WHERE closed_at IS NOT NULL AND realized_pnl <= 0),
+				count(*) FILTER (WHERE closed_at IS NULL),
+				coalesce(sum(realized_pnl), 0),
+				min(opened_at),
+				max(coalesce(closed_at, opened_at))
+			FROM paper_orders
+			WHERE strategy_id = $1 AND variant = 'baseline'
+		`
+	}
+	err := r.pool.QueryRow(ctx, query, strategyID).Scan(&stats.SignalCount, &stats.Wins, &stats.Losses, &stats.OpenCount,
 		&stats.RealizedPnL, &stats.FirstOpened, &stats.LastActivity)
 	if err != nil {
-		return port.StrategyStats{}, fmt.Errorf("strategy stats for %d: %w", strategyID, err)
+		return port.StrategyStats{}, fmt.Errorf("strategy stats for %d (mode %s): %w", strategyID, mode, err)
 	}
 	return stats, nil
 }

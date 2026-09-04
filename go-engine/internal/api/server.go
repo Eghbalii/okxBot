@@ -372,7 +372,12 @@ func (s *Server) handleStrategyStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stats, err := s.Repo.StrategyStatsFor(r.Context(), id)
+	mode, ok := statsMode(r.URL.Query().Get("mode"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		return
+	}
+	stats, err := s.Repo.StrategyStatsFor(r.Context(), id, mode)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

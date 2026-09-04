@@ -88,18 +88,21 @@ export const api = {
     request<void>(`/strategies/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   deleteStrategy: (id: number) => request<void>(`/strategies/${id}`, { method: 'DELETE' }),
   resetStrategy: (id: number) => request<void>(`/strategies/${id}/reset`, { method: 'POST' }),
-  strategyStats: (id: number) => request<StrategyStats>(`/strategies/${id}/stats`),
+  // mode ("paper" or "real") scopes the track record — paper and real trading each have a fully
+  // independent one, sourced from paper_orders vs. real_orders respectively.
+  strategyStats: (id: number, mode: PositionMode) => request<StrategyStats>(`/strategies/${id}/stats?mode=${mode}`),
 
-  listAssignments: (opts?: { instId?: string; enabledOnly?: boolean }) => {
+  listAssignments: (opts?: { instId?: string; enabledOnly?: boolean; mode?: PositionMode }) => {
     const params = new URLSearchParams()
     if (opts?.instId) params.set('instId', opts.instId)
     if (opts?.enabledOnly) params.set('enabledOnly', 'true')
+    if (opts?.mode) params.set('mode', opts.mode)
     return requestList<StrategyAssignment>(`/assignments?${params}`)
   },
-  createAssignment: (body: { strategyId: number; instId: string; bar: string }) =>
+  createAssignment: (body: { strategyId: number; instId: string; bar: string; mode?: PositionMode }) =>
     request<{ id: number }>('/assignments', {
       method: 'POST',
-      body: JSON.stringify({ StrategyID: body.strategyId, InstID: body.instId, Bar: body.bar }),
+      body: JSON.stringify({ StrategyID: body.strategyId, InstID: body.instId, Bar: body.bar, Mode: body.mode }),
     }),
   setAssignmentEnabled: (id: number, enabled: boolean) =>
     request<void>(`/assignments/${id}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
@@ -197,7 +200,7 @@ export const api = {
   paperTradingStats: (mode: PositionMode) => request<PaperTradingStats>(`/paper-trading/stats?mode=${mode}`),
   // "Manage tokens" modal's per-token 24h stats table (2026-09-04 request) — paper-trading only,
   // no mode param (TokenStats24h has no real-trading equivalent yet).
-  tokenStats24h: () => requestList<TokenStats>('/paper-trading/token-stats'),
+  tokenStats24h: (mode: PositionMode) => requestList<TokenStats>(`/paper-trading/token-stats?mode=${mode}`),
   // Go's null-array-column columns (activeKinds/disabledInstIds/activeBars) marshal as JSON null,
   // not [] — normalized here the same way requestList does for list endpoints, so PaperTradingConfig
   // consumers can always call .length/.map on these fields without a crash (found live: an

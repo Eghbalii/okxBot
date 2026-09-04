@@ -241,24 +241,35 @@ func (r *Repository) CountPositions(ctx context.Context, f port.PositionFilter) 
 	return count, nil
 }
 
-// TokenStats24h computes each token's last-24h paper-trading activity (CLAUDE.md, "Manage tokens"
-// panel, 2026-09-04 request) — position count and PnL$/PnL% for baseline trades CLOSED in the last
-// 24 hours, mirroring StrategyStatsFor's variant='baseline' scoping (a high adjustment rate can
-// fork one signal into several rows, which would otherwise dilute/skew a token's real 24h record,
-// CLAUDE.md §16.9) and mode='paper' (this modal is paper-trading's own control surface). PnL% is
+// TokenStats24h computes each token's last-24h activity for mode ("paper" or "real") — CLAUDE.md,
+// "Manage tokens" panel, 2026-09-04 request, extended to real trading by the real-trading
+// readiness plan (2026-09-04) — position count and PnL$/PnL% for trades CLOSED in the last 24
+// hours, sourced from paper_orders (filtered to variant='baseline', excluding shadow forks —
+// CLAUDE.md §16.9) or real_orders (no variant column, every row counts) depending on mode. PnL% is
 // expressed against the token's own summed entry notional in the window (return on capital
 // deployed for that token), not the shared account's equity — a token has no "starting equity" of
 // its own the way the whole account does (CLAUDE.md §15.6's shared pool).
-func (r *Repository) TokenStats24h(ctx context.Context) ([]port.TokenStats, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT inst_id, count(*), coalesce(sum(realized_pnl), 0), coalesce(sum(size), 0)
-		FROM paper_orders
-		WHERE mode = 'paper' AND variant = 'baseline'
-			AND closed_at IS NOT NULL AND closed_at >= now() - interval '24 hours'
-		GROUP BY inst_id
-	`)
+func (r *Repository) TokenStats24h(ctx context.Context, mode string) ([]port.TokenStats, error) {
+	var query string
+	if mode == "real" {
+		query = `
+			SELECT inst_id, count(*), coalesce(sum(realized_pnl), 0), coalesce(sum(size), 0)
+			FROM real_orders
+			WHERE closed_at IS NOT NULL AND closed_at >= now() - interval '24 hours'
+			GROUP BY inst_id
+		`
+	} else {
+		query = `
+			SELECT inst_id, count(*), coalesce(sum(realized_pnl), 0), coalesce(sum(size), 0)
+			FROM paper_orders
+			WHERE mode = 'paper' AND variant = 'baseline'
+				AND closed_at IS NOT NULL AND closed_at >= now() - interval '24 hours'
+			GROUP BY inst_id
+		`
+	}
+	rows, err := r.pool.Query(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("token stats 24h: %w", err)
+		return nil, fmt.Errorf("token stats 24h (mode %s): %w", mode, err)
 	}
 	defer rows.Close()
 
