@@ -29,7 +29,7 @@ type fakeRepository struct {
 	equityPoints       []port.EquityPoint
 	paramChanges       []port.ParamChange
 	orderAdjustments   []port.PaperOrderAdjustment
-	paperTradingConfig *port.PaperTradingConfig
+	paperTradingConfig map[string]*port.PaperTradingConfig
 
 	// realOrders uses its own counter (nextRealID), deliberately NOT sharing nextID with the
 	// paper orders map — real_orders and paper_orders are independent Postgres sequences post-
@@ -96,7 +96,7 @@ func (r *fakeRepository) ResetStrategyToOrigin(ctx context.Context, id int64) er
 func (r *fakeRepository) CreateAssignment(ctx context.Context, a port.StrategyAssignment) (int64, error) {
 	return 0, nil
 }
-func (r *fakeRepository) ListAssignments(ctx context.Context, instID string, enabledOnly bool) ([]port.StrategyAssignment, error) {
+func (r *fakeRepository) ListAssignments(ctx context.Context, instID string, enabledOnly bool, mode string) ([]port.StrategyAssignment, error) {
 	return nil, nil
 }
 func (r *fakeRepository) SetAssignmentEnabled(ctx context.Context, id int64, enabled bool) error {
@@ -204,20 +204,23 @@ func (r *fakeRepository) RequestManualCloseAll(ctx context.Context) (int, error)
 	}
 	return n, nil
 }
-func (r *fakeRepository) GetPaperTradingConfig(ctx context.Context) (port.PaperTradingConfig, error) {
+func (r *fakeRepository) GetPaperTradingConfig(ctx context.Context, mode string) (port.PaperTradingConfig, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.paperTradingConfig == nil || r.paperTradingConfig[mode] == nil {
+		return port.PaperTradingConfig{TradingState: "running"}, nil
+	}
+	return *r.paperTradingConfig[mode], nil
+}
+func (r *fakeRepository) SavePaperTradingConfig(ctx context.Context, mode string, patch port.PaperTradingConfigPatch) (port.PaperTradingConfig, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.paperTradingConfig == nil {
-		return port.PaperTradingConfig{TradingState: "running"}, nil
+		r.paperTradingConfig = make(map[string]*port.PaperTradingConfig)
 	}
-	return *r.paperTradingConfig, nil
-}
-func (r *fakeRepository) SavePaperTradingConfig(ctx context.Context, patch port.PaperTradingConfigPatch) (port.PaperTradingConfig, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	c := port.PaperTradingConfig{TradingState: "running"}
-	if r.paperTradingConfig != nil {
-		c = *r.paperTradingConfig
+	if r.paperTradingConfig[mode] != nil {
+		c = *r.paperTradingConfig[mode]
 	}
 	if patch.TradingState != nil {
 		c.TradingState = *patch.TradingState
@@ -237,10 +240,10 @@ func (r *fakeRepository) SavePaperTradingConfig(ctx context.Context, patch port.
 	if patch.ActiveBars != nil {
 		c.ActiveBars = *patch.ActiveBars
 	}
-	r.paperTradingConfig = &c
+	r.paperTradingConfig[mode] = &c
 	return c, nil
 }
-func (r *fakeRepository) SetAssignmentsEnabledForKinds(ctx context.Context, activeKinds []string) error {
+func (r *fakeRepository) SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string) error {
 	return nil
 }
 func (r *fakeRepository) UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {

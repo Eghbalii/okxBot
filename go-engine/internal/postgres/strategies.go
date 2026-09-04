@@ -108,31 +108,38 @@ func (r *Repository) ResetStrategyToOrigin(ctx context.Context, id int64) error 
 	return nil
 }
 
-// CreateAssignment binds a strategy to an instrument+timeframe.
+// CreateAssignment binds a strategy to an instrument+timeframe+mode. a.Mode defaults to "paper"
+// when unset, matching every pre-existing caller's implicit assumption before mode scoping
+// (CLAUDE.md real-trading readiness plan, 2026-09-04).
 func (r *Repository) CreateAssignment(ctx context.Context, a port.StrategyAssignment) (int64, error) {
+	mode := a.Mode
+	if mode == "" {
+		mode = "paper"
+	}
 	var id int64
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO strategy_assignments (strategy_id, inst_id, bar, enabled)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (strategy_id, inst_id, bar) DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()
+		INSERT INTO strategy_assignments (strategy_id, inst_id, bar, enabled, mode)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (strategy_id, inst_id, bar, mode) DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()
 		RETURNING id
-	`, a.StrategyID, a.InstID, a.Bar, a.Enabled).Scan(&id)
+	`, a.StrategyID, a.InstID, a.Bar, a.Enabled, mode).Scan(&id)
 	if err != nil {
-		return 0, fmt.Errorf("create assignment (strategy %d, %s/%s): %w", a.StrategyID, a.InstID, a.Bar, err)
+		return 0, fmt.Errorf("create assignment (strategy %d, %s/%s, mode %s): %w", a.StrategyID, a.InstID, a.Bar, mode, err)
 	}
 	return id, nil
 }
 
-// ListAssignments returns strategy assignments, optionally filtered to one instrument and/or only
-// enabled ones. Callers (e.g. cmd/paper-trader at startup) use this to reload durable
-// token/timeframe→strategy bindings after a crash/restart instead of hardcoding them in Go.
-func (r *Repository) ListAssignments(ctx context.Context, instID string, enabledOnly bool) ([]port.StrategyAssignment, error) {
+// ListAssignments returns mode's strategy assignments, optionally filtered to one instrument
+// and/or only enabled ones. Callers (e.g. cmd/paper-trader/cmd/trader at startup) use this to
+// reload durable token/timeframe→strategy bindings after a crash/restart instead of hardcoding
+// them in Go.
+func (r *Repository) ListAssignments(ctx context.Context, instID string, enabledOnly bool, mode string) ([]port.StrategyAssignment, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, strategy_id, inst_id, bar, enabled
+		SELECT id, strategy_id, inst_id, bar, enabled, mode
 		FROM strategy_assignments
-		WHERE ($1 = '' OR inst_id = $1) AND (NOT $2 OR enabled)
+		WHERE ($1 = '' OR inst_id = $1) AND (NOT $2 OR enabled) AND mode = $3
 		ORDER BY id
-	`, instID, enabledOnly)
+	`, instID, enabledOnly, mode)
 	if err != nil {
 		return nil, fmt.Errorf("list assignments: %w", err)
 	}
@@ -141,7 +148,7 @@ func (r *Repository) ListAssignments(ctx context.Context, instID string, enabled
 	var out []port.StrategyAssignment
 	for rows.Next() {
 		var a port.StrategyAssignment
-		if err := rows.Scan(&a.ID, &a.StrategyID, &a.InstID, &a.Bar, &a.Enabled); err != nil {
+		if err := rows.Scan(&a.ID, &a.StrategyID, &a.InstID, &a.Bar, &a.Enabled, &a.Mode); err != nil {
 			return nil, fmt.Errorf("scan assignment: %w", err)
 		}
 		out = append(out, a)

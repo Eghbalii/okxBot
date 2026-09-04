@@ -376,10 +376,29 @@ func (s *Server) handleStrategyStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
+// assignmentMode resolves the mode query param/body field to "paper" or "real" — CLAUDE.md
+// real-trading readiness plan, 2026-09-04: strategy_assignments is now mode-scoped. Defaults to
+// "paper" (every caller before this change implicitly meant paper trading).
+func assignmentMode(raw string) (string, bool) {
+	switch raw {
+	case "":
+		return "paper", true
+	case "paper", "real":
+		return raw, true
+	default:
+		return "", false
+	}
+}
+
 func (s *Server) handleListAssignments(w http.ResponseWriter, r *http.Request) {
 	instID := r.URL.Query().Get("instId")
 	enabledOnly := r.URL.Query().Get("enabledOnly") == "true"
-	list, err := s.Repo.ListAssignments(r.Context(), instID, enabledOnly)
+	mode, ok := assignmentMode(r.URL.Query().Get("mode"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		return
+	}
+	list, err := s.Repo.ListAssignments(r.Context(), instID, enabledOnly, mode)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -393,6 +412,12 @@ func (s *Server) handleCreateAssignment(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
+	mode, ok := assignmentMode(req.Mode)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		return
+	}
+	req.Mode = mode
 	req.Enabled = true
 	id, err := s.Repo.CreateAssignment(r.Context(), req)
 	if err != nil {
@@ -452,14 +477,70 @@ type positionsListResponse struct {
 	Total int               `json:"total"`
 }
 
+// realOrderToPosition maps a real_orders row onto the port.PaperOrder-shaped DTO the panel already
+// consumes for paper/demo positions (CLAUDE.md real-trading readiness plan, 2026-09-04) — keeps
+// /api/positions a single response shape regardless of which table backed the row. ParentOrderID/
+// Variant don't exist for real orders (no shadow-fork mechanic, §27.3) so they're left at their
+// paper-shaped defaults (nil/"baseline"); Status is the one field only real rows populate.
+func realOrderToPosition(o port.RealOrder) port.PaperOrder {
+	status := o.Status
+	return port.PaperOrder{
+		ID:                   o.ID,
+		InstID:               o.InstID,
+		StrategyID:           o.StrategyID,
+		Bar:                  o.Bar,
+		Side:                 o.Side,
+		EntryPx:              o.EntryPx,
+		SLPx:                 o.SLPx,
+		TPPx:                 o.TPPx,
+		Size:                 o.Size,
+		Leverage:             o.Leverage,
+		OpenedAt:             o.OpenedAt,
+		ClosedAt:             o.ClosedAt,
+		CloseReason:          o.CloseReason,
+		ClosePx:              o.ClosePx,
+		RealizedPnL:          o.RealizedPnL,
+		FeaturesJSON:         o.FeaturesJSON,
+		Mode:                 "real",
+		PnLMaxPct:            o.PnLMaxPct,
+		PnLMinPct:            o.PnLMinPct,
+		Variant:              "baseline",
+		StrategyName:         o.StrategyName,
+		ManualCloseRequested: o.ManualCloseRequested,
+		ExchangeOrderID:      o.ExchangeOrderID,
+		ExchangeAlgoOrderID:  o.ExchangeAlgoOrderID,
+		Status:               &status,
+	}
+}
+
+// positionsMode validates the ?mode= query param against the full paper/demo/real enum
+// handleListPositions accepts (unlike assignmentMode/statsMode, "" here means "all modes" for
+// backward compatibility with any caller that still wants a cross-mode view) — CLAUDE.md
+// real-trading readiness plan, 2026-09-04: closes the "typo'd mode silently returns 0 rows" gap.
+func positionsMode(raw string) (string, bool) {
+	switch raw {
+	case "", "paper", "demo", "real":
+		return raw, true
+	default:
+		return "", false
+	}
+}
+
 // handleListPositions serves the positions panel (CLAUDE.md §11.4): filterable by mode
 // (paper/demo/real), instrument, open/closed, sortable by opened_at/closed_at/pnl/inst_id, and
 // paged via page/pageSize (page is 0-indexed; pageSize defaults to defaultPositionsPageSize,
-// capped at maxPositionsPageSize).
+// capped at maxPositionsPageSize). mode="real" routes to real_orders (its own table, CLAUDE.md
+// real-trading readiness plan, 2026-09-04) rather than paper_orders, mapped through
+// realOrderToPosition so the response shape stays identical either way.
 func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	mode, ok := positionsMode(q.Get("mode"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper, demo, or real)")
+		return
+	}
 	filter := port.PositionFilter{
-		Mode:     q.Get("mode"),
+		Mode:     mode,
 		InstID:   q.Get("instId"),
 		SortBy:   q.Get("sortBy"),
 		SortDesc: q.Get("sortDesc") == "true",
@@ -487,6 +568,25 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 	filter.Limit = pageSize
 	filter.Offset = page * pageSize
 
+	if mode == "real" {
+		realList, err := s.Repo.ListRealPositions(r.Context(), filter)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		total, err := s.Repo.CountRealPositions(r.Context(), filter)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		list := make([]port.PaperOrder, len(realList))
+		for i, o := range realList {
+			list[i] = realOrderToPosition(o)
+		}
+		writeJSON(w, http.StatusOK, positionsListResponse{Items: list, Total: total})
+		return
+	}
+
 	list, err := s.Repo.ListPositions(r.Context(), filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -500,17 +600,44 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, positionsListResponse{Items: list, Total: total})
 }
 
-// handleClosePosition lets the panel close an open paper position by hand (2026-08-31 request).
-// cmd/api runs in a separate process from the PaperTrader that actually owns this order's
-// instrument's tick stream, so it cannot close the order itself — it only flags intent via
-// RequestManualClose; PaperTrader closes it at the live price on its next tick, close_reason=
-// 'manual', reported to the model as closed_early (conductor.TerminalCategory). Only meaningful
-// for paper-mode positions, since that is the only mode PaperTrader's loop monitors — demo/real
-// positions have no equivalent close-my-own-order path yet.
+// idMode resolves the required ?mode= query param on an ID-addressed positions endpoint
+// (close/adjust/adjustments) to "paper" or "real" — CLAUDE.md real-trading readiness plan,
+// 2026-09-04: paper_orders.id and real_orders.id are independent sequences post-table-split, so an
+// id is no longer globally unique and the caller must say which table it means. Required (no
+// default), unlike positionsMode/statsMode/assignmentMode — defaulting here would silently target
+// the wrong table for whichever mode isn't the default.
+func idMode(raw string) (string, bool) {
+	switch raw {
+	case "paper", "real":
+		return raw, true
+	default:
+		return "", false
+	}
+}
+
+// handleClosePosition lets the panel close an open position by hand (2026-08-31 request, extended
+// to real positions 2026-09-04). cmd/api runs in a separate process from the PaperTrader/RealTrader
+// that actually owns this order's instrument's tick stream, so it cannot close the order itself —
+// it only flags intent via RequestManualClose/RequestRealManualClose; the owning engine closes it
+// at the live price on its next tick, close_reason='manual', reported to the model as closed_early
+// (conductor.TerminalCategory).
 func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
 	id, err := pathInt64(r, "id")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	mode, ok := idMode(r.URL.Query().Get("mode"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "mode query param is required (want paper or real)")
+		return
+	}
+	if mode == "real" {
+		if err := s.Repo.RequestRealManualClose(r.Context(), id); err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 		return
 	}
 	if err := s.Repo.RequestManualClose(r.Context(), id); err != nil {
@@ -550,10 +677,23 @@ type adjustPositionRequest struct {
 // local, no exchange call — RealTrader's own tick-driven monitor picks up the new levels on its
 // next tick, same as it would for a model-driven change (§3a's correction: no resting exchange-
 // side order to amend).
+// handleAdjustPosition is real-trading-only by construction (mode="real" always routes to
+// real_orders, mode="paper" 404s since GetPaperOrder has no manual-unclamped-edit path) — the old
+// explicit o.Mode != "real" check is gone now that the table itself is the mode discriminator
+// (CLAUDE.md real-trading readiness plan, 2026-09-04).
 func (s *Server) handleAdjustPosition(w http.ResponseWriter, r *http.Request) {
 	id, err := pathInt64(r, "id")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	mode, ok := idMode(r.URL.Query().Get("mode"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "mode query param is required (want paper or real)")
+		return
+	}
+	if mode != "real" {
+		writeError(w, http.StatusBadRequest, "manual SL/TP adjustment is only supported for real positions")
 		return
 	}
 
@@ -567,17 +707,13 @@ func (s *Server) handleAdjustPosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	o, err := s.Repo.GetPaperOrder(r.Context(), id)
+	o, err := s.Repo.GetRealOrder(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	if o.ClosedAt != nil {
 		writeError(w, http.StatusConflict, "order is already closed")
-		return
-	}
-	if o.Mode != "real" {
-		writeError(w, http.StatusBadRequest, "manual SL/TP adjustment is only supported for real positions")
 		return
 	}
 	if !o.EntryPx.IsPositive() {
@@ -595,17 +731,17 @@ func (s *Server) handleAdjustPosition(w http.ResponseWriter, r *http.Request) {
 		newTP = &px
 	}
 
-	if err := s.Repo.UpdatePaperOrderSLTP(r.Context(), id, newSL, newTP); err != nil {
+	if err := s.Repo.UpdateRealOrderSLTP(r.Context(), id, newSL, newTP); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if req.SLPct != nil && !samePriceOrNil(newSL, o.SLPx) {
-		if err := s.Repo.RecordPaperOrderAdjustment(r.Context(), id, "sl", o.SLPx, newSL, "manual"); err != nil {
+		if err := s.Repo.RecordRealOrderAdjustment(r.Context(), id, "sl", o.SLPx, newSL, "manual"); err != nil {
 			s.Logger.Warn("adjust position: record sl adjustment failed", "id", id, "error", err)
 		}
 	}
 	if req.TPPct != nil && !samePriceOrNil(newTP, o.TPPx) {
-		if err := s.Repo.RecordPaperOrderAdjustment(r.Context(), id, "tp", o.TPPx, newTP, "manual"); err != nil {
+		if err := s.Repo.RecordRealOrderAdjustment(r.Context(), id, "tp", o.TPPx, newTP, "manual"); err != nil {
 			s.Logger.Warn("adjust position: record tp adjustment failed", "id", id, "error", err)
 		}
 	}
@@ -652,13 +788,28 @@ func priceFromMarginPct(entryPx, leverage decimal.Decimal, side string, pct deci
 // handleListPaperOrderAdjustments serves an order's in-trade SL/TP adjustment history (CLAUDE.md
 // §15.4/§15.12 revision, 2026-09-02) — the audit trail the order-detail modal shows on click,
 // replacing the old baseline-vs-rl_adjusted A/B comparison.
+// handleListPaperOrderAdjustments routes to real_order_adjustments when ?mode=real (CLAUDE.md
+// real-trading readiness plan, 2026-09-04) — defaults to "paper" when omitted (unlike
+// close/adjust, this is a read with no ambiguous side effect, so a missing mode is treated as the
+// pre-existing paper-only behavior rather than a 400, preserving every caller from before the
+// table split).
 func (s *Server) handleListPaperOrderAdjustments(w http.ResponseWriter, r *http.Request) {
 	id, err := pathInt64(r, "id")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	adjustments, err := s.Repo.ListPaperOrderAdjustments(r.Context(), id)
+	mode, ok := statsMode(r.URL.Query().Get("mode"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		return
+	}
+	var adjustments []port.PaperOrderAdjustment
+	if mode == "real" {
+		adjustments, err = s.Repo.ListRealOrderAdjustments(r.Context(), id)
+	} else {
+		adjustments, err = s.Repo.ListPaperOrderAdjustments(r.Context(), id)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

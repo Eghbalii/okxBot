@@ -338,7 +338,10 @@ type Repository interface {
 	// exactly which variant was running where (CLAUDE.md §11.3) instead of relying on in-code
 	// wiring like cmd/paper-trader/main.go's current hardcoded []usecase.StrategyAssignment.
 	CreateAssignment(ctx context.Context, a StrategyAssignment) (int64, error)
-	ListAssignments(ctx context.Context, instID string, enabledOnly bool) ([]StrategyAssignment, error)
+	// ListAssignments returns assignments for mode ("paper" or "real") — CLAUDE.md real-trading
+	// readiness plan, 2026-09-04: paper and real trading each maintain independent assignments, so
+	// a strategy tuned/enabled for one has no effect on the other.
+	ListAssignments(ctx context.Context, instID string, enabledOnly bool, mode string) ([]StrategyAssignment, error)
 	SetAssignmentEnabled(ctx context.Context, id int64, enabled bool) error
 	DeleteAssignment(ctx context.Context, id int64) error
 
@@ -486,13 +489,15 @@ type Repository interface {
 	// no lower bound), oldest first — the shape the panel's marker-overlay chart consumes.
 	ListParamChanges(ctx context.Context, instID string, since time.Time) ([]ParamChange, error)
 
-	// GetPaperTradingConfig returns the panel-editable control-box config (CLAUDE.md), seeding it
-	// at column defaults if it hasn't been written yet.
-	GetPaperTradingConfig(ctx context.Context) (PaperTradingConfig, error)
-	// SavePaperTradingConfig applies patch's non-nil fields onto the singleton row.
-	SavePaperTradingConfig(ctx context.Context, patch PaperTradingConfigPatch) (PaperTradingConfig, error)
-	// SetAssignmentsEnabledForKinds bulk-enables/disables strategy_assignments so only assignments
-	// whose strategy's Kind is in activeKinds are enabled — the global per-kind "active strategies"
-	// toggle. A no-op when activeKinds is empty (no restriction configured).
-	SetAssignmentsEnabledForKinds(ctx context.Context, activeKinds []string) error
+	// GetPaperTradingConfig returns mode's ("paper" or "real") panel-editable control-box config
+	// (CLAUDE.md real-trading readiness plan, 2026-09-04 — paper_trading_config is now one row per
+	// mode), seeding it at column defaults if it hasn't been written yet.
+	GetPaperTradingConfig(ctx context.Context, mode string) (PaperTradingConfig, error)
+	// SavePaperTradingConfig applies patch's non-nil fields onto mode's row.
+	SavePaperTradingConfig(ctx context.Context, mode string, patch PaperTradingConfigPatch) (PaperTradingConfig, error)
+	// SetAssignmentsEnabledForKinds bulk-enables/disables mode's strategy_assignments so only
+	// assignments whose strategy's Kind is in activeKinds are enabled — the global per-kind "active
+	// strategies" toggle, scoped to one mode. A no-op when activeKinds is empty (no restriction
+	// configured).
+	SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string) error
 }

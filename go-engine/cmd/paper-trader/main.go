@@ -60,7 +60,7 @@ func main() {
 	// crash-recovery posture as loadStrategyAssignments below — a restart resumes with exactly the
 	// pause/stop/direction/kind/token/bar restrictions the panel last saved, not whatever was true
 	// in memory before the process last exited.
-	ptCfg, err := repo.GetPaperTradingConfig(ctx)
+	ptCfg, err := repo.GetPaperTradingConfig(ctx, "paper")
 	if err != nil {
 		logger.Error("failed to load paper trading config", "error", err)
 		os.Exit(1)
@@ -91,7 +91,7 @@ func main() {
 	// Global per-kind "active strategies" toggle (CLAUDE.md): bulk-applied to strategy_assignments
 	// BEFORE loadStrategyAssignments reads them below, so ListAssignments(enabledOnly=true) picks
 	// up the result with no change needed to that function. A no-op when ActiveKinds is empty.
-	if err := repo.SetAssignmentsEnabledForKinds(ctx, ptCfg.ActiveKinds); err != nil {
+	if err := repo.SetAssignmentsEnabledForKinds(ctx, "paper", ptCfg.ActiveKinds); err != nil {
 		logger.Error("failed to apply active-strategy-kinds restriction", "error", err)
 		os.Exit(1)
 	}
@@ -320,7 +320,7 @@ func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, ins
 	defaultBar := paperTradingBars[0]
 
 	for _, instID := range instIDs {
-		assignments, err := repo.ListAssignments(ctx, instID, false)
+		assignments, err := repo.ListAssignments(ctx, instID, false, "paper")
 		if err != nil {
 			return err
 		}
@@ -332,6 +332,7 @@ func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, ins
 			InstID:     instID,
 			Bar:        defaultBar,
 			Enabled:    true,
+			Mode:       "paper",
 		}); err != nil {
 			return err
 		}
@@ -343,7 +344,7 @@ func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, ins
 // usecase.StrategyAssignment values the PaperTrader can run, rebuilding the strategy.Strategy from
 // its DB row's Kind+Config every time (CLAUDE.md §11.3) rather than trusting any in-memory cache.
 func loadStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID string) ([]usecase.StrategyAssignment, error) {
-	rows, err := repo.ListAssignments(ctx, instID, true)
+	rows, err := repo.ListAssignments(ctx, instID, true, "paper")
 	if err != nil {
 		return nil, err
 	}

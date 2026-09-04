@@ -19,7 +19,7 @@ import (
 // it surfaces immediately as "this test needs a stub for X" rather than silently doing nothing.
 type stubRepo struct {
 	port.Repository
-	order           port.PaperOrder
+	order           port.RealOrder
 	getErr          error
 	updateSLTPCalls []struct {
 		id     int64
@@ -33,14 +33,14 @@ type stubRepo struct {
 	}
 }
 
-func (s *stubRepo) GetPaperOrder(ctx context.Context, id int64) (port.PaperOrder, error) {
+func (s *stubRepo) GetRealOrder(ctx context.Context, id int64) (port.RealOrder, error) {
 	if s.getErr != nil {
-		return port.PaperOrder{}, s.getErr
+		return port.RealOrder{}, s.getErr
 	}
 	return s.order, nil
 }
 
-func (s *stubRepo) UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
+func (s *stubRepo) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
 	s.updateSLTPCalls = append(s.updateSLTPCalls, struct {
 		id     int64
 		sl, tp *decimal.Decimal
@@ -48,7 +48,7 @@ func (s *stubRepo) UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, tpP
 	return nil
 }
 
-func (s *stubRepo) RecordPaperOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error {
+func (s *stubRepo) RecordRealOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error {
 	s.adjustmentsRecorded = append(s.adjustmentsRecorded, struct {
 		id        int64
 		field     string
@@ -65,9 +65,15 @@ func newTestServer(repo *stubRepo) *Server {
 	}
 }
 
+// doAdjust defaults to ?mode=real (every pre-existing test in this file exercises the real-mode
+// path); doAdjustMode lets a test override it (e.g. to exercise the paper-mode-rejected case).
 func doAdjust(srv *Server, id string, body adjustPositionRequest) *httptest.ResponseRecorder {
+	return doAdjustMode(srv, id, "real", body)
+}
+
+func doAdjustMode(srv *Server, id, mode string, body adjustPositionRequest) *httptest.ResponseRecorder {
 	raw, _ := json.Marshal(body)
-	req := httptest.NewRequest("POST", "/api/positions/"+id+"/adjust", bytes.NewReader(raw))
+	req := httptest.NewRequest("POST", "/api/positions/"+id+"/adjust?mode="+mode, bytes.NewReader(raw))
 	req.SetPathValue("id", id)
 	rec := httptest.NewRecorder()
 	srv.handleAdjustPosition(rec, req)
@@ -77,8 +83,8 @@ func doAdjust(srv *Server, id string, body adjustPositionRequest) *httptest.Resp
 func floatPtr(f float64) *float64 { return &f }
 
 func TestHandleAdjustPosition_MovesSLIntoLoss(t *testing.T) {
-	repo := &stubRepo{order: port.PaperOrder{
-		ID: 1, InstID: "BTC-USDT-SWAP", Mode: "real", Side: "buy",
+	repo := &stubRepo{order: port.RealOrder{
+		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("10"),
 	}}
 	srv := newTestServer(repo)
@@ -88,7 +94,7 @@ func TestHandleAdjustPosition_MovesSLIntoLoss(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(repo.updateSLTPCalls) != 1 {
-		t.Fatalf("expected 1 UpdatePaperOrderSLTP call, got %d", len(repo.updateSLTPCalls))
+		t.Fatalf("expected 1 UpdateRealOrderSLTP call, got %d", len(repo.updateSLTPCalls))
 	}
 	// -5% margin loss at 10x leverage = 0.5% price move from entry, below (loss side) for a long.
 	got := repo.updateSLTPCalls[0].sl
@@ -101,8 +107,8 @@ func TestHandleAdjustPosition_MovesSLIntoLoss(t *testing.T) {
 }
 
 func TestHandleAdjustPosition_BringsSLIntoProfit(t *testing.T) {
-	repo := &stubRepo{order: port.PaperOrder{
-		ID: 1, InstID: "BTC-USDT-SWAP", Mode: "real", Side: "buy",
+	repo := &stubRepo{order: port.RealOrder{
+		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("10"),
 	}}
 	srv := newTestServer(repo)
@@ -120,8 +126,8 @@ func TestHandleAdjustPosition_BringsSLIntoProfit(t *testing.T) {
 }
 
 func TestHandleAdjustPosition_ShortSideDirectionIsMirrored(t *testing.T) {
-	repo := &stubRepo{order: port.PaperOrder{
-		ID: 1, InstID: "BTC-USDT-SWAP", Mode: "real", Side: "sell",
+	repo := &stubRepo{order: port.RealOrder{
+		ID: 1, InstID: "BTC-USDT-SWAP", Side: "sell",
 		EntryPx: dec("100"), Leverage: dec("10"),
 	}}
 	srv := newTestServer(repo)
@@ -144,8 +150,8 @@ func TestHandleAdjustPosition_ShortSideDirectionIsMirrored(t *testing.T) {
 // A -50% "loss" at 10x leverage (a 5% price move, ten times CLAUDE.md §19.2's normal 15%-of-margin/
 // leverage cap) must still be written exactly as entered.
 func TestHandleAdjustPosition_IsDeliberatelyUnclamped(t *testing.T) {
-	repo := &stubRepo{order: port.PaperOrder{
-		ID: 1, InstID: "BTC-USDT-SWAP", Mode: "real", Side: "buy",
+	repo := &stubRepo{order: port.RealOrder{
+		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("10"),
 	}}
 	srv := newTestServer(repo)
@@ -166,8 +172,8 @@ func TestHandleAdjustPosition_IsDeliberatelyUnclamped(t *testing.T) {
 // conductor.Clamps.Apply would reject outright, since it treats any long stop above entry as an
 // incoherent/"wrong side" level. The unclamped manual endpoint must allow it.
 func TestHandleAdjustPosition_BringsSLPastEntryIntoProfit(t *testing.T) {
-	repo := &stubRepo{order: port.PaperOrder{
-		ID: 1, InstID: "BTC-USDT-SWAP", Mode: "real", Side: "buy",
+	repo := &stubRepo{order: port.RealOrder{
+		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("20"),
 	}}
 	srv := newTestServer(repo)
@@ -185,8 +191,8 @@ func TestHandleAdjustPosition_BringsSLPastEntryIntoProfit(t *testing.T) {
 
 func TestHandleAdjustPosition_RejectsClosedOrder(t *testing.T) {
 	now := time.Now()
-	repo := &stubRepo{order: port.PaperOrder{
-		ID: 1, Mode: "real", Side: "buy", EntryPx: dec("100"), Leverage: dec("10"),
+	repo := &stubRepo{order: port.RealOrder{
+		ID: 1, Side: "buy", EntryPx: dec("100"), Leverage: dec("10"),
 		ClosedAt: &now,
 	}}
 	srv := newTestServer(repo)
@@ -200,23 +206,36 @@ func TestHandleAdjustPosition_RejectsClosedOrder(t *testing.T) {
 	}
 }
 
+// TestHandleAdjustPosition_RejectsPaperMode confirms ?mode=paper is rejected outright, before any
+// repository call — the table split (CLAUDE.md real-trading readiness plan, 2026-09-04) makes
+// mode="real" the only table this endpoint can ever address.
 func TestHandleAdjustPosition_RejectsPaperMode(t *testing.T) {
-	repo := &stubRepo{order: port.PaperOrder{
-		ID: 1, Mode: "paper", Side: "buy", EntryPx: dec("100"), Leverage: dec("10"),
-	}}
+	repo := &stubRepo{order: port.RealOrder{ID: 1, Side: "buy", EntryPx: dec("100"), Leverage: dec("10")}}
 	srv := newTestServer(repo)
 
-	rec := doAdjust(srv, "1", adjustPositionRequest{SLPct: floatPtr(-5)})
+	rec := doAdjustMode(srv, "1", "paper", adjustPositionRequest{SLPct: floatPtr(-5)})
 	if rec.Code != 400 {
-		t.Fatalf("expected 400 for a paper-mode order, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 400 for mode=paper, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(repo.updateSLTPCalls) != 0 {
-		t.Error("expected no write for a paper-mode order")
+		t.Error("expected no write for mode=paper")
+	}
+}
+
+// TestHandleAdjustPosition_RejectsMissingMode confirms the mode query param is required, not
+// defaulted — a missing mode must never silently target the wrong table.
+func TestHandleAdjustPosition_RejectsMissingMode(t *testing.T) {
+	repo := &stubRepo{order: port.RealOrder{ID: 1, Side: "buy", EntryPx: dec("100"), Leverage: dec("10")}}
+	srv := newTestServer(repo)
+
+	rec := doAdjustMode(srv, "1", "", adjustPositionRequest{SLPct: floatPtr(-5)})
+	if rec.Code != 400 {
+		t.Fatalf("expected 400 for a missing mode, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
 func TestHandleAdjustPosition_RejectsEmptyBody(t *testing.T) {
-	repo := &stubRepo{order: port.PaperOrder{ID: 1, Mode: "real", Side: "buy", EntryPx: dec("100"), Leverage: dec("10")}}
+	repo := &stubRepo{order: port.RealOrder{ID: 1, Side: "buy", EntryPx: dec("100"), Leverage: dec("10")}}
 	srv := newTestServer(repo)
 
 	rec := doAdjust(srv, "1", adjustPositionRequest{})

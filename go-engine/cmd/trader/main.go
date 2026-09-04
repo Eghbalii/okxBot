@@ -327,7 +327,7 @@ func buildRealTraderClamps(cfg *config.Config) conductor.Clamps {
 // loadRealTraderStrategyAssignments mirrors cmd/paper-trader/main.go's loadStrategyAssignments —
 // resolves durable strategy_assignments rows into live usecase.StrategyAssignment values.
 func loadRealTraderStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID string) ([]usecase.StrategyAssignment, error) {
-	rows, err := repo.ListAssignments(ctx, instID, true)
+	rows, err := repo.ListAssignments(ctx, instID, true, "real")
 	if err != nil {
 		return nil, err
 	}

@@ -31,17 +31,47 @@ type paperTradingStatsView struct {
 	PnL30dPct         string `json:"pnl30dPct"`
 }
 
+// statsMode resolves the mode query param to "paper" or "real" — CLAUDE.md real-trading readiness
+// plan, 2026-09-04: stats/config now serve both tabs from one handler rather than a hardcoded
+// "paper". Defaults to "paper" (every caller before this change implicitly meant paper trading).
+func statsMode(raw string) (string, bool) {
+	switch raw {
+	case "":
+		return "paper", true
+	case "paper", "real":
+		return raw, true
+	default:
+		return "", false
+	}
+}
+
 func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	open := true
-	positions, err := s.Repo.ListPositions(ctx, port.PositionFilter{Mode: "paper", Open: &open})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	mode, ok := statsMode(r.URL.Query().Get("mode"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
 		return
 	}
 
-	account, err := s.Repo.GetAccountEquity(ctx, "paper", s.AccountInitialUSD)
+	open := true
+	var openCount int
+	if mode == "real" {
+		positions, err := s.Repo.ListRealPositions(ctx, port.PositionFilter{Open: &open})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		openCount = len(positions)
+	} else {
+		positions, err := s.Repo.ListPositions(ctx, port.PositionFilter{Mode: mode, Open: &open})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		openCount = len(positions)
+	}
+
+	account, err := s.Repo.GetAccountEquity(ctx, mode, s.AccountInitialUSD)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -50,7 +80,7 @@ func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request)
 	// One history read covering the longest window (30d) is enough for all three sub-windows —
 	// each is a fold over the same rows, not a separate query.
 	now := time.Now().UTC()
-	history, err := s.Repo.ListEquityHistory(ctx, "paper", now.Add(-30*24*time.Hour), 0)
+	history, err := s.Repo.ListEquityHistory(ctx, mode, now.Add(-30*24*time.Hour), 0)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -61,7 +91,7 @@ func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request)
 	pnl30dUSD, pnl30dPct := realizedPnLOverWindow(history, now.Add(-30*24*time.Hour))
 
 	writeJSON(w, http.StatusOK, paperTradingStatsView{
-		OpenCount:         len(positions),
+		OpenCount:         openCount,
 		TotalEquityUSD:    account.EquityUSD.String(),
 		AccountBalanceUSD: account.AccountBalanceUSD.String(),
 		PnL24hUSD:         pnl24hUSD.String(),
@@ -149,7 +179,12 @@ type paperTradingConfigView struct {
 // (that process only re-reads this at its own startup). The panel is responsible for surfacing
 // "restart required" state, same as the strategy-tester tab already does for its own config.
 func (s *Server) handleGetPaperTradingConfig(w http.ResponseWriter, r *http.Request) {
-	c, err := s.Repo.GetPaperTradingConfig(r.Context())
+	mode, ok := statsMode(r.URL.Query().Get("mode"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		return
+	}
+	c, err := s.Repo.GetPaperTradingConfig(r.Context(), mode)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -166,6 +201,7 @@ func (s *Server) handleGetPaperTradingConfig(w http.ResponseWriter, r *http.Requ
 }
 
 type savePaperTradingConfigRequest struct {
+	Mode            string    `json:"mode"`
 	TradingState    *string   `json:"tradingState"`
 	DisableLong     *bool     `json:"disableLong"`
 	DisableShort    *bool     `json:"disableShort"`
@@ -178,6 +214,11 @@ func (s *Server) handleSavePaperTradingConfig(w http.ResponseWriter, r *http.Req
 	var req savePaperTradingConfigRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	mode, ok := statsMode(req.Mode)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
 		return
 	}
 	if req.TradingState != nil {
@@ -196,7 +237,7 @@ func (s *Server) handleSavePaperTradingConfig(w http.ResponseWriter, r *http.Req
 		DisabledInstIDs: req.DisabledInstIDs,
 		ActiveBars:      req.ActiveBars,
 	}
-	if _, err := s.Repo.SavePaperTradingConfig(r.Context(), patch); err != nil {
+	if _, err := s.Repo.SavePaperTradingConfig(r.Context(), mode, patch); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

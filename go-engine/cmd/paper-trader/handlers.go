@@ -92,7 +92,7 @@ func (s *paperTraderService) handleSaveConfig(w http.ResponseWriter, r *http.Req
 		DisabledInstIDs: req.DisabledInstIDs,
 		ActiveBars:      req.ActiveBars,
 	}
-	if _, err := s.repo.SavePaperTradingConfig(r.Context(), patch); err != nil {
+	if _, err := s.repo.SavePaperTradingConfig(r.Context(), "paper", patch); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
