@@ -71,6 +71,10 @@ type Config struct {
 		// OKX_SIMULATED_TRADING would make an unset env var the difference between a sandbox and
 		// real capital; going live should require saying so.
 		AllowRealMoney bool `yaml:"allow_real_money"`
+		// URL is cmd/trader's own restart-only HTTP surface as reached from cmd/api (env only, same
+		// pattern as PaperTrading.URL/Tester.URL/RLService.URL) — used to proxy the panel's Real-tab
+		// restart button through cmd/api (CLAUDE.md §11 / real-trading readiness plan, 2026-09-04).
+		URL string `yaml:"-"`
 		// UseConductorLifecycle switches cmd/trader from the old flat delta-notional rebalance loop
 		// (usecase.Trader) to usecase.RealTrader — the strategy-signal + conductor-mediated
 		// lifecycle usecase.PaperTrader already runs, adapted for real orders (CLAUDE.md §27's
@@ -556,6 +560,7 @@ func Load(path string) (*Config, error) {
 
 	cfg.Tester.URL = envOr("TESTER_SERVICE_URL", "http://localhost:8092")
 	cfg.PaperTrading.URL = envOr("PAPER_TRADER_SERVICE_URL", "http://localhost:8093")
+	cfg.Trading.URL = envOr("TRADER_SERVICE_URL", "http://localhost:8095")
 	cfg.Gateway.URL = envOr("OKX_GATEWAY_URL", "http://localhost:8094")
 	if cfg.Gateway.Addr == "" {
 		cfg.Gateway.Addr = envOr("GATEWAY_ADDR", "0.0.0.0:8094")

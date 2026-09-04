@@ -176,6 +176,11 @@ services:
       # migration on the real server (2026-09-01): every real/demo poll was logging a Postgres
       # connection-refused warning that a correctly-set DSN eliminates.
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
+      # Restart-only HTTP surface (CLAUDE.md real-trading readiness plan, 2026-09-04) — mirrors
+      # PAPER_TRADER_ADDR's pattern, next free app port at 8095 (8094 is okx-gateway).
+      TRADER_ADDR: "0.0.0.0:8095"
+    ports:
+      - "8095:8095"
     volumes:
       - ./go-engine/configs:/app/configs
     # No redis/kafka dependency: cmd/trader's loop is REST-poll (via okx-gateway) + rl-service,
@@ -327,6 +332,7 @@ services:
       RL_SERVICE_URL: http://rl-service:8000
       TESTER_SERVICE_URL: http://strategy-tester:8092
       PAPER_TRADER_SERVICE_URL: http://paper-trader:8093
+      TRADER_SERVICE_URL: http://trader:8095
       API_ADDR: "0.0.0.0:8090" # container-internal bind; only reachable via the OpenVPN network in prod, see CLAUDE.md §11
       API_PROCESS_MANAGER: docker
     ports:

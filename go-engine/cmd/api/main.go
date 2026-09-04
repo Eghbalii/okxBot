@@ -75,6 +75,7 @@ func main() {
 		GrafanaURL:         cfg.API.GrafanaURL,
 		TesterBaseURL:      cfg.Tester.URL,
 		PaperTraderBaseURL: cfg.PaperTrading.URL,
+		TraderBaseURL:      cfg.Trading.URL,
 		ProcessMgr:         cfg.API.ProcessMgr,
 		Units:              cfg.API.Units,
 		Logger:             logger,

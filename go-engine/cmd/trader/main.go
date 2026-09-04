@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -228,6 +229,19 @@ func runRealTrader(
 	orderEventsPub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "okx.paper-order-events")
 	defer orderEventsPub.Close()
 
+	// Restart-only HTTP surface (CLAUDE.md real-trading readiness plan, 2026-09-04) — mirrors
+	// cmd/paper-trader's own control-box POST /restart, so cmd/api's mode-aware restart proxy has
+	// something to forward to for mode=real. See handlers.go for why this is restart-only.
+	traderSvc := &traderService{logger: logger}
+	traderAddr := envOr("TRADER_ADDR", "0.0.0.0:8095")
+	traderHTTPServer := &http.Server{Addr: traderAddr, Handler: traderSvc.routes()}
+	go func() {
+		logger.Info("serving trader restart api", "addr", traderAddr)
+		if err := traderHTTPServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("trader restart api stopped", "error", err)
+		}
+	}()
+
 	clamps := buildRealTraderClamps(cfg)
 
 	errCh := make(chan error, len(cfg.Trading.InstIDs)+1+len(candleDispatchers))
@@ -322,6 +336,13 @@ func buildRealTraderClamps(cfg *config.Config) conductor.Clamps {
 		MaxLossPct:   cfg.PaperTrading.RLClamps.MaxLossPct,
 		MinTPSLRatio: cfg.PaperTrading.RLClamps.MinTPSLRatio,
 	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // loadRealTraderStrategyAssignments mirrors cmd/paper-trader/main.go's loadStrategyAssignments —

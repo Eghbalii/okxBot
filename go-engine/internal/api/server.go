@@ -30,7 +30,11 @@ type Server struct {
 	// Repo instead, same as every other cmd/api handler, since that data must stay readable/
 	// writable even when cmd/paper-trader itself happens to be down or mid-restart.
 	PaperTraderBaseURL string
-	ProcessMgr         string
+	// TraderBaseURL is cmd/trader's own restart-only HTTP surface (CLAUDE.md real-trading readiness
+	// plan, 2026-09-04) — used the same way PaperTraderBaseURL is: only the restart action needs to
+	// reach the running process, everything else (config reads/writes) hits Postgres directly.
+	TraderBaseURL string
+	ProcessMgr    string
 	Units              []string
 	Logger             *slog.Logger
 
@@ -147,7 +151,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/paper-trading/token-stats", s.handleTokenStats24h)
 	mux.HandleFunc("GET /api/paper-trading/config", s.handleGetPaperTradingConfig)
 	mux.HandleFunc("PUT /api/paper-trading/config", s.handleSavePaperTradingConfig)
-	mux.HandleFunc("POST /api/paper-trading/restart", s.proxyPaperTrader("/restart"))
+	mux.HandleFunc("POST /api/paper-trading/restart", s.handleRestartTrading)
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
