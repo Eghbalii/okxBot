@@ -78,6 +78,16 @@ function slTpPct(p: Position, target: string | null): number | null {
   return (direction * (t - entry) * 100 * leverage) / entry
 }
 
+// Rounds a percent's MAGNITUDE up (2026-09-04 request: "round up so 8.82 shows as 9", clarified as
+// ceiling on the absolute value — e.g. -8.82 -> -9, not -8) rather than plain integer rounding,
+// which would round 8.82 down to 9 anyway but would round e.g. -8.2 UP toward zero to -8, the
+// opposite of "bigger magnitude" for a negative number. No decimal point, no sign, no percent
+// suffix — those are added at the call site (a "+"/"−" was explicitly dropped as unnecessary here,
+// the color already conveys direction).
+function roundPctUp(pct: number): number {
+  return Math.sign(pct) * Math.ceil(Math.abs(pct))
+}
+
 export default function PositionsPage() {
   const [mode, setMode] = useState<PositionMode | 'all'>('all')
   const [instId, setInstId] = useState('')
@@ -336,16 +346,14 @@ export default function PositionsPage() {
                   {showLiveColumns && <td className="mono">{p.ClosedAt ? '—' : trimPrice(lastPrice)}</td>}
                   <td className="mono sl-tp-cell">
                     <div>
-                      <span className="text-dim">{trimPrice(p.SLPx)}</span>{' '}
-                      {slPct !== null && (
-                        <span className="text-red">{`(${slPct >= 0 ? '+' : ''}${slPct.toFixed(2)}%)`}</span>
-                      )}
+                      {tpPct !== null && <span className="text-green">{roundPctUp(tpPct)}%</span>}
+                      {tpPct !== null && ' | '}
+                      <span className="text-dim">{trimPrice(p.TPPx)}</span>
                     </div>
                     <div>
-                      <span className="text-dim">{trimPrice(p.TPPx)}</span>{' '}
-                      {tpPct !== null && (
-                        <span className="text-green">{`(${tpPct >= 0 ? '+' : ''}${tpPct.toFixed(2)}%)`}</span>
-                      )}
+                      {slPct !== null && <span className="text-red">{roundPctUp(slPct)}%</span>}
+                      {slPct !== null && ' | '}
+                      <span className="text-dim">{trimPrice(p.SLPx)}</span>
                     </div>
                   </td>
                   <td className="mono">{p.Leverage}x</td>
