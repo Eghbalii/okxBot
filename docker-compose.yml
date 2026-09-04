@@ -231,7 +231,12 @@ services:
     ports:
       - "8001:8001"
 
+  # DELIBERATELY DISABLED (2026-09-04, explicit operator instruction) — profiles: [disabled] means
+  # a plain "docker compose up -d" (with no service name and no --profile flag) never starts this,
+  # even after a host reboot or a broad compose up. Do not remove the profiles line without asking
+  # first. See CLAUDE.md for the reasoning (paired with strategy-tester, §21's own known-bug note).
   strategy-optimizer:
+    profiles: ["disabled"]
     logging: *default-logging
     restart: *default-restart
     build:
@@ -270,7 +275,11 @@ services:
   # entirely apart from the RL agent and cmd/paper-trader (CLAUDE.md's tester package doc comment
   # has the full design). Separate storage (tester_orders/tester_strategy_versions, migration
   # 000010) so it can never collide with production paper-trading data.
+  # DELIBERATELY DISABLED (2026-09-04, explicit operator instruction, reaffirming §21's own
+  # known-bug note) — profiles: [disabled] means a plain "docker compose up -d" never starts this.
+  # Do not remove the profiles line without asking first.
   strategy-tester:
+    profiles: ["disabled"]
     logging: *default-logging
     restart: *default-restart
     build:
