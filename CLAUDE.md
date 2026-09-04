@@ -149,6 +149,23 @@ okxBot/
   - `GET /api/v5/account/balance`
 - Never commit API keys/secrets. Use `.env` (gitignored) loaded via config package.
 
+**IMPORTANT — real OKX API credentials (added 2026-09-04).** This project now has real,
+live-money OKX API keys (§27) for testing order placement/cancellation against the real account.
+These must **NEVER** be committed to git, ever, in any form — not in `config.yaml`, not in a
+`.env` file staged by accident, not in a shell script, not in a commit message, not in this file.
+They live **only on the server**, in the server's own gitignored `.env`/`config.yaml` (per §27.1's
+design, ultimately only inside `cmd/okx-gateway`'s environment once that migration is complete —
+today, before that migration finishes for every service, wherever a given service's real config
+currently holds them on the server).
+
+**Never run any service, script, or test with the real API key on the local machine — full stop.**
+This is not just "don't commit it" — the key must never even be typed, pasted, exported, or
+loaded into a process on this laptop, not in an untracked file, not in a shell env var, not in a
+one-off test script, regardless of gitignore status. All order-placement/cancellation testing
+against the real account happens by SSHing to the server (`ssh okx`) and running there. Before any
+`git add`/commit that touches config or env-shaped files, check the diff for a stray key/secret/
+passphrase, per this project's own standing git-safety practice.
+
 ## 5. Risk management (non-negotiable, independent of the RL model)
 
 The Go `internal/risk` package enforces **hard limits that the RL agent cannot override**:
