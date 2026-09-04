@@ -40,7 +40,12 @@ export interface TokenStats {
   pnlPct: string
 }
 
-export type PositionMode = 'paper' | 'demo' | 'real'
+// 'demo' was dropped 2026-09-04 (real-trading readiness plan) — the project never built a demo
+// controller and decided not to pursue one; only paper and real trading exist going forward.
+export type PositionMode = 'paper' | 'real'
+// Fill-lifecycle status for a real order (real_orders.status) — null for paper/demo rows, which
+// have no fill lifecycle (a paper order is always instantly and fully filled).
+export type OrderStatus = 'pending' | 'partial' | 'filled' | 'canceled'
 // 'rl_early' is the model choosing to close a position before either SL or TP was touched
 // (CLAUDE.md §15.12's early-close action, gated behind paper_trading.rl_early_close).
 export type CloseReason = 'sl' | 'tp' | 'manual' | 'timeout' | 'rl_early'
@@ -81,6 +86,8 @@ export interface Position {
   // stored as embedded JSON. Shape is the rl_service Observation; the order-detail view reads the
   // strategy signal out of it to compare against what the order ended up with.
   FeaturesJSON: unknown
+  // Status is the fill lifecycle for a real order (real_orders.status) — null for paper/demo rows.
+  Status: OrderStatus | null
 }
 
 // PaperOrderAdjustment is one row of an order's in-trade SL/TP adjustment history (CLAUDE.md

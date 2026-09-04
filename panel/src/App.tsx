@@ -1,4 +1,4 @@
-import { NavLink, Route, Routes } from 'react-router-dom'
+import { Navigate, NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import './App.css'
 import ResourcesPage from './pages/ResourcesPage'
 import ModelStatusPage from './pages/ModelStatusPage'
@@ -7,7 +7,7 @@ import PositionsPage from './pages/PositionsPage'
 import StrategyTesterPage from './pages/StrategyTesterPage'
 
 const tabs = [
-  { to: '/positions', label: 'Positions' },
+  { to: '/positions/paper', label: 'Positions' },
   { to: '/strategies', label: 'Strategies' },
   { to: '/strategy-tester', label: 'Strategy Tester' },
   { to: '/model', label: 'RL Model' },
@@ -15,26 +15,32 @@ const tabs = [
 ]
 
 export default function App() {
+  const location = useLocation()
   return (
     <div className="app">
       <header className="app-header">
         <span className="app-title">okxBot Panel</span>
         <nav className="app-nav">
-          {tabs.map((tab) => (
-            <NavLink
-              key={tab.to}
-              to={tab.to}
-              className={({ isActive }) => 'nav-link' + (isActive ? ' active' : '')}
-            >
-              {tab.label}
-            </NavLink>
-          ))}
+          {tabs.map((tab) => {
+            // Positions' own link target is /positions/paper, but /positions/real should still
+            // highlight this tab — match on the /positions prefix rather than the exact path.
+            const active =
+              tab.to === '/positions/paper'
+                ? location.pathname.startsWith('/positions')
+                : location.pathname === tab.to
+            return (
+              <NavLink key={tab.to} to={tab.to} className={'nav-link' + (active ? ' active' : '')}>
+                {tab.label}
+              </NavLink>
+            )
+          })}
         </nav>
       </header>
       <main className="app-main">
         <Routes>
-          <Route path="/" element={<PositionsPage />} />
-          <Route path="/positions" element={<PositionsPage />} />
+          <Route path="/" element={<Navigate to="/positions/paper" replace />} />
+          <Route path="/positions" element={<Navigate to="/positions/paper" replace />} />
+          <Route path="/positions/:mode" element={<PositionsPage />} />
           <Route path="/strategies" element={<StrategiesPage />} />
           <Route path="/strategy-tester" element={<StrategyTesterPage />} />
           <Route path="/model" element={<ModelStatusPage />} />

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { Navigate, useNavigate, useParams } from 'react-router-dom'
 import { usePolling } from '../hooks/usePolling'
 import { usePositionAlerts } from '../hooks/usePositionAlerts'
 import { usePositionEvents } from '../hooks/usePositionEvents'
@@ -11,7 +12,7 @@ import Pagination, { DEFAULT_PAGE_SIZE } from '../components/Pagination'
 import SortableTh from '../components/SortableTh'
 import { api } from '../api/client'
 import { formatDateTimeLines, formatUsd, pnlClass, tokenSymbol, trimPrice } from '../utils/format'
-import type { CloseReason, Position, PositionMode } from '../api/types'
+import type { CloseReason, OrderStatus, Position, PositionMode } from '../api/types'
 
 // Sortable columns are limited to what Postgres can ORDER BY directly (internal/postgres's
 // positionSortColumns) since sorting/paging moved server-side 2026-09-02 — closed positions grew
@@ -26,6 +27,17 @@ function closeReasonBadge(reason: CloseReason | null) {
   if (!reason) return <span className="badge badge-dim">open</span>
   const cls = reason === 'tp' ? 'badge-green' : reason === 'sl' ? 'badge-red' : 'badge-dim'
   return <span className={'badge ' + cls}>{reason}</span>
+}
+
+// Real-order fill-lifecycle status badge (CLAUDE.md real-trading readiness plan, 2026-09-04) —
+// shown only for real positions, where "pending"/"partial" carry real product meaning (an order
+// still in flight or a fill smaller than requested); "filled" is the unremarkable default so it's
+// dimmed rather than colored, and "canceled" reads distinctly from a normal closed/SL/TP row since
+// it never became a position at all.
+function statusBadge(status: OrderStatus | null) {
+  if (!status || status === 'filled') return <span className="badge badge-dim">filled</span>
+  const cls = status === 'canceled' ? 'badge-red' : 'badge-yellow'
+  return <span className={'badge ' + cls}>{status}</span>
 }
 
 // Date on one line, time on the other — a single "03/09/2026, 05:40:11" line was too wide for the
@@ -89,7 +101,15 @@ function roundPctUp(pct: number): number {
 }
 
 export default function PositionsPage() {
-  const [mode, setMode] = useState<PositionMode | 'all'>('all')
+  const { mode: rawMode } = useParams<{ mode: string }>()
+  const navigate = useNavigate()
+  // Only 'paper'/'real' are valid route segments — an unrecognized value (a stale bookmark, a typo)
+  // redirects to paper rather than silently misinterpreting it.
+  if (rawMode !== 'paper' && rawMode !== 'real') {
+    return <Navigate to="/positions/paper" replace />
+  }
+  const mode: PositionMode = rawMode
+
   const [instId, setInstId] = useState('')
   // Defaults to open-only: the panel's job is to show real open positions, not the full historical
   // log — closed trades are still one click away via the filter.
@@ -129,7 +149,7 @@ export default function PositionsPage() {
   const { data, error } = usePolling(
     () =>
       api.listPositions({
-        mode: mode === 'all' ? undefined : mode,
+        mode,
         instId: instId || undefined,
         open: openFilter === 'all' ? undefined : openFilter === 'open',
         sortBy,
@@ -193,7 +213,7 @@ export default function PositionsPage() {
     if (!confirm(`Close ${tokenSymbol(p.InstID)} #${p.ID} now at the live price? Reason will be recorded as "manual".`)) return
     setClosingId(p.ID)
     try {
-      await api.closePosition(p.ID)
+      await api.closePosition(p.ID, p.Mode)
       setWsRefreshCount((c) => c + 1)
     } catch (err) {
       alert(`Failed to request close: ${(err as Error).message}`)
@@ -214,7 +234,7 @@ export default function PositionsPage() {
       return
     }
     try {
-      await api.adjustPosition(id, body)
+      await api.adjustPosition(id, 'real', body)
       setAdjustingId(null)
     } catch (err) {
       alert(`Failed to adjust position: ${(err as Error).message}`)
@@ -222,22 +242,28 @@ export default function PositionsPage() {
   }
 
   // 12 always-shown columns (ID, Inst, Side, Strategy, TF, Entry, SL/TP, Leverage, Vol, Opened,
-  // PnL, Max) plus showLiveColumns' 3 (Last, Updated, the close-button column) and
-  // showClosedColumns' 2 (Closed, Reason).
-  const columnCount = 12 + (showLiveColumns ? 3 : 0) + (showClosedColumns ? 2 : 0)
+  // PnL, Max) plus showLiveColumns' 3 (Last, Updated, the close-button column), showClosedColumns'
+  // 2 (Closed, Reason), and the real-only Status column.
+  const columnCount = 12 + (showLiveColumns ? 3 : 0) + (showClosedColumns ? 2 : 0) + (mode === 'real' ? 1 : 0)
 
   return (
     <div>
-      <PaperTradingStatsBox />
-      <PaperTradingConfigBox />
+      <div className="mode-tabs" style={{ marginBottom: '0.9rem' }}>
+        {(['paper', 'real'] as PositionMode[]).map((m) => (
+          <button
+            key={m}
+            className={'mode-tab' + (mode === m ? ' active' : '')}
+            onClick={() => navigate(`/positions/${m}`)}
+          >
+            {m[0].toUpperCase() + m.slice(1)}
+          </button>
+        ))}
+      </div>
+
+      <PaperTradingStatsBox mode={mode} />
+      <PaperTradingConfigBox mode={mode} />
 
       <div className="toolbar">
-        <select value={mode} onChange={(e) => setMode(e.target.value as PositionMode | 'all')}>
-          <option value="all">All modes</option>
-          <option value="paper">Paper</option>
-          <option value="demo">Demo</option>
-          <option value="real">Real</option>
-        </select>
         <select value={openFilter} onChange={(e) => setOpenFilter(e.target.value as OpenFilter)}>
           <option value="all">Open + Closed</option>
           <option value="open">Open only</option>
@@ -275,6 +301,9 @@ export default function PositionsPage() {
                 Inst
               </SortableTh>
               <th className="th-static">Side</th>
+              {/* Fill-lifecycle status only carries meaning for real orders (a paper order is
+                  always instantly and fully filled). */}
+              {mode === 'real' && <th className="th-static">Status</th>}
               <th className="th-static">Strategy</th>
               <th className="th-static">TF</th>
               <th className="th-static">Entry</th>
@@ -340,6 +369,7 @@ export default function PositionsPage() {
                       {p.Side === 'buy' ? 'long' : 'short'}
                     </span>
                   </td>
+                  {mode === 'real' && <td>{statusBadge(p.Status)}</td>}
                   <td>{p.StrategyName || '—'}</td>
                   <td className="mono text-dim">{p.Bar || '—'}</td>
                   <td className="mono">{trimPrice(p.EntryPx)}</td>
@@ -409,7 +439,7 @@ export default function PositionsPage() {
                           onClick={() => setAdjustingId(adjustingId === p.ID ? null : p.ID)}
                           title="Manually move this position's SL/TP (no exchange call, unclamped)"
                         >
-                          Adjust
+                          Update
                         </button>
                       )}
                     </td>

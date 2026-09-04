@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { usePolling } from '../hooks/usePolling'
 import { api } from '../api/client'
 import { formatUsd, pnlClass } from '../utils/format'
+import type { PositionMode } from '../api/types'
 
 function PnLTile({ label, usd, pct }: { label: string; usd: string; pct: string }) {
   const usdNum = Number(usd)
@@ -23,7 +24,7 @@ function PnLTile({ label, usd, pct }: { label: string; usd: string; pct: string 
 // a new cap re-baselines Total Equity (what new positions size against) without touching Account
 // Balance, the real continuous total (CLAUDE.md §31.2) — both numbers stay visible above so the
 // effect of a cap change is immediately checkable against the account's real history.
-function TradingCapTile({ onSaved }: { onSaved: () => void }) {
+function TradingCapTile({ mode, onSaved }: { mode: PositionMode; onSaved: () => void }) {
   const [value, setValue] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -37,7 +38,7 @@ function TradingCapTile({ onSaved }: { onSaved: () => void }) {
     setSaving(true)
     setError(null)
     try {
-      await api.setAccountCap(String(num))
+      await api.setAccountCap(String(num), mode)
       setValue('')
       onSaved()
     } catch (err) {
@@ -74,9 +75,9 @@ function TradingCapTile({ onSaved }: { onSaved: () => void }) {
 // Stats box above the Positions table: open order count, Account Balance, Total Equity, and
 // 24h/1w/1month realized PnL, plus the Set Trading Cap control. Polls at a slower interval than
 // the position table's own 5s poll — this data doesn't need that freshness.
-export default function PaperTradingStatsBox() {
+export default function PaperTradingStatsBox({ mode }: { mode: PositionMode }) {
   const [refreshSignal, setRefreshSignal] = useState(0)
-  const { data, error } = usePolling(() => api.paperTradingStats(), 15_000, [], refreshSignal)
+  const { data, error } = usePolling(() => api.paperTradingStats(mode), 15_000, [mode], refreshSignal)
 
   return (
     <div className="card">
@@ -107,7 +108,7 @@ export default function PaperTradingStatsBox() {
           <PnLTile label="24h PnL" usd={data.pnl24hUsd} pct={data.pnl24hPct} />
           <PnLTile label="1W PnL" usd={data.pnl7dUsd} pct={data.pnl7dPct} />
           <PnLTile label="1M PnL" usd={data.pnl30dUsd} pct={data.pnl30dPct} />
-          <TradingCapTile onSaved={() => setRefreshSignal((n) => n + 1)} />
+          <TradingCapTile mode={mode} onSaved={() => setRefreshSignal((n) => n + 1)} />
         </div>
       )}
     </div>

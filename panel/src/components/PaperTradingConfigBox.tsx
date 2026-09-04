@@ -15,44 +15,22 @@ const STATE_META: Record<string, { label: string; badge: string; dot: string }> 
   stopped: { label: 'Stopped', badge: 'badge-red', dot: 'var(--red)' },
 }
 
-// Trading controls, scoped to whichever mode is selected (Paper/Demo/Real). Only paper trading has
-// a real controller behind it today — cmd/trader (demo/real) predates the signal-lifecycle
-// redesign entirely (no strategy signals, no reward reporting), so this box is mode-aware in the
-// UI but only actually wires up when Paper is selected; Demo/Real show clearly as not-yet-available
-// rather than silently doing nothing when clicked.
-export default function PaperTradingConfigBox() {
-  const [mode, setMode] = useState<PositionMode>('paper')
-
+// Trading controls for one mode (Paper or Real) — the page-level tab (PositionsPage) now owns mode
+// selection, so this component just renders whichever mode it's given (CLAUDE.md real-trading
+// readiness plan, 2026-09-04: both modes are wired up identically, reading/writing the same
+// mode-scoped Postgres rows via cmd/api's now mode-aware endpoints).
+export default function PaperTradingConfigBox({ mode }: { mode: PositionMode }) {
   return (
     <div className="card config-box">
       <div className="config-box-header">
         <h2>Trading controls</h2>
-        <div className="mode-tabs">
-          {(['paper', 'demo', 'real'] as PositionMode[]).map((m) => (
-            <button
-              key={m}
-              className={'mode-tab' + (mode === m ? ' active' : '')}
-              onClick={() => setMode(m)}
-            >
-              {m[0].toUpperCase() + m.slice(1)}
-            </button>
-          ))}
-        </div>
       </div>
-
-      {mode === 'paper' ? (
-        <PaperControls />
-      ) : (
-        <div className="empty-state">
-          {mode === 'demo' ? 'Demo' : 'Real'} trading isn't wired up yet — there's no controller
-          behind it to configure (see CLAUDE.md §22). These controls will appear here once it is.
-        </div>
-      )}
+      <TradingControls mode={mode} />
     </div>
   )
 }
 
-function PaperControls() {
+function TradingControls({ mode }: { mode: PositionMode }) {
   const [cfg, setCfg] = useState<PaperTradingConfig | null>(null)
   const [disableLong, setDisableLong] = useState(false)
   const [disableShort, setDisableShort] = useState(false)
@@ -67,7 +45,7 @@ function PaperControls() {
 
   function load() {
     api
-      .paperTradingConfig()
+      .paperTradingConfig(mode)
       .then((c) => {
         setCfg(c)
         setDisableLong(c.disableLong)
@@ -78,7 +56,7 @@ function PaperControls() {
       .catch((err) => setError((err as Error).message))
   }
 
-  useEffect(load, [])
+  useEffect(load, [mode])
 
   function toggleBar(bar: string) {
     setActiveBars((prev) => {
@@ -94,14 +72,14 @@ function PaperControls() {
   // config, they take effect immediately) — each is its own request + restart, not bundled into the
   // Save button.
   async function setTradingState(next: 'running' | 'paused' | 'stopped') {
-    if (next === 'stopped' && !confirm('Stop trading? This closes every open paper position now. New positions stay off until you resume.')) {
+    if (next === 'stopped' && !confirm('Stop trading? This closes every open position now. New positions stay off until you resume.')) {
       return
     }
     setStateChanging(true)
     setError(null)
     try {
-      await api.savePaperTradingConfig({ tradingState: next })
-      await api.restartPaperTrader()
+      await api.savePaperTradingConfig(mode, { tradingState: next })
+      await api.restartPaperTrader(mode)
       setMessage(`${STATE_META[next].label} — applying now, back within a few seconds.`)
       setTimeout(load, 4000)
     } catch (err) {
@@ -119,12 +97,12 @@ function PaperControls() {
     setSaving(true)
     setError(null)
     try {
-      await api.savePaperTradingConfig({
+      await api.savePaperTradingConfig(mode, {
         disableLong,
         disableShort,
         activeBars: [...activeBars],
       })
-      await api.restartPaperTrader()
+      await api.restartPaperTrader(mode)
       setDirty(false)
       setMessage('Saved — applying now, back within a few seconds.')
       setTimeout(load, 4000)
@@ -136,15 +114,15 @@ function PaperControls() {
   }
 
   async function saveActiveKinds(kinds: string[]) {
-    await api.savePaperTradingConfig({ activeKinds: kinds })
-    await api.restartPaperTrader()
+    await api.savePaperTradingConfig(mode, { activeKinds: kinds })
+    await api.restartPaperTrader(mode)
     setMessage('Saved — applying now, back within a few seconds.')
     setTimeout(load, 4000)
   }
 
   async function saveDisabledInstIds(instIds: string[]) {
-    await api.savePaperTradingConfig({ disabledInstIds: instIds })
-    await api.restartPaperTrader()
+    await api.savePaperTradingConfig(mode, { disabledInstIds: instIds })
+    await api.restartPaperTrader(mode)
     setMessage('Saved — applying now, back within a few seconds.')
     setTimeout(load, 4000)
   }

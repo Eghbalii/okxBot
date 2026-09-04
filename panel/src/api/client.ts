@@ -130,27 +130,31 @@ export const api = {
       total: r.total,
     }))
   },
-  // Manual close from the panel (2026-08-31): flags the order for PaperTrader to close on its
-  // next tick, close_reason='manual', reported to the model as closed_early. Paper mode only.
-  closePosition: (id: number) =>
-    request<{ ok: boolean }>(`/positions/${id}/close`, { method: 'POST' }),
+  // Manual close from the panel (2026-08-31, extended to real positions 2026-09-04): flags the
+  // order for the owning engine (PaperTrader or RealTrader) to close on its next tick,
+  // close_reason='manual', reported to the model as closed_early. mode is required — paper_orders.id
+  // and real_orders.id are independent sequences post-table-split, so it disambiguates which table
+  // id addresses.
+  closePosition: (id: number, mode: PositionMode) =>
+    request<{ ok: boolean }>(`/positions/${id}/close?mode=${mode}`, { method: 'POST' }),
 
   // Manual SL/TP edit for real positions (CLAUDE.md §27's real-trading plan §3b, 2026-09-03) —
-  // real mode only, unlike closePosition above which is paper-only today. Each percentage is
+  // real mode only, unlike closePosition above which also supports paper. Each percentage is
   // SIGNED and leverage-adjusted (negative = loss side, positive = profit side, e.g. -5 on a 10x
   // position moves that level to a 0.5% price move from entry) and is applied with NO clamp —
   // an explicit operator/admin action is trusted directly, unlike the model's own automated edits.
-  adjustPosition: (id: number, body: { slPct?: number; tpPct?: number }) =>
-    request<{ slPx: string | null; tpPx: string | null }>(`/positions/${id}/adjust`, {
+  adjustPosition: (id: number, mode: PositionMode, body: { slPct?: number; tpPct?: number }) =>
+    request<{ slPx: string | null; tpPx: string | null }>(`/positions/${id}/adjust?mode=${mode}`, {
       method: 'POST',
       body: JSON.stringify(body),
     }),
 
   // An order's in-trade SL/TP adjustment history (CLAUDE.md §15.4/§15.12 revision, 2026-09-02) —
   // replaces the old baseline-vs-rl_adjusted A/B comparison now that the RL mechanic edits the
-  // order in place instead of forking it.
-  paperOrderAdjustments: (orderId: number) =>
-    requestList<PaperOrderAdjustment>(`/positions/${orderId}/adjustments`),
+  // order in place instead of forking it. mode picks paper_order_adjustments vs.
+  // real_order_adjustments.
+  paperOrderAdjustments: (orderId: number, mode: PositionMode) =>
+    requestList<PaperOrderAdjustment>(`/positions/${orderId}/adjustments?mode=${mode}`),
 
   // Candles + param-changes back the Strategies page's price-chart marker overlay (CLAUDE.md
   // §16): candles draw the price line, param-changes draw the vertical "params changed here"
@@ -188,35 +192,40 @@ export const api = {
     }),
   restartTester: () => request<{ status: string }>('/tester/restart', { method: 'POST' }),
 
-  // Paper-trading control box + stats box (2026-09-01 request), above the Positions table.
-  paperTradingStats: () => request<PaperTradingStats>('/paper-trading/stats'),
-  // "Manage tokens" modal's per-token 24h stats table (2026-09-04 request).
+  // Paper-trading control box + stats box (2026-09-01 request, extended to real trading
+  // 2026-09-04), above the Positions table — mode selects which tab's data this serves.
+  paperTradingStats: (mode: PositionMode) => request<PaperTradingStats>(`/paper-trading/stats?mode=${mode}`),
+  // "Manage tokens" modal's per-token 24h stats table (2026-09-04 request) — paper-trading only,
+  // no mode param (TokenStats24h has no real-trading equivalent yet).
   tokenStats24h: () => requestList<TokenStats>('/paper-trading/token-stats'),
   // Go's null-array-column columns (activeKinds/disabledInstIds/activeBars) marshal as JSON null,
   // not [] — normalized here the same way requestList does for list endpoints, so PaperTradingConfig
   // consumers can always call .length/.map on these fields without a crash (found live: an
   // unnormalized null.length threw and unmounted the whole app to a blank page after the initial
   // paint, since nothing here has an error boundary).
-  paperTradingConfig: () =>
-    request<PaperTradingConfig>('/paper-trading/config').then((c) => ({
+  paperTradingConfig: (mode: PositionMode) =>
+    request<PaperTradingConfig>(`/paper-trading/config?mode=${mode}`).then((c) => ({
       ...c,
       activeKinds: c.activeKinds ?? [],
       disabledInstIds: c.disabledInstIds ?? [],
       activeBars: c.activeBars ?? [],
       allInstIds: c.allInstIds ?? [],
     })),
-  savePaperTradingConfig: (patch: Partial<Omit<PaperTradingConfig, 'allInstIds'>>) =>
+  savePaperTradingConfig: (mode: PositionMode, patch: Partial<Omit<PaperTradingConfig, 'allInstIds'>>) =>
     request<{ ok: boolean; restartRequired: boolean }>('/paper-trading/config', {
       method: 'PUT',
-      body: JSON.stringify(patch),
+      body: JSON.stringify({ ...patch, mode }),
     }),
-  restartPaperTrader: () => request<{ status: string }>('/paper-trading/restart', { method: 'POST' }),
+  // Paper trading restarts cmd/paper-trader; real trading restarts cmd/trader (its own self-restart
+  // handler, added alongside the mode-scoped config work) via cmd/api's mode-aware proxy.
+  restartPaperTrader: (mode: PositionMode) =>
+    request<{ status: string }>(`/paper-trading/restart?mode=${mode}`, { method: 'POST' }),
 
   // CLAUDE.md §31.2/§31.3: an explicit deposit/withdrawal bringing both "Total Equity" and the
   // real, continuous "Account Balance" to the same new value together — takes effect immediately,
   // no restart needed, since dynamic sizing reads the live account_equity row on every open rather
   // than a cached value.
-  setAccountCap: (newCapUsd: string, mode: PositionMode = 'paper') =>
+  setAccountCap: (newCapUsd: string, mode: PositionMode) =>
     request<AccountEquity>('/account/cap', {
       method: 'POST',
       body: JSON.stringify({ mode, newCapUsd }),
