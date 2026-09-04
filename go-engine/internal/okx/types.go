@@ -1,10 +1,33 @@
 package okx
 
 import (
+	"bytes"
+
 	"github.com/shopspring/decimal"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 )
+
+// decimalOrZero decodes an OKX-returned numeric field the same way decimal.Decimal does, except
+// that a blank string ("") or JSON null decodes as zero instead of erroring. Found live
+// 2026-09-04 (cmd/okx-apitest's diagnostic): GET /api/v5/trade/order returns avgPx/accFillSz as
+// "" — not "0" — for an order that hasn't started filling yet, which decimal.Decimal's own
+// UnmarshalJSON rejects outright. RealTrader.waitForFill's polling loop already tolerates a
+// GetOrder error by retrying (it never surfaced as a user-visible bug), but every retry logged a
+// spurious warning and wasted a poll cycle for the entirely normal case of an order still being
+// registered.
+type decimalOrZero struct {
+	decimal.Decimal
+}
+
+func (d *decimalOrZero) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.Trim(data, `"`)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		d.Decimal = decimal.Zero
+		return nil
+	}
+	return d.Decimal.UnmarshalJSON(data)
+}
 
 // Ticker is a normalized OKX v5 "tickers" channel / REST market ticker payload.
 type Ticker struct {
@@ -96,21 +119,24 @@ func (r OrderResult) ToDomain() domain.OrderResult {
 }
 
 // OrderStatus mirrors a single entry of the GET /api/v5/trade/order response data array.
+// AvgPx/AccFillSz/Sz use decimalOrZero, not decimal.Decimal directly: OKX returns these as ""
+// (not "0") for an order that hasn't started filling yet (found live 2026-09-04), which
+// decimal.Decimal's own UnmarshalJSON rejects.
 type OrderStatus struct {
-	InstID    string          `json:"instId"`
-	OrdID     string          `json:"ordId"`
-	ClOrdID   string          `json:"clOrdId"`
-	State     string          `json:"state"` // "live", "partially_filled", "filled", "canceled"
-	AvgPx     decimal.Decimal `json:"avgPx"`
-	AccFillSz decimal.Decimal `json:"accFillSz"`
-	Sz        decimal.Decimal `json:"sz"`
+	InstID    string        `json:"instId"`
+	OrdID     string        `json:"ordId"`
+	ClOrdID   string        `json:"clOrdId"`
+	State     string        `json:"state"` // "live", "partially_filled", "filled", "canceled"
+	AvgPx     decimalOrZero `json:"avgPx"`
+	AccFillSz decimalOrZero `json:"accFillSz"`
+	Sz        decimalOrZero `json:"sz"`
 }
 
 // ToDomain converts an OrderStatus to its domain representation.
 func (s OrderStatus) ToDomain() domain.OrderStatus {
 	return domain.OrderStatus{
 		InstID: s.InstID, OrdID: s.OrdID, ClOrdID: s.ClOrdID, State: s.State,
-		AvgPx: s.AvgPx, AccFillSz: s.AccFillSz, Sz: s.Sz,
+		AvgPx: s.AvgPx.Decimal, AccFillSz: s.AccFillSz.Decimal, Sz: s.Sz.Decimal,
 	}
 }
 
