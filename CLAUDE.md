@@ -4300,3 +4300,117 @@ embedded observation snapshot (captured at order-open time as an immutable point
 CLAUDE.md §15.3) still reads the old `"inst_id": "BTC-USDT-SWAP"` for orders opened before the
 rename — correct behavior, since that field is historical record of what the model was actually
 shown at the time, not live state the migration should touch.
+
+## 34. Real orders get their own table; Paper/Real mode fully separated end to end (2026-09-04)
+
+Explicit operator decision, **reversing §27.3/§27.7's earlier call** that real orders should share
+`paper_orders` (`mode='real'`, no separate table needed). The trigger: showing an in-flight order's
+fill status (pending/partial/filled/canceled) on the panel needed somewhere to live, and a status
+column meaningful only for real rows didn't belong on every paper row. This section documents that
+reversal is deliberate, not an oversight — §27.3/§27.7's text is left as-is (this project's own
+practice of appending corrections rather than rewriting history, per §33's "correction, same day"
+notes).
+
+**New `real_orders`/`real_order_adjustments` tables** (migration `000019`), a near-exact mirror of
+`paper_orders`/`paper_order_adjustments` minus the paper-only shadow-fork columns
+(`parent_order_id`/`variant` — real trading has no forking, §27.3), plus a `status` column tracking
+the fill lifecycle independently of `closed_at`/`close_reason`: `'pending'` (order accepted,
+fill not yet confirmed — written the instant `PlaceOrder` succeeds, *before* `waitForFill` blocks,
+so an in-flight order is visible on the panel for the whole wait rather than only after it
+resolves), `'partial'`, `'filled'`, `'canceled'` (never filled before the timeout — the row STAYS,
+so a timed-out attempt stays visible rather than being silently dropped). No `mode` column: every
+row is real by construction, the table itself is the discriminator.
+
+`usecase.RealTrader` rewired throughout to `port.RealOrder`/the new repository methods
+(`OpenRealOrder`, `UpdateRealOrderStatus`, `CloseRealOrder`, `UpdateRealOrderSLTP`,
+`ListRealPositions`, `RecordRealOrderAdjustment`, ...). The shared pure math this file reuses from
+paper trading (`closeReason`, `realizedPnL`, `computeAdjustedLevels`, `positionStateOf`,
+`unrealizedPnLPct`, `RatchetSLTP` — all typed against `port.PaperOrder`) stays untouched; a small
+`asPaperOrderView(o port.RealOrder) port.PaperOrder` adapter converts at the call boundary rather
+than either duplicating the math or forcing paper trading's proven code to change shape.
+`RealTrader.monitorOpenPositions` also gained a `ManualCloseRequested` check (mirroring
+`PaperTrader`), so the panel's Close button now has a real effect on real positions rather than
+being a client-side-only no-op.
+
+**Mode scoping extended to `strategy_assignments` and `paper_trading_config`** (migration `000020`)
+— both were global before this: `cmd/paper-trader` and `cmd/trader` read the identical rows, so a
+strategy tuned or a token disabled for paper trading silently took effect on real trading too.
+`strategy_assignments` gained a `mode` column (unique constraint widened to include it, so the same
+strategy+token+timeframe can be independently assigned under both modes); `paper_trading_config`
+converted from its `id=1` singleton to one row per mode, the new `'real'` row seeded
+`trading_state='stopped'` — a deliberate fail-safe distinct from paper's `'running'` default, so a
+fresh real-mode config never silently defaults to running before an operator has reviewed it.
+`Repository.ListAssignments`/`GetPaperTradingConfig`/`SavePaperTradingConfig`/
+`SetAssignmentsEnabledForKinds` all gained a `mode` parameter; every call site updated
+(`cmd/paper-trader` passes `"paper"`, `cmd/trader` passes `"real"`, `cmd/strategy-optimizer` passes
+`"paper"` since it only ever compares against production's paper-trading assignments, §16.1).
+
+**Deploying migration `000020` ahead of the Go code that reads it briefly took `paper-trader`
+down** — a real, if short-lived, incident worth recording: the schema change (dropping
+`paper_trading_config.id`) landed and was applied before the corresponding Go query (`WHERE
+id = 1`) was updated in the same deploy step, so `paper-trader` crash-looped (`os.Exit(1)` on
+`GetPaperTradingConfig`'s error) for a few minutes until the fix was built and deployed. Caught
+immediately from the container's own restart-loop status and fixed same-session — no data loss,
+since the crash was on startup before any trading logic ran. Lesson already documented once for
+this exact failure shape (§16.10's "a documented policy is not an implemented one" — here it's "a
+migration is not the same deploy as the code that depends on it," the schema/code half of the same
+underlying risk): going forward, a migration that changes a column's *shape* (not just adds one)
+should land in the same build/deploy step as its Go consumers, not a separate one.
+
+**`internal/api` positions/adjust/close endpoints unified across both tables.**
+`handleListPositions` routes `?mode=real` to the new `ListRealPositions`/`CountRealPositions` and
+maps each `RealOrder` onto the existing `port.PaperOrder`-shaped response DTO
+(`realOrderToPosition`), so the panel's `/api/positions` contract stays one shape regardless of
+which table backed a row — avoiding a second parallel endpoint the panel would need entirely
+separate plumbing for. This surfaced a real design gap the table split introduces: `paper_orders.id`
+and `real_orders.id` are independent sequences, so an id is no longer globally unique across the
+two tables. Every ID-addressed endpoint (`close`, `adjust`, `adjustments`) now requires (or, for
+the read-only adjustments endpoint, defaults to `"paper"` for) an explicit `?mode=` query param to
+say which table an id addresses — a caller that omits it on close/adjust gets a 400, not a guess.
+`handleAdjustPosition`'s old `o.Mode != "real"` runtime check is gone; routing to `real_orders` by
+table makes an accidental paper-mode call 404 for a different, more accurate reason ("no such id in
+this table") rather than a mode-mismatch message. `account.go`'s `validModes` drops `'demo'`
+(existing `'demo'` rows/CHECK constraints in `account_equity`/`paper_orders` are left untouched —
+this only stops the API from accepting/seeding a *new* demo row going forward, per §33.4-style
+"don't erase historical data just because a config default changed" precedent).
+
+**`cmd/trader` gained a minimal restart-only HTTP surface** (`POST /restart`, mirroring
+`cmd/paper-trader`'s own self-`os.Exit(0)` + Docker-restart-policy mechanism), so the panel's
+Real-tab Save & Apply / Pause / Stop buttons can actually take effect — before this, real trading's
+config had a write path (Postgres, via `cmd/api`'s now mode-aware endpoints) but no way to make a
+running `cmd/trader` process pick up a change. `cmd/api`'s `POST /api/paper-trading/restart` became
+mode-aware (`handleRestartTrading`), proxying to `cmd/paper-trader` or `cmd/trader` depending on
+`?mode=`. Unlike paper-trader's control box, `cmd/trader` needed no `GET/PUT /config` mirror — its
+config lives entirely in the same mode-scoped Postgres rows `cmd/api` already reads/writes
+directly, and `cmd/trader` itself only reads them once at its own startup.
+
+**Panel restructured around a page-level Paper/Real tab** (`/positions/paper`, `/positions/real`
+routes — route-based rather than component state, for bookmarkability and consistency with every
+other tab in this app), replacing `PositionsPage`'s old in-page mode dropdown and
+`PaperTradingConfigBox`'s own internal paper/demo/real tabs + "not wired up yet" placeholder — both
+modes now render the identical controls/stats components, parameterized by `mode`, reading from the
+same mode-scoped backend this section describes. `PositionMode` itself drops `'demo'` from the
+panel's type entirely (this project never built a demo controller and has decided not to pursue
+one). Real positions show a new Status column (pending/partial/filled/canceled, dimmed for the
+unremarkable `filled` case, colored for the other three) driven by `real_orders.status`. The
+per-row "Adjust" button is relabeled "Update" (label-only change — the underlying component/
+function/API-method/URL names are untouched, a smaller and lower-risk change with an identical
+user-visible result).
+
+**Known gap, deliberately out of scope this round**: `StrategiesPage.tsx` gained no mode-assignment
+UI — the backend capability (mode-scoped `strategy_assignments`) is delivered, but assigning a
+strategy to real mode today requires a direct API call (`POST /api/assignments` with
+`{"mode":"real",...}`) or direct DB access, not a panel control. This directly affects the first
+live real-money test: at least one `mode='real'` assignment must exist for the chosen test
+token/timeframe before a real signal can ever fire, and none exist yet by default.
+
+All 465 Go tests pass (11 new: real-order pending/canceled/status-transition coverage, positions/
+adjust/close mode-routing, missing-mode rejection, real-vs-paper table isolation). `tsc -b` and
+`vite build` both clean. Deployed and smoke-tested live on the server: `real_orders`/mode-scoping
+migrations applied, `paper-trader`/`api`/`panel` rebuilt and confirmed serving correctly
+(`GET /api/positions?mode=real` returns `{"items":[],"total":0}` — an empty, correctly-shaped real
+positions view, since no real order has been placed yet), paper trading's own data/behavior
+unaffected throughout. `cmd/trader` itself was rebuilt and confirmed to compile but was
+**deliberately not started** — `use_conductor_lifecycle` remains off, `okx-gateway` still runs
+demo credentials (§33.5) — flipping either is real-capital-risk territory reserved for an explicit,
+separate go/no-go decision, not something this deploy pass does on its own judgment.
