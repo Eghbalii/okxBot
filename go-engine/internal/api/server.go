@@ -143,6 +143,8 @@ func (s *Server) Routes() http.Handler {
 	// proxying to cmd/paper-trader, so they stay available even if that process is down or
 	// mid-restart; only the restart action itself needs to reach the running process.
 	mux.HandleFunc("GET /api/paper-trading/stats", s.handlePaperTradingStats)
+	// Backs the "Manage tokens" modal's per-token 24h position count/PnL table (2026-09-04 request).
+	mux.HandleFunc("GET /api/paper-trading/token-stats", s.handleTokenStats24h)
 	mux.HandleFunc("GET /api/paper-trading/config", s.handleGetPaperTradingConfig)
 	mux.HandleFunc("PUT /api/paper-trading/config", s.handleSavePaperTradingConfig)
 	mux.HandleFunc("POST /api/paper-trading/restart", s.proxyPaperTrader("/restart"))

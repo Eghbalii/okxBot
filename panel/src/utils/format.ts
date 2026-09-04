@@ -42,6 +42,16 @@ export function pnlClass(value: number | null | undefined): string {
   return value > 0 ? 'text-green' : 'text-red'
 }
 
+// Wins/Losses come from the backend as "closed with positive realized PnL" vs. non-positive
+// (CLAUDE.md §11.3) — not close_reason='tp'/'sl', which under the RL ratchet reported a
+// profitable strategy as 0%. Open trades are excluded: their outcome isn't decided yet. Shared by
+// StrategiesPage and StrategyKindModal (2026-09-04) so both read the same definition.
+export function winRate(wins: number | undefined, losses: number | undefined): string {
+  const decided = (wins ?? 0) + (losses ?? 0)
+  if (decided === 0) return '—'
+  return `${Math.round(((wins ?? 0) / decided) * 100)}% (${wins}/${decided})`
+}
+
 // Shortens an OKX instId (e.g. "BTC-USDT-SWAP") to just its base token ("BTC") for display —
 // every instrument this project trades is a USDT-settled perpetual swap (CLAUDE.md's own trading
 // config), so the "-USDT-SWAP" suffix is constant noise, never information. Display-only: the

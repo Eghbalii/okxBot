@@ -102,6 +102,32 @@ func realizedPnLOverWindow(history []port.EquityPoint, since time.Time) (usd, pc
 	return tradeSum, pct
 }
 
+// tokenStatsView is one row of the panel's "Manage tokens" 24h stats table (2026-09-04 request).
+type tokenStatsView struct {
+	InstID        string `json:"instId"`
+	PositionCount int64  `json:"positionCount"`
+	PnLUSD        string `json:"pnlUsd"`
+	PnLPct        string `json:"pnlPct"`
+}
+
+func (s *Server) handleTokenStats24h(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.Repo.TokenStats24h(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	views := make([]tokenStatsView, len(stats))
+	for i, s := range stats {
+		views[i] = tokenStatsView{
+			InstID:        s.InstID,
+			PositionCount: s.PositionCount,
+			PnLUSD:        s.PnLUSD.String(),
+			PnLPct:        s.PnLPct.String(),
+		}
+	}
+	writeJSON(w, http.StatusOK, views)
+}
+
 // paperTradingConfigView mirrors cmd/paper-trader's own paperTradingConfigView shape (camelCase,
 // same field names) — this handler talks to Postgres directly rather than proxying, but the panel
 // should see identical JSON regardless of which config endpoint it happens to call.

@@ -1,18 +1,8 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import ParamChangeChart from '../components/ParamChangeChart'
-import { formatUsd, pnlClass, tokenSymbol } from '../utils/format'
+import { formatUsd, pnlClass, tokenSymbol, winRate } from '../utils/format'
 import type { StrategyAssignment, StrategyConfig, StrategyStats } from '../api/types'
-
-// Wins/Losses come from the backend as "closed with positive realized PnL" vs. non-positive
-// (CLAUDE.md §11.3) — not close_reason='tp'/'sl', which under the RL ratchet reported a
-// profitable strategy as 0%. Open trades are excluded: their outcome isn't decided yet.
-function winRate(stats: StrategyStats | undefined): string {
-  if (!stats) return '—'
-  const decided = stats.Wins + stats.Losses
-  if (decided === 0) return '—'
-  return `${Math.round((stats.Wins / decided) * 100)}% (${stats.Wins}/${decided})`
-}
 
 function ParamEditor({
   strategy,
@@ -118,7 +108,7 @@ function StrategyRow({
         </span>
       </td>
       <td>{stats?.SignalCount ?? '—'}</td>
-      <td>{winRate(stats)}</td>
+      <td>{winRate(stats?.Wins, stats?.Losses)}</td>
       {/* Rounded for readability — the exact NUMERIC value stays in the database (CLAUDE.md §7).
           This is the sum of every closed trade's realized PnL, gains and losses together. */}
       <td className={'mono ' + pnlClass(stats ? Number(stats.RealizedPnL) : null)}>

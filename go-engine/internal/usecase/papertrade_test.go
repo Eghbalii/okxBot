@@ -93,6 +93,9 @@ func (r *fakeRepository) DeleteAssignment(ctx context.Context, id int64) error {
 func (r *fakeRepository) StrategyStatsFor(ctx context.Context, strategyID int64) (port.StrategyStats, error) {
 	return port.StrategyStats{}, nil
 }
+func (r *fakeRepository) TokenStats24h(ctx context.Context) ([]port.TokenStats, error) {
+	return nil, nil
+}
 func (r *fakeRepository) ListPositions(ctx context.Context, f port.PositionFilter) ([]port.PaperOrder, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

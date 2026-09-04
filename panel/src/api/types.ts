@@ -31,6 +31,15 @@ export interface StrategyStats {
   LastActivity: string | null
 }
 
+// TokenStats is one row of the "Manage tokens" modal's 24h stats table (2026-09-04 request) —
+// positions CLOSED in the last 24h, per token.
+export interface TokenStats {
+  instId: string
+  positionCount: number
+  pnlUsd: string // decimal.Decimal marshals as a JSON string
+  pnlPct: string
+}
+
 export type PositionMode = 'paper' | 'demo' | 'real'
 // 'rl_early' is the model choosing to close a position before either SL or TP was touched
 // (CLAUDE.md §15.12's early-close action, gated behind paper_trading.rl_early_close).

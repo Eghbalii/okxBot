@@ -11,6 +11,7 @@ import type {
   StrategyAssignment,
   StrategyConfig,
   StrategyStats,
+  TokenStats,
   TesterConfig,
   TesterVersion,
   TesterVersionDetail,
@@ -189,6 +190,8 @@ export const api = {
 
   // Paper-trading control box + stats box (2026-09-01 request), above the Positions table.
   paperTradingStats: () => request<PaperTradingStats>('/paper-trading/stats'),
+  // "Manage tokens" modal's per-token 24h stats table (2026-09-04 request).
+  tokenStats24h: () => requestList<TokenStats>('/paper-trading/token-stats'),
   // Go's null-array-column columns (activeKinds/disabledInstIds/activeBars) marshal as JSON null,
   // not [] — normalized here the same way requestList does for list endpoints, so PaperTradingConfig
   // consumers can always call .length/.map on these fields without a crash (found live: an

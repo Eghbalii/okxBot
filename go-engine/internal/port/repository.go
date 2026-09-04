@@ -65,6 +65,18 @@ type StrategyStats struct {
 	LastActivity *time.Time
 }
 
+// TokenStats summarizes one token's last-24h paper-trading activity for the panel's "Manage
+// tokens" modal (2026-09-04 request) — mirrors StrategyStats' shape/scoping (variant='baseline'
+// only, same fork-dilution reasoning, CLAUDE.md §16.9) but keyed by inst_id instead of
+// strategy_id, and windowed to trades CLOSED in the last 24h rather than all-time (PnL only exists
+// once a trade closes, matching how the account-wide 24h stat already works, CLAUDE.md §32).
+type TokenStats struct {
+	InstID        string
+	PositionCount int64 // closed in the last 24h
+	PnLUSD        decimal.Decimal
+	PnLPct        decimal.Decimal // relative to the token's own summed entry notional in the window
+}
+
 // PositionFilter selects/sorts/pages positions across trading modes for the panel (CLAUDE.md
 // §11.4). Limit/Offset were added 2026-09-02: the panel used to fetch every matching row on every
 // 5s poll and paginate/sort client-side, which became a genuinely slow query and a multi-MB
@@ -269,6 +281,11 @@ type Repository interface {
 
 	// StrategyStatsFor computes per-strategy track record from paper_orders (CLAUDE.md §11.3).
 	StrategyStatsFor(ctx context.Context, strategyID int64) (StrategyStats, error)
+
+	// TokenStats24h computes each active token's last-24h paper-trading activity (position count,
+	// PnL$, PnL%) for the panel's "Manage tokens" modal — one row per inst_id that has at least
+	// one baseline trade closed in the window.
+	TokenStats24h(ctx context.Context) ([]TokenStats, error)
 
 	// OpenPaperOrder inserts o and returns its id. o.ExchangeOrderID is persisted when set (real
 	// trading, CLAUDE.md §27) — the algo order's ID is not known until after this call returns

@@ -241,6 +241,45 @@ func (r *Repository) CountPositions(ctx context.Context, f port.PositionFilter) 
 	return count, nil
 }
 
+// TokenStats24h computes each token's last-24h paper-trading activity (CLAUDE.md, "Manage tokens"
+// panel, 2026-09-04 request) — position count and PnL$/PnL% for baseline trades CLOSED in the last
+// 24 hours, mirroring StrategyStatsFor's variant='baseline' scoping (a high adjustment rate can
+// fork one signal into several rows, which would otherwise dilute/skew a token's real 24h record,
+// CLAUDE.md §16.9) and mode='paper' (this modal is paper-trading's own control surface). PnL% is
+// expressed against the token's own summed entry notional in the window (return on capital
+// deployed for that token), not the shared account's equity — a token has no "starting equity" of
+// its own the way the whole account does (CLAUDE.md §15.6's shared pool).
+func (r *Repository) TokenStats24h(ctx context.Context) ([]port.TokenStats, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT inst_id, count(*), coalesce(sum(realized_pnl), 0), coalesce(sum(size), 0)
+		FROM paper_orders
+		WHERE mode = 'paper' AND variant = 'baseline'
+			AND closed_at IS NOT NULL AND closed_at >= now() - interval '24 hours'
+		GROUP BY inst_id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("token stats 24h: %w", err)
+	}
+	defer rows.Close()
+
+	var out []port.TokenStats
+	for rows.Next() {
+		var s port.TokenStats
+		var notionalSum decimal.Decimal
+		if err := rows.Scan(&s.InstID, &s.PositionCount, &s.PnLUSD, &notionalSum); err != nil {
+			return nil, fmt.Errorf("token stats 24h scan: %w", err)
+		}
+		if notionalSum.IsPositive() {
+			s.PnLPct = s.PnLUSD.Div(notionalSum).Mul(decimal.NewFromInt(100))
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("token stats 24h rows: %w", err)
+	}
+	return out, nil
+}
+
 // UpdatePaperOrderPnLExtremes advances an open order's peak/trough unrealized PnL (CLAUDE.md
 // §15.11). GREATEST/LEAST are applied in SQL rather than in Go so a concurrent writer can never
 // walk a high-water mark backwards — the tick handler and any other caller may both be updating
