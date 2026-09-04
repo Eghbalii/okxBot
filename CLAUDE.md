@@ -4230,3 +4230,73 @@ legacy `Trader`, mutation-verified regression tests proving `PlaceOrder`/`SetLev
 (`rewriteInstID`, `reverseSymbolMap`), and `cmd/strategy-optimizer` (`seedWindow`'s symbol
 resolution) — 453 Go tests total (was 424 before this section's work). None of this is deployed to
 the server yet; `use_conductor_lifecycle`/`allow_real_money` remain off there.
+
+### 33.5 Deployed to the server (2026-09-04): OKX's demo environment has no X-Perp instruments at all, so strategy-optimizer/strategy-tester are disabled; DB rows migrated to short symbols
+
+The symbol-map design from §33.4 was deployed: `config.yaml`'s `trading.inst_ids` switched to the
+10 short symbols and `symbol_map`/`exec_inst_type`/`exec_settle_ccy` were added (verified via a
+before/after diff restricted to exactly those fields — nothing else in the file changed).
+`cmd/ingestor` and `cmd/okx-gateway` were rebuilt and restarted; `cmd/ingestor`'s own metrics
+confirmed live ticks/candles flowing under the short symbols within seconds
+(`okxbot_ingestor_events_total{inst_id="BTC",...}`), sourced from the real X-Perp WS subscription.
+
+**Found while rebuilding `cmd/strategy-optimizer`**: its candle-seeding call failed with `51001:
+Instrument ID... doesn't exist` against every X-Perp instId. Root-caused, not assumed: `okx-gateway`
+is currently running with **demo/simulated** OKX credentials (`simulated=true` in its own startup
+log), and a direct curl to the same public `/market/candles` endpoint with
+`x-simulated-trading: 1` reproduces the identical `51001` that succeeds instantly without that
+header. **OKX's demo/simulated trading environment does not have the X-Perp product at all** — it
+only exists on the real account. This is an environment mismatch, not a code bug: nothing here can
+be fixed until the gateway holds real credentials (§27's still-pending migration step).
+
+**Explicit operator decision, given this**: `strategy-optimizer` and `strategy-tester` must not run
+at all for now — reaffirming §21's existing strategy-tester call and extending it to
+strategy-optimizer (which the operator had also already decided against running, independently of
+this X-Perp finding). Both containers were stopped and removed on the server. `docker-compose.yml`
+gained `profiles: ["disabled"]` on both service definitions — Docker Compose excludes a service
+from `docker compose config --services` entirely when its profile isn't explicitly activated, so a
+plain `docker compose up -d` (no service name, no `--profile` flag) structurally cannot start
+either one again, including across a host reboot. `optimizer-service` (the shared Python/Optuna
+sidecar both depend on) was left running — the operator's instruction named the two Go services
+specifically, and the sidecar is cheap/idle with no other consumer.
+
+**A real, non-obvious consequence found before restarting `cmd/paper-trader`**: this project's
+`strategy_assignments`/`paper_orders`/`candles`/`account_equity_history`/`strategy_param_changes`/
+`tester_orders` tables are all keyed by `inst_id` as free-text, not a foreign key into any
+"instrument" table — so renaming `trading.inst_ids` in config does not migrate existing rows, it
+just makes `paper-trader` see every token as brand-new. Confirmed directly: `BTC-USDT-SWAP` had 54
+tuned `strategy_assignments` rows built up over the project's history; after the first restart with
+the new config, `BTC` (the new symbol) had exactly 1 — the origin-seeding logic's own default
+`rsi_sma`/5m row, auto-created fresh. Every other token showed the identical pattern. This was
+caught by comparing `strategy_assignments` row counts before declaring the deploy done, not assumed
+safe from the code review alone.
+
+**Migrated via one transaction** (`UPDATE ... SET inst_id = '<symbol>' WHERE inst_id =
+'<OLD-INSTID-SWAP>'` per table, restricted to exactly the 10 currently-configured tokens):
+`strategy_assignments`, `paper_orders`, `candles`, `account_equity_history`,
+`strategy_param_changes`, `tester_orders`. Historical/retired tokens this project no longer trades
+(`ENA-USDT-SWAP`, `XAU-USDT-SWAP` — see §22's earlier DOGE→XAU swap) were deliberately left
+untouched, since they have no `symbol_map` entry and aren't part of the active roster.
+
+One real collision found and handled before running the migration, not assumed clean: the 10
+freshly auto-seeded `rsi_sma`/5m default assignments (created at the exact restart timestamp) would
+have violated `strategy_assignments`' `UNIQUE(strategy_id, inst_id, bar)` constraint once the old
+`BTC-USDT-SWAP`/5m/`rsi_sma` row (same `strategy_id`) was renamed to the same `(strategy_id, "BTC",
+"5m")` tuple — deleted those 10 rows (identified precisely by their shared `created_at`, not by
+`inst_id` pattern alone, since a same-symbol row could otherwise be mistaken for the seed) before
+the rename, so the real 27-kind × 3-timeframe tuned history is what survived, not the incidental
+seed. `candles`' `(inst_id, bar, ts)` primary key was checked for a similar risk and found safe
+without needing a delete: old data's latest timestamp (12:30 UTC) was already behind new data's
+earliest (13:00 UTC) by the time of the migration, so no `ts` overlap was possible between the
+pre-rename and post-rename candle sets.
+
+`cmd/paper-trader` was restarted a second time after the migration (its first restart, right after
+the config deploy, had already cached the pre-migration empty assignment state in memory) — logs
+confirmed the full historical candle windows re-seeded from Postgres under the new symbols with no
+gap (e.g. `instId=BTC bar=5m candles=100`), and `okxbot_paper_orders_open{inst_id="BTC"} 1` etc.
+confirmed every position that was open before the rename stayed correctly tracked afterward, keyed
+by its new short symbol. One cosmetic-only artifact, left as-is: `paper_orders.features_json`'s
+embedded observation snapshot (captured at order-open time as an immutable point-in-time JSON blob,
+CLAUDE.md §15.3) still reads the old `"inst_id": "BTC-USDT-SWAP"` for orders opened before the
+rename — correct behavior, since that field is historical record of what the model was actually
+shown at the time, not live state the migration should touch.
