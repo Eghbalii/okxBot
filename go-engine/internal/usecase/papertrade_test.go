@@ -403,6 +403,19 @@ func (r *fakeRepository) RequestRealManualClose(ctx context.Context, id int64) e
 	r.realOrders[id] = o
 	return nil
 }
+func (r *fakeRepository) RequestRealManualCloseAll(ctx context.Context) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for id, o := range r.realOrders {
+		if o.ClosedAt == nil && (o.Status == "filled" || o.Status == "partial") {
+			o.ManualCloseRequested = true
+			r.realOrders[id] = o
+			n++
+		}
+	}
+	return n, nil
+}
 func (r *fakeRepository) UpdateRealOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

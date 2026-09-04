@@ -165,6 +165,22 @@ func (r *Repository) RequestRealManualClose(ctx context.Context, id int64) error
 	return nil
 }
 
+// RequestRealManualCloseAll flags every currently-open real order for close, the bulk form of
+// RequestRealManualClose — mirrors RequestManualCloseAll. Used by the panel's Stop button
+// (operator decision, 2026-09-04): flagging every open row here takes effect on RealTrader's very
+// next tick for each instrument, independent of whether/when the trader process itself restarts
+// to pick up the trading_state='stopped' new-open gate. Returns how many rows were flagged.
+func (r *Repository) RequestRealManualCloseAll(ctx context.Context) (int, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE real_orders SET manual_close_requested = true
+		WHERE closed_at IS NULL AND status IN ('filled', 'partial')
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("request real manual close all: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // UpdateRealOrderPnLExtremes advances an open real order's peak/trough unrealized PnL. Mirrors
 // UpdatePaperOrderPnLExtremes.
 func (r *Repository) UpdateRealOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error {

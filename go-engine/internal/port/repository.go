@@ -435,6 +435,11 @@ type Repository interface {
 	// own tick loop to close on its next tick (RealTrader.monitorOpenPositions), the same
 	// intent-not-action pattern RequestManualClose uses since cmd/api runs in a separate process.
 	RequestRealManualClose(ctx context.Context, id int64) error
+	// RequestRealManualCloseAll is RequestRealManualClose's bulk form, mirroring
+	// RequestManualCloseAll — used when the operator sets trading_state="stopped" for real mode
+	// from the panel: flags every open real position for close on its very next tick, independent
+	// of the trader process restarting. Returns how many rows were flagged.
+	RequestRealManualCloseAll(ctx context.Context) (int, error)
 	// UpdateRealOrderPnLExtremes mirrors UpdatePaperOrderPnLExtremes.
 	UpdateRealOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error
 	// ListRealPositions mirrors ListPositions for real_orders. f.Mode is ignored (every row is real

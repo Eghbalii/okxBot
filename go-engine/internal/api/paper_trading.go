@@ -246,5 +246,15 @@ func (s *Server) handleSavePaperTradingConfig(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Real mode's Stop button (operator decision, 2026-09-04): close every open real position
+	// IMMEDIATELY, from this always-running process, rather than waiting for cmd/trader to notice
+	// trading_state='stopped' at its own next startup — a market-volatility emergency stop must not
+	// depend on a restart completing. Paper mode keeps its existing behavior (cmd/paper-trader's own
+	// startup sweep, RequestManualCloseAll) unchanged; this is additive, real-mode-only.
+	if mode == "real" && req.TradingState != nil && *req.TradingState == "stopped" {
+		if _, err := s.Repo.RequestRealManualCloseAll(r.Context()); err != nil {
+			s.Logger.Error("failed to request immediate close of all open real positions", "error", err)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "restartRequired": true})
 }
