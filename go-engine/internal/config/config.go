@@ -65,6 +65,23 @@ type Config struct {
 		// (RLSizing/RLSLTPAdjust/etc.) — this is the riskiest commit in that plan to get wrong
 		// silently, so an explicit off-by-default flag is the safety valve.
 		UseConductorLifecycle bool `yaml:"use_conductor_lifecycle"`
+
+		// ExecInstIDMap/ExecInstType/ExecSettleCcy answer "which OKX instrument/instType/currency
+		// does REAL ORDER PLACEMENT actually use," separately from InstIDs (which market data is
+		// collected/decided against). Found load-bearing 2026-09-04 (CLAUDE.md §27): a real account
+		// may only have usable margin on a different OKX product for the same underlying than the
+		// classic SWAP instrument this codebase's market data/observation identity uses (this
+		// project's real account trades OKX's newer "X-Perp" product, instId format
+		// "BTC-USD_UM_XPERP-<date>", instType FUTURES, settled in USDC — not BTC-USDT-SWAP/SWAP/
+		// USDT). All three are empty by default, which RealTrader's own accessor methods treat as
+		// "trade the InstID directly, instType SWAP, currency USDT" — i.e. no mapping needed at all
+		// for any deployment whose account CAN trade the SWAP instrument directly. ExecInstIDMap
+		// carries an explicit expiry-dated instId per entry (X-Perp instIds are NOT eternal — OKX
+		// rolls them to a new far-dated contract periodically) and must be re-verified/updated
+		// against a live account before each real-trading deployment, not assumed stable long-term.
+		ExecInstIDMap map[string]string `yaml:"exec_inst_id_map"`
+		ExecInstType  string            `yaml:"exec_inst_type"`
+		ExecSettleCcy string            `yaml:"exec_settle_ccy"`
 	} `yaml:"trading"`
 
 	// Ingestion controls cmd/ingestor: the always-on, broad set of candle timeframes it collects

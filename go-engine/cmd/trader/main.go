@@ -236,6 +236,16 @@ func runRealTrader(
 			PosMode:         cfg.Trading.PosMode,
 			ActiveTokens:    cfg.Trading.InstIDs,
 
+			// ExecInstID/ExecInstType/SettleCcy answer "which instrument does a REAL order actually
+			// target," separate from InstID's market-data identity (CLAUDE.md §27, found live
+			// 2026-09-04: this account can only trade OKX's newer X-Perp product, not the classic
+			// SWAP instrument InstID names). Empty ExecInstIDMap[instID] leaves ExecInstID empty,
+			// which RealTrader's own execInstID() treats as "trade InstID directly" — the correct
+			// behavior for a deployment whose account CAN trade the SWAP instrument.
+			ExecInstID:   cfg.Trading.ExecInstIDMap[instID],
+			ExecInstType: cfg.Trading.ExecInstType,
+			SettleCcy:    cfg.Trading.ExecSettleCcy,
+
 			AccountInitialUSD:   cfg.Account.InitialUSD,
 			MaxLeverage:         cfg.Risk.MaxLeverage,
 			MaxPositionPct:      cfg.Account.MaxPositionPct,

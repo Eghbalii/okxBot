@@ -50,6 +50,24 @@ type RealTrader struct {
 	RiskManager     *risk.Manager
 	Logger          *slog.Logger
 
+	// ExecInstID is the instId actually placed/canceled/queried on the exchange — NOT necessarily
+	// InstID. Found live 2026-09-04: this project's market data (candles/ticks/paper_orders/the RL
+	// observation's token identity) is collected against the classic, deeply liquid SWAP
+	// instruments (e.g. BTC-USDT-SWAP), but a given real account may only have usable margin on a
+	// DIFFERENT OKX product for the same underlying — this account's is BTC-USD_UM_XPERP-<date>
+	// ("X-Perp", instType FUTURES, settled in USD/USDC/USDG under Multi-currency margin mode).
+	// Prices track within ~0.1% of the SWAP market (verified live across all 10 configured tokens),
+	// so InstID's collected candles/observation remain valid training/decision input — only the
+	// literal exchange call needs to target a possibly-different instId. Falls back to InstID when
+	// empty, so a deployment whose account CAN trade the SWAP instrument directly needs no mapping
+	// at all. ExecInstType/ExecCtValCcy answer instType/CtValCcy for GetPositions/GetInstrument;
+	// SettleCcy answers GetBalance's ccy — all three must agree with whichever product ExecInstID
+	// actually names, since a SWAP-shaped default (instType=SWAP, ccy=USDT) silently returns
+	// nothing (not an error) against an account whose usable balance/positions live elsewhere.
+	ExecInstID   string
+	ExecInstType string // e.g. "SWAP" or "FUTURES"; defaults to "SWAP" when empty
+	SettleCcy    string // e.g. "USDT" or "USDC"; defaults to "USDT" when empty
+
 	// Mode is "demo" or "real" (CLAUDE.md §15.6) — never "paper". Selects which account_equity row
 	// this engine's equity timeline is recorded under and which mode's rows ListPositions/
 	// ListOpenPaperOrders-equivalent queries are scoped to (see openPositions/allOpenPositions
@@ -103,6 +121,73 @@ type RealTrader struct {
 
 	conductorOnce sync.Once
 	lifecycle     *conductor.Conductor
+
+	instrumentOnce sync.Once
+	instrument     domain.Instrument
+	instrumentErr  error
+}
+
+// execInstID is the instId actually sent to the exchange — ExecInstID when set, else InstID
+// (CLAUDE.md §27's real-account finding: an account may only have usable margin on a different
+// OKX product than the one this engine's market data/observation identity uses).
+func (e *RealTrader) execInstID() string {
+	if e.ExecInstID != "" {
+		return e.ExecInstID
+	}
+	return e.InstID
+}
+
+// execInstType is the instType used for GetPositions/GetInstrument calls — "SWAP" when
+// ExecInstType is unset, matching this codebase's pre-2026-09-04 assumption for every deployment
+// whose account trades the classic SWAP product directly.
+func (e *RealTrader) execInstType() string {
+	if e.ExecInstType != "" {
+		return e.ExecInstType
+	}
+	return "SWAP"
+}
+
+// settleCcy is the currency used for GetBalance calls — "USDT" when SettleCcy is unset, matching
+// this codebase's pre-2026-09-04 assumption.
+func (e *RealTrader) settleCcy() string {
+	if e.SettleCcy != "" {
+		return e.SettleCcy
+	}
+	return "USDT"
+}
+
+// instrumentMeta fetches and caches execInstID's contract-shape metadata (CtVal/LotSz/MinSz) on
+// first use — a real network call only once per process lifetime, not once per order, since an
+// instrument's contract shape does not change while the process runs. A fetch failure is cached
+// too (instrumentOnce fires exactly once regardless of outcome) rather than retried on every
+// order: a real order must not silently fall back to an unconverted size if this call is broken,
+// so callers treat a returned error as fatal to that order rather than proceeding with a guess.
+func (e *RealTrader) instrumentMeta() (domain.Instrument, error) {
+	e.instrumentOnce.Do(func() {
+		e.instrument, e.instrumentErr = e.Exchange.GetInstrument(e.execInstType(), e.execInstID())
+	})
+	return e.instrument, e.instrumentErr
+}
+
+// sizeToContracts converts a desired notional (USD) at the given price into a valid contract
+// count for execInstID: notional/price gives the base-unit size (e.g. BTC), divided by CtVal to
+// get contracts, then rounded down to the nearest LotSz multiple — OKX rejects a size that isn't
+// an exact multiple (51121, found live 2026-09-04). Rounding DOWN, never up, so a real order can
+// never request more notional than what was actually sized/approved by the risk manager upstream.
+// A CtVal of zero (unset/misconfigured instrument metadata) is treated as 1 — the pre-2026-09-04
+// implicit assumption — rather than dividing by zero.
+func sizeToContracts(notionalUSD, price decimal.Decimal, inst domain.Instrument) decimal.Decimal {
+	ctVal := inst.CtVal
+	if !ctVal.IsPositive() {
+		ctVal = decimal.NewFromInt(1)
+	}
+	baseUnits := notionalUSD.Div(price)
+	contracts := baseUnits.Div(ctVal)
+	if inst.LotSz.IsPositive() {
+		lots := contracts.Div(inst.LotSz).Floor()
+		contracts = lots.Mul(inst.LotSz)
+	}
+	return contracts
 }
 
 // DefaultReconcileInterval is the reconciliation poll's cadence when RealTrader.ReconcileInterval
@@ -156,9 +241,9 @@ func (e *RealTrader) waitForFill(ctx context.Context, ordID string, logger *slog
 	deadline := time.Now().Add(e.fillTimeout())
 	var last domain.OrderStatus
 	for {
-		status, err := e.Exchange.GetOrder(e.InstID, ordID)
+		status, err := e.Exchange.GetOrder(e.execInstID(), ordID)
 		if err != nil {
-			logger.Warn("fill-timeout: get order status failed, will retry", "instId", e.InstID, "ordId", ordID, "error", err)
+			logger.Warn("fill-timeout: get order status failed, will retry", "instId", e.execInstID(), "ordId", ordID, "error", err)
 		} else {
 			last = status
 			if status.IsTerminal() {
@@ -177,9 +262,9 @@ func (e *RealTrader) waitForFill(ctx context.Context, ordID string, logger *slog
 	}
 
 	logger.Warn("fill-timeout: order not filled within timeout, canceling",
-		"instId", e.InstID, "ordId", ordID, "timeout", e.fillTimeout(), "lastState", last.State)
-	if err := e.Exchange.CancelOrder(e.InstID, ordID); err != nil {
-		logger.Error("fill-timeout: cancel failed", "instId", e.InstID, "ordId", ordID, "error", err)
+		"instId", e.execInstID(), "ordId", ordID, "timeout", e.fillTimeout(), "lastState", last.State)
+	if err := e.Exchange.CancelOrder(e.execInstID(), ordID); err != nil {
+		logger.Error("fill-timeout: cancel failed", "instId", e.execInstID(), "ordId", ordID, "error", err)
 		return last, fmt.Errorf("order %s not filled within %s and cancel failed: %w", ordID, e.fillTimeout(), err)
 	}
 	return last, nil
@@ -468,8 +553,17 @@ func (e *RealTrader) openReal(
 		return nil, fmt.Errorf("set leverage: %w", err)
 	}
 
-	sz := order.Size.Div(price)
-	req := domain.OrderRequest{InstID: e.InstID, TdMode: e.TdMode, Side: order.Side, OrdType: "market", Sz: sz}
+	inst, err := e.instrumentMeta()
+	if err != nil {
+		return nil, fmt.Errorf("fetch instrument metadata: %w", err)
+	}
+	sz := sizeToContracts(order.Size, price, inst)
+	if sz.IsZero() || (inst.MinSz.IsPositive() && sz.LessThan(inst.MinSz)) {
+		logger.Info("real open: sized order below instrument minimum, declining",
+			"instId", e.execInstID(), "sz", sz, "minSz", inst.MinSz)
+		return nil, nil
+	}
+	req := domain.OrderRequest{InstID: e.execInstID(), TdMode: e.TdMode, Side: order.Side, OrdType: "market", Sz: sz}
 	if e.PosMode == "long_short" {
 		req.PosSide = posSideFor(signedNotional(order.Side, order.Size))
 	}
@@ -548,7 +642,7 @@ func (e *RealTrader) setLeverageIfNeeded(leverage decimal.Decimal, side string, 
 	if !leverage.IsPositive() {
 		return nil
 	}
-	req := domain.LeverageChange{InstID: e.InstID, Lever: leverage, MgnMode: e.TdMode}
+	req := domain.LeverageChange{InstID: e.execInstID(), Lever: leverage, MgnMode: e.TdMode}
 	if e.PosMode == "long_short" {
 		req.PosSide = posSideFor(signedNotionalForSide(side))
 	}
@@ -713,11 +807,16 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.PaperOrder, price
 		if o.Side == "sell" {
 			side = "buy"
 		}
-		sz := o.Size.Div(o.EntryPx)
+		closePrice := o.EntryPx
 		if price.IsPositive() {
-			sz = o.Size.Div(price)
+			closePrice = price
 		}
-		req := domain.OrderRequest{InstID: e.InstID, TdMode: e.TdMode, Side: side, OrdType: "market", Sz: sz}
+		inst, err := e.instrumentMeta()
+		if err != nil {
+			return fmt.Errorf("fetch instrument metadata: %w", err)
+		}
+		sz := sizeToContracts(o.Size, closePrice, inst)
+		req := domain.OrderRequest{InstID: e.execInstID(), TdMode: e.TdMode, Side: side, OrdType: "market", Sz: sz}
 		if e.PosMode == "long_short" {
 			req.PosSide = posSideFor(signedNotionalForSide(o.Side))
 		}
@@ -855,7 +954,7 @@ func (e *RealTrader) buildObservation(ctx context.Context, bar string, price dec
 	// Ground truth from the exchange, not GetAccountEquity's bookkeeping row — real trading does
 	// not own this number the way paper trading owns its shared account (CLAUDE.md §27's plan §6:
 	// this is the one spot flagged as easy to get wrong by careless reuse).
-	balances, err := e.Exchange.GetBalance("USDT")
+	balances, err := e.Exchange.GetBalance(e.settleCcy())
 	if err != nil {
 		logger.Warn("real observation: get balance failed", "instId", e.InstID, "error", err)
 	} else if len(balances) > 0 {
@@ -904,14 +1003,14 @@ func (e *RealTrader) runReconcileLoop(ctx context.Context, logger *slog.Logger) 
 // Exported as a method (not folded into the loop) so tests can call it directly without waiting on
 // a real ticker.
 func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
-	remotePositions, err := e.Exchange.GetPositions("SWAP")
+	remotePositions, err := e.Exchange.GetPositions(e.execInstType())
 	if err != nil {
 		logger.Warn("reconcile: get positions failed", "instId", e.InstID, "error", err)
 		return
 	}
 	var remote *domain.Position
 	for i := range remotePositions {
-		if remotePositions[i].InstID == e.InstID && !remotePositions[i].Pos.IsZero() {
+		if remotePositions[i].InstID == e.execInstID() && !remotePositions[i].Pos.IsZero() {
 			remote = &remotePositions[i]
 			break
 		}
@@ -963,7 +1062,7 @@ func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
 		}
 	}
 
-	if balances, err := e.Exchange.GetBalance("USDT"); err != nil {
+	if balances, err := e.Exchange.GetBalance(e.settleCcy()); err != nil {
 		logger.Warn("reconcile: get balance failed", "instId", e.InstID, "error", err)
 	} else if len(balances) > 0 {
 		e.recordEquityReal(ctx, balances[0].Eq, logger)
