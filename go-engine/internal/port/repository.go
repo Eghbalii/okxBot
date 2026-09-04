@@ -46,6 +46,11 @@ type StrategyAssignment struct {
 	InstID     string
 	Bar        string
 	Enabled    bool
+	// Mode scopes this assignment to "paper" or "real" trading (CLAUDE.md, real-trading readiness
+	// plan, 2026-09-04) — paper and real trading each maintain independent strategy assignments,
+	// so a strategy tuned/enabled for paper trading has no effect on real trading and vice versa.
+	// Defaults to "paper" for every row created before this field existed.
+	Mode string
 }
 
 // StrategyStats summarizes one strategy's paper-trading track record (CLAUDE.md §11.3),
@@ -153,6 +158,64 @@ type PaperOrder struct {
 	// identifies the resting SL/TP algo/conditional order placed immediately after — needed later
 	// to amend or cancel it, since real trading edits that order in place rather than forking
 	// (§27.3). Populated only by RealTrader's open path.
+	ExchangeOrderID     *string
+	ExchangeAlgoOrderID *string
+
+	// Status is nil for paper/demo rows (which have no fill lifecycle — a paper order is always
+	// instantly and fully filled) and set for rows sourced from real_orders (CLAUDE.md, real-
+	// trading readiness plan, 2026-09-04): "pending", "partial", "filled", or "canceled". Lets
+	// handleListPositions present RealOrder rows through the same DTO shape the panel already
+	// consumes for paper/demo positions, without inventing a second response type.
+	Status *string
+}
+
+// RealOrder is a real-money trade placed against the exchange (CLAUDE.md, real-trading readiness
+// plan, 2026-09-04) — stored in its own table, separate from PaperOrder/paper_orders. This is a
+// deliberate reversal of the earlier decision (§27.3/§27.7) to share paper_orders with mode='real':
+// a real order has a fill lifecycle (Status) with no paper-trading equivalent (a paper order is
+// always instantly and fully filled), so it needs its own home rather than a column that would mean
+// nothing on every paper row. Every RealOrder IS mode="real" by construction — the table itself is
+// the mode discriminator, there is no Mode field here.
+//
+// Mirrors PaperOrder field-for-field except: no ParentOrderID/Variant (real trading has no
+// shadow-fork mechanic, §27.3) and no Mode (redundant by construction), plus the new Status field.
+type RealOrder struct {
+	ID         int64
+	InstID     string
+	StrategyID *int64
+	Bar        string
+	Side       string // "buy" or "sell"
+	EntryPx    decimal.Decimal
+	SLPx       *decimal.Decimal
+	TPPx       *decimal.Decimal
+	Size       decimal.Decimal
+	Leverage   decimal.Decimal
+	OpenedAt   time.Time
+	ClosedAt   *time.Time
+	CloseReason  *string // "sl", "tp", "manual", "timeout", "rl_early"
+	ClosePx      *decimal.Decimal
+	RealizedPnL  *decimal.Decimal
+	FeaturesJSON json.RawMessage
+
+	// Status tracks the fill lifecycle, independent of ClosedAt/CloseReason (which keep meaning
+	// "the position was later closed by SL/TP/manual/timeout" — unchanged from PaperOrder).
+	// "pending": order accepted by the exchange, fill not yet confirmed — written immediately so
+	// an in-flight order is visible on the panel, not only after it resolves.
+	// "partial": partially filled, remainder canceled by the fill timeout — a real, smaller
+	// position exists.
+	// "filled": fully filled — the normal case.
+	// "canceled": never filled before the fill timeout — no position exists; the row stays so a
+	// timed-out attempt is still visible rather than silently dropped.
+	Status string
+
+	PnLMaxPct decimal.Decimal
+	PnLMinPct decimal.Decimal
+
+	// StrategyName is joined in by ListRealPositions for display — not a stored column.
+	StrategyName string
+
+	ManualCloseRequested bool
+
 	ExchangeOrderID     *string
 	ExchangeAlgoOrderID *string
 }
@@ -333,6 +396,52 @@ type Repository interface {
 	// SortBy/Limit/Offset — what the panel's pagination control needs to know the total page
 	// count, without pulling every row back just to len() it.
 	CountPositions(ctx context.Context, f PositionFilter) (int, error)
+
+	// OpenRealOrder inserts a real order and returns its id (CLAUDE.md, real-trading readiness
+	// plan, 2026-09-04). Callers MUST set o.Status explicitly (normally "pending" — see RealOrder's
+	// doc comment) rather than relying on the column default, matching this codebase's existing
+	// style of Go-side explicitness for values the caller already knows.
+	OpenRealOrder(ctx context.Context, o RealOrder) (int64, error)
+	// GetRealOrder fetches a single real order by id, mirroring GetPaperOrder.
+	GetRealOrder(ctx context.Context, id int64) (RealOrder, error)
+	// UpdateRealOrderStatus transitions a real order's fill status once PlaceOrder's outcome is
+	// known: "filled" or "partial" (entryPx/size non-nil, corrected to the exchange-confirmed
+	// avgPx/filled size) or "canceled" (both nil — the entry never filled, no position exists).
+	UpdateRealOrderStatus(ctx context.Context, id int64, status string, entryPx *decimal.Decimal, size *decimal.Decimal) error
+	// SetRealOrderFeatures records the decision-time observation snapshot, mirroring how
+	// FeaturesJSON is set on PaperOrder — called once the fill/partial/canceled outcome is known.
+	SetRealOrderFeatures(ctx context.Context, id int64, featuresJSON json.RawMessage) error
+	// SetRealOrderExchangeAlgoOrderID mirrors SetExchangeAlgoOrderID for real_orders. Kept for
+	// parity even though no resting exchange-side algo order is placed today (§27.3's correction:
+	// real trading watches SL/TP in-process, the same mechanism paper trading uses).
+	SetRealOrderExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error
+	// CloseRealOrder mirrors ClosePaperOrder.
+	CloseRealOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error
+	// UpdateRealOrderSLTP mirrors UpdatePaperOrderSLTP — callers must have already clamped the
+	// proposed levels (RatchetSLTP for a model-driven edit; no clamp at all for a manual/operator
+	// edit, CLAUDE.md §27.7 commit 6) before calling this.
+	UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error
+	// ListOpenRealOrders mirrors ListOpenPaperOrders, restricted to Status IN ('filled','partial')
+	// — a still-pending order is not yet a real position and must never be double-counted as one.
+	ListOpenRealOrders(ctx context.Context, instID string) ([]RealOrder, error)
+	// RequestRealManualClose mirrors RequestManualClose — flags an open real order for RealTrader's
+	// own tick loop to close on its next tick (RealTrader.monitorOpenPositions), the same
+	// intent-not-action pattern RequestManualClose uses since cmd/api runs in a separate process.
+	RequestRealManualClose(ctx context.Context, id int64) error
+	// UpdateRealOrderPnLExtremes mirrors UpdatePaperOrderPnLExtremes.
+	UpdateRealOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error
+	// ListRealPositions mirrors ListPositions for real_orders. f.Mode is ignored (every row is real
+	// by construction); f.Open filters on Status IN ('filled','partial') AND ClosedAt IS NULL/NOT
+	// NULL as appropriate — a "canceled" row is never "open" (nothing to be open) and is only ever
+	// returned by a f.Open == nil (both) or explicit closed query, never an open-only one.
+	ListRealPositions(ctx context.Context, f PositionFilter) ([]RealOrder, error)
+	// CountRealPositions mirrors CountPositions.
+	CountRealPositions(ctx context.Context, f PositionFilter) (int, error)
+	// RecordRealOrderAdjustment mirrors RecordPaperOrderAdjustment, into real_order_adjustments.
+	RecordRealOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error
+	// ListRealOrderAdjustments mirrors ListPaperOrderAdjustments. Reuses the PaperOrderAdjustment
+	// shape (the fields are identical) rather than a parallel RealOrderAdjustment struct.
+	ListRealOrderAdjustments(ctx context.Context, orderID int64) ([]PaperOrderAdjustment, error)
 
 	// GetAccountEquity returns mode's current balance row, creating it (seeded at initialUSD, with
 	// a reason="seed" history point) if it doesn't exist yet — CLAUDE.md §15.6.

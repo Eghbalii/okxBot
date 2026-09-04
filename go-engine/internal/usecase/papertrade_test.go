@@ -30,10 +30,23 @@ type fakeRepository struct {
 	paramChanges       []port.ParamChange
 	orderAdjustments   []port.PaperOrderAdjustment
 	paperTradingConfig *port.PaperTradingConfig
+
+	// realOrders uses its own counter (nextRealID), deliberately NOT sharing nextID with the
+	// paper orders map — real_orders and paper_orders are independent Postgres sequences post-
+	// split (CLAUDE.md, real-trading readiness plan, 2026-09-04), so a test can construct the
+	// exact cross-table id-collision scenario (paper order id=3 and real order id=3 coexisting)
+	// production code must disambiguate correctly by mode/table, not by assuming ids are unique.
+	nextRealID           int64
+	realOrders           map[int64]port.RealOrder
+	realOrderAdjustments []port.PaperOrderAdjustment
 }
 
 func newFakeRepository() *fakeRepository {
-	return &fakeRepository{orders: make(map[int64]port.PaperOrder), accounts: make(map[string]port.AccountEquity)}
+	return &fakeRepository{
+		orders:     make(map[int64]port.PaperOrder),
+		accounts:   make(map[string]port.AccountEquity),
+		realOrders: make(map[int64]port.RealOrder),
+	}
 }
 
 func (r *fakeRepository) SaveCandle(ctx context.Context, c port.Candle) error {
@@ -277,6 +290,186 @@ func (r *fakeRepository) UpdatePaperOrderPnLExtremes(ctx context.Context, id int
 	}
 	r.orders[id] = o
 	return nil
+}
+
+func (r *fakeRepository) OpenRealOrder(ctx context.Context, o port.RealOrder) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.nextRealID++
+	o.ID = r.nextRealID
+	if o.Status == "" {
+		o.Status = "pending"
+	}
+	r.realOrders[o.ID] = o
+	return o.ID, nil
+}
+func (r *fakeRepository) GetRealOrder(ctx context.Context, id int64) (port.RealOrder, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok {
+		return port.RealOrder{}, fmt.Errorf("real order %d not found", id)
+	}
+	return o, nil
+}
+func (r *fakeRepository) UpdateRealOrderStatus(ctx context.Context, id int64, status string, entryPx *decimal.Decimal, size *decimal.Decimal) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok {
+		return fmt.Errorf("real order %d not found", id)
+	}
+	o.Status = status
+	if entryPx != nil {
+		o.EntryPx = *entryPx
+	}
+	if size != nil {
+		o.Size = *size
+	}
+	r.realOrders[id] = o
+	return nil
+}
+func (r *fakeRepository) SetRealOrderFeatures(ctx context.Context, id int64, featuresJSON json.RawMessage) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok {
+		return fmt.Errorf("real order %d not found", id)
+	}
+	o.FeaturesJSON = featuresJSON
+	r.realOrders[id] = o
+	return nil
+}
+func (r *fakeRepository) SetRealOrderExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok {
+		return fmt.Errorf("real order %d not found", id)
+	}
+	aid := algoOrderID
+	o.ExchangeAlgoOrderID = &aid
+	r.realOrders[id] = o
+	return nil
+}
+func (r *fakeRepository) CloseRealOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o := r.realOrders[id]
+	now := o.OpenedAt
+	o.ClosedAt = &now
+	o.CloseReason = &reason
+	cp := closePx
+	o.ClosePx = &cp
+	pnl := realizedPnL
+	o.RealizedPnL = &pnl
+	r.realOrders[id] = o
+	return nil
+}
+func (r *fakeRepository) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok || o.ClosedAt != nil {
+		return nil
+	}
+	o.SLPx = slPx
+	o.TPPx = tpPx
+	r.realOrders[id] = o
+	return nil
+}
+func (r *fakeRepository) ListOpenRealOrders(ctx context.Context, instID string) ([]port.RealOrder, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []port.RealOrder
+	for _, o := range r.realOrders {
+		if o.InstID == instID && o.ClosedAt == nil && (o.Status == "filled" || o.Status == "partial") {
+			out = append(out, o)
+		}
+	}
+	return out, nil
+}
+func (r *fakeRepository) RequestRealManualClose(ctx context.Context, id int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok || o.ClosedAt != nil {
+		return fmt.Errorf("real order %d is not open", id)
+	}
+	o.ManualCloseRequested = true
+	r.realOrders[id] = o
+	return nil
+}
+func (r *fakeRepository) UpdateRealOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok || o.ClosedAt != nil {
+		return nil
+	}
+	if maxPct.GreaterThan(o.PnLMaxPct) {
+		o.PnLMaxPct = maxPct
+	}
+	if minPct.LessThan(o.PnLMinPct) {
+		o.PnLMinPct = minPct
+	}
+	r.realOrders[id] = o
+	return nil
+}
+func (r *fakeRepository) ListRealPositions(ctx context.Context, f port.PositionFilter) ([]port.RealOrder, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []port.RealOrder
+	for _, o := range r.realOrders {
+		if f.InstID != "" && o.InstID != f.InstID {
+			continue
+		}
+		if f.Open != nil {
+			isOpenPosition := o.ClosedAt == nil && (o.Status == "filled" || o.Status == "partial")
+			if *f.Open {
+				if !isOpenPosition {
+					continue
+				}
+			} else {
+				if isOpenPosition {
+					continue
+				}
+			}
+		}
+		out = append(out, o)
+	}
+	if f.Limit > 0 && f.Offset < len(out) {
+		end := f.Offset + f.Limit
+		if end > len(out) {
+			end = len(out)
+		}
+		out = out[f.Offset:end]
+	}
+	return out, nil
+}
+func (r *fakeRepository) CountRealPositions(ctx context.Context, f port.PositionFilter) (int, error) {
+	out, err := r.ListRealPositions(ctx, f)
+	return len(out), err
+}
+func (r *fakeRepository) RecordRealOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.nextRealID++
+	r.realOrderAdjustments = append(r.realOrderAdjustments, port.PaperOrderAdjustment{
+		ID: r.nextRealID, OrderID: orderID, Field: field, OldValue: oldValue, NewValue: newValue, Source: source,
+	})
+	return nil
+}
+func (r *fakeRepository) ListRealOrderAdjustments(ctx context.Context, orderID int64) ([]port.PaperOrderAdjustment, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []port.PaperOrderAdjustment
+	for _, a := range r.realOrderAdjustments {
+		if a.OrderID == orderID {
+			out = append(out, a)
+		}
+	}
+	return out, nil
 }
 
 func (r *fakeRepository) GetAccountEquity(ctx context.Context, mode string, initialUSD decimal.Decimal) (port.AccountEquity, error) {
