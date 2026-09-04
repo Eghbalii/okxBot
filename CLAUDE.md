@@ -687,7 +687,9 @@ Phase 2 — clean architecture refactor & live wiring (current phase):
       `cmd/ingestor` was run against live OKX WS for the first time. Known simplifications still
       open: liquidation-buffer estimate is a conservative `100/leverage` approximation (ignores
       maintenance margin), order sizing assumes a contract multiplier of 1 (no
-      `/api/v5/public/instruments` lookup yet).
+      `/api/v5/public/instruments` lookup yet — fixed for `RealTrader`/`Trader` in §33.3, found
+      load-bearing against a real account whose tradeable instrument's contract shape is nowhere
+      near 1:1).
 - [x] `cmd/ingestor` + `cmd/paper-trader` dry run validated end-to-end against live OKX public
       market data (top-10 crypto perpetuals by volume) and a local Redis/TimescaleDB — confirmed
       the full pipeline (WS → Redis Streams → strategy evaluation → Postgres persistence →
@@ -4123,3 +4125,108 @@ Panel: `PaperTradingStatsBox` gained an "Account Balance" tile alongside the exi
 Equity" one, plus an inline "Set Trading Cap" number input + button that calls the new endpoint and
 immediately refetches stats — no restart button needed for this one, unlike the box's other
 controls, since the cap takes effect on the very next position open.
+
+## 33. First real-API-key test uncovered the account can't trade the classic SWAP instrument at all — real trading now targets a separate execution instrument via short internal symbols (2026-09-04)
+
+The operator's first real OKX API key test (`cmd/okx-apitest`, a throwaway diagnostic —
+account balance/positions, a far-from-market order verifying the 60s fill-timeout+cancel path,
+SL attach/amend/cancel via `order-algo`) surfaced two real, load-bearing findings before any order
+could even be tested, plus a design decision on how real trading and market-data collection now
+relate to each other.
+
+### 33.1 `www.okx.com` rejects EEA-hosted requests with a misleading "key doesn't exist" error
+
+The server (OVH, Roubaix, France) got `50119: API key doesn't exist` from `www.okx.com` for a
+fully valid key. This is a documented OKX regional-routing behavior, not a key problem — EEA
+traffic must use `my.okx.com` instead. `cmd/okx-apitest` now defaults to `my.okx.com`
+(`OKX_BASE_URL` overridable). **Not yet applied to `internal/okx/rest.Client`'s own
+`rest_base_url` config default** — still `https://www.okx.com` in `config.example.yaml` — since
+production traffic goes through `cmd/okx-gateway`, which was not yet exercised against a real key
+when this was found. Revisit before the gateway's own credentials go live.
+
+### 33.2 This account has zero usable margin on the classic SWAP/MARGIN/FUTURES(dated) instruments
+
+Every real order attempt against `BTC-USDT-SWAP` (linear), `BTC-USD-SWAP` (inverse), a dated
+`BTC-USD-<expiry>` future, and `BTC-USDT` margin all returned `50124: This API Key does not have
+trading permission for the market` — not a key-permission problem (Trade permission was confirmed
+present via `GET /account/config`'s `perm` field) but an account-mode one: `GET /account/max-size`
+returned `maxBuy=maxSell=0` for **every** one of them, regardless of instType. Root cause: this
+account is in OKX's **Multi-currency margin mode** (`acctLv=3`) with a **USDC** balance, and the
+only instrument category it can actually trade is OKX's newer **"X-Perp"** product — USD/USDC/
+USDG-settled perpetual futures with an auto-rolling far-dated expiry, exposed via `instType=
+FUTURES` with instId format `BTC-USD_UM_XPERP-<date>` (e.g. `BTC-USD_UM_XPERP-310404`), confirmed
+directly against a mobile-app screenshot showing the same instrument traded successfully as
+"X-Perp"/"UM" with a real USDC balance. `GET /account/max-size` against this instId returned
+`maxBuy=maxSell=14` — the first non-zero result in the whole investigation. This account was also
+found to be in **hedge mode** (`posMode: long_short_mode`), not net mode — `configs/config.yaml`
+and `config.example.yaml` both still say `pos_mode: "net"`; flagged in the example config as
+something to verify against the real account before going live, not fixed there directly since
+real trading is still off (`use_conductor_lifecycle: false`).
+
+Price comparison across all 10 configured tokens (SWAP vs. the matching X-Perp instrument, live
+ticker data): price differs by under 0.1% in every case (arbitrage keeps the two markets tight),
+but 24h volume on the X-Perp side is **29x to 144x lower** than the classic SWAP market this
+project's ingestor has always collected data from — real liquidity/spread on the execution venue
+is materially thinner than what paper-trading/RL training have been learning against. This does
+not invalidate price-based training signal, but it does mean volume-dependent strategies
+(`volume_breakout`, `vwap_reversion`) and any future order-book work were reasoning about a
+different market's depth than the one real orders actually execute against — see §33.4.
+
+### 33.3 Real-order execution now targets `ExecInstID`, separate from `InstID`
+
+`RealTrader` (and, for consistency, the older/being-phased-out `Trader`) gained `ExecInstID`/
+`ExecInstType`/`SettleCcy` fields, all falling back to today's behavior when unset (`InstID`
+directly / `"SWAP"` / `"USDT"`) — every literal exchange call (`PlaceOrder`, `CancelOrder`,
+`GetOrder`, `SetLeverage`, `GetPositions`, `GetBalance`) now targets these, while `InstID` stays
+the market-data/observation identity. Fixed a second bug in the same pass: `reconcile()` compared
+OKX's returned position `InstID` against the market-data `InstID`, which would never match once
+the two diverge — silently breaking drift detection.
+
+Also fixed real order sizing, previously `notional.Div(price)` — assumes a contract multiplier of
+1, a gap CLAUDE.md §14 already flagged as open ("order sizing assumes a contract multiplier of 1").
+The X-Perp instrument's real shape (`CtVal=0.0001`, `LotSz=1`) would have sized every real order
+roughly 10,000x too large. `domain.Instrument` + `ExchangeClient.GetInstrument` (`GET /public/
+instruments`) were added end-to-end (port, `rest.Client`, the gateway proxy, `gatewayclient`), and
+`sizeToContracts` converts notional through `CtVal` and rounds **down** to the nearest `LotSz`
+multiple — cached once per process via `sync.Once` (an instrument's contract shape doesn't change
+while the process runs).
+
+### 33.4 Design decision: short internal symbols everywhere, OKX's wire format only at the boundary
+
+Explicit operator instruction, given this bot only trades USD-quoted perpetual futures: every
+service, DB row, Kafka topic key, and config entry should carry a short symbol (`"BTC"`, `"ETH"`,
+...), never OKX's full wire-format instId — which additionally varies by product (`BTC-USDT-SWAP`
+vs. `BTC-USD_UM_XPERP-<date>`) and, for X-Perp, changes over time as OKX rolls the contract's
+expiry. **Full switch, not a parallel/dual-source addition** (operator's explicit choice over
+keeping SWAP-shaped data alongside X-Perp): `trading.inst_ids` now holds short symbols directly,
+and `trading.symbol_map` (`internal/okx.SymbolMap`) is the *one* translation table, used *only* at
+the boundary where a service is about to make a real OKX WS/REST call. `SymbolMap.Resolve`/
+`ResolveAll` fail loudly on an unmapped symbol — never a silent empty-instId call, matching this
+project's own "loud failure over a data gap that looks healthy" precedent (§9's bar-casing
+validation).
+
+`cmd/ingestor` is now the **only** process that ever touches OKX's wire-format instId: it resolves
+each symbol to a real instId for the WS subscription, then translates every inbound message's
+`instId` back to the short symbol before publishing to Kafka (`rewriteInstID` for the raw-JSON
+ticker passthrough; a plain struct-field set for the already-typed `candleEvent`). Every downstream
+consumer — `PaperTrader`, `RealTrader`, the panel, every DB row — only ever sees the short symbol
+from here on. `cmd/trader`, `cmd/strategy-tester`, and `cmd/strategy-optimizer` each resolve a
+symbol to its real instId only immediately before the one REST call that needs it (order
+placement/cancel/query/leverage, and read-only `GetCandles` window-seeding respectively); every
+other piece of state in those services (candle windows, trials, targets, strategy assignments)
+stays keyed by the short symbol, unchanged.
+
+**Deliberately not yet done**: no DB migration for historical `paper_orders`/`candles` rows already
+keyed by the old `BTC-USDT-SWAP`-shaped instId — those stay as historical data under the old
+identity; only newly-collected data uses the short symbol going forward. `config.example.yaml`'s
+`symbol_map` is populated with the real X-Perp instIds verified live for all 10 configured tokens,
+but — per §33.2's own warning — these carry expiry dates OKX periodically rolls and must be
+re-verified against a live account before every real-trading deployment, not assumed stable.
+
+19 new tests across `internal/okx` (SymbolMap, GetInstrument decoding), `internal/usecase`
+(`sizeToContracts`, `execInstID`/`execInstType`/`settleCcy` accessors for both `RealTrader` and the
+legacy `Trader`, mutation-verified regression tests proving `PlaceOrder`/`SetLeverage` target
+`ExecInstID` not `InstID`), `internal/config` (symbol_map parsing), `cmd/ingestor`
+(`rewriteInstID`, `reverseSymbolMap`), and `cmd/strategy-optimizer` (`seedWindow`'s symbol
+resolution) — 453 Go tests total (was 424 before this section's work). None of this is deployed to
+the server yet; `use_conductor_lifecycle`/`allow_real_money` remain off there.
