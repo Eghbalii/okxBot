@@ -143,6 +143,15 @@ func (e *RealTrader) fillTimeout() time.Duration {
 // filled result means for its own path. A GetOrder error mid-poll is logged and treated as "not
 // yet terminal" rather than aborting the wait outright — a single flaky status read must not
 // abandon an order that may still be filling normally.
+// WaitForFillForTesting exports waitForFill for cmd/okx-apitest (CLAUDE.md's 2026-09-04 API-key
+// diagnostic) to call the real production fill-timeout/cancel path directly, without pulling in
+// the rest of RealTrader's strategy/conductor/Kafka machinery — the diagnostic must never risk
+// opening a position on its own initiative. Behavior is identical to waitForFill; this is purely
+// a visibility export, not a separate implementation.
+func (e *RealTrader) WaitForFillForTesting(ctx context.Context, ordID string, logger *slog.Logger) (domain.OrderStatus, error) {
+	return e.waitForFill(ctx, ordID, logger)
+}
+
 func (e *RealTrader) waitForFill(ctx context.Context, ordID string, logger *slog.Logger) (domain.OrderStatus, error) {
 	deadline := time.Now().Add(e.fillTimeout())
 	var last domain.OrderStatus
