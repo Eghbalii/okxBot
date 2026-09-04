@@ -62,6 +62,22 @@ function unrealizedPnL(p: Position, lastPrice: string | undefined): { pct: numbe
   return { pct, usd }
 }
 
+// Leverage-adjusted % move from entry to a target price (SL or TP), same formula unrealizedPnL
+// uses against the live price above — for SL this is always <= 0 (a stop realizes a loss) and for
+// TP always >= 0 (a target realizes a gain), given a coherent order; shown to the operator as a
+// magnitude with its own fixed sign convention (2026-09-04 request: SL/TP columns show % instead
+// of price, so the real risk/reward at the position's actual leverage is visible at a glance
+// rather than requiring the operator to do the leverage math against a raw price themselves).
+function slTpPct(p: Position, target: string | null): number | null {
+  if (!target) return null
+  const entry = Number(p.EntryPx)
+  const t = Number(target)
+  const leverage = Number(p.Leverage) || 1
+  if (!entry || !Number.isFinite(t)) return null
+  const direction = p.Side === 'buy' ? 1 : -1
+  return (direction * (t - entry) * 100 * leverage) / entry
+}
+
 export default function PositionsPage() {
   const [mode, setMode] = useState<PositionMode | 'all'>('all')
   const [instId, setInstId] = useState('')
@@ -288,6 +304,8 @@ export default function PositionsPage() {
               const isFork = p.Variant === 'rl_adjusted'
               const wasUpdated = updatedOrderIds.has(p.ID)
               const realized = p.RealizedPnL !== null ? Number(p.RealizedPnL) : null
+              const slPct = slTpPct(p, p.SLPx)
+              const tpPct = slTpPct(p, p.TPPx)
               return (
                 <tr key={p.ID}>
                   <td>
@@ -316,12 +334,22 @@ export default function PositionsPage() {
                   <td className="mono text-dim">{p.Bar || '—'}</td>
                   <td className="mono">{trimPrice(p.EntryPx)}</td>
                   {showLiveColumns && <td className="mono">{p.ClosedAt ? '—' : trimPrice(lastPrice)}</td>}
-                  <td className="mono text-dim sl-tp-cell">
-                    <div>SL {trimPrice(p.SLPx)}</div>
-                    <div>TP {trimPrice(p.TPPx)}</div>
+                  <td className="mono sl-tp-cell">
+                    <div>
+                      <span className="text-dim">{trimPrice(p.SLPx)}</span>{' '}
+                      {slPct !== null && (
+                        <span className="text-red">{`(${slPct >= 0 ? '+' : ''}${slPct.toFixed(2)}%)`}</span>
+                      )}
+                    </div>
+                    <div>
+                      <span className="text-dim">{trimPrice(p.TPPx)}</span>{' '}
+                      {tpPct !== null && (
+                        <span className="text-green">{`(${tpPct >= 0 ? '+' : ''}${tpPct.toFixed(2)}%)`}</span>
+                      )}
+                    </div>
                   </td>
                   <td className="mono">{p.Leverage}x</td>
-                  <td className="mono">${Number(p.Size).toLocaleString()}</td>
+                  <td className="mono">${trimPrice(p.Size)}</td>
                   <DateTimeCell iso={p.OpenedAt} />
                   {showClosedColumns && <DateTimeCell iso={p.ClosedAt} />}
                   {showClosedColumns && <td>{closeReasonBadge(p.CloseReason)}</td>}

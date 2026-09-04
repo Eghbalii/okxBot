@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { Position } from '../api/types'
-import { tokenSymbol } from '../utils/format'
+import { tokenSymbol, trimPrice } from '../utils/format'
 
 // Manual SL/TP-edit form for a real position (CLAUDE.md §27's real-trading plan §3b, 2026-09-03).
 // Both inputs are a SIGNED percentage of margin, leverage-adjusted — negative moves the level to
@@ -32,7 +32,7 @@ export default function AdjustPositionForm({
   return (
     <div className="adjust-position-form">
       <span className="text-dim">
-        Adjust {tokenSymbol(position.InstID)} #{position.ID} ({position.Side}, entry {position.EntryPx}, {position.Leverage}x)
+        Adjust {tokenSymbol(position.InstID)} #{position.ID} ({position.Side}, entry {trimPrice(position.EntryPx)}, {position.Leverage}x)
       </span>
       <label>
         SL %

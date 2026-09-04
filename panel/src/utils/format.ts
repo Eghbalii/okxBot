@@ -63,16 +63,31 @@ export function tokenSymbol(instId: string | null | undefined): string {
   return instId.endsWith('-USDT-SWAP') ? instId.slice(0, -'-USDT-SWAP'.length) : instId
 }
 
-// Trims a price/size string to at most 4 decimal places once its magnitude is >= 1 (display only —
-// the exact NUMERIC value from Postgres, CLAUDE.md §7, is untouched; this never reaches the
-// backend). Values below 1 are left at full precision: many tokens here trade at sub-cent prices
-// (e.g. 0.00012345), where rounding to 4dp would discard the digits that actually distinguish one
-// price from another, not just trailing noise the way it is for a $50,000 BTC price.
+// Trims a price/size value for display (2026-09-04 request) — the exact NUMERIC value from
+// Postgres (CLAUDE.md §7) is untouched, this never reaches the backend, purely cosmetic rounding
+// of numbers that were otherwise showing far more precision than is readable.
+//
+// Two regimes, split at magnitude 1:
+//   >= 1: at most 4 digits after the decimal point (e.g. 81234.56789 -> "81234.5679").
+//   < 1:  at most 4 SIGNIFICANT digits counted from the first non-zero digit, not 4 decimal
+//         places flat — many tokens here trade at sub-cent prices (e.g. 0.000003624), where a
+//         flat 4dp round would collapse the entire value to "0.0000" and destroy the only digits
+//         that actually distinguish one price from another. 0.000003624 -> "0.000003624" trimmed
+//         to its first 4 significant digits -> "0.000003624" -> "0.0000036".
 export function trimPrice(value: string | number | null | undefined): string {
   if (value == null) return '—'
   const n = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(n)) return String(value)
-  if (Math.abs(n) < 1) return typeof value === 'number' ? String(value) : value
-  // toFixed(4) then strip trailing zeros, so an integer-like value doesn't sprout ".0000".
-  return n.toFixed(4).replace(/\.?0+$/, '') || '0'
+  if (n === 0) return '0'
+  if (Math.abs(n) >= 1) {
+    // toFixed(4) then strip trailing zeros, so an integer-like value doesn't sprout ".0000".
+    return n.toFixed(4).replace(/\.?0+$/, '') || '0'
+  }
+  // toPrecision(4) on a sub-1 value gives 4 significant digits total; since the leading digit is
+  // always "0" for |n| < 1, this reads as 4 significant digits after the decimal point's leading
+  // zeros — exactly "4 digits after the first non-zero digit" for values with several leading
+  // zeros (0.000003624 -> "0.000003624"), and plain 4-significant-digit rounding otherwise
+  // (0.123456 -> "0.1235"). Strips trailing zeros the same way the >=1 branch does.
+  const fixed = n.toPrecision(4)
+  return fixed.includes('.') ? fixed.replace(/0+$/, '').replace(/\.$/, '') : fixed
 }

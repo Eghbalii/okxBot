@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import type { PaperOrderAdjustment, Position } from '../api/types'
-import { tokenSymbol } from '../utils/format'
+import { tokenSymbol, trimPrice } from '../utils/format'
 
 // The decision-time observation persisted on the order (CLAUDE.md §15.3) — what the model was
 // ASKED. Only the fields this view compares are typed; the rest of the payload is ignored.
@@ -42,6 +42,14 @@ function parseObservation(raw: unknown): DecisionObservation | null {
 function fmt(v: string | number | null | undefined): string {
   if (v === null || v === undefined || v === '') return '—'
   return String(v)
+}
+
+// Like fmt, but for price/notional-shaped fields (entry/SL/TP/size) — trimmed for readability the
+// same way the Positions table's own prices are (2026-09-04 request), rather than showing raw
+// full-precision NUMERIC values.
+function fmtPrice(v: string | number | null | undefined): string {
+  if (v === null || v === undefined || v === '') return '—'
+  return trimPrice(v)
 }
 
 // Distance of a SL/TP level from entry, as a signed percent — positive means "in the direction of
@@ -119,7 +127,7 @@ function AdjustmentHistory({ orderId }: { orderId: number }) {
             <td className="mono">{new Date(a.CreatedAt).toLocaleString()}</td>
             <td>{a.Field.toUpperCase()}</td>
             <td className="mono">
-              {fmt(a.OldValue)} → {fmt(a.NewValue)}
+              {fmtPrice(a.OldValue)} → {fmtPrice(a.NewValue)}
             </td>
             <td>{a.Source}</td>
           </tr>
@@ -175,18 +183,18 @@ export default function OrderDetailModal({
           </thead>
           <tbody>
             <Row label="Side" strategy={fmt(sig?.side)} model={fmt(position.Side)} />
-            <Row label="Entry price" strategy={fmt(sig?.entry_px)} model={fmt(position.EntryPx)} />
+            <Row label="Entry price" strategy={fmtPrice(sig?.entry_px)} model={fmtPrice(position.EntryPx)} />
             <Row
               label="Stop loss"
-              strategy={fmt(sig?.sl_px) + (sig?.sl_px ? pctFromEntry(sig.sl_px, sig?.entry_px || position.EntryPx, position.Side) : '')}
-              model={fmt(position.SLPx) + (position.SLPx ? pctFromEntry(position.SLPx, position.EntryPx, position.Side) : '')}
+              strategy={fmtPrice(sig?.sl_px) + (sig?.sl_px ? pctFromEntry(sig.sl_px, sig?.entry_px || position.EntryPx, position.Side) : '')}
+              model={fmtPrice(position.SLPx) + (position.SLPx ? pctFromEntry(position.SLPx, position.EntryPx, position.Side) : '')}
             />
             <Row
               label="Take profit"
-              strategy={fmt(sig?.tp_px) + (sig?.tp_px ? pctFromEntry(sig.tp_px, sig?.entry_px || position.EntryPx, position.Side) : '')}
-              model={fmt(position.TPPx) + (position.TPPx ? pctFromEntry(position.TPPx, position.EntryPx, position.Side) : '')}
+              strategy={fmtPrice(sig?.tp_px) + (sig?.tp_px ? pctFromEntry(sig.tp_px, sig?.entry_px || position.EntryPx, position.Side) : '')}
+              model={fmtPrice(position.TPPx) + (position.TPPx ? pctFromEntry(position.TPPx, position.EntryPx, position.Side) : '')}
             />
-            <Row label="Size (USD)" strategy="—" model={fmt(position.Size)} />
+            <Row label="Size (USD)" strategy="—" model={fmtPrice(position.Size)} />
             <Row label="Leverage" strategy="—" model={fmt(position.Leverage) + 'x'} />
             <Row label="Confidence" strategy={fmt(sig?.confidence)} model="—" />
             <Row label="Strategy win rate" strategy={fmt(sig?.win_rate)} model="—" />
