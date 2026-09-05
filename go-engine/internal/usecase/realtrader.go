@@ -143,12 +143,36 @@ type RealTrader struct {
 
 	openMu sync.Mutex
 
+	// rlAdjustMu/lastRLAdjustAt throttle runUpdates to RLAdjustInterval cadence, mirroring
+	// PaperTrader's identical throttle exactly (CLAUDE.md §15.9's MidPrice-freshness fix) — found
+	// missing 2026-09-05 during the first real-trading activation: RealTrader.handleTick called
+	// runUpdates (which queries real_orders via openPositions()) on EVERY tick with no throttle at
+	// all, unlike PaperTrader's shouldRunRLAdjust gate. At OKX's live tick rate across 10
+	// instruments this measured as a genuinely elevated, continuous Postgres query load (~65% CPU
+	// on the timescaledb container) — not a slow query (0.14ms execution, correctly indexed), a
+	// frequency problem.
+	rlAdjustMu     sync.Mutex
+	lastRLAdjustAt time.Time
+
 	conductorOnce sync.Once
 	lifecycle     *conductor.Conductor
 
 	instrumentOnce sync.Once
 	instrument     domain.Instrument
 	instrumentErr  error
+}
+
+// shouldRunRLAdjust mirrors PaperTrader.shouldRunRLAdjust exactly: reports whether RLAdjustInterval
+// has elapsed since the last update pass, and if so atomically claims the slot so concurrent ticks
+// can't both pass the check and double-fire.
+func (e *RealTrader) shouldRunRLAdjust() bool {
+	e.rlAdjustMu.Lock()
+	defer e.rlAdjustMu.Unlock()
+	if time.Since(e.lastRLAdjustAt) < RLAdjustInterval {
+		return false
+	}
+	e.lastRLAdjustAt = time.Now()
+	return true
 }
 
 // asPaperOrderView converts a RealOrder into the port.PaperOrder shape the shared pure math
@@ -424,7 +448,13 @@ func (e *RealTrader) handleTick(ctx context.Context, data []byte, logger *slog.L
 	if err := e.monitorOpenPositions(ctx, price, logger); err != nil {
 		return err
 	}
-	e.runUpdates(ctx, e.decisionBar(), price, logger)
+	// Throttled to RLAdjustInterval (CLAUDE.md §15.9's freshness fix, mirrored from PaperTrader) —
+	// runUpdates queries real_orders and, when a position is actually due for a decision, calls the
+	// model; running it on every single tick against 10 live instruments produced a continuous,
+	// unnecessary Postgres query load with no benefit (found 2026-09-05 during first activation).
+	if e.shouldRunRLAdjust() {
+		e.runUpdates(ctx, e.decisionBar(), price, logger)
+	}
 	return nil
 }
 

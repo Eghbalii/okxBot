@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -612,5 +613,63 @@ func TestCloseReal_UnfilledFlattenDoesNotMarkClosed(t *testing.T) {
 	}
 	if len(exchange.cancelOrderCalls) != 1 {
 		t.Errorf("expected the unfilled flatten order to be canceled, got %d cancel calls", len(exchange.cancelOrderCalls))
+	}
+}
+
+// TestHandleTick_RunUpdatesThrottled covers the RLAdjustInterval throttle added 2026-09-05 during
+// the first real-trading activation: RealTrader.handleTick previously called runUpdates
+// unconditionally on EVERY tick with no throttle at all (unlike PaperTrader's identical
+// shouldRunRLAdjust gate), which measured live as a continuous, unnecessary Postgres query load
+// across 10 real instruments at OKX's live tick rate. A burst of ticks within one interval must
+// only trigger one Predict call.
+func TestHandleTick_RunUpdatesThrottled(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	model := &fakeModelClientRL{action: domain.Action{}}
+	rt := newTestRealTrader(repo, exchange, model, nil)
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+
+	sl := dec("95")
+	repo.realOrders[1] = port.RealOrder{
+		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("100"), SLPx: &sl,
+		Size: dec("10"), Leverage: dec("1"),
+	}
+
+	for i := 0; i < 5; i++ {
+		tick, _ := json.Marshal(tickEvent{InstID: rt.InstID, Last: "103.5"})
+		if err := rt.handleTick(context.Background(), tick, testLogger()); err != nil {
+			t.Fatalf("handleTick #%d: %v", i, err)
+		}
+	}
+
+	if model.calls != 1 {
+		t.Errorf("expected exactly 1 Predict call across a burst of ticks within RLAdjustInterval, got %d", model.calls)
+	}
+}
+
+// TestHandleTick_RunUpdatesFiresOnFirstTick confirms the throttle doesn't suppress the FIRST tick
+// — an open position must still get an update pass promptly, not only after some initial delay.
+func TestHandleTick_RunUpdatesFiresOnFirstTick(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	model := &fakeModelClientRL{action: domain.Action{}}
+	rt := newTestRealTrader(repo, exchange, model, nil)
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+
+	sl := dec("95")
+	repo.realOrders[1] = port.RealOrder{
+		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("100"), SLPx: &sl,
+		Size: dec("10"), Leverage: dec("1"),
+	}
+
+	tick, _ := json.Marshal(tickEvent{InstID: rt.InstID, Last: "103.5"})
+	if err := rt.handleTick(context.Background(), tick, testLogger()); err != nil {
+		t.Fatalf("handleTick: %v", err)
+	}
+
+	if model.calls != 1 {
+		t.Errorf("expected Predict called once on the very first tick, got %d calls", model.calls)
 	}
 }
