@@ -1239,31 +1239,33 @@ func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
 	if balances, err := e.Exchange.GetBalance(e.settleCcy()); err != nil {
 		logger.Warn("reconcile: get balance failed", "instId", e.InstID, "error", err)
 	} else if len(balances) > 0 {
-		e.recordEquityReal(ctx, e.tradableEquity(balances[0].Eq), logger)
+		e.recordEquityReal(ctx, balances[0].Eq, logger)
 	}
 }
 
-// recordEquityReal mirrors trade.go's Trader.recordEquity: the exchange's reported equity is
+// recordEquityReal mirrors trade.go's Trader.recordEquity: the exchange's reported balance is
 // ground truth, so this only observes it and records the delta from what was last stored, never
 // applying a top-up/reset the way paper mode's balance does. Best-effort.
-func (e *RealTrader) recordEquityReal(ctx context.Context, equity decimal.Decimal, logger *slog.Logger) {
+//
+// Takes the RAW exchange balance (NOT run through tradableEquity first) and lets
+// RecordExchangeBalance apply the SafeMoneyUSD reserve as a pure derived-EquityUSD view rather
+// than a stored delta — CLAUDE.md §32's incident: computing tradableEquity(rawBalance) here and
+// feeding that into a plain delta-from-EquityUSD comparison meant the reserve itself was read as
+// a realized trade loss the first time SafeMoneyUSD went from 0 to nonzero, corrupting the real
+// AccountBalanceUSD by the reserve amount.
+func (e *RealTrader) recordEquityReal(ctx context.Context, rawBalance decimal.Decimal, logger *slog.Logger) {
 	if e.Repo == nil {
 		return
 	}
 	initial := e.AccountInitialUSD
 	if !initial.IsPositive() {
-		initial = equity
+		initial = rawBalance
 	}
-	acct, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), initial)
-	if err != nil {
+	if _, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), initial); err != nil {
 		logger.Warn("reconcile: equity timeline read failed", "mode", e.accountMode(), "error", err)
 		return
 	}
-	delta := equity.Sub(acct.EquityUSD)
-	if delta.IsZero() {
-		return
-	}
-	if _, _, err := e.Repo.ApplyRealizedPnL(ctx, e.accountMode(), delta, nil, e.InstID); err != nil {
+	if _, err := e.Repo.RecordExchangeBalance(ctx, e.accountMode(), rawBalance, e.SafeMoneyUSD, e.InstID); err != nil {
 		logger.Warn("reconcile: equity timeline write failed", "mode", e.accountMode(), "error", err)
 	}
 }

@@ -529,6 +529,29 @@ func (r *fakeRepository) ApplyRealizedPnL(ctx context.Context, mode string, pnl 
 	return ae, reset, nil
 }
 
+func (r *fakeRepository) RecordExchangeBalance(ctx context.Context, mode string, rawBalanceUSD, safeMoneyUSD decimal.Decimal, instID string) (port.AccountEquity, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ae, ok := r.accounts[mode]
+	if !ok {
+		return port.AccountEquity{}, fmt.Errorf("record exchange balance: no account row for mode %s", mode)
+	}
+	delta := rawBalanceUSD.Sub(ae.AccountBalanceUSD)
+	ae.AccountBalanceUSD = rawBalanceUSD
+	tradable := rawBalanceUSD.Sub(safeMoneyUSD)
+	if tradable.IsNegative() {
+		tradable = decimal.Zero
+	}
+	ae.EquityUSD = tradable
+	if !delta.IsZero() {
+		r.equityPoints = append(r.equityPoints, port.EquityPoint{
+			Mode: mode, EquityUSD: ae.EquityUSD, DeltaUSD: delta, Reason: "trade", InstID: instID,
+		})
+	}
+	r.accounts[mode] = ae
+	return ae, nil
+}
+
 func (r *fakeRepository) SetAccountCap(ctx context.Context, mode string, newCapUSD decimal.Decimal) (port.AccountEquity, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -2091,6 +2114,62 @@ func TestSetAccountCap_MovesBalanceAndEquityTogether(t *testing.T) {
 	}
 	if !acct.EquityUSD.Equal(acct.AccountBalanceUSD) {
 		t.Errorf("invariant violated after a trade: EquityUSD (%s) must still equal AccountBalanceUSD (%s)", acct.EquityUSD, acct.AccountBalanceUSD)
+	}
+}
+
+// TestRecordExchangeBalance_ReservedNeverReportsAsATrade is the CLAUDE.md §32 incident,
+// reproduced exactly: a real account seeded at $40 (no SafeMoneyUSD reserve applied yet), then the
+// FIRST poll after safe_money_usd=20 is configured reports the exchange's raw balance completely
+// unchanged at $40. Before this fix, RealTrader.recordEquityReal computed
+// tradableEquity($40) = $20 FIRST and fed that into ApplyRealizedPnL's delta-from-EquityUSD
+// comparison — which read as a genuine $20 trade loss and dragged the real AccountBalanceUSD down
+// to $20 too, even though the exchange balance never moved. The fix must show AccountBalanceUSD
+// staying at $40 (the exchange's own truth) while EquityUSD alone reflects the $20 reserve split.
+func TestRecordExchangeBalance_ReservedNeverReportsAsATrade(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	// Raw exchange balance is unchanged at $40; a $20 safe-money reserve is applied for the first
+	// time on this poll.
+	acct, err := repo.RecordExchangeBalance(ctx, "real", dec("40"), dec("20"), "BTC")
+	if err != nil {
+		t.Fatalf("record exchange balance: %v", err)
+	}
+	if !acct.AccountBalanceUSD.Equal(dec("40")) {
+		t.Errorf("AccountBalanceUSD must stay at the exchange's real, unchanged balance: want 40, got %s "+
+			"— a reserve split must never be misreported as a real trade loss", acct.AccountBalanceUSD)
+	}
+	if !acct.EquityUSD.Equal(dec("20")) {
+		t.Errorf("EquityUSD must reflect the reserve split (40-20): want 20, got %s", acct.EquityUSD)
+	}
+
+	// No history point should have been written for a zero-delta raw balance, since nothing about
+	// the real account actually changed — only the derived tradable view did.
+	points, err := repo.ListEquityHistory(ctx, "real", time.Time{}, 0)
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	for _, p := range points {
+		if p.Reason == "trade" {
+			t.Errorf("no 'trade' history point should exist for a reserve split with zero real balance change, got %+v", p)
+		}
+	}
+
+	// Now the exchange balance genuinely drops by $5 (a real trade loss) on the next poll — this
+	// must show up as a real $5 delta on AccountBalanceUSD, and EquityUSD must track it minus the
+	// same $20 reserve.
+	acct, err = repo.RecordExchangeBalance(ctx, "real", dec("35"), dec("20"), "BTC")
+	if err != nil {
+		t.Fatalf("record exchange balance after real loss: %v", err)
+	}
+	if !acct.AccountBalanceUSD.Equal(dec("35")) {
+		t.Errorf("AccountBalanceUSD after a real $5 loss: want 35, got %s", acct.AccountBalanceUSD)
+	}
+	if !acct.EquityUSD.Equal(dec("15")) {
+		t.Errorf("EquityUSD after a real $5 loss (35-20 reserve): want 15, got %s", acct.EquityUSD)
 	}
 }
 

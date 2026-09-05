@@ -465,6 +465,19 @@ type Repository interface {
 	// account is a stop condition requiring a human decision, so it is left at/below zero and
 	// reported as drained instead. Returns the updated row and whether a reset occurred.
 	ApplyRealizedPnL(ctx context.Context, mode string, pnl decimal.Decimal, orderID *int64, instID string) (AccountEquity, bool, error)
+	// RecordExchangeBalance observes the exchange's own raw reported balance (rawBalanceUSD,
+	// BEFORE any SafeMoneyUSD reserve is subtracted) and reconciles it against this mode's stored
+	// AccountBalanceUSD, recording the real delta as a reason="trade" EquityPoint exactly like
+	// ApplyRealizedPnL does — the true P&L, since a live exchange balance's change from one poll to
+	// the next IS a realized trade outcome. EquityUSD (the tradable figure the panel shows and
+	// position sizing reads) is then set to max(new AccountBalanceUSD - safeMoneyUSD, 0) in the
+	// SAME transaction, with NO separate history point of its own: subtracting a reserve is a
+	// bookkeeping split, not a second P&L event, and must never be misreported as one (CLAUDE.md
+	// §32's balance-corruption incident — RecordEquityReal used to route the reserve-adjusted
+	// number through ApplyRealizedPnL directly, which dragged the real AccountBalanceUSD down by
+	// the reserve amount the very first time SafeMoneyUSD was set). Real mode never auto-resets,
+	// same carve-out as ApplyRealizedPnL. Returns the updated row.
+	RecordExchangeBalance(ctx context.Context, mode string, rawBalanceUSD, safeMoneyUSD decimal.Decimal, instID string) (AccountEquity, error)
 	// ListEquityHistory returns mode's balance timeline for the panel's chart (CLAUDE.md §15.7),
 	// oldest-first for direct plotting. A zero since means no lower bound; limit<=0 means no cap.
 	ListEquityHistory(ctx context.Context, mode string, since time.Time, limit int) ([]EquityPoint, error)

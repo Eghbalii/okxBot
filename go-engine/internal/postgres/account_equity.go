@@ -129,6 +129,63 @@ func (r *Repository) ApplyRealizedPnL(
 	return ae, true, nil
 }
 
+// RecordExchangeBalance reconciles the exchange's own raw reported balance against this mode's
+// stored AccountBalanceUSD, applying the real delta as a reason="trade" EquityPoint (mirroring
+// ApplyRealizedPnL exactly), then derives EquityUSD independently as
+// max(AccountBalanceUSD-safeMoneyUSD, 0) with NO history point of its own — CLAUDE.md §32's
+// incident. Before this existed, RealTrader.recordEquityReal computed
+// tradableEquity(rawBalance) = rawBalance-SafeMoneyUSD FIRST and fed that already-reserve-
+// subtracted number into ApplyRealizedPnL's delta-from-EquityUSD comparison — the moment
+// SafeMoneyUSD was set to a nonzero value, that read as a real trade loss equal to the reserve
+// and dragged the real AccountBalanceUSD down by it too, even though nothing had actually
+// happened to the exchange balance. This method takes the RAW balance instead and computes the
+// delta against AccountBalanceUSD (the true running total), so a reserve being subtracted for
+// display/sizing purposes can never be mistaken for a realized trade.
+func (r *Repository) RecordExchangeBalance(ctx context.Context, mode string, rawBalanceUSD, safeMoneyUSD decimal.Decimal, instID string) (port.AccountEquity, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return port.AccountEquity{}, fmt.Errorf("begin record exchange balance: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+
+	var previousBalance decimal.Decimal
+	if err := tx.QueryRow(ctx, `SELECT account_balance_usd FROM account_equity WHERE mode = $1`, mode).Scan(&previousBalance); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("record exchange balance for mode %s: no existing row (call GetAccountEquity first): %w", mode, err)
+	}
+
+	delta := rawBalanceUSD.Sub(previousBalance)
+	tradable := rawBalanceUSD.Sub(safeMoneyUSD)
+	if tradable.IsNegative() {
+		tradable = decimal.Zero
+	}
+
+	var ae port.AccountEquity
+	row := tx.QueryRow(ctx, `
+		UPDATE account_equity
+		SET account_balance_usd = $2,
+			equity_usd = $3,
+			updated_at = now()
+		WHERE mode = $1
+		RETURNING `+accountEquityCols, mode, rawBalanceUSD, tradable)
+	if err := scanAccountEquity(row, &ae); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("record exchange balance for mode %s: %w", mode, err)
+	}
+
+	if !delta.IsZero() {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO account_equity_history (mode, equity_usd, delta_usd, reason, inst_id)
+			VALUES ($1, $2, $3, 'trade', $4)
+		`, mode, ae.EquityUSD, delta, nullableText(instID)); err != nil {
+			return port.AccountEquity{}, fmt.Errorf("record exchange balance history for mode %s: %w", mode, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("commit record exchange balance: %w", err)
+	}
+	return ae, nil
+}
+
 // SetAccountCap is a operator-triggered DEPOSIT/WITHDRAWAL, not an independent re-baselining of
 // EquityUSD alone (corrected 2026-09-04, CLAUDE.md §31.3 — the first version of this method set
 // EquityUSD to newCapUSD while leaving AccountBalanceUSD untouched, which left Balance sitting
