@@ -169,6 +169,12 @@ services:
       # holds OKX_API_KEY/SECRET/PASSPHRASE/SIMULATED_TRADING at all (only the gateway does). Mode
       # (real vs demo) is derived from the gateway's own GET /health response, not a local env var.
       OKX_GATEWAY_URL: http://okx-gateway:8094
+      # Found missing 2026-09-05 during the first real-trading activation: without this,
+      # kafkastream.NewConsumer falls back to its own localhost:9092 default — inside this
+      # container that's its OWN loopback, not the kafka container, so RealTrader received zero
+      # ticks/candles and could never evaluate a signal. Same class of oversight as the
+      # previously-missing POSTGRES_DSN on this same service (§27.7).
+      KAFKA_BROKERS: kafka:9092
       # Postgres is OPTIONAL for cmd/trader (§15.7: used only for the equity-timeline chart, a
       # connection failure degrades to "no timeline recorded" rather than exiting) — but was
       # previously left unset here entirely, silently falling back to config's localhost default,
