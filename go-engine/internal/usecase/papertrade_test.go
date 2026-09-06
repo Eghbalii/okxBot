@@ -369,7 +369,7 @@ func (r *fakeRepository) CloseRealOrder(ctx context.Context, id int64, closePx d
 	r.realOrders[id] = o
 	return nil
 }
-func (r *fakeRepository) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
+func (r *fakeRepository) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal, manualOverride bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
@@ -378,6 +378,9 @@ func (r *fakeRepository) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx
 	}
 	o.SLPx = slPx
 	o.TPPx = tpPx
+	if manualOverride {
+		o.ManualOverride = true
+	}
 	r.realOrders[id] = o
 	return nil
 }

@@ -224,6 +224,15 @@ type RealOrder struct {
 	// ListRealPositions only.
 	AdjustmentCount int
 
+	// ManualOverride is set the moment an operator edits this order's SL/TP via the panel's Update
+	// button (handleAdjustPosition) and checked by RealTrader.runUpdates, which skips the order
+	// entirely once it's true — the model is never even asked about it again, so it can neither
+	// move the levels a second time nor close the position early (rl_early_close). Explicit
+	// operator request, 2026-09-06: a manual correction must stick, not be overwritten or
+	// second-guessed by the next model call. Paper orders have no equivalent field — this is
+	// real-trading-only by the same choice that scopes handleAdjustPosition to real.
+	ManualOverride bool
+
 	ManualCloseRequested bool
 
 	ExchangeOrderID     *string
@@ -436,8 +445,10 @@ type Repository interface {
 	CloseRealOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error
 	// UpdateRealOrderSLTP mirrors UpdatePaperOrderSLTP — callers must have already clamped the
 	// proposed levels (RatchetSLTP for a model-driven edit; no clamp at all for a manual/operator
-	// edit, CLAUDE.md §27.7 commit 6) before calling this.
-	UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error
+	// edit, CLAUDE.md §27.7 commit 6) before calling this. manualOverride is true only for the
+	// operator's own edit and locks the order out of RealTrader.runUpdates from then on
+	// (2026-09-06) — pass false for every model-driven call.
+	UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal, manualOverride bool) error
 	// ListOpenRealOrders mirrors ListOpenPaperOrders, restricted to Status IN ('filled','partial')
 	// — a still-pending order is not yet a real position and must never be double-counted as one.
 	ListOpenRealOrders(ctx context.Context, instID string) ([]RealOrder, error)

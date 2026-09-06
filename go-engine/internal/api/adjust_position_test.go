@@ -22,8 +22,9 @@ type stubRepo struct {
 	order           port.RealOrder
 	getErr          error
 	updateSLTPCalls []struct {
-		id     int64
-		sl, tp *decimal.Decimal
+		id             int64
+		sl, tp         *decimal.Decimal
+		manualOverride bool
 	}
 	adjustmentsRecorded []struct {
 		id        int64
@@ -40,11 +41,12 @@ func (s *stubRepo) GetRealOrder(ctx context.Context, id int64) (port.RealOrder, 
 	return s.order, nil
 }
 
-func (s *stubRepo) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
+func (s *stubRepo) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal, manualOverride bool) error {
 	s.updateSLTPCalls = append(s.updateSLTPCalls, struct {
-		id     int64
-		sl, tp *decimal.Decimal
-	}{id, slPx, tpPx})
+		id             int64
+		sl, tp         *decimal.Decimal
+		manualOverride bool
+	}{id, slPx, tpPx, manualOverride})
 	return nil
 }
 
@@ -241,6 +243,25 @@ func TestHandleAdjustPosition_RejectsEmptyBody(t *testing.T) {
 	rec := doAdjust(srv, "1", adjustPositionRequest{})
 	if rec.Code != 400 {
 		t.Fatalf("expected 400 for an empty body, got %d", rec.Code)
+	}
+}
+
+// A manual edit must lock the order out of the model's update loop (2026-09-06 request): the
+// handler passes manualOverride=true to UpdateRealOrderSLTP on every manual adjustment, regardless
+// of which field (SL or TP, or both) was actually touched.
+func TestHandleAdjustPosition_SetsManualOverride(t *testing.T) {
+	repo := &stubRepo{order: port.RealOrder{
+		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
+		EntryPx: dec("100"), Leverage: dec("10"),
+	}}
+	srv := newTestServer(repo)
+
+	rec := doAdjust(srv, "1", adjustPositionRequest{SLPct: floatPtr(-5)})
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(repo.updateSLTPCalls) != 1 || !repo.updateSLTPCalls[0].manualOverride {
+		t.Fatalf("expected UpdateRealOrderSLTP to be called with manualOverride=true, got %+v", repo.updateSLTPCalls)
 	}
 }
 

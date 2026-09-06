@@ -36,12 +36,13 @@ func (r *Repository) GetRealOrder(ctx context.Context, id int64) (port.RealOrder
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at,
 			closed_at, close_reason, close_px, realized_pnl, features_json, status, bar,
-			pnl_max_pct, pnl_min_pct, manual_close_requested, exchange_order_id, exchange_algo_order_id
+			pnl_max_pct, pnl_min_pct, manual_close_requested, exchange_order_id, exchange_algo_order_id,
+			manual_override
 		FROM real_orders WHERE id = $1
 	`, id).Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size,
 		&o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx, &o.RealizedPnL,
 		&o.FeaturesJSON, &o.Status, &bar, &o.PnLMaxPct, &o.PnLMinPct,
-		&o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID)
+		&o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.ManualOverride)
 	if err != nil {
 		return port.RealOrder{}, fmt.Errorf("get real order %d: %w", id, err)
 	}
@@ -107,12 +108,18 @@ func (r *Repository) CloseRealOrder(ctx context.Context, id int64, closePx decim
 
 // UpdateRealOrderSLTP applies an in-trade SL/TP adjustment to an open real order. Mirrors
 // UpdatePaperOrderSLTP — the caller is responsible for any clamping before calling this.
-func (r *Repository) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
+//
+// manualOverride is true only for the operator's own edit (handleAdjustPosition) and false for
+// every model-driven adjustment (RealTrader.applyRealAdjustment) — set in the SAME statement as
+// the SL/TP write so the two can never observe a gap between "levels changed" and "locked from the
+// model" (2026-09-06 request). Once true it is never cleared here: only an operator action should
+// be able to hand control back to the model, and there is no such action yet.
+func (r *Repository) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal, manualOverride bool) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE real_orders
-		SET sl_px = $2, tp_px = $3
+		SET sl_px = $2, tp_px = $3, manual_override = manual_override OR $4
 		WHERE id = $1 AND closed_at IS NULL
-	`, id, slPx, tpPx)
+	`, id, slPx, tpPx, manualOverride)
 	if err != nil {
 		return fmt.Errorf("update real order %d SL/TP: %w", id, err)
 	}
@@ -218,7 +225,7 @@ func (r *Repository) ListRealPositions(ctx context.Context, f port.PositionFilte
 		SELECT ro.id, ro.inst_id, ro.strategy_id, ro.side, ro.entry_px, ro.sl_px, ro.tp_px, ro.size, ro.leverage,
 			ro.opened_at, ro.closed_at, ro.close_reason, ro.close_px, ro.realized_pnl, ro.features_json, ro.status,
 			ro.bar, ro.pnl_max_pct, ro.pnl_min_pct, COALESCE(s.name, ''),
-			ro.exchange_order_id, ro.exchange_algo_order_id, ro.manual_close_requested,
+			ro.exchange_order_id, ro.exchange_algo_order_id, ro.manual_close_requested, ro.manual_override,
 			-- In-place SL/TP edit count, mirroring ListPositions — backs the panel's "Updated"
 			-- column for real rows so it means the same thing in both modes.
 			(SELECT COUNT(*) FROM real_order_adjustments a WHERE a.order_id = ro.id)
@@ -248,7 +255,7 @@ func (r *Repository) ListRealPositions(ctx context.Context, f port.PositionFilte
 			&o.Size, &o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx,
 			&o.RealizedPnL, &o.FeaturesJSON, &o.Status, &bar,
 			&o.PnLMaxPct, &o.PnLMinPct, &o.StrategyName, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID,
-			&o.ManualCloseRequested, &o.AdjustmentCount); err != nil {
+			&o.ManualCloseRequested, &o.ManualOverride, &o.AdjustmentCount); err != nil {
 			return nil, fmt.Errorf("scan real position: %w", err)
 		}
 		if bar != nil {

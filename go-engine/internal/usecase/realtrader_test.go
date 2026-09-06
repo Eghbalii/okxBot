@@ -648,6 +648,51 @@ func TestHandleTick_RunUpdatesThrottled(t *testing.T) {
 	}
 }
 
+// TestRunUpdates_SkipsManualOverrideEntirely covers the 2026-09-06 request: once an operator has
+// edited a position's SL/TP by hand (handleAdjustPosition, which sets ManualOverride), the model
+// must never be consulted about that order again — not to move the levels a second time, and not
+// to close it early (rl_early_close). Asserted at the strongest level available: zero Predict
+// calls, not merely "the levels didn't change" (which a model returning ActionNone would also
+// produce, without proving the lockout actually happened).
+//
+// Calls runUpdates directly rather than through handleTick, and seeds the conductor's per-order
+// PnL baseline first via a throwaway ShouldUpdate call. Two earlier versions of this test looked
+// right and passed but proved nothing, each defeated by a different gate upstream of the guard
+// under test: ShouldUpdate returns false unconditionally on an order's first-ever sighting (it
+// only seeds the baseline then), and handleTick's own RLAdjustInterval throttle blocks a second
+// call issued immediately after the first. Both were only caught by mutation-testing — deleting
+// the ManualOverride guard and confirming the test then failed — which is why every fix in this
+// codebase gets that check before being trusted.
+func TestRunUpdates_SkipsManualOverrideEntirely(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionClose}}
+	rt := newTestRealTrader(repo, exchange, model, nil)
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+
+	sl := dec("95")
+	repo.realOrders[1] = port.RealOrder{
+		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("100"), SLPx: &sl,
+		Size: dec("10"), Leverage: dec("1"), ManualOverride: true, OpenedAt: time.Now(),
+	}
+
+	ctx := context.Background()
+	// Seed the conductor's baseline for order 1 directly, bypassing ShouldUpdate's own
+	// always-false-on-first-sighting behavior so the guard under test is what actually gets
+	// exercised on the runUpdates call below.
+	rt.conductor().ShouldUpdate(1, dec("0"), time.Now().Add(-time.Hour))
+
+	rt.runUpdates(ctx, "1m", dec("110"), testLogger()) // a real 10% PnL move from entry 100
+
+	if model.calls != 0 {
+		t.Errorf("expected zero Predict calls for a manually-overridden order, got %d", model.calls)
+	}
+	if repo.realOrders[1].ClosedAt != nil {
+		t.Error("expected the manually-overridden order to remain open — the model's ActionClose must never reach it")
+	}
+}
+
 // TestHandleTick_RunUpdatesFiresOnFirstTick confirms the throttle doesn't suppress the FIRST tick
 // — an open position must still get an update pass promptly, not only after some initial delay.
 func TestHandleTick_RunUpdatesFiresOnFirstTick(t *testing.T) {

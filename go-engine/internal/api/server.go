@@ -687,6 +687,11 @@ type adjustPositionRequest struct {
 // local, no exchange call — RealTrader's own tick-driven monitor picks up the new levels on its
 // next tick, same as it would for a model-driven change (§3a's correction: no resting exchange-
 // side order to amend).
+//
+// Also sets manual_override (2026-09-06, explicit operator request): once an operator has edited a
+// position's SL/TP by hand, RealTrader.runUpdates skips it permanently — the model is never asked
+// about it again, so it can neither move the levels a second time nor close the position early
+// (rl_early_close). A manual correction has to stick.
 // handleAdjustPosition is real-trading-only by construction (mode="real" always routes to
 // real_orders, mode="paper" 404s since GetPaperOrder has no manual-unclamped-edit path) — the old
 // explicit o.Mode != "real" check is gone now that the table itself is the mode discriminator
@@ -741,7 +746,7 @@ func (s *Server) handleAdjustPosition(w http.ResponseWriter, r *http.Request) {
 		newTP = &px
 	}
 
-	if err := s.Repo.UpdateRealOrderSLTP(r.Context(), id, newSL, newTP); err != nil {
+	if err := s.Repo.UpdateRealOrderSLTP(r.Context(), id, newSL, newTP, true); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

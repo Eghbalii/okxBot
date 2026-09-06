@@ -879,6 +879,15 @@ func (e *RealTrader) runUpdates(ctx context.Context, bar string, price decimal.D
 	now := time.Now()
 
 	for _, o := range open {
+		// An operator's manual SL/TP edit (handleAdjustPosition) locks this order out of the model's
+		// update loop entirely (explicit request, 2026-09-06): the model is never even asked about
+		// it again, so it can neither move the levels a second time nor close the position early
+		// (rl_early_close). A manual correction must stick, not be silently overwritten or
+		// second-guessed by the next call.
+		if o.ManualOverride {
+			continue
+		}
+
 		pnl := unrealizedPnLPct(asPaperOrderView(o), price)
 		if !e.conductor().ShouldUpdate(o.ID, pnl, now) {
 			continue
@@ -913,7 +922,7 @@ func (e *RealTrader) applyRealAdjustment(ctx context.Context, o port.RealOrder, 
 	if !changed {
 		return
 	}
-	if err := e.Repo.UpdateRealOrderSLTP(ctx, o.ID, newSL, newTP); err != nil {
+	if err := e.Repo.UpdateRealOrderSLTP(ctx, o.ID, newSL, newTP, false); err != nil {
 		logger.Warn("real updates: sl/tp update failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 		return
 	}
