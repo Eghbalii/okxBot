@@ -173,3 +173,13 @@ func (c *Client) GetInstrument(instType, instID string) (domain.Instrument, erro
 	err := c.do(context.Background(), http.MethodGet, path, nil, &out)
 	return out, err
 }
+
+func (c *Client) GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error) {
+	var out []domain.FundingRate
+	path := "/funding-rate-history?" + url.Values{
+		"instId": {instID},
+		"limit":  {fmt.Sprintf("%d", limit)},
+	}.Encode()
+	err := c.do(context.Background(), http.MethodGet, path, nil, &out)
+	return out, err
+}

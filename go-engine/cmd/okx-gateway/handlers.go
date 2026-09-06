@@ -25,6 +25,7 @@ type exchangeClient interface {
 	CancelOrder(instID, ordID string) error
 	GetOrder(instID, ordID string) (domain.OrderStatus, error)
 	GetInstrument(instType, instID string) (domain.Instrument, error)
+	GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error)
 }
 
 type service struct {
@@ -51,6 +52,7 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("POST /order/cancel", s.handleCancelOrder)
 	mux.HandleFunc("GET /order", s.handleGetOrder)
 	mux.HandleFunc("GET /instrument", s.handleGetInstrument)
+	mux.HandleFunc("GET /funding-rate-history", s.handleGetFundingRateHistory)
 	mux.HandleFunc("POST /leverage", s.handleSetLeverage)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -239,6 +241,33 @@ func (s *service) handleGetOrder(w http.ResponseWriter, r *http.Request) {
 	err := s.call(r.Context(), gateway.ClassAccount, r, func() error {
 		var innerErr error
 		result, innerErr = s.client.GetOrder(instID, ordID)
+		return innerErr
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *service) handleGetFundingRateHistory(w http.ResponseWriter, r *http.Request) {
+	instID := r.URL.Query().Get("instId")
+	if instID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("instId is required"))
+		return
+	}
+	limit := 10
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	var result []domain.FundingRate
+	// ClassMarket: /public/funding-rate-history is unauthenticated market data, same rate-limit
+	// family as GetTicker/GetCandles/GetInstrument.
+	err := s.call(r.Context(), gateway.ClassMarket, r, func() error {
+		var innerErr error
+		result, innerErr = s.client.GetFundingRateHistory(instID, limit)
 		return innerErr
 	})
 	if err != nil {

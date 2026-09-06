@@ -45,6 +45,10 @@ func (f *fakeExchange) GetInstrument(instType, instID string) (domain.Instrument
 	return domain.Instrument{}, nil
 }
 
+func (f *fakeExchange) GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error) {
+	return nil, nil
+}
+
 // TestSeedWindow_ResolvesSymbolBeforeCallingExchange confirms GetCandles is called with the real
 // OKX instId (via symbolMap), not the short internal symbol this service otherwise uses to key
 // its candle windows/trials/targets (CLAUDE.md §27, 2026-09-04 design).

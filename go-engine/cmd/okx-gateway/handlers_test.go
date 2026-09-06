@@ -27,6 +27,7 @@ type fakeExchange struct {
 	orderResult *domain.OrderResult
 	orderStatus domain.OrderStatus
 	instrument  domain.Instrument
+	fundingRates []domain.FundingRate
 
 	placeOrderCalls    int
 	cancelOrderCalls   int
@@ -99,6 +100,13 @@ func (f *fakeExchange) GetInstrument(instType, instID string) (domain.Instrument
 		return domain.Instrument{}, err
 	}
 	return f.instrument, nil
+}
+
+func (f *fakeExchange) GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error) {
+	if err := f.maybeFail(); err != nil {
+		return nil, err
+	}
+	return f.fundingRates, nil
 }
 
 func newTestService(fx *fakeExchange) *service {

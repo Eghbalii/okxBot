@@ -29,4 +29,8 @@ type ExchangeClient interface {
 	// BTC-USD_UM_XPERP instrument, whose CtVal/LotSz differ sharply from the classic SWAP
 	// instruments this codebase otherwise assumes a multiplier of 1 for).
 	GetInstrument(instType, instID string) (domain.Instrument, error)
+	// GetFundingRateHistory fetches recent settled funding periods for one instrument (CLAUDE.md,
+	// 2026-09-06) — an unauthenticated public endpoint, but routed through the same client/gateway
+	// path as every other OKX call for consistency. Oldest-first.
+	GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error)
 }

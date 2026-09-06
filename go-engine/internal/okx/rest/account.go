@@ -94,6 +94,41 @@ func (c *Client) GetTicker(instID string) (domain.Ticker, error) {
 	return tickers[0].ToDomain(), nil
 }
 
+// GetFundingRateHistory fetches recent SETTLED funding periods for one instrument (2026-09-06),
+// via GET /api/v5/public/funding-rate-history — unauthenticated like GetInstrument, routed through
+// the same signed do() for consistency. Returns oldest-first (OKX returns newest-first; reversed
+// here) so a caller storing rows can insert in chronological order.
+func (c *Client) GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error) {
+	if instID == "" {
+		return nil, fmt.Errorf("instID is required")
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	path := "/api/v5/public/funding-rate-history?" + url.Values{
+		"instId": {instID},
+		"limit":  {fmt.Sprintf("%d", limit)},
+	}.Encode()
+
+	var wire []okx.FundingRate
+	if err := c.do("GET", path, nil, &wire); err != nil {
+		return nil, err
+	}
+
+	out := make([]domain.FundingRate, 0, len(wire))
+	for _, w := range wire {
+		fr, err := w.ToDomain()
+		if err != nil {
+			return nil, fmt.Errorf("get funding rate history for %s: %w", instID, err)
+		}
+		out = append(out, fr)
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
 // GetInstrument fetches one instId's contract-shape metadata via
 // GET /api/v5/public/instruments — an unauthenticated, unsigned endpoint (no OK-ACCESS-* headers
 // needed for /public/*), but routed through the same signed do() as every other call for

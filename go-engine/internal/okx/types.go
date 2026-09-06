@@ -2,6 +2,9 @@ package okx
 
 import (
 	"bytes"
+	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/shopspring/decimal"
 
@@ -48,6 +51,27 @@ func (t Ticker) ToDomain() domain.Ticker {
 		InstID: t.InstID, Last: t.Last, AskPx: t.AskPx, BidPx: t.BidPx,
 		Open24h: t.Open24h, High24h: t.High24h, Low24h: t.Low24h, Vol24h: t.Vol24h,
 	}
+}
+
+// FundingRate is GET /public/funding-rate-history's wire shape (2026-09-06), live-verified against
+// a real response for BTC-USD_UM_XPERP.
+type FundingRate struct {
+	InstID      string          `json:"instId"`
+	FundingRate decimal.Decimal `json:"fundingRate"`
+	FundingTime string          `json:"fundingTime"` // ms-epoch string, same convention as candle.Ts
+}
+
+// ToDomain converts a FundingRate to its domain representation.
+func (f FundingRate) ToDomain() (domain.FundingRate, error) {
+	ms, err := strconv.ParseInt(f.FundingTime, 10, 64)
+	if err != nil {
+		return domain.FundingRate{}, fmt.Errorf("parse funding rate time for %s: %w", f.InstID, err)
+	}
+	return domain.FundingRate{
+		InstID:      f.InstID,
+		FundingTime: time.UnixMilli(ms).UTC(),
+		FundingRate: f.FundingRate,
+	}, nil
 }
 
 // Position mirrors OKX's /api/v5/account/positions entry (fields we care about).

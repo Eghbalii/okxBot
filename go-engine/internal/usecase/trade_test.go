@@ -99,6 +99,10 @@ func (f *fakeExchangeClient) GetInstrument(instType, instID string) (domain.Inst
 	return domain.Instrument{InstID: instID, CtVal: decimal.NewFromInt(1)}, nil
 }
 
+func (f *fakeExchangeClient) GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error) {
+	return nil, nil
+}
+
 // fakeModelClient is a hand-rolled port.ModelClient returning a configured Action.
 type fakeModelClient struct {
 	action  domain.Action
