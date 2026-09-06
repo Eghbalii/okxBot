@@ -92,27 +92,50 @@ func TestRatchetSLTP_CannotUndoPriorTightening(t *testing.T) {
 func TestRatchetSLTP_LargeSLAdjustmentAppliesInFull(t *testing.T) {
 	// No per-step size cap any more (removed 2026-09-04, explicit operator decision): a proposed
 	// 10% adjust applies in full rather than being clamped to a fixed percentage.
-	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), SLPx: ptr(dec("95")), TPPx: ptr(dec("110"))}
-	price := dec("100")
+	//
+	// Priced with room above the resulting stop on purpose. This test originally ran at price 100
+	// and asserted the stop moved to 105 — i.e. 5% ABOVE the live price, which is not a stop at all
+	// but an instant market close, and is precisely the defect that closed orders 2043/2044 seconds
+	// after they opened on 2026-09-05. The no-per-step-cap property it exists to check is
+	// independent of that, so it is asserted here at a price where a full-size move is still a
+	// legitimate stop (see TestRatchetSL_NeverCrossesLivePrice for the boundary itself).
+	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), SLPx: ptr(dec("95")), TPPx: ptr(dec("130"))}
+	price := dec("120")
 	newSL, _ := RatchetSLTP(o, price, dec("0.10"), dec("0"))
-	// 10% of 100 = 10 -> 95+10=105
-	if !newSL.Equal(dec("105")) {
-		t.Errorf("expected SL moved in full to 105, got %s", newSL)
+	// 10% of 120 = 12 -> 95+12=107, applied in full and still well below the live price.
+	if !newSL.Equal(dec("107")) {
+		t.Errorf("expected SL moved in full to 107, got %s", newSL)
 	}
 }
 
 func TestRatchetSLTP_LargeTPAdjustmentAppliesInFull(t *testing.T) {
 	// Same for TP: a large proposed move that stays on the profitable side of entry applies in
-	// full, with no per-step cap.
+	// full, with no per-step cap. The target chosen here lands inside MaxTPDistPct — this test is
+	// about the absence of a PER-STEP cap (CLAUDE.md §29), which is a different constraint from the
+	// distance-from-entry ceiling covered by TestMoveTP_RejectsTargetBeyondMaxDistance below.
 	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), SLPx: ptr(dec("95")), TPPx: ptr(dec("110"))}
 	price := dec("100")
-	newSL, newTP := RatchetSLTP(o, price, dec("0"), dec("0.50"))
+	newSL, newTP := RatchetSLTP(o, price, dec("0"), dec("0.30"))
 	if newSL == nil || !newSL.Equal(dec("95")) {
 		t.Errorf("expected SL unchanged at 95, got %v", newSL)
 	}
-	// 50% of 100 = 50 -> 110+50=160
-	if !newTP.Equal(dec("160")) {
-		t.Errorf("expected TP moved in full to 160, got %s", newTP)
+	// 30% of 100 = 30 -> 110+30=140, which is 40% from entry and so within the ceiling.
+	if !newTP.Equal(dec("140")) {
+		t.Errorf("expected TP moved in full to 140, got %s", newTP)
+	}
+}
+
+// The distance ceiling itself: a proposal landing beyond MaxTPDistPct of entry is REJECTED (the
+// existing target is kept) rather than clamped to the boundary. Clamping would accept every
+// runaway proposal at the limit, which reads as a model that converged on a 50%-away target
+// instead of one whose output is being discarded — see moveTP's comment.
+func TestMoveTP_RejectsTargetBeyondMaxDistance(t *testing.T) {
+	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), SLPx: ptr(dec("95")), TPPx: ptr(dec("110"))}
+	price := dec("100")
+	// 110 + 50 = 160, i.e. 60% from entry — past the 50% ceiling.
+	_, newTP := RatchetSLTP(o, price, dec("0"), dec("0.50"))
+	if newTP == nil || !newTP.Equal(dec("110")) {
+		t.Errorf("a target beyond the ceiling must leave TP untouched at 110, got %v", newTP)
 	}
 }
 
@@ -180,5 +203,97 @@ func TestRatchetSLTP_LongTPCannotCrossEntry(t *testing.T) {
 	}
 	if newTP.LessThanOrEqual(entry) {
 		t.Errorf("long's TP must stay above entry %s, got %s (hitting it realizes a loss)", entry, newTP)
+	}
+}
+
+// TestMoveTP_CannotWalkTargetAwayForever reproduces the CLAUDE.md §31.1 incident: order 1851
+// (ZEC, sell, entry 955.96) had its TP marched from 936 to -566552 across 19 adjustments in six
+// minutes, roughly doubling each step. Each individual move was legal — every one left the target
+// on the profitable side of entry — because the only guard bounded direction, not distance, while
+// moveTP runs off the tick stream and re-applies whatever bias the model has every couple of
+// seconds. MaxTPDistPct bounds the distance so the walk terminates.
+func TestMoveTP_CannotWalkTargetAwayForever(t *testing.T) {
+	entry := decimal.RequireFromString("955.96")
+	price := decimal.RequireFromString("955.96")
+	direction := decimal.NewFromInt(-1) // short
+	tp := decimal.RequireFromString("936.0")
+
+	current := &tp
+	for i := 0; i < 50; i++ {
+		// A persistently-biased model asking to push the target further away, every single call.
+		current = moveTP(current, direction, price, entry, decimal.RequireFromString("0.02"))
+	}
+
+	dist := current.Sub(entry).Abs()
+	maxDist := entry.Mul(decimal.NewFromFloat(MaxTPDistPct))
+	if dist.GreaterThan(maxDist) {
+		t.Errorf("TP walked to %s, %s from entry — beyond the %s ceiling; the §31.1 runaway is back",
+			current, dist, maxDist)
+	}
+	if current.GreaterThanOrEqual(entry) {
+		t.Errorf("short TP %s must stay below entry %s", current, entry)
+	}
+}
+
+// A single large, legitimate move must still be allowed — the point of §29's change was that the
+// model can reprice a target decisively in one step. Only the unbounded walk is prohibited.
+func TestMoveTP_AllowsOneLargeLegitimateMove(t *testing.T) {
+	entry := decimal.NewFromInt(100)
+	price := decimal.NewFromInt(100)
+	tp := decimal.NewFromInt(102)
+
+	got := moveTP(&tp, decimal.NewFromInt(1), price, entry, decimal.RequireFromString("0.10"))
+	if got == nil || !got.Equal(decimal.NewFromInt(112)) {
+		t.Fatalf("want a single 10%% move to 112, got %v", got)
+	}
+}
+
+// TestRatchetSL_NeverCrossesLivePrice reproduces the 2026-09-05 incident: order 2043 (TRUMP long,
+// entry 2.388) had its stop ratcheted from 2.3737 up to 2.5846 — past entry AND past the live
+// price AND past its own take-profit — and closed at market 0 seconds later for a loss. Trailing
+// past entry is intended; landing beyond the live price is not, because such a stop is already
+// touched the moment it is written.
+func TestRatchetSL_NeverCrossesLivePrice(t *testing.T) {
+	// An over-reaching proposal is clamped to just inside price, not rejected (2026-09-06): the
+	// stop still MOVES — the model keeps control of it — it just cannot land somewhere that is
+	// already touched. Rejecting outright left the model with no influence over the stop at all
+	// (measured: 5 SL adjustments vs 306 TP ones).
+	long := port.PaperOrder{Side: "buy", EntryPx: dec("2.388"), SLPx: ptr(dec("2.3737")), TPPx: ptr(dec("2.4095"))}
+	price := dec("2.388")
+	newSL, _ := RatchetSLTP(long, price, dec("0.10"), dec("0"))
+	if newSL == nil {
+		t.Fatal("long stop should have moved, got nil")
+	}
+	if newSL.GreaterThanOrEqual(price) {
+		t.Errorf("long stop %s is at/above live price %s — it would trigger instantly", newSL, price)
+	}
+	if !newSL.GreaterThan(dec("2.3737")) {
+		t.Errorf("long stop should still have tightened from 2.3737 toward price, got %s", newSL)
+	}
+
+	// Short: mirrored — clamped to just above price, never at or below it.
+	short := port.PaperOrder{Side: "sell", EntryPx: dec("0.09308"), SLPx: ptr(dec("0.09449")), TPPx: ptr(dec("0.09097"))}
+	sPrice := dec("0.09308")
+	newSL2, _ := RatchetSLTP(short, sPrice, dec("0.10"), dec("0"))
+	if newSL2 == nil {
+		t.Fatal("short stop should have moved, got nil")
+	}
+	if newSL2.LessThanOrEqual(sPrice) {
+		t.Errorf("short stop %s is at/below live price %s — it would trigger instantly", newSL2, sPrice)
+	}
+	if !newSL2.LessThan(dec("0.09449")) {
+		t.Errorf("short stop should still have tightened from 0.09449 toward price, got %s", newSL2)
+	}
+}
+
+// The legitimate case must still work: a modest tightening that stays on the protective side of
+// price is applied in full, including when it crosses entry to lock in profit.
+func TestRatchetSL_StillTrailsIntoProfitBelowPrice(t *testing.T) {
+	// Long entered at 100, price has run to 120; moving the stop to 110 locks in profit and is
+	// still safely below price.
+	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), SLPx: ptr(dec("95")), TPPx: ptr(dec("130"))}
+	newSL, _ := RatchetSLTP(o, dec("120"), dec("0.125"), dec("0")) // 95 + 0.125*120 = 110
+	if newSL == nil || !newSL.Equal(dec("110")) {
+		t.Fatalf("want stop trailed to 110 (past entry, below price), got %v", newSL)
 	}
 }

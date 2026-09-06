@@ -309,6 +309,23 @@ func (e *PaperTrader) dynamicNotional(ctx context.Context, logger *slog.Logger) 
 	return equity.Div(countDec)
 }
 
+// evenShareOfAccount is dynamicNotional expressed as a FRACTION rather than a dollar amount: the
+// share of the account one token is expected to take when equity is split evenly across the active
+// roster. Fed to the model as MaxPositionPct (observation schema v7) so its size_pct is a fraction
+// of the budget it actually has rather than of the whole account.
+//
+// Deliberately derived from ActiveTokenCount, not from a config value: the fixed-sizing path this
+// mirrors (dynamicNotional) divides by the same count, so reading a config constant here would let
+// the two disagree the moment a token is enabled or disabled. Lives beside dynamicNotional for that
+// reason — the two must change together.
+func (e *PaperTrader) evenShareOfAccount() decimal.Decimal {
+	count := e.ActiveTokenCount
+	if count <= 0 {
+		count = 1
+	}
+	return decimal.NewFromInt(1).Div(decimal.NewFromInt(int64(count)))
+}
+
 // Run consumes ticks/candles from the event bus until ctx is cancelled. Candle windows start
 // empty and fill in from the live feed as bars close — no REST candle-seeding at startup
 // (removed 2026-08-29: it was a real crash source at Phase B's 10-instrument scale, tripping an
@@ -629,17 +646,32 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 // the currently-stored SL is looser than what MaxLossPct/MaxSLDistPct actually allow at this order's
 // leverage — self-healing for an already-open position that was opened before a clamp-wiring bug
 // (like the missing MaxLossPct field fixed 2026-09-01, CLAUDE.md) is fixed, without needing a
-// manual DB edit or a manual close for every affected order. Apply only ever tightens a stop that's
-// too wide (clampRange clamps into a [min,max] range) — a stop already inside bounds returns
-// unchanged, so this is a safe no-op on every order that was never affected. Returns the order with
-// its in-memory SLPx/TPPx updated (so this same tick's touch-check below uses the corrected level)
-// and true if a correction was actually persisted; the original order and false otherwise.
+// manual DB edit or a manual close for every affected order.
+//
+// It applies the correction ONLY when that makes the stop tighter, which the name promises and an
+// earlier version of this comment wrongly assumed Apply guaranteed on its own. Apply enforces a
+// RANGE: clampRange pulls a distance up to MinSLDistPct as readily as it pulls one down to the
+// maximum. That floor is right at open time (a stop 0.001% away is stopped out by noise before the
+// trade can breathe) and wrong here, because trailing a stop closer than the initial minimum is
+// exactly what locking in profit means. Found on order 2114 (PUMP, 2026-09-06): the model trailed
+// the stop to 0.125% from entry, this ran on the next tick, saw 0.125% < the 0.5% floor, and pushed
+// it back out to 0.5% — every tick, so the model's stop could never survive and the panel showed it
+// frozen at a value no adjustment row explained.
 func (e *PaperTrader) tightenOverWideStop(ctx context.Context, o port.PaperOrder, logger *slog.Logger) (port.PaperOrder, bool) {
 	if o.SLPx == nil || !o.EntryPx.IsPositive() {
 		return o, false
 	}
 	corrected := e.conductorClamps().Apply(o.Side, o.EntryPx, o.Leverage, conductor.Levels{SLPx: o.SLPx, TPPx: o.TPPx})
 	if corrected.SLPx == nil || corrected.SLPx.Equal(*o.SLPx) {
+		return o, false
+	}
+	// Drop the correction when it would LOOSEN the stop (move it further from entry). For a long,
+	// tighter means higher; for a short, lower.
+	if o.Side == "sell" {
+		if corrected.SLPx.GreaterThan(*o.SLPx) {
+			return o, false
+		}
+	} else if corrected.SLPx.LessThan(*o.SLPx) {
 		return o, false
 	}
 	if err := e.Repo.UpdatePaperOrderSLTP(ctx, o.ID, corrected.SLPx, corrected.TPPx); err != nil {

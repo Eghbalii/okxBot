@@ -2490,3 +2490,66 @@ func TestSignalResolveLevels_KeepsExplicitLevels(t *testing.T) {
 		t.Errorf("explicit levels must survive resolution, got SL %s / TP %s", s.SLPx, s.TPPx)
 	}
 }
+
+// A stop the model has trailed CLOSER than MinSLDistPct must be left alone. tightenOverWideStop
+// exists to pull an over-wide stop in, never to push a tight one back out — but it routes through
+// Clamps.Apply, which enforces a RANGE, so before this was guarded it dragged every trailed stop
+// back to the floor on the very next tick.
+//
+// Order 2114 (PUMP, 2026-09-06) is the fixture: entry 0.003970, leverage ~8.9, model trailed the
+// stop to 0.003965031 (0.125% from entry, locking in profit). MinSLDistPct is 0.5%, so Apply
+// rebuilt it at 0.00395015 and stored that instead — on every tick, so the model's stop never
+// survived and paper_order_adjustments showed a value that did not match paper_orders.
+func TestMonitorOpenOrders_DoesNotWidenAStopTrailedInsideTheMinimum(t *testing.T) {
+	repo := newFakeRepository()
+	entry := dec("0.003970")
+	trailed := dec("0.003965031") // 0.125% from entry — inside MinSLDistPct on purpose
+	id, _ := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: entry, SLPx: &trailed,
+		Size: dec("3"), Leverage: dec("8.899"), OpenedAt: time.Now(),
+	})
+
+	pt := newTestPaperTrader(repo, nil)
+	pt.RLClamps = conductor.Clamps{
+		MinSLDistPct: dec("0.005"), MaxSLDistPct: dec("0.05"), MaxLossPct: dec("0.15"),
+	}
+
+	if err := pt.monitorOpenOrders(context.Background(), dec("0.003980"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders returned error: %v", err)
+	}
+
+	got := repo.orders[id].SLPx
+	if got == nil || !got.Equal(trailed) {
+		t.Errorf("a stop trailed to %s must survive: got %v — widening it back to the floor "+
+			"destroys the locked-in profit the model just secured", trailed, got)
+	}
+}
+
+// The over-wide direction must still be corrected — this guard must not disable the self-healing
+// the function exists for (the 2026-09-01 incident).
+func TestMonitorOpenOrders_StillTightensAnOverWideStopAfterTheWideningGuard(t *testing.T) {
+	repo := newFakeRepository()
+	entry := dec("100")
+	wide := dec("95") // 5% at 20x = 100% loss, far past MaxLossPct
+	id, _ := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: entry, SLPx: &wide,
+		Size: dec("100"), Leverage: dec("20"), OpenedAt: time.Now(),
+	})
+
+	pt := newTestPaperTrader(repo, nil)
+	pt.RLClamps = conductor.Clamps{
+		MinSLDistPct: dec("0.005"), MaxSLDistPct: dec("0.05"), MaxLossPct: dec("0.15"),
+	}
+
+	// Priced above the corrected stop so the order stays OPEN and the stored level can be
+	// inspected — at price 100 the tightened 99.5 stop is touched on this same tick (which is
+	// TestMonitorOpenOrders_TightenedStopAppliesOnTheSameTick's subject) and the order closes.
+	if err := pt.monitorOpenOrders(context.Background(), dec("105"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders returned error: %v", err)
+	}
+
+	got := repo.orders[id].SLPx
+	if got == nil || !got.GreaterThan(wide) {
+		t.Errorf("an over-wide stop must still be tightened up from %s, got %v", wide, got)
+	}
+}
