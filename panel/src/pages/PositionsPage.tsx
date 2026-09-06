@@ -103,6 +103,17 @@ function slTpPct(p: Position, target: string | null): number | null {
 // been breached. Reported as "SL is at 16, the 15% limit isn't working"; the limit was working and
 // only this display was wrong. The epsilon is far below any distance that matters on a real stop,
 // so it can only absorb representation error, never a genuine excess.
+// feesDisplay renders the trading fee + funding cost/credit already subtracted into a closed
+// position's PnL (2026-09-06). Kept as one combined total for the table's compact column — the
+// order-detail modal is where a reader who wants the fee/funding split separately can see it — but
+// both are null-safe independently since a row closed before funding tracking existed carries a
+// fee with no funding value.
+function feesDisplay(feesUSD: string | null, fundingUSD: string | null): string {
+  if (feesUSD === null && fundingUSD === null) return '—'
+  const total = (feesUSD !== null ? Number(feesUSD) : 0) + (fundingUSD !== null ? Number(fundingUSD) : 0)
+  return formatUsd(-total) // stored as a cost (positive = charged); display as its effect on PnL
+}
+
 function roundPctUp(pct: number): number {
   const snapped = Math.abs(pct) - 1e-9
   return Math.sign(pct) * Math.ceil(Math.max(snapped, 0))
@@ -257,8 +268,8 @@ export default function PositionsPage() {
 
   // 12 always-shown columns (ID, Inst, Side, Strategy, TF, Entry, SL/TP, Leverage, Vol, Opened,
   // PnL, Max) plus showLiveColumns' 3 (Last, Updated, the close-button column), showClosedColumns'
-  // 2 (Closed, Reason), and the real-only Status column.
-  const columnCount = 12 + (showLiveColumns ? 3 : 0) + (showClosedColumns ? 2 : 0) + (mode === 'real' ? 1 : 0)
+  // 3 (Closed, Reason, Fees — the last added 2026-09-06), and the real-only Status column.
+  const columnCount = 12 + (showLiveColumns ? 3 : 0) + (showClosedColumns ? 3 : 0) + (mode === 'real' ? 1 : 0)
 
   return (
     <div>
@@ -341,6 +352,9 @@ export default function PositionsPage() {
               <SortableTh field="pnl" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
                 PnL
               </SortableTh>
+              {/* Trading fee + funding cost/credit already subtracted into PnL (2026-09-06) — only
+                  meaningful once a position has actually closed and those costs are known. */}
+              {showClosedColumns && <th className="th-static">Fees</th>}
               {/* Peak/trough unrealized PnL this position reached while open (CLAUDE.md §15.11) —
                   unlike Last/Updated/the close button below, this is meaningful for closed rows
                   too (it's exactly what surfaces "this ran to +25% and still closed negative"
@@ -418,6 +432,11 @@ export default function PositionsPage() {
                       '—'
                     )}
                   </td>
+                  {showClosedColumns && (
+                    <td className="mono text-dim" title="Trading fee + funding cost/credit already subtracted into PnL">
+                      {feesDisplay(p.FeesUSD, p.FundingUSD)}
+                    </td>
+                  )}
                   <td className="mono pnl-cell">
                     <div className={pnlClass(Number(p.PnLMaxPct))}>
                       {`${Number(p.PnLMaxPct) >= 0 ? '+' : ''}${(Number(p.PnLMaxPct) * 100).toFixed(2)}%`}

@@ -218,10 +218,11 @@ services:
       # refused". Only surfaced once paper_trading.rl_sizing/rl_sltp_adjust were actually turned on
       # (§14's rollout order) — before that the model call path was never exercised in production.
       RL_SERVICE_URL: http://rl-service:8000
-      # CLAUDE.md §27.1: cmd/paper-trader no longer talks to OKX directly at all (its only REST
-      # dependency was the -backfill flag, removed entirely 2026-09-01 per explicit operator
-      # instruction — GetHistoryCandles must never be called). It has no gateway-routed calls
-      # today, so no OKX_GATEWAY_URL is needed here; left unset intentionally, not an oversight.
+      # CLAUDE.md §27.1: cmd/paper-trader had NO OKX dependency from 2026-09-01 (when the
+      # -backfill flag was removed) until 2026-09-06, when the funding-rate poller
+      # (runFundingRatePoller) became its one gateway-routed call — a read-only, unauthenticated
+      # public endpoint (GET /funding-rate-history), not a trading call.
+      OKX_GATEWAY_URL: http://okx-gateway:8094
     ports:
       - "9102:9102"
       - "8093:8093"
@@ -231,6 +232,8 @@ services:
       kafka:
         condition: service_healthy
       rl-service:
+        condition: service_started
+      okx-gateway:
         condition: service_started
       timescaledb:
         condition: service_started

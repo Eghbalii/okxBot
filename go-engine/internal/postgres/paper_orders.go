@@ -69,12 +69,12 @@ func (r *Repository) SetExchangeAlgoOrderID(ctx context.Context, id int64, algoO
 }
 
 // ClosePaperOrder marks a virtual trade closed with its realized outcome.
-func (r *Repository) ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error {
+func (r *Repository) ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL, feesUSD, fundingUSD decimal.Decimal) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE paper_orders
-		SET closed_at = now(), close_px = $2, close_reason = $3, realized_pnl = $4
+		SET closed_at = now(), close_px = $2, close_reason = $3, realized_pnl = $4, fees_usd = $5, funding_usd = $6
 		WHERE id = $1
-	`, id, closePx, reason, realizedPnL)
+	`, id, closePx, reason, realizedPnL, feesUSD, fundingUSD)
 	if err != nil {
 		return fmt.Errorf("close paper order %d: %w", id, err)
 	}
@@ -184,7 +184,7 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 	// with an empty strategy name rather than disappearing from the panel entirely.
 	query := `
 		SELECT po.id, po.inst_id, po.strategy_id, po.side, po.entry_px, po.sl_px, po.tp_px, po.size, po.leverage,
-			po.opened_at, po.closed_at, po.close_reason, po.close_px, po.realized_pnl, po.features_json, po.mode,
+			po.opened_at, po.closed_at, po.close_reason, po.close_px, po.realized_pnl, po.fees_usd, po.funding_usd, po.features_json, po.mode,
 			po.parent_order_id, po.variant, po.bar, po.pnl_max_pct, po.pnl_min_pct, COALESCE(s.name, ''),
 			po.exchange_order_id, po.exchange_algo_order_id,
 			-- How many in-place SL/TP edits this order has had. The panel's "Updated" column used to
@@ -219,7 +219,7 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 		var bar *string
 		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx,
 			&o.Size, &o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx,
-			&o.RealizedPnL, &o.FeaturesJSON, &o.Mode, &o.ParentOrderID, &o.Variant, &bar,
+			&o.RealizedPnL, &o.FeesUSD, &o.FundingUSD, &o.FeaturesJSON, &o.Mode, &o.ParentOrderID, &o.Variant, &bar,
 			&o.PnLMaxPct, &o.PnLMinPct, &o.StrategyName, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID,
 			&o.AdjustmentCount); err != nil {
 			return nil, fmt.Errorf("scan position: %w", err)

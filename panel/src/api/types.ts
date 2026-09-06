@@ -65,6 +65,12 @@ export interface Position {
   CloseReason: CloseReason | null
   ClosePx: string | null
   RealizedPnL: string | null
+  // FeesUSD (trading fee) and FundingUSD (accrued funding cost/credit, positive = cost) are both
+  // already subtracted into RealizedPnL (2026-09-06) — kept separate rather than combined so this
+  // view can show which one actually moved a trade's PnL. Null for still-open positions and for
+  // orders closed before these columns existed.
+  FeesUSD: string | null
+  FundingUSD: string | null
   Mode: PositionMode
   // ParentOrderID/Variant are what remains of the SL/TP shadow-fork mechanic (CLAUDE.md §15.4),
   // removed 2026-09-02 in favor of the RL agent editing an order's SL/TP in place — every order is

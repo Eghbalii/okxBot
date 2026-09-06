@@ -219,8 +219,7 @@ func (e *PaperTrader) closeEarly(ctx context.Context, o port.PaperOrder, price d
 	if !e.RLEarlyClose {
 		return
 	}
-	pnl := realizedPnL(o, price)
-	if err := e.closeOrder(ctx, o, price, conductor.CloseReasonRLEarly, pnl, logger); err != nil {
+	if err := e.closeOrder(ctx, o, price, conductor.CloseReasonRLEarly, logger); err != nil {
 		logger.Error("lifecycle: early close failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 	}
 }

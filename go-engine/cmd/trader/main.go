@@ -40,6 +40,7 @@ func main() {
 		logger.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
+	usecase.TakerFeeRate = cfg.Trading.TakerFeeRate
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

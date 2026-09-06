@@ -30,6 +30,7 @@ type fakeRepository struct {
 	paramChanges       []port.ParamChange
 	orderAdjustments   []port.PaperOrderAdjustment
 	paperTradingConfig map[string]*port.PaperTradingConfig
+	fundingRates       []port.FundingRate
 
 	// realOrders uses its own counter (nextRealID), deliberately NOT sharing nextID with the
 	// paper orders map — real_orders and paper_orders are independent Postgres sequences post-
@@ -166,7 +167,7 @@ func (r *fakeRepository) SetExchangeAlgoOrderID(ctx context.Context, id int64, a
 	r.orders[id] = o
 	return nil
 }
-func (r *fakeRepository) ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error {
+func (r *fakeRepository) ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL, feesUSD, fundingUSD decimal.Decimal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o := r.orders[id]
@@ -177,6 +178,10 @@ func (r *fakeRepository) ClosePaperOrder(ctx context.Context, id int64, closePx 
 	o.ClosePx = &cp
 	pnl := realizedPnL
 	o.RealizedPnL = &pnl
+	fees := feesUSD
+	o.FeesUSD = &fees
+	funding := fundingUSD
+	o.FundingUSD = &funding
 	r.orders[id] = o
 	return nil
 }
@@ -245,6 +250,27 @@ func (r *fakeRepository) SavePaperTradingConfig(ctx context.Context, mode string
 }
 func (r *fakeRepository) SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string) error {
 	return nil
+}
+func (r *fakeRepository) SaveFundingRates(ctx context.Context, rates []port.FundingRate) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fundingRates = append(r.fundingRates, rates...)
+	return nil
+}
+func (r *fakeRepository) SumFundingCost(ctx context.Context, instID string, openedAt, closedAt time.Time, notionalUSD decimal.Decimal) (decimal.Decimal, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	total := decimal.Zero
+	for _, fr := range r.fundingRates {
+		if fr.InstID != instID {
+			continue
+		}
+		if fr.FundingTime.Before(openedAt) || fr.FundingTime.After(closedAt) {
+			continue
+		}
+		total = total.Add(fr.FundingRate)
+	}
+	return total.Mul(notionalUSD), nil
 }
 func (r *fakeRepository) UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
 	r.mu.Lock()
@@ -699,6 +725,134 @@ func TestRealizedPnL_ExactNoFloatDrift(t *testing.T) {
 	want := dec("50")                           // (9.9-9.0)/9.0 * 100 * 5 = 0.1 * 500 = 50
 	if !pnlProfit.Equal(want) {
 		t.Errorf("expected exact PnL %s, got %s", want, pnlProfit.String())
+	}
+}
+
+// TestTradingFee_ChargedOnNotionalBothLegs verifies the fee formula against the exact real-money
+// reasoning behind it: OKX charges a percentage of NOTIONAL (size * leverage), not of the margin
+// committed (size alone), on BOTH the entry and exit market order. Values chosen so entry and exit
+// notional differ (price moved), which is what would expose a bug that charged the fee only once
+// or against the wrong base.
+func TestTradingFee_ChargedOnNotionalBothLegs(t *testing.T) {
+	old := TakerFeeRate
+	TakerFeeRate = dec("0.0005") // OKX's real base-tier taker fee, 0.05%
+	defer func() { TakerFeeRate = old }()
+
+	// size=10 (margin), leverage=10 -> entry notional = 100. Price moves from 100 to 110 -> exit
+	// notional = 100 * 110/100 = 110.
+	order := port.PaperOrder{Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("10")}
+	fee := tradingFee(order, dec("110"))
+	want := dec("100").Add(dec("110")).Mul(dec("0.0005")) // (100+110)*0.0005 = 0.105
+	if !fee.Equal(want) {
+		t.Errorf("expected fee %s (0.05%% of entry+exit notional), got %s", want, fee)
+	}
+}
+
+// TestTradingFee_ZeroRateChargesNothing confirms the feature is genuinely additive: a zero
+// TakerFeeRate (the Go zero value, and every existing test's implicit default before this feature
+// existed) must reproduce the exact pre-2026-09-06 PnL with no fee line at all.
+func TestTradingFee_ZeroRateChargesNothing(t *testing.T) {
+	old := TakerFeeRate
+	TakerFeeRate = decimal.Zero
+	defer func() { TakerFeeRate = old }()
+
+	order := port.PaperOrder{Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("10")}
+	if fee := tradingFee(order, dec("110")); !fee.IsZero() {
+		t.Errorf("expected zero fee when TakerFeeRate is zero, got %s", fee)
+	}
+}
+
+// TestRealizedPnL_DeductsFee ties the two together: realizedPnL's net result must equal the
+// pre-fee gross move minus the fee tradingFee computes independently, for both a winning and a
+// losing trade — a fee must reduce a win and DEEPEN a loss, never the reverse.
+func TestRealizedPnL_DeductsFee(t *testing.T) {
+	old := TakerFeeRate
+	TakerFeeRate = dec("0.0005")
+	defer func() { TakerFeeRate = old }()
+
+	order := port.PaperOrder{Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("10")}
+
+	winClose := dec("110")
+	gross := grossPnL(order, winClose)
+	fee := tradingFee(order, winClose)
+	net := realizedPnL(order, winClose)
+	if !net.Equal(gross.Sub(fee)) {
+		t.Errorf("winning trade: net %s != gross %s - fee %s", net, gross, fee)
+	}
+	if !net.LessThan(gross) {
+		t.Errorf("a fee must reduce a winning trade's PnL: net %s should be < gross %s", net, gross)
+	}
+
+	lossClose := dec("90")
+	grossLoss := grossPnL(order, lossClose)
+	netLoss := realizedPnL(order, lossClose)
+	if !netLoss.LessThan(grossLoss) {
+		t.Errorf("a fee must DEEPEN a losing trade, never reduce the loss: net %s should be < gross %s", netLoss, grossLoss)
+	}
+}
+
+// TestRealizedPnLWithFunding_LongPaysPositiveRate covers OKX's own sign convention (a positive
+// fundingRate means longs pay shorts): a long position accruing a positive summed rate must have
+// that amount SUBTRACTED from its PnL, and the returned fundingCost must be positive (a cost).
+func TestRealizedPnLWithFunding_LongPaysPositiveRate(t *testing.T) {
+	repo := newFakeRepository()
+	opened := time.Now().Add(-time.Hour)
+	closed := time.Now()
+	repo.fundingRates = []port.FundingRate{
+		{InstID: "BTC", FundingTime: opened.Add(30 * time.Minute), FundingRate: dec("0.0001")},
+	}
+	order := port.PaperOrder{
+		InstID: "BTC", Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("10"), OpenedAt: opened,
+	}
+	pnl, fundingCost := realizedPnLWithFunding(context.Background(), repo, order, dec("100"), closed, testLogger())
+	// notional = 10*10 = 100; funding = 0.0001*100 = 0.01, a cost to the long.
+	if !fundingCost.Equal(dec("0.01")) {
+		t.Errorf("expected fundingCost=0.01 (a cost), got %s", fundingCost)
+	}
+	if !pnl.Equal(dec("-0.01")) {
+		t.Errorf("expected pnl=-0.01 (round-trip price, only funding cost applied), got %s", pnl)
+	}
+}
+
+// TestRealizedPnLWithFunding_ShortReceivesPositiveRate mirrors the above for a short: a positive
+// summed rate is a CREDIT to a short (longs are paying, and a short is on the other side of that
+// payment), so it must be ADDED to PnL and reported as a negative fundingCost.
+func TestRealizedPnLWithFunding_ShortReceivesPositiveRate(t *testing.T) {
+	repo := newFakeRepository()
+	opened := time.Now().Add(-time.Hour)
+	closed := time.Now()
+	repo.fundingRates = []port.FundingRate{
+		{InstID: "BTC", FundingTime: opened.Add(30 * time.Minute), FundingRate: dec("0.0001")},
+	}
+	order := port.PaperOrder{
+		InstID: "BTC", Side: "sell", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("10"), OpenedAt: opened,
+	}
+	pnl, fundingCost := realizedPnLWithFunding(context.Background(), repo, order, dec("100"), closed, testLogger())
+	if !fundingCost.Equal(dec("-0.01")) {
+		t.Errorf("expected fundingCost=-0.01 (a credit, negative), got %s", fundingCost)
+	}
+	if !pnl.Equal(dec("0.01")) {
+		t.Errorf("expected pnl=+0.01 (a short receiving the credit), got %s", pnl)
+	}
+}
+
+// TestRealizedPnLWithFunding_OutsideWindowNotCounted confirms a funding period that settled
+// before the position opened or after it closed is excluded — the sum must be scoped to exactly
+// the position's own lifetime, not to every rate ever polled for the instrument.
+func TestRealizedPnLWithFunding_OutsideWindowNotCounted(t *testing.T) {
+	repo := newFakeRepository()
+	opened := time.Now().Add(-time.Hour)
+	closed := time.Now()
+	repo.fundingRates = []port.FundingRate{
+		{InstID: "BTC", FundingTime: opened.Add(-time.Minute), FundingRate: dec("0.01")},  // before open
+		{InstID: "BTC", FundingTime: closed.Add(time.Minute), FundingRate: dec("0.01")},   // after close
+	}
+	order := port.PaperOrder{
+		InstID: "BTC", Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("10"), OpenedAt: opened,
+	}
+	_, fundingCost := realizedPnLWithFunding(context.Background(), repo, order, dec("100"), closed, testLogger())
+	if !fundingCost.IsZero() {
+		t.Errorf("expected zero funding cost when every settled rate falls outside the position's lifetime, got %s", fundingCost)
 	}
 }
 

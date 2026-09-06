@@ -123,6 +123,12 @@ type PaperOrder struct {
 	CloseReason  *string // "sl", "tp", "manual", "timeout"
 	ClosePx      *decimal.Decimal
 	RealizedPnL  *decimal.Decimal
+	// FeesUSD (trading fee) and FundingUSD (accrued funding cost/credit, positive = cost) are both
+	// already subtracted into RealizedPnL (2026-09-06), stored separately so the panel's
+	// closed-positions view can show which one actually moved a trade's PnL. Nil for still-open
+	// positions and for orders closed before these columns existed.
+	FeesUSD      *decimal.Decimal
+	FundingUSD   *decimal.Decimal
 	FeaturesJSON json.RawMessage
 	Mode         string // "paper", "demo", or "real" (CLAUDE.md §11.4); defaults to "paper"
 
@@ -388,7 +394,11 @@ type Repository interface {
 	// SetExchangeAlgoOrderID records the resting SL/TP algo order's OKX-assigned ID on an already-
 	// open real order (CLAUDE.md §27.3), so it can be amended/cancelled later. Real trading only.
 	SetExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error
-	ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error
+	// feesUSD (trading fee) and fundingUSD (accrued funding cost/credit, positive = cost) are
+	// already subtracted into realizedPnL (2026-09-06) — stored as their own columns, kept separate
+	// rather than combined, so the panel's closed-positions view can show which one actually moved
+	// a given trade without recomputing either from entry/exit prices.
+	ClosePaperOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL, feesUSD, fundingUSD decimal.Decimal) error
 	// UpdatePaperOrderSLTP applies an in-trade SL/TP adjustment to an open order (CLAUDE.md §15.4).
 	// Callers MUST have already run the proposed new prices through the ratchet clamp
 	// (usecase.RatchetSLTP) before calling this — the repository does not re-validate the ratchet
@@ -543,4 +553,24 @@ type Repository interface {
 	// strategies" toggle, scoped to one mode. A no-op when activeKinds is empty (no restriction
 	// configured).
 	SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string) error
+
+	// SaveFundingRates upserts a batch of funding-rate periods (2026-09-06's funding-cost service).
+	// Upsert on (inst_id, funding_time) so re-polling an already-stored period is a safe no-op —
+	// OKX's history endpoint always returns the same recent window, not just new rows since the
+	// last poll.
+	SaveFundingRates(ctx context.Context, rates []FundingRate) error
+	// SumFundingCost returns the sum of funding_rate * notionalUSD for every settled period between
+	// openedAt and closedAt (inclusive) for instID — the actual funding cost/credit a position of
+	// that notional would have paid across its lifetime. A positive result is a cost paid by a LONG
+	// (and a credit to a short); realizedPnL subtracts this for a long and adds it for a short,
+	// mirroring the sign convention OKX itself uses (positive fundingRate = longs pay shorts).
+	SumFundingCost(ctx context.Context, instID string, openedAt, closedAt time.Time, notionalUSD decimal.Decimal) (decimal.Decimal, error)
+}
+
+// FundingRate is one settled 8-hour funding period as stored (mirrors domain.FundingRate — see
+// that type's doc comment for why this is polled rather than assumed from a config constant).
+type FundingRate struct {
+	InstID      string
+	FundingTime time.Time
+	FundingRate decimal.Decimal
 }

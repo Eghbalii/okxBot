@@ -633,7 +633,7 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 		if !hit {
 			continue
 		}
-		if err := e.closeOrder(ctx, o, price, reason, realizedPnL(o, price), logger); err != nil {
+		if err := e.closeOrder(ctx, o, price, reason, logger); err != nil {
 			logger.Error("failed to close paper order", "id", o.ID, "error", err)
 			continue
 		}
@@ -694,10 +694,16 @@ func (e *PaperTrader) closeOrder(
 	o port.PaperOrder,
 	price decimal.Decimal,
 	reason string,
-	pnl decimal.Decimal,
 	logger *slog.Logger,
 ) error {
-	if err := e.Repo.ClosePaperOrder(ctx, o.ID, price, reason, pnl); err != nil {
+	// pnl/funding computed HERE rather than by the caller (2026-09-06 revision, when funding cost
+	// was added): every closeOrder caller previously computed pnl via realizedPnL(o, price) right
+	// before calling, so centralizing it here removes that duplication and is what let the funding
+	// lookup — which needs ctx/Repo, unlike the pure trading-fee deduction — land in exactly one
+	// place instead of at every call site.
+	pnl, fundingCost := realizedPnLWithFunding(ctx, e.Repo, o, price, time.Now(), logger)
+	fees := tradingFee(o, price)
+	if err := e.Repo.ClosePaperOrder(ctx, o.ID, price, reason, pnl, fees, fundingCost); err != nil {
 		return err
 	}
 	metrics.PaperOrdersClosedTotal.WithLabelValues(e.InstID, reason).Inc()
@@ -787,12 +793,83 @@ func SLTPTouchReason(side string, slPx, tpPx *decimal.Decimal, price decimal.Dec
 }
 
 func realizedPnL(o port.PaperOrder, closePx decimal.Decimal) decimal.Decimal {
+	gross := grossPnL(o, closePx)
+	return gross.Sub(tradingFee(o, closePx))
+}
+
+// grossPnL is the price-move component alone, before fees — split out from realizedPnL so the fee
+// deduction (added 2026-09-06) is visibly a separate line item rather than folded silently into one
+// formula, and so callers that need the pre-fee number (e.g. a panel column showing gross vs. fees
+// vs. net side by side) don't have to re-derive it by adding the fee back.
+func grossPnL(o port.PaperOrder, closePx decimal.Decimal) decimal.Decimal {
 	direction := decimal.NewFromInt(1)
 	if o.Side == "sell" {
 		direction = decimal.NewFromInt(-1)
 	}
 	return direction.Mul(closePx.Sub(o.EntryPx)).Div(o.EntryPx).Mul(o.Size).Mul(o.Leverage)
 }
+
+// tradingFee is OKX's own taker fee (CLAUDE.md 2026-09-06, live-confirmed against OKX's published
+// fee schedule: 0.05% per side for perpetual futures) charged on BOTH legs of the round trip — the
+// market order that opened the position and the one that closed it — since paper trading previously
+// modeled neither, making every closed trade's realized_pnl (and the reward the RL model trains on)
+// more optimistic than a real fill would be. Charged on NOTIONAL (o.Size * o.Leverage), not on
+// o.Size alone: o.Size is the margin committed, and a fee is a percentage of what actually trades on
+// the exchange, which is the leveraged notional. TakerFeeRate is a package-level var, not a
+// PaperTrader field, so this shared function (also used by RealTrader via the same call sites) needs
+// no struct threaded through it — set once at process startup from config.
+func tradingFee(o port.PaperOrder, closePx decimal.Decimal) decimal.Decimal {
+	if !TakerFeeRate.IsPositive() {
+		return decimal.Zero
+	}
+	notional := o.Size.Mul(o.Leverage)
+	entryNotional := notional
+	exitNotional := notional.Mul(closePx).Div(o.EntryPx)
+	return entryNotional.Add(exitNotional).Mul(TakerFeeRate)
+}
+
+// realizedPnLWithFunding adds the position's actual accrued funding cost/credit on top of
+// realizedPnL's trading-fee-adjusted result (2026-09-06). A separate step from realizedPnL itself
+// because funding requires a DB lookup (SumFundingCost, against the polled funding_rates table)
+// while trading fees are pure arithmetic — keeping realizedPnL synchronous means every existing
+// call site and test that only cares about fees is untouched.
+//
+// OKX's own sign convention: a positive fundingRate means longs pay shorts. So a positive summed
+// rate is a COST to a long (subtracted) and a CREDIT to a short (added) — mirrored here rather than
+// baking the sign into SumFundingCost, which stays a neutral "sum of rates * notional" the caller
+// interprets.
+//
+// Best-effort: a funding-lookup failure must never block closing a position, so it degrades to
+// "funding cost not available" (fee-only PnL, decimal.Zero for the fee-alone case) rather than
+// propagating the error up through the single close path every order goes through.
+func realizedPnLWithFunding(ctx context.Context, repo port.Repository, o port.PaperOrder, closePx decimal.Decimal, closedAt time.Time, logger *slog.Logger) (pnl, fundingCost decimal.Decimal) {
+	pnl = realizedPnL(o, closePx)
+	if repo == nil {
+		return pnl, decimal.Zero
+	}
+	notional := o.Size.Mul(o.Leverage)
+	cost, err := repo.SumFundingCost(ctx, o.InstID, o.OpenedAt, closedAt, notional)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("realized pnl: funding cost lookup failed, charging fee only", "instId", o.InstID, "error", err)
+		}
+		return pnl, decimal.Zero
+	}
+	if o.Side == "sell" {
+		return pnl.Add(cost), cost.Neg()
+	}
+	return pnl.Sub(cost), cost
+}
+
+// TakerFeeRate is set once at process startup (cmd/paper-trader, cmd/trader) from
+// config.Trading.TakerFeeRate. A package-level var rather than a field on PaperTrader/RealTrader
+// because realizedPnL/tradingFee are free functions shared by both types (PaperTrader and
+// RealTrader both call realizedPnL) — this keeps paper and real trading's fee model from ever
+// silently diverging by construction, rather than by remembering to pass the same config value to
+// two separate struct fields. internal/optimizer's own trial scoring does NOT use this: it
+// deliberately judges purely on SL/TP touch, never PnL (CLAUDE.md §16.1), so a fee has nothing to
+// attach to there.
+var TakerFeeRate decimal.Decimal
 
 // hasOpenBaseline reports whether any of these orders is a real (non-fork) open position. Forks
 // are tracking-only shadows of their baseline parent (CLAUDE.md §15.4), so one must never make the

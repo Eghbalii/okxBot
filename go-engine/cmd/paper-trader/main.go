@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
+	"github.com/eghbalii/okxBot/go-engine/internal/gatewayclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
@@ -37,6 +38,7 @@ func main() {
 		logger.Error("invalid config", "error", err)
 		os.Exit(1)
 	}
+	usecase.TakerFeeRate = cfg.Trading.TakerFeeRate
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -55,6 +57,20 @@ func main() {
 	}
 
 	logger.Info("starting paper trader", "instIds", cfg.Trading.InstIDs)
+
+	// Funding-rate poller (CLAUDE.md, 2026-09-06): keeps funding_rates current so realizedPnL's
+	// funding-cost lookup has real, per-instrument, per-period data rather than a fixed config
+	// constant. paper-trader is the right home for this despite having no other OKX dependency —
+	// it is the sole owner of the closed-position PnL calculation that actually consumes this data.
+	go runFundingRatePoller(
+		ctx,
+		gatewayclient.New(cfg.Gateway.URL, "paper-trader"),
+		repo,
+		cfg.Trading.SymbolMap,
+		cfg.Trading.InstIDs,
+		cfg.FundingRate.PollInterval,
+		logger,
+	)
 
 	// Panel control-box config (CLAUDE.md): read fresh from Postgres at every start, same
 	// crash-recovery posture as loadStrategyAssignments below — a restart resumes with exactly the

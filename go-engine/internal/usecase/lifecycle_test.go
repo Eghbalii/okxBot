@@ -191,7 +191,7 @@ func TestClose_ManualCloseReportsClosedEarly(t *testing.T) {
 	id, _ := repo.OpenPaperOrder(context.Background(), o)
 	o.ID = id
 
-	if err := pt.closeOrder(context.Background(), o, dec("105"), "manual", dec("5"), testLogger()); err != nil {
+	if err := pt.closeOrder(context.Background(), o, dec("105"), "manual", testLogger()); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 	cats := model.categories()

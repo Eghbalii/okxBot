@@ -71,6 +71,14 @@ type Config struct {
 		// OKX_SIMULATED_TRADING would make an unset env var the difference between a sandbox and
 		// real capital; going live should require saying so.
 		AllowRealMoney bool `yaml:"allow_real_money"`
+		// TakerFeeRate is OKX's own base-tier taker fee (2026-09-06, live-confirmed against OKX's
+		// published fee schedule: 0.05% per side for perpetual futures). realizedPnL charges it on
+		// both the entry AND the exit leg — paper trading previously charged no fee at all, so every
+		// closed trade's realized_pnl (and the reward the RL model trains on) was more optimistic
+		// than a real fill would be by roughly this amount on every round trip. Zero disables it,
+		// matching every other feature flag's "additive" posture, though there is no real reason to
+		// run with it at zero other than reproducing pre-2026-09-06 numbers for comparison.
+		TakerFeeRate decimal.Decimal `yaml:"taker_fee_rate"`
 		// URL is cmd/trader's own restart-only HTTP surface as reached from cmd/api (env only, same
 		// pattern as PaperTrading.URL/Tester.URL/RLService.URL) — used to proxy the panel's Real-tab
 		// restart button through cmd/api (CLAUDE.md §11 / real-trading readiness plan, 2026-09-04).
@@ -373,6 +381,21 @@ type Config struct {
 	FillTimeout struct {
 		OrderFillTimeoutSec int `yaml:"order_fill_timeout_sec"`
 	} `yaml:"trading_fill_timeout"`
+
+	// FundingRate configures the poller that keeps the funding_rates table current (2026-09-06).
+	// Needed because OKX's real funding rate swings roughly 60x between calm and volatile periods
+	// (live-measured: 0.005%-0.03% per 8h normally, up to 0.3% in strong trends) and, on the X-Perp
+	// product this project actually trades, can even run the OPPOSITE sign from the standard
+	// BTC-USD-SWAP market (live-confirmed: BTC-USD_UM_XPERP read ~-0.02% per 8h, i.e. shorts paying
+	// longs, the same day the standard market read positive) — a single config constant cannot
+	// track either the magnitude or the sign correctly.
+	FundingRate struct {
+		// PollInterval is how often each configured instrument's latest funding rate is fetched.
+		// OKX settles funding 3x/day (every 8h); polling more often than that just re-reads the
+		// same current-period rate, so hourly is frequent enough to catch a new period promptly
+		// without hammering the endpoint.
+		PollInterval time.Duration `yaml:"poll_interval"`
+	} `yaml:"funding_rate"`
 }
 
 // GatewayClassLimit is one endpoint class's config-overridable rate limit (CLAUDE.md §27.1). A
@@ -577,6 +600,15 @@ func Load(path string) (*Config, error) {
 		// 60s, per explicit operator decision (CLAUDE.md §27.5) — cancel-and-wait-for-next-signal,
 		// never a synthetic retry at a new price.
 		cfg.FillTimeout.OrderFillTimeoutSec = 60
+	}
+	if cfg.Trading.TakerFeeRate.IsZero() {
+		// OKX's own published base-tier taker fee (0.05% per side), live-confirmed 2026-09-06 — not
+		// opt-in the way most feature flags in this codebase are, since a config that omits this
+		// should still model a real cost rather than silently reverting to a fee-free simulation.
+		cfg.Trading.TakerFeeRate = decimal.RequireFromString("0.0005")
+	}
+	if cfg.FundingRate.PollInterval == 0 {
+		cfg.FundingRate.PollInterval = time.Hour
 	}
 	if cfg.Tester.Addr == "" {
 		cfg.Tester.Addr = envOr("TESTER_ADDR", "0.0.0.0:8092")
