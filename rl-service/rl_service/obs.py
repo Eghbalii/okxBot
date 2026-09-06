@@ -26,13 +26,22 @@ from pydantic import BaseModel, Field, field_validator
 # `signal` — and, critically, actually fed strategy signals into the model's input vector, which
 # v3/v4 never did despite carrying them over the wire the whole time.
 #
-# v6 (current): CLAUDE.md §15.11. Signal SL/TP became prices rather than percentages (a strategy
+# v6: CLAUDE.md §15.11. Signal SL/TP became prices rather than percentages (a strategy
 # derives a level from chart structure; a percentage discards that) and gained entry_px; the two
 # overlapping position blocks merged into one carrying pnl_max/pnl_min and age; price context now
 # includes the LIVE FORMING candle's OHLC; market_context and recent_trades dropped. One-hot
-# vocabularies are over-provisioned so the roster can grow without a retrain. Must match
-# domain.ObservationSchemaVersion on the Go side.
-OBSERVATION_SCHEMA_VERSION = 6
+# vocabularies are over-provisioned so the roster can grow without a retrain.
+#
+# v7 (current): the RISK BUDGET is now an input (max_position_pct, max_leverage), and size_pct /
+# leverage_frac are interpreted against it rather than against the whole account. Before this the
+# model proposed a fraction of total equity while Go independently clamped the result to
+# account.max_position_pct — so the policy was optimising in a space its own risk layer would
+# overrule, and offline training drove requested size to ~90% of equity because nothing in the
+# observation or the reward said that was impossible. Feeding the caps in makes the constraint part
+# of the problem the model is actually solving, and keeps it correct when a cap changes: raise
+# max_leverage from 10x to 20x and the same policy adapts instead of needing a retrain, which a
+# hardcoded rescaling of the output could never do. Must match domain.ObservationSchemaVersion.
+OBSERVATION_SCHEMA_VERSION = 7
 
 # ACTIONS is the model's single decision field (CLAUDE.md §15.11). Deliberately named to match the
 # input categories so the same word means the same thing on both sides of the call: the model sees
@@ -302,6 +311,15 @@ class Observation(BaseModel):
     account_initial_usd: float = 0.0
     open_exposure_usd: float = 0.0
 
+    # The risk budget this decision must fit inside (schema v7). These are the SAME caps Go
+    # enforces after the fact (account.max_position_pct, risk.max_leverage) — handed to the model so
+    # it optimises within them instead of against them. size_pct and leverage_frac in the action are
+    # read as fractions OF THESE, so a policy asking for 1.0 wants the maximum it is allowed, not
+    # the whole account. Defaults match the deployed config (CLAUDE.md §26) so an older caller that
+    # omits them still produces a sane vector rather than a zero budget.
+    max_position_pct: float = 0.10
+    max_leverage: float = 10.0
+
     # Legacy flat window, still accepted for the pre-Phase-A / cmd/trader no-op path (CLAUDE.md
     # §15.3's TODO on usecase/trade.go) until that loop is repointed at the global-agent design.
     features: list[float] = Field(default_factory=list)
@@ -348,10 +366,20 @@ def observation_tail(obs: Observation) -> np.ndarray:
     initial = obs.account_initial_usd or obs.account_equity_usd
     equity_ratio = obs.account_equity_usd / initial if initial else 0.0
     exposure_ratio = obs.open_exposure_usd / obs.account_equity_usd if obs.account_equity_usd else 0.0
+    # The risk budget itself (schema v7). Fed as inputs so the policy can condition on how much room
+    # it actually has — a decision made without knowing the cap is a decision made in a different
+    # problem than the one Go will execute. max_leverage is scaled by a nominal 100x ceiling purely
+    # to keep it in the same rough magnitude as the other inputs; nothing depends on that constant
+    # being the true maximum, only on it being fixed.
+    max_position_pct = obs.max_position_pct
+    max_leverage_norm = obs.max_leverage / 100.0
     return np.concatenate(
         [
             _one_hot(obs.inst_id, obs.active_tokens, MAX_TOKEN_SLOTS),
-            np.array([equity_ratio, exposure_ratio], dtype=np.float32),
+            np.array(
+                [equity_ratio, exposure_ratio, max_position_pct, max_leverage_norm],
+                dtype=np.float32,
+            ),
             signal_block(obs),
             position_block(obs),
         ]
@@ -493,7 +521,9 @@ def decode_action(raw: np.ndarray, obs: Observation) -> Action:
     Layout (CLAUDE.md §15.11), all emitted by the policy in [-1, 1] and mapped here:
       [0] sl offset       -> scaled by MAX_SLTP_OFFSET_PCT, turned into a PRICE against last_price
       [1] tp offset       -> same
-      [2] size_pct        in [0, 1] — fraction of account equity to commit
+      [2] size_pct        in [0, 1] — fraction of the ALLOWED budget (obs.max_position_pct), not
+                          of the whole account: 1.0 means "the most I am permitted", so the value
+                          returned is already the fraction-of-equity Go will act on (schema v7)
       [3] leverage_frac   in [0, 1] — mapped to [1x, max_leverage] by the caller
       [4:] action head    -> argmax over ACTIONS
 
@@ -512,7 +542,10 @@ def decode_action(raw: np.ndarray, obs: Observation) -> Action:
 
     sl_offset = float(np.clip(vec[0], -1.0, 1.0)) * MAX_SLTP_OFFSET_PCT
     tp_offset = float(np.clip(vec[1], -1.0, 1.0)) * MAX_SLTP_OFFSET_PCT
-    size_pct = float(np.clip(vec[2], 0.0, 1.0))
+    # Scaled by the budget the observation carried (schema v7), so the policy's "how much of what I
+    # am allowed" becomes the "fraction of equity" the caller expects. Asking for the maximum is
+    # therefore exactly the current fixed-sizing behaviour rather than an account-emptying request.
+    size_pct = float(np.clip(vec[2], 0.0, 1.0)) * obs.max_position_pct
     leverage_frac = float(np.clip(vec[3], 0.0, 1.0))
 
     # An argmax rather than a threshold, so exactly one action is always selected — but only over

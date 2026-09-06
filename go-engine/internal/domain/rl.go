@@ -22,11 +22,19 @@ import "github.com/shopspring/decimal"
 // RecentTrades into the model's input vector, which v3/v4 never did despite both sides carrying
 // them over the wire the whole time.
 //
-// v6 (current): CLAUDE.md §15.11. Signal SL/TP became PRICES rather than percentages (a strategy
+// v6: CLAUDE.md §15.11. Signal SL/TP became PRICES rather than percentages (a strategy
 // derives a level from chart structure; a percentage discards that) and gained EntryPx; the two
 // overlapping position blocks merged into one carrying PnLMax/PnLMin and age; price context gained
 // the live forming candle's OHLC; MarketContext and RecentTrades dropped.
-const ObservationSchemaVersion = 6
+//
+// v7 (current): the risk budget became an INPUT — MaxPositionPct/MaxLeverage, the same caps Go
+// already enforces after the fact. Before this the model proposed a fraction of total equity while
+// the risk layer independently clamped it, so the policy was optimising in a space its own
+// constraints would overrule: offline training drove requested size to ~90% of equity because
+// nothing it could see said that was impossible. Action size_pct is now read as a fraction OF the
+// cap rather than of the account, which also means a cap change (10x -> 20x leverage, say) adapts
+// the same policy instead of needing a retrain.
+const ObservationSchemaVersion = 7
 
 // ActionSchemaVersion tracks the Action's layout independently of the observation's — a model
 // trained against a narrower action space can't answer the full CLAUDE.md §15.4 action, and that's
@@ -237,6 +245,15 @@ type Observation struct {
 	// token, so the agent can see how much of the shared account is already committed before asking
 	// for more — without it, one policy serving N tokens has no way to avoid over-committing.
 	OpenExposureUSD decimal.Decimal `json:"open_exposure_usd"`
+
+	// MaxPositionPct/MaxLeverage are the RISK BUDGET this decision has to fit inside (schema v7) —
+	// the same caps risk/conductor enforce on the way back out, handed to the model on the way in.
+	// The model's size_pct is interpreted as a fraction OF MaxPositionPct rather than of the whole
+	// account, so "give me everything I'm allowed" is a bounded, sane request instead of one the
+	// risk layer has to overrule. Feeding the caps rather than baking them into the output scaling
+	// is what keeps a later change (raising MaxLeverage, adding tokens) working without a retrain.
+	MaxPositionPct decimal.Decimal `json:"max_position_pct"`
+	MaxLeverage    decimal.Decimal `json:"max_leverage"`
 
 	Features []decimal.Decimal `json:"features"` // legacy flat window, kept for the no-op/pre-Phase-A path
 }

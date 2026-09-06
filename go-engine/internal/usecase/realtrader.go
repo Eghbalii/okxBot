@@ -361,6 +361,18 @@ func (e *RealTrader) tradableEquity(rawBalance decimal.Decimal) decimal.Decimal 
 	return tradable
 }
 
+// evenShareOfAccount mirrors PaperTrader.evenShareOfAccount: the fraction of the account one token
+// is expected to take when equity is split evenly across the active roster, fed to the model as
+// MaxPositionPct (observation schema v7). Derived from the live roster length rather than a config
+// constant so enabling or disabling a token reshapes the budget on its own.
+func (e *RealTrader) evenShareOfAccount() decimal.Decimal {
+	count := len(e.ActiveTokens)
+	if count <= 0 {
+		count = 1
+	}
+	return decimal.NewFromInt(1).Div(decimal.NewFromInt(int64(count)))
+}
+
 func (e *RealTrader) accountMode() string {
 	if e.Mode == "" {
 		return "real"
@@ -1120,6 +1132,12 @@ func (e *RealTrader) buildObservation(ctx context.Context, bar string, price dec
 		LastPrice:         price,
 		Timeframes:        []domain.TimeframeBlock{tb},
 		AccountInitialUSD: e.AccountInitialUSD,
+		// The risk budget the model must size within (schema v7) — the per-token even share of the
+		// account, matching PaperTrader.evenShareOfAccount so one policy serving both modes reads
+		// the same meaning from the field. account.max_position_pct still applies afterwards in
+		// sizeFromModelAction as the hard ceiling.
+		MaxPositionPct: e.evenShareOfAccount(),
+		MaxLeverage:    e.MaxLeverage,
 		Category:          domain.CategoryUpdate,
 	}
 

@@ -234,6 +234,16 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 		LastPrice:         price,
 		Timeframes:        []domain.TimeframeBlock{tb},
 		AccountInitialUSD: e.AccountInitialUSD,
+		// The risk budget the model must size within (schema v7). MaxPositionPct is the per-token
+		// EVEN SHARE of the account (1/ActiveTokenCount), NOT account.max_position_pct: the fixed
+		// sizing path (dynamicNotional) already divides equity evenly across the active tokens, so
+		// that share is what one position is actually expected to take. Deriving it from the live
+		// token count rather than a config constant means adding or disabling a token reshapes the
+		// budget automatically — which is the whole reason the caps are an input rather than being
+		// baked into the output scaling. account.max_position_pct still applies afterwards in
+		// sizeFromModelAction as the hard ceiling it has always been.
+		MaxPositionPct: e.evenShareOfAccount(),
+		MaxLeverage:    e.MaxLeverage,
 		// The lifecycle category and per-call Signal are always set by the caller, which is the
 		// only place that knows which decision is being asked (CLAUDE.md §15.12). CategoryUpdate
 		// stands as the fallback because it is the one category that claims nothing — no strategy

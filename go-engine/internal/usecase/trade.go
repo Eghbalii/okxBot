@@ -170,6 +170,15 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 		initial = equity
 	}
 
+	// The risk budget as an observation input (schema v7). This loop's limits are expressed as a
+	// notional ceiling rather than a percentage, so convert against equity to give the model the
+	// same fraction-of-account meaning every other caller sends.
+	riskLimits := t.RiskManager.Limits()
+	maxPositionPct := decimal.Zero
+	if equity.IsPositive() {
+		maxPositionPct = riskLimits.MaxPositionNotionalUSD.Div(equity)
+	}
+
 	obs := domain.Observation{
 		SchemaVersion:     domain.ObservationSchemaVersion,
 		InstID:            t.InstID,
@@ -180,6 +189,8 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 		UnrealizedPnLPct:  uplRatio,
 		AccountEquityUSD:  equity,
 		AccountInitialUSD: initial,
+		MaxPositionPct:    maxPositionPct,
+		MaxLeverage:       riskLimits.MaxLeverage,
 	}
 
 	t.recordEquity(ctx, equity, initial, logger)
