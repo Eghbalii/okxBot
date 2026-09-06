@@ -143,6 +143,12 @@ type PaperOrder struct {
 	ParentOrderID *int64
 	Variant       string // "baseline" (default); "rl_adjusted" only appears in historical rows
 
+	// AdjustmentCount is how many in-place SL/TP edits this order has had — the live replacement
+	// for what ParentOrderID used to tell the panel's "Updated" column before forking was removed.
+	// Computed by ListPositions only (a per-row COUNT over paper_order_adjustments); zero on the
+	// other read paths, which have no need for it.
+	AdjustmentCount int
+
 	// StrategyName is joined in by ListPositions for display (CLAUDE.md §11.4's positions panel) —
 	// not a stored column, and not populated by OpenPaperOrder/ListOpenPaperOrders. Empty when
 	// StrategyID is nil (an order opened with no strategy attribution).
@@ -213,6 +219,10 @@ type RealOrder struct {
 
 	// StrategyName is joined in by ListRealPositions for display — not a stored column.
 	StrategyName string
+
+	// AdjustmentCount mirrors PaperOrder.AdjustmentCount: in-place SL/TP edits, counted by
+	// ListRealPositions only.
+	AdjustmentCount int
 
 	ManualCloseRequested bool
 

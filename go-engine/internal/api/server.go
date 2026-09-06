@@ -515,6 +515,7 @@ func realOrderToPosition(o port.RealOrder) port.PaperOrder {
 		PnLMinPct:            o.PnLMinPct,
 		Variant:              "baseline",
 		StrategyName:         o.StrategyName,
+		AdjustmentCount:      o.AdjustmentCount,
 		ManualCloseRequested: o.ManualCloseRequested,
 		ExchangeOrderID:      o.ExchangeOrderID,
 		ExchangeAlgoOrderID:  o.ExchangeAlgoOrderID,

@@ -71,6 +71,9 @@ export interface Position {
   // now Variant='baseline'/ParentOrderID=null going forward; 'rl_adjusted' only appears on
   // historical rows from before the change.
   ParentOrderID: number | null
+  // How many in-place SL/TP edits the model has made on this order — the live replacement for
+  // ParentOrderID as the "Updated" signal, since forking was removed (see above).
+  AdjustmentCount: number
   Variant: 'baseline' | 'rl_adjusted' | ''
   // Bar is the decision timeframe the signal that opened this order fired on (e.g. "5m", "1H").
   // Empty for orders opened before this field existed.

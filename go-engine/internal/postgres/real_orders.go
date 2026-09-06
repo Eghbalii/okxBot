@@ -218,7 +218,10 @@ func (r *Repository) ListRealPositions(ctx context.Context, f port.PositionFilte
 		SELECT ro.id, ro.inst_id, ro.strategy_id, ro.side, ro.entry_px, ro.sl_px, ro.tp_px, ro.size, ro.leverage,
 			ro.opened_at, ro.closed_at, ro.close_reason, ro.close_px, ro.realized_pnl, ro.features_json, ro.status,
 			ro.bar, ro.pnl_max_pct, ro.pnl_min_pct, COALESCE(s.name, ''),
-			ro.exchange_order_id, ro.exchange_algo_order_id, ro.manual_close_requested
+			ro.exchange_order_id, ro.exchange_algo_order_id, ro.manual_close_requested,
+			-- In-place SL/TP edit count, mirroring ListPositions — backs the panel's "Updated"
+			-- column for real rows so it means the same thing in both modes.
+			(SELECT COUNT(*) FROM real_order_adjustments a WHERE a.order_id = ro.id)
 		FROM real_orders ro
 		LEFT JOIN strategies s ON s.id = ro.strategy_id
 		WHERE ($1 = '' OR ro.inst_id = $1)
@@ -245,7 +248,7 @@ func (r *Repository) ListRealPositions(ctx context.Context, f port.PositionFilte
 			&o.Size, &o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx,
 			&o.RealizedPnL, &o.FeaturesJSON, &o.Status, &bar,
 			&o.PnLMaxPct, &o.PnLMinPct, &o.StrategyName, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID,
-			&o.ManualCloseRequested); err != nil {
+			&o.ManualCloseRequested, &o.AdjustmentCount); err != nil {
 			return nil, fmt.Errorf("scan real position: %w", err)
 		}
 		if bar != nil {

@@ -96,8 +96,16 @@ function slTpPct(p: Position, target: string | null): number | null {
 // opposite of "bigger magnitude" for a negative number. No decimal point, no sign, no percent
 // suffix — those are added at the call site (a "+"/"−" was explicitly dropped as unnecessary here,
 // the color already conveys direction).
+//
+// Snapped to a small epsilon before the ceiling (2026-09-06): a stop placed exactly ON the 15%
+// loss cap computes to -15.000000000000037 in float64 — the cap IS being honoured to the limit —
+// and a bare Math.ceil turned that into 16, making every capped position look like the cap had
+// been breached. Reported as "SL is at 16, the 15% limit isn't working"; the limit was working and
+// only this display was wrong. The epsilon is far below any distance that matters on a real stop,
+// so it can only absorb representation error, never a genuine excess.
 function roundPctUp(pct: number): number {
-  return Math.sign(pct) * Math.ceil(Math.abs(pct))
+  const snapped = Math.abs(pct) - 1e-9
+  return Math.sign(pct) * Math.ceil(Math.max(snapped, 0))
 }
 
 export default function PositionsPage() {
@@ -184,6 +192,12 @@ export default function PositionsPage() {
   // 'rl_adjusted' copy instead) — derived client-side from ParentOrderID. Only sees forks within
   // the current page now that fetching is paginated, which is an accepted trade-off of the same
   // change: this was never a global computation the panel could afford to keep unbounded either.
+  // Superseded 2026-09-06: this used to mark a row "updated" when some OTHER row was a shadow fork
+  // of it (ParentOrderID). Forking was replaced by in-place SL/TP edits on 2026-09-02 (CLAUDE.md
+  // §15.4 revision), so no fork has been created since and the column was permanently blank —
+  // measured on live data: 0 forks against 338 real adjustments across 37 orders. AdjustmentCount
+  // (served by ListPositions/ListRealPositions) is the live equivalent. The fork set is still built
+  // so historical rows from before the change keep rendering as updated.
   const updatedOrderIds = new Set<number>()
   for (const p of rows ?? []) {
     if (p.ParentOrderID != null) updatedOrderIds.add(p.ParentOrderID)
@@ -341,7 +355,8 @@ export default function PositionsPage() {
               const lastPrice = livePrices[p.InstID]
               const live = unrealizedPnL(p, lastPrice)
               const isFork = p.Variant === 'rl_adjusted'
-              const wasUpdated = updatedOrderIds.has(p.ID)
+              // Either a real in-place edit (current behaviour) or a historical shadow fork.
+              const wasUpdated = p.AdjustmentCount > 0 || updatedOrderIds.has(p.ID)
               const realized = p.RealizedPnL !== null ? Number(p.RealizedPnL) : null
               const slPct = slTpPct(p, p.SLPx)
               const tpPct = slTpPct(p, p.TPPx)
@@ -386,7 +401,7 @@ export default function PositionsPage() {
                       <span className="text-dim">{trimPrice(p.SLPx)}</span>
                     </div>
                   </td>
-                  <td className="mono">{p.Leverage}x</td>
+                  <td className="mono">{Number(p.Leverage).toFixed(1)}x</td>
                   <td className="mono">${trimPrice(p.Size)}</td>
                   <DateTimeCell iso={p.OpenedAt} />
                   {showClosedColumns && <DateTimeCell iso={p.ClosedAt} />}
@@ -414,7 +429,12 @@ export default function PositionsPage() {
                   {showLiveColumns && (
                     <td>
                       {wasUpdated ? (
-                        <span className="badge badge-green">yes</span>
+                        <span
+                          className="badge badge-green"
+                          title={`${p.AdjustmentCount} in-place SL/TP edit${p.AdjustmentCount === 1 ? '' : 's'}`}
+                        >
+                          {p.AdjustmentCount}
+                        </span>
                       ) : (
                         <span className="badge badge-dim">no</span>
                       )}

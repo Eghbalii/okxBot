@@ -186,7 +186,14 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 		SELECT po.id, po.inst_id, po.strategy_id, po.side, po.entry_px, po.sl_px, po.tp_px, po.size, po.leverage,
 			po.opened_at, po.closed_at, po.close_reason, po.close_px, po.realized_pnl, po.features_json, po.mode,
 			po.parent_order_id, po.variant, po.bar, po.pnl_max_pct, po.pnl_min_pct, COALESCE(s.name, ''),
-			po.exchange_order_id, po.exchange_algo_order_id
+			po.exchange_order_id, po.exchange_algo_order_id,
+			-- How many in-place SL/TP edits this order has had. The panel's "Updated" column used to
+			-- be derived from parent_order_id (was this order shadow-forked?), but forking was
+			-- replaced by in-place edits on 2026-09-02 (CLAUDE.md §15.4 revision), so that column has
+			-- been permanently blank ever since: zero forks exist, while the adjustment log holds
+			-- hundreds of real edits. Counted here rather than joined so an order with no
+			-- adjustments still returns exactly one row.
+			(SELECT COUNT(*) FROM paper_order_adjustments a WHERE a.order_id = po.id)
 		FROM paper_orders po
 		LEFT JOIN strategies s ON s.id = po.strategy_id
 		WHERE ($1 = '' OR po.mode = $1)
@@ -213,7 +220,8 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx,
 			&o.Size, &o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx,
 			&o.RealizedPnL, &o.FeaturesJSON, &o.Mode, &o.ParentOrderID, &o.Variant, &bar,
-			&o.PnLMaxPct, &o.PnLMinPct, &o.StrategyName, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID); err != nil {
+			&o.PnLMaxPct, &o.PnLMinPct, &o.StrategyName, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID,
+			&o.AdjustmentCount); err != nil {
 			return nil, fmt.Errorf("scan position: %w", err)
 		}
 		if bar != nil {
