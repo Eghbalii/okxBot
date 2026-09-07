@@ -113,15 +113,37 @@ func ratchetSL(current *decimal.Decimal, direction, price, adjustPct decimal.Dec
 // than any realistic target on a 5m/15m/1H scalp, so this constrains only the runaway case.
 const MaxTPDistPct = 0.50
 
+// TPPriceGapPct is how far beyond the live price a clamped take-profit is placed, as a fraction of
+// price. Mirrors SLPriceGapPct and exists for the same reason: a target sitting exactly at price is
+// already touched, so clamping to the boundary itself would still close on the very next tick.
+const TPPriceGapPct = 0.001 // 0.1%
+
 // moveTP applies the model's proposed TP move with NO ratchet and no per-step size cap (removed
 // 2026-09-04, explicit operator decision): the model may move the target closer (locking in a
 // nearer profit) or further away (letting a winning trade run for more) in one step.
 //
-// Two guards remain, answering different questions. The result must stay on the profitable side of
-// ENTRY — a "take-profit" that crosses entry realizes a LOSS on touch, which isn't a take-profit at
-// all, and checking against the current price instead is not sufficient (the 2026-08-29 order
-// 100/110 incident this function's predecessor was built to fix). And it must stay within
-// MaxTPDistPct of entry, which is what stops repeated calls from walking the target to infinity.
+// Three guards remain, answering different questions.
+//
+// The result must stay on the profitable side of ENTRY — a "take-profit" that crosses entry
+// realizes a LOSS on touch, which isn't a take-profit at all (the 2026-08-29 order 100/110
+// incident this function's predecessor was built to fix).
+//
+// It must stay within MaxTPDistPct of entry, which is what stops repeated calls from walking the
+// target to infinity (the §31.1 order 1851 runaway).
+//
+// And it must stay on the unreached side of the LIVE PRICE. This is the SL guard's exact mirror
+// (ratchetSL's clamp, added 2026-09-05) and was missing here until 2026-09-07: entry and price
+// answer different questions once a trade is in profit. For a long that has run up, everything
+// between entry and price is "above entry" and passes the entry check, yet a target placed there
+// is already behind the market — the next tick closes at whatever fraction of the move it happens
+// to sit on. Found on order 2595 (PUMP long, entry 0.004315): at +6.5% unrealized the model pulled
+// the target from 0.004664 to 0.004322 while price was 0.004349, and the trade closed 39 seconds
+// after opening for a fraction of what it had reached. A scan of the trade log found 27 orders with
+// the same shape, several peaking near +10% and realizing a few cents.
+//
+// Clamped rather than rejected, matching ratchetSL's own revision: rejecting throws away every
+// proposal the model makes near price and costs it the ability to pull a target in at all, which is
+// legitimate behaviour — only landing it BEHIND price is not.
 func moveTP(current *decimal.Decimal, direction, price, entry, adjustPct decimal.Decimal) *decimal.Decimal {
 	if current == nil {
 		return nil
@@ -136,6 +158,20 @@ func moveTP(current *decimal.Decimal, direction, price, entry, adjustPct decimal
 		maxDist := entry.Mul(decimal.NewFromFloat(MaxTPDistPct))
 		if proposed.Sub(entry).Abs().GreaterThan(maxDist) {
 			return current
+		}
+	}
+
+	// Keep the target strictly beyond the live price, so it can still be reached rather than being
+	// already behind the market. Applied before the entry check below, which then rejects anything
+	// this clamp could not place profitably (a long whose price has fallen below entry, say).
+	if price.IsPositive() {
+		gap := price.Mul(decimal.NewFromFloat(TPPriceGapPct))
+		if direction.IsPositive() {
+			if limit := price.Add(gap); proposed.LessThan(limit) {
+				proposed = limit
+			}
+		} else if limit := price.Sub(gap); proposed.GreaterThan(limit) {
+			proposed = limit
 		}
 	}
 

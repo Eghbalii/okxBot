@@ -153,18 +153,79 @@ func TestRatchetSLTP_NilSLTPStaysNil(t *testing.T) {
 	}
 }
 
-func TestRatchetSLTP_TPMayCrossCurrentPrice(t *testing.T) {
-	// TP crossing the CURRENT price is allowed (2026-09-04): only entry bounds it now. A proposal
-	// that pushes TP below the live price but still above entry applies in full — this used to be
-	// rejected, but a target between entry and the live price is a perfectly coherent (if
-	// close-to-being-hit) take-profit, not a "loosening" the way crossing entry would be.
+// A target may be pulled in toward the live price, but never PAST it. Between 2026-09-04 and
+// 2026-09-07 this test asserted the opposite — that landing TP between entry and the live price was
+// "a perfectly coherent (if close-to-being-hit) take-profit" — and order 2595 showed what that
+// costs in practice: a target parked behind the market is not close to being hit, it is already
+// hit, and the next tick closes the trade there regardless of how far the move had run.
+func TestRatchetSLTP_TPClampedToLivePriceNotPastIt(t *testing.T) {
 	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), SLPx: ptr(dec("95")), TPPx: ptr(dec("105"))}
 	price := dec("102")
-	// -4% of 102 = -4.08, proposed TP = 105 - 4.08 = 100.92 — below the live price (102) but still
-	// above entry (100), so it applies even though it now sits between entry and the live price.
+
+	// -4% of 102 = -4.08, so the raw proposal is 105 - 4.08 = 100.92 — above entry (100) but BELOW
+	// the live price (102), i.e. already passed. It is clamped up to just beyond price instead.
 	_, newTP := RatchetSLTP(o, price, dec("0"), dec("-0.04"))
-	if !newTP.Equal(dec("100.92")) {
-		t.Errorf("expected TP moved to 100.92 (crossing current price is now allowed), got %s", newTP)
+
+	if newTP == nil {
+		t.Fatal("expected a TP, got nil")
+	}
+	if !newTP.GreaterThan(price) {
+		t.Errorf("long's TP must stay above the live price %s, got %s (already touched)", price, newTP)
+	}
+	// Clamped to price + TPPriceGapPct, not to price itself: a target exactly at price is still
+	// touched by the next tick.
+	want := dec("102.102") // 102 * 1.001
+	if !newTP.Equal(want) {
+		t.Errorf("expected TP clamped to %s, got %s", want, newTP)
+	}
+}
+
+// The short-side mirror of the above.
+func TestRatchetSLTP_ShortTPClampedToLivePriceNotPastIt(t *testing.T) {
+	o := port.PaperOrder{Side: "sell", EntryPx: dec("100"), SLPx: ptr(dec("105")), TPPx: ptr(dec("95"))}
+	price := dec("98")
+
+	// For a short, "pulling in" raises the target. Raw proposal: 95 + 0.04*98 = 98.92, which is
+	// above the live price (98) and therefore already passed.
+	_, newTP := RatchetSLTP(o, price, dec("0"), dec("-0.04"))
+
+	if newTP == nil {
+		t.Fatal("expected a TP, got nil")
+	}
+	if !newTP.LessThan(price) {
+		t.Errorf("short's TP must stay below the live price %s, got %s (already touched)", price, newTP)
+	}
+	want := dec("97.902") // 98 * 0.999
+	if !newTP.Equal(want) {
+		t.Errorf("expected TP clamped to %s, got %s", want, newTP)
+	}
+}
+
+// The exact production incident, reproduced with order 2595's real numbers (PUMP long, 2026-09-07).
+// The model pulled the target from 0.004664 to 0.004322 while price was 0.004349 and the trade was
+// +6.5% unrealized; the trade closed 39 seconds after opening for a fraction of what it reached.
+// Every guard that existed at the time passed it: the target was above entry, and well inside
+// MaxTPDistPct. Only the live price ruled it out.
+func TestRatchetSLTP_Order2595_TargetNotParkedBehindMarket(t *testing.T) {
+	entry := dec("0.004315")
+	tp := dec("0.004663795655012131")
+	price := dec("0.004349")
+	o := port.PaperOrder{Side: "buy", EntryPx: entry, TPPx: &tp}
+
+	// The adjustment that actually ran: enough to land the target at 0.0043224, under price.
+	adjustPct := dec("0.004322391895651816975").Sub(tp).Div(price)
+
+	_, newTP := RatchetSLTP(o, price, decimal.Zero, adjustPct)
+
+	if newTP == nil {
+		t.Fatal("expected a TP, got nil")
+	}
+	if newTP.LessThanOrEqual(price) {
+		t.Errorf("TP %s is at or below the live price %s — this is the order-2595 bug: the target "+
+			"is already touched and the position closes on the next tick", newTP, price)
+	}
+	if newTP.LessThanOrEqual(entry) {
+		t.Errorf("TP %s must stay above entry %s", newTP, entry)
 	}
 }
 
