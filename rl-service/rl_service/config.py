@@ -91,13 +91,17 @@ class ServeConfig:
     buffer_path: str = "models/sac_global_buffer.pkl"
     # Overrides the learning_rate baked into the loaded checkpoint at startup (SAC.load's own
     # learning_rate kwarg) — SAC.load otherwise restores whatever rate the checkpoint was saved
-    # with, so this is the only way to change it without retraining from scratch. Raised 5x
-    # (0.0003 -> 0.0015) on 2026-09-07: the model had accumulated 62k gradient updates against only
-    # ~4.4k replay-buffer experiences (many repeats of the same thin dataset) with still-negative
-    # 24h PnL, so a faster per-update step was chosen over waiting longer at the original rate.
-    # Watch for instability (action distribution collapsing to all-skip, as happened once before
-    # when rl_sizing was first enabled, CLAUDE.md §16.9) before raising further.
-    learning_rate: float = 0.0015
+    # with, so this is the only way to change it without retraining from scratch.
+    #
+    # Held at SAC's default 0.0003. A 5x raise (0.0015) was tried on 2026-09-07 and REVERTED the
+    # same hour: within 6 closed trades (24 gradient steps) the actor's size dimension went from
+    # +0.807 to negative, which decode_action clips to zero — so size_pct became 0.0 on every call
+    # and every open silently fell back to fixed sizing ("model action not sizable" in the
+    # paper-trader log). Confirmed by replaying one identical observation through the on-disk
+    # pre-raise checkpoint (+0.807) and the live post-raise model (negative) side by side.
+    # The thin replay buffer (~4.4k real experiences) is what makes the policy this easy to move;
+    # raising this again needs a way to catch the collapse automatically, not just a smaller step.
+    learning_rate: float = 0.0003
 
 
 @dataclass

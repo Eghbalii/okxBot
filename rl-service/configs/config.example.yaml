@@ -43,9 +43,9 @@ serve:
   snapshot_every: 25         # closed trades between snapshots (weights AND buffer, never just one)
   buffer_path: "models/sac_global_buffer.pkl"
   # Overrides the learning_rate baked into the checkpoint at startup (SAC.load's own kwarg).
-  # 0.0003 is SAC's/this project's original default; raised 5x here on 2026-09-07 after the model
-  # had accumulated 62k gradient updates against only ~4.4k replay-buffer experiences with still-
-  # negative 24h PnL. Watch the action distribution for collapse (e.g. all-skip) before raising more.
-  learning_rate: 0.0015
+  # Keep at 0.0003: a 5x raise was tried on 2026-09-07 and reverted within the hour — 6 closed
+  # trades were enough to drive the actor's size output negative, which clips to size_pct=0 and
+  # makes every open fall back to fixed sizing. See ServeConfig.learning_rate for the full trace.
+  learning_rate: 0.0003
   host: "0.0.0.0"
   port: 8000
