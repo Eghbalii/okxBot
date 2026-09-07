@@ -89,6 +89,15 @@ class ServeConfig:
     snapshot_every: int = 25
     # Where the replay buffer is snapshotted. Sits beside model_path by default.
     buffer_path: str = "models/sac_global_buffer.pkl"
+    # Overrides the learning_rate baked into the loaded checkpoint at startup (SAC.load's own
+    # learning_rate kwarg) — SAC.load otherwise restores whatever rate the checkpoint was saved
+    # with, so this is the only way to change it without retraining from scratch. Raised 5x
+    # (0.0003 -> 0.0015) on 2026-09-07: the model had accumulated 62k gradient updates against only
+    # ~4.4k replay-buffer experiences (many repeats of the same thin dataset) with still-negative
+    # 24h PnL, so a faster per-update step was chosen over waiting longer at the original rate.
+    # Watch for instability (action distribution collapsing to all-skip, as happened once before
+    # when rl_sizing was first enabled, CLAUDE.md §16.9) before raising further.
+    learning_rate: float = 0.0015
 
 
 @dataclass

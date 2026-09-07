@@ -28,6 +28,7 @@ from typing import Optional
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from stable_baselines3 import SAC
+from stable_baselines3.common.utils import update_learning_rate
 
 from rl_service.config import load_config
 from rl_service.learner import Learner, reward_from_outcome
@@ -71,8 +72,24 @@ def _load_model() -> None:
         )
         return
 
-    _model = SAC.load(_cfg.serve.model_path)
-    logger.info("Loaded global RL model from %s", _cfg.serve.model_path)
+    _model = SAC.load(_cfg.serve.model_path, learning_rate=_cfg.serve.learning_rate)
+
+    # SAC.load sets `learning_rate` as a plain attribute, but the checkpoint's serialized
+    # `lr_schedule` closure (built from the OLD rate at save time) overrides it unless rebuilt here
+    # — verified directly: without this, the actor/critic optimizers kept running at the
+    # checkpoint's original rate even though `_model.learning_rate` read the new value.
+    _model._setup_lr_schedule()
+    new_lr = _model.lr_schedule(1)
+    update_learning_rate(_model.actor.optimizer, new_lr)
+    update_learning_rate(_model.critic.optimizer, new_lr)
+    if getattr(_model, "ent_coef_optimizer", None) is not None:
+        update_learning_rate(_model.ent_coef_optimizer, new_lr)
+
+    logger.info(
+        "Loaded global RL model from %s (learning_rate overridden to %s, applied to actor/critic"
+        "/ent_coef optimizers)",
+        _cfg.serve.model_path, _cfg.serve.learning_rate,
+    )
 
     if not _cfg.serve.learning_enabled:
         logger.info("Continuous learning disabled; serving frozen weights.")

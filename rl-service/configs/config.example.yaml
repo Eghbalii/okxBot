@@ -42,5 +42,10 @@ serve:
   gradient_steps: 4          # per closed trade; off-policy reuses each experience many times
   snapshot_every: 25         # closed trades between snapshots (weights AND buffer, never just one)
   buffer_path: "models/sac_global_buffer.pkl"
+  # Overrides the learning_rate baked into the checkpoint at startup (SAC.load's own kwarg).
+  # 0.0003 is SAC's/this project's original default; raised 5x here on 2026-09-07 after the model
+  # had accumulated 62k gradient updates against only ~4.4k replay-buffer experiences with still-
+  # negative 24h PnL. Watch the action distribution for collapse (e.g. all-skip) before raising more.
+  learning_rate: 0.0015
   host: "0.0.0.0"
   port: 8000
