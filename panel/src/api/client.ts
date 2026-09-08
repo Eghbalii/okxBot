@@ -1,5 +1,6 @@
 import type {
   AccountEquity,
+  EquityPoint,
   Candle,
   ModelStatus,
   PaperOrderAdjustment,
@@ -233,6 +234,18 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ mode, newCapUsd }),
     }),
+
+  // Current account row, for the trading-cap slider's upper bound (the real Account Balance —
+  // capping above what the account actually holds isn't a deposit the panel can make).
+  account: (mode: PositionMode) => request<AccountEquity>(`/account?mode=${mode}`),
+
+  // Balance/equity timeline for the stats box's chart. `since` is RFC3339; passing it explicitly
+  // overrides cmd/api's own default of "since the last reset" (CLAUDE.md §31.2), which is what the
+  // day/week/month/year range selector needs — a fixed window, not one that shifts with resets.
+  accountHistory: (mode: PositionMode, since: Date, limit = 0) =>
+    requestList<EquityPoint>(
+      `/account/history?mode=${mode}&since=${encodeURIComponent(since.toISOString())}&limit=${limit}`,
+    ),
 }
 
 // PaperOrderEvent mirrors Go's usecase.PaperOrderEvent — the lightweight message pushed over

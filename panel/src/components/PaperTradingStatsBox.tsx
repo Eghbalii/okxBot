@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { usePolling } from '../hooks/usePolling'
 import { api } from '../api/client'
 import { formatUsd, pnlClass } from '../utils/format'
 import type { PositionMode } from '../api/types'
+import BalanceChart from './BalanceChart'
 
 function PnLTile({ label, usd, pct }: { label: string; usd: string; pct: string }) {
   const usdNum = Number(usd)
@@ -20,17 +21,43 @@ function PnLTile({ label, usd, pct }: { label: string; usd: string; pct: string 
   )
 }
 
-// Trading-cap input, inline in its own tile: "I've decided to trade with $X from now on." Setting
-// a new cap re-baselines Total Equity (what new positions size against) without touching Account
-// Balance, the real continuous total (CLAUDE.md §31.2) — both numbers stay visible above so the
-// effect of a cap change is immediately checkable against the account's real history.
-function TradingCapTile({ mode, onSaved }: { mode: PositionMode; onSaved: () => void }) {
+// Trading-cap control, inline in its own tile alongside the other stat tiles: "I've decided to
+// trade with $X from now on." Setting a new cap moves BOTH Total Equity and Account Balance to the
+// chosen value together (CLAUDE.md §31.2/§31.3), so both numbers above update at once.
+//
+// The slider's upper bound is the account's REAL Account Balance, not an arbitrary ceiling: a cap
+// above what the account actually holds would be claiming a deposit the panel cannot make. The
+// direct number input is deliberately kept and left UNBOUNDED — an operator who really has
+// deposited more on the exchange needs to be able to say so, and the backend is the authority on
+// what is valid, not this control. The slider is the convenience, the input is the escape hatch.
+function TradingCapTile({
+  mode,
+  maxAvailable,
+  onSaved,
+}: {
+  mode: PositionMode
+  maxAvailable: number
+  onSaved: () => void
+}) {
   const [value, setValue] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // Seed the control from the account's own current balance so the slider starts somewhere
+  // meaningful rather than at zero, and re-seed if the account moves while the field is untouched.
+  useEffect(() => {
+    if (value === '' && maxAvailable > 0) setValue(maxAvailable.toFixed(2))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [maxAvailable])
+
+  const num = Number(value)
+  // The slider can only express [0, maxAvailable]; a typed value above that is still valid (see
+  // the note above), it just pins the thumb to the far end rather than rescaling the track.
+  const sliderMax = maxAvailable > 0 ? maxAvailable : 100
+  const sliderValue = Number.isFinite(num) ? Math.min(Math.max(num, 0), sliderMax) : 0
+  const step = sliderMax >= 100 ? 1 : sliderMax >= 10 ? 0.1 : 0.01
+
   async function save() {
-    const num = Number(value)
     if (!Number.isFinite(num) || num <= 0) {
       setError('enter a positive number')
       return
@@ -39,7 +66,6 @@ function TradingCapTile({ mode, onSaved }: { mode: PositionMode; onSaved: () => 
     setError(null)
     try {
       await api.setAccountCap(String(num), mode)
-      setValue('')
       onSaved()
     } catch (err) {
       setError((err as Error).message)
@@ -51,23 +77,30 @@ function TradingCapTile({ mode, onSaved }: { mode: PositionMode; onSaved: () => 
   return (
     <div className="config-tile">
       <div className="config-tile-label">Set Trading Cap</div>
-      <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
+      <div className="cap-row">
+        <input
+          type="range"
+          min={0}
+          max={sliderMax}
+          step={step}
+          value={sliderValue}
+          onChange={(e) => setValue(e.target.value)}
+          className="cap-slider"
+          title={`Max available: $${sliderMax.toFixed(2)}`}
+        />
         <input
           type="number"
           placeholder="e.g. 40"
           value={value}
           onChange={(e) => setValue(e.target.value)}
-          style={{ width: '5.5rem' }}
+          className="cap-input"
         />
         <button className="btn-primary" onClick={save} disabled={saving}>
-          {saving ? 'Saving…' : 'Set'}
+          {saving ? '…' : 'Set'}
         </button>
       </div>
-      {error && (
-        <div className="text-dim" style={{ color: 'var(--red, #e5484d)', fontSize: '0.75rem', marginTop: '0.3rem' }}>
-          {error}
-        </div>
-      )}
+      <div className="text-dim cap-hint">max ${sliderMax.toFixed(2)}</div>
+      {error && <div className="cap-error">{error}</div>}
     </div>
   )
 }
@@ -108,8 +141,20 @@ export default function PaperTradingStatsBox({ mode }: { mode: PositionMode }) {
           <PnLTile label="24h PnL" usd={data.pnl24hUsd} pct={data.pnl24hPct} />
           <PnLTile label="1W PnL" usd={data.pnl7dUsd} pct={data.pnl7dPct} />
           <PnLTile label="1M PnL" usd={data.pnl30dUsd} pct={data.pnl30dPct} />
-          <TradingCapTile mode={mode} onSaved={() => setRefreshSignal((n) => n + 1)} />
+          <TradingCapTile
+            mode={mode}
+            maxAvailable={Number(data.accountBalanceUsd)}
+            onSaved={() => setRefreshSignal((n) => n + 1)}
+          />
         </div>
+      )}
+      {data && (
+        <BalanceChart
+          mode={mode}
+          currentEquity={Number(data.totalEquityUsd)}
+          currentBalance={Number(data.accountBalanceUsd)}
+          refreshSignal={refreshSignal}
+        />
       )}
     </div>
   )

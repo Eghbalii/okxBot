@@ -250,3 +250,18 @@ export interface PaperTradingConfig {
   // token-manage modal knows what tokens exist to toggle.
   allInstIds: string[]
 }
+
+// account_equity_history row (GET /api/account/history) — mirrors go-engine/internal/port.
+// EquityPoint's JSON shape (Go default casing, no json tags). One row per balance change, so the
+// panel's balance/equity chart can show a drain-and-reset that happened overnight after the fact
+// (CLAUDE.md §15.7), not just the current number.
+export interface EquityPoint {
+  ID: number
+  Mode: string
+  EquityUSD: string // balance AFTER this change
+  DeltaUSD: string // signed: realized PnL for a trade, top-up amount for a reset
+  Reason: 'trade' | 'reset' | 'seed'
+  OrderID: number | null
+  InstID: string
+  CreatedAt: string
+}
