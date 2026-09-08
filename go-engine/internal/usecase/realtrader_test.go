@@ -718,3 +718,127 @@ func TestHandleTick_RunUpdatesFiresOnFirstTick(t *testing.T) {
 		t.Errorf("expected Predict called once on the very first tick, got %d calls", model.calls)
 	}
 }
+
+// Sizing must draw against the operator's stored trading cap, not the full exchange balance and
+// not the config-level SafeMoneyUSD reserve (2026-09-08). This is what lets safe_money_usd be
+// retired: without it, zeroing that config value would silently hand the model the whole balance.
+func TestTradableEquityFor_PrefersStoredCapOverSafeMoney(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := repo.SetTradingCap(ctx, "real", dec("20")); err != nil {
+		t.Fatalf("set cap: %v", err)
+	}
+
+	// SafeMoneyUSD deliberately zero — the cap alone must produce the reserve.
+	e := &RealTrader{Repo: repo}
+	if got := e.tradableEquityFor(ctx, dec("40")); !got.Equal(dec("20")) {
+		t.Fatalf("tradable against a $20 cap on a $40 balance: want 20, got %s", got)
+	}
+
+	// The balance grew by 5 (realized profit). The reserve stays at 20, so tradable becomes 25 —
+	// the requested behavior. Pinning at the flat cap would report 20 and discard the gain.
+	if got := e.tradableEquityFor(ctx, dec("45")); !got.Equal(dec("25")) {
+		t.Fatalf("tradable after +5 profit: want 25, got %s", got)
+	}
+}
+
+// With no cap stored, behavior falls back to SafeMoneyUSD exactly as before — accounts that never
+// set a cap are unaffected by the change above.
+func TestTradableEquityFor_FallsBackToSafeMoneyWithoutCap(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	e := &RealTrader{Repo: repo, SafeMoneyUSD: dec("15")}
+	if got := e.tradableEquityFor(ctx, dec("40")); !got.Equal(dec("25")) {
+		t.Fatalf("no cap set, want safe-money fallback 25, got %s", got)
+	}
+}
+
+// Regression for the first real order ever placed (id 3, SOL short, 2026-09-08): it opened with a
+// stop and NO take-profit. The model answered with a non-zero SLPx and a ZERO TPPx, and the old
+// code treated "the model returned levels" as all-or-nothing — so the model's stop replaced the
+// strategy's while the strategy's target was dropped rather than kept, and nothing downstream
+// re-supplied one. Since RealTrader watches SL/TP in-process, that position could only ever end at
+// its stop, at the 6h timeout, or by hand.
+func TestOpenReal_ModelStopWithoutTargetStillGetsATarget(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	// The exact shape that produced order 3: a stop from the model, no target.
+	model := &fakeModelClient{action: domain.Action{
+		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
+		SLPx: dec("98"), TPPx: dec("0"),
+	}}
+	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
+	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
+
+	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, err := rt.openPositions(context.Background())
+	if err != nil {
+		t.Fatalf("openPositions: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("expected 1 persisted open real position, got %d", len(open))
+	}
+	if open[0].TPPx == nil {
+		t.Fatal("a real position must never open without a take-profit: it could then only exit at its stop, at the timeout, or by hand")
+	}
+	if !open[0].TPPx.GreaterThan(open[0].EntryPx) {
+		t.Fatalf("a long's target must sit above entry, got tp=%s entry=%s", open[0].TPPx, open[0].EntryPx)
+	}
+	// The model's stop must still win over the strategy's — the per-side fallback fills the gap,
+	// it does not discard the answer the model actually gave.
+	if open[0].SLPx == nil || !open[0].SLPx.Equal(dec("98")) {
+		t.Fatalf("expected the model's own stop (98) to be used, got %v", open[0].SLPx)
+	}
+}
+
+// The second layer of the same fix: when NEITHER the model nor the strategy supplies a target,
+// EnsureTarget derives one from the stop distance. The per-side fallback above cannot help here —
+// there is nothing to fall back TO — so without this a position would still open with no target.
+func TestOpenReal_NoTargetAnywhereStillGetsOneFromStopDistance(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	model := &fakeModelClient{action: domain.Action{
+		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
+		SLPx: dec("98"), TPPx: dec("0"),
+	}}
+	// A signal carrying a stop but no target at all (stoch_cross does exactly this in production).
+	sig := buySignal()
+	sig.TPPct = dec("0")
+	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: sig}, StrategyID: 1, Kind: "stub"}}
+	rt := newTestRealTrader(repo, exchange, model, strategies)
+	// The derivation is a RATIO of the stop distance, so it only applies where one is configured —
+	// production sets this (paper_trading.rl_clamps.min_tp_sl_ratio); the shared harness does not.
+	rt.RLClamps.MinTPSLRatio = dec("1.5")
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
+
+	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, err := rt.openPositions(context.Background())
+	if err != nil {
+		t.Fatalf("openPositions: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("expected 1 persisted open real position, got %d", len(open))
+	}
+	if open[0].TPPx == nil {
+		t.Fatal("with no target from either source, one must still be derived from the stop distance")
+	}
+	if !open[0].TPPx.GreaterThan(open[0].EntryPx) {
+		t.Fatalf("a long's derived target must sit above entry, got tp=%s entry=%s", open[0].TPPx, open[0].EntryPx)
+	}
+}

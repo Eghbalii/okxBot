@@ -172,3 +172,33 @@ func clampRange(v, min, max decimal.Decimal) decimal.Decimal {
 	}
 	return v
 }
+
+// EnsureTarget supplies a take-profit when none is set, derived from the stop's own distance at
+// MinTPSLRatio — the same risk:reward bound Apply enforces when both levels are present, so a
+// filled-in target is never more aggressive than a supplied one would have been allowed to be.
+//
+// This is the take-profit counterpart to EnsureStop, added 2026-09-08 after the first real order
+// opened with a stop and no target: the model emitted SLPx but a zero TPPx, and nothing downstream
+// re-supplied it. RealTrader watches SL/TP in-process rather than resting orders on the exchange,
+// so a position with no target cannot take profit at all — it can only end at its stop, at the
+// timeout, or by hand, which is strictly worse than an imperfect target.
+//
+// Returns the levels unchanged when a target already exists, when there is no stop to derive from,
+// or when MinTPSLRatio is unset — deriving from nothing would be inventing a number rather than
+// applying a rule.
+func (cl Clamps) EnsureTarget(side string, entryPx decimal.Decimal, in Levels) Levels {
+	if in.TPPx != nil && in.TPPx.IsPositive() {
+		return in
+	}
+	if in.SLPx == nil || !entryPx.IsPositive() || !cl.MinTPSLRatio.IsPositive() {
+		return in
+	}
+	long := side != "sell"
+	slDist := signedDist(long, entryPx, *in.SLPx, true)
+	if !slDist.IsPositive() {
+		return in
+	}
+	px := offsetFrom(long, entryPx, slDist.Mul(cl.MinTPSLRatio), false)
+	in.TPPx = &px
+	return in
+}

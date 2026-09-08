@@ -2,7 +2,12 @@ import { useState } from 'react'
 import type { Position } from '../api/types'
 import { tokenSymbol, trimPrice } from '../utils/format'
 
-// Manual SL/TP-edit form for a real position (CLAUDE.md §27's real-trading plan §3b, 2026-09-03).
+// Manual SL/TP-edit dialog for a real position (CLAUDE.md §27's real-trading plan §3b).
+//
+// Rendered as a modal rather than a row expanded beneath the order (2026-09-08 request): an
+// expanded row pushed the rest of the table down and, on a table that refetches every 5s, the
+// controls could shift under the pointer mid-edit. A modal keeps the edit anchored regardless of
+// what the table does behind it.
 // Both inputs are a SIGNED percentage of margin, leverage-adjusted — negative moves the level to
 // the loss side, positive to the profit side (e.g. -5 on a 10x position means "move to a 5% loss
 // of margin," a 0.5% price move from entry). Unclamped on the backend: an explicit operator/admin
@@ -30,38 +35,61 @@ export default function AdjustPositionForm({
   }
 
   return (
-    <div className="adjust-position-form">
-      <span className="text-dim">
-        Adjust {tokenSymbol(position.InstID)} #{position.ID} ({position.Side}, entry {trimPrice(position.EntryPx)}, {position.Leverage}x)
-      </span>
-      <label>
-        SL %
-        <input
-          type="number"
-          step="0.1"
-          placeholder="e.g. -5"
-          value={slPct}
-          onChange={(e) => setSlPct(e.target.value)}
-          title="Signed, leverage-adjusted margin %. Negative = loss side, positive = profit side."
-        />
-      </label>
-      <label>
-        TP %
-        <input
-          type="number"
-          step="0.1"
-          placeholder="e.g. 10"
-          value={tpPct}
-          onChange={(e) => setTpPct(e.target.value)}
-          title="Signed, leverage-adjusted margin %. Negative = loss side, positive = profit side."
-        />
-      </label>
-      <button onClick={handleSubmit} disabled={submitting}>
-        {submitting ? 'Applying…' : 'Apply'}
-      </button>
-      <button onClick={onCancel} disabled={submitting}>
-        Cancel
-      </button>
+    <div className="modal-backdrop" onClick={onCancel}>
+      <div className="modal modal-narrow" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>
+            Update #{position.ID} — <span title={position.InstID}>{tokenSymbol(position.InstID)}</span>{' '}
+            <span className="text-dim">
+              {position.Side} · entry {trimPrice(position.EntryPx)} · {position.Leverage}x
+            </span>
+          </h2>
+          <button className="modal-close" onClick={onCancel} aria-label="Close" disabled={submitting}>
+            ✕
+          </button>
+        </div>
+
+        <p className="text-dim adjust-help">
+          Both values are a <strong>signed percentage of margin</strong>, leverage-adjusted:
+          negative moves the level to the loss side, positive to the profit side. On a 10x position,
+          −5 means "stop at a 5% loss of margin" — a 0.5% price move from entry. Leave a field empty
+          to leave that level unchanged. Not clamped: an explicit operator edit is trusted directly,
+          unlike the model's own automated moves.
+        </p>
+
+        <div className="adjust-fields">
+          <label>
+            SL %
+            <input
+              type="number"
+              step="0.1"
+              placeholder="e.g. -5"
+              value={slPct}
+              onChange={(e) => setSlPct(e.target.value)}
+              autoFocus
+            />
+          </label>
+          <label>
+            TP %
+            <input
+              type="number"
+              step="0.1"
+              placeholder="e.g. 10"
+              value={tpPct}
+              onChange={(e) => setTpPct(e.target.value)}
+            />
+          </label>
+        </div>
+
+        <div className="adjust-actions">
+          <button className="btn-primary" onClick={handleSubmit} disabled={submitting || (!slPct && !tpPct)}>
+            {submitting ? 'Applying…' : 'Apply'}
+          </button>
+          <button onClick={onCancel} disabled={submitting}>
+            Cancel
+          </button>
+        </div>
+      </div>
     </div>
   )
 }

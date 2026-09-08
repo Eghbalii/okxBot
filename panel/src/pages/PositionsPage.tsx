@@ -197,6 +197,7 @@ export default function PositionsPage() {
   // Resolved from the current poll's data rather than held in state, so an open modal keeps showing
   // fresh values (live PnL, a close that just landed) instead of a snapshot frozen at click time.
   const detailPosition = detailOrderId === null ? null : (rows?.find((p) => p.ID === detailOrderId) ?? null)
+  const adjustingPosition = adjustingId === null ? null : (rows?.find((p) => p.ID === adjustingId) ?? null)
 
   // A baseline order counts as "updated" if some other row in this same PAGE is a fork of it
   // (CLAUDE.md §15.4/§15.12: the RL controller never edits SL/TP in place, it creates a linked
@@ -461,7 +462,12 @@ export default function PositionsPage() {
                   )}
                   {showLiveColumns && (
                     <td>
-                      {!p.ClosedAt && p.Mode === 'paper' && (
+                      {/* Close works in BOTH modes. It was gated to paper until 2026-09-08, which
+                          left real positions with no way to exit from the panel at all — the
+                          backend half (RequestRealManualClose, and RealTrader's own
+                          ManualCloseRequested check on every tick) had been in place the whole
+                          time, only the button was missing. */}
+                      {!p.ClosedAt && (
                         <button
                           onClick={() => closePosition(p)}
                           disabled={closingId === p.ID}
@@ -475,7 +481,7 @@ export default function PositionsPage() {
                           real-trading plan §3b). */}
                       {!p.ClosedAt && p.Mode === 'real' && (
                         <button
-                          onClick={() => setAdjustingId(adjustingId === p.ID ? null : p.ID)}
+                          onClick={() => setAdjustingId(p.ID)}
                           title="Manually move this position's SL/TP (no exchange call, unclamped)"
                         >
                           Update
@@ -486,22 +492,6 @@ export default function PositionsPage() {
                 </tr>
               )
             })}
-            {adjustingId !== null &&
-              (() => {
-                const p = rows?.find((x) => x.ID === adjustingId)
-                if (!p) return null
-                return (
-                  <tr key={`adjust-${p.ID}`}>
-                    <td colSpan={columnCount}>
-                      <AdjustPositionForm
-                        position={p}
-                        onCancel={() => setAdjustingId(null)}
-                        onSubmit={(slPct, tpPct) => submitAdjust(p.ID, slPct, tpPct)}
-                      />
-                    </td>
-                  </tr>
-                )
-              })()}
             {total === 0 && (
               <tr>
                 <td colSpan={columnCount} className="text-dim">
@@ -523,6 +513,19 @@ export default function PositionsPage() {
 
       {detailPosition && (
         <OrderDetailModal position={detailPosition} onClose={() => setDetailOrderId(null)} />
+      )}
+
+      {/* Mounted here, outside the table, rather than as an expanded row beneath the order
+          (2026-09-08 request): the expanded row pushed the rest of the table down, and with a 5s
+          refetch running the controls could shift under the pointer mid-edit. Resolved from `rows`
+          by id so a refetch that reorders or re-pages the table cannot leave the dialog showing a
+          different order than the one that was clicked — it closes instead. */}
+      {adjustingPosition && (
+        <AdjustPositionForm
+          position={adjustingPosition}
+          onCancel={() => setAdjustingId(null)}
+          onSubmit={(slPct, tpPct) => submitAdjust(adjustingPosition.ID, slPct, tpPct)}
+        />
       )}
     </div>
   )

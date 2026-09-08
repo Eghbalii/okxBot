@@ -218,3 +218,63 @@ func TestEnsureStop_MaxLossPctBoundsTheFilledStop(t *testing.T) {
 		t.Errorf("filled SL = %v, want 99.25 (0.75%% price distance at 20x, capping loss at 15%%)", got.SLPx)
 	}
 }
+
+// The first real order (id 3, SOL short) opened with a stop from the model and NO take-profit,
+// because the model emitted SLPx but a zero TPPx and nothing downstream re-supplied a target the
+// way EnsureStop re-supplies a stop. RealTrader watches SL/TP in-process, so that position could
+// only ever end at its stop, at the timeout, or by hand.
+func TestEnsureTarget_FillsMissingTargetFromStopDistance(t *testing.T) {
+	cl := Clamps{MinTPSLRatio: decimal.NewFromFloat(1.5)}
+	entry := decimal.NewFromFloat(104.16)
+	sl := decimal.NewFromFloat(104.62) // short: stop above entry
+
+	out := cl.EnsureTarget("sell", entry, Levels{SLPx: &sl})
+	if out.TPPx == nil {
+		t.Fatal("expected a target to be filled in")
+	}
+	// stop distance 0.46 * 1.5 = 0.69 below entry for a short.
+	want := decimal.NewFromFloat(104.16 - 0.69)
+	if out.TPPx.Sub(want).Abs().GreaterThan(decimal.NewFromFloat(0.001)) {
+		t.Fatalf("target: want ~%s, got %s", want, out.TPPx)
+	}
+	if !out.TPPx.LessThan(entry) {
+		t.Fatalf("a short's target must sit below entry, got %s vs entry %s", out.TPPx, entry)
+	}
+}
+
+func TestEnsureTarget_LongSideFillsAboveEntry(t *testing.T) {
+	cl := Clamps{MinTPSLRatio: decimal.NewFromFloat(2)}
+	entry := decimal.NewFromFloat(100)
+	sl := decimal.NewFromFloat(98) // long: stop below entry
+
+	out := cl.EnsureTarget("buy", entry, Levels{SLPx: &sl})
+	if out.TPPx == nil || !out.TPPx.Equal(decimal.NewFromFloat(104)) {
+		t.Fatalf("long target: want 104 (2*2 above entry), got %v", out.TPPx)
+	}
+}
+
+// An existing target is never overwritten — this only fills a gap, it does not re-price.
+func TestEnsureTarget_LeavesExistingTargetAlone(t *testing.T) {
+	cl := Clamps{MinTPSLRatio: decimal.NewFromFloat(1.5)}
+	entry := decimal.NewFromFloat(100)
+	sl := decimal.NewFromFloat(98)
+	tp := decimal.NewFromFloat(101)
+
+	out := cl.EnsureTarget("buy", entry, Levels{SLPx: &sl, TPPx: &tp})
+	if out.TPPx == nil || !out.TPPx.Equal(decimal.NewFromFloat(101)) {
+		t.Fatalf("existing target must be preserved, got %v", out.TPPx)
+	}
+}
+
+// With nothing to derive from, inventing a number would be worse than leaving the gap visible.
+func TestEnsureTarget_NoStopOrNoRatioLeavesGap(t *testing.T) {
+	entry := decimal.NewFromFloat(100)
+	sl := decimal.NewFromFloat(98)
+
+	if out := (Clamps{MinTPSLRatio: decimal.NewFromFloat(1.5)}).EnsureTarget("buy", entry, Levels{}); out.TPPx != nil {
+		t.Fatalf("no stop to derive from: want nil target, got %v", out.TPPx)
+	}
+	if out := (Clamps{}).EnsureTarget("buy", entry, Levels{SLPx: &sl}); out.TPPx != nil {
+		t.Fatalf("no ratio configured: want nil target, got %v", out.TPPx)
+	}
+}

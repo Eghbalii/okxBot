@@ -346,10 +346,38 @@ func (e *RealTrader) waitForFill(ctx context.Context, ordID string, logger *slog
 	return last, nil
 }
 
-// tradableEquity applies SafeMoneyUSD's reserve to a raw exchange balance — the one place that
-// subtraction happens, so sizing and the recorded equity timeline can never disagree about what
-// "this mode's equity" means. Floored at zero: a balance the reserve exceeds must never report as
-// negative equity (which would read as the account being drained, not merely under the reserve).
+// tradableEquityFor resolves how much of a raw exchange balance this engine may size against,
+// preferring the operator's stored trading cap over the config-level SafeMoneyUSD reserve
+// (2026-09-08). Both express the same split — tradable vs. held back — but from opposite sides,
+// and the cap is the one the operator actually sets from the panel, so it has to win where both
+// exist. Without this, zeroing safe_money_usd (now redundant) would silently let sizing draw
+// against the FULL exchange balance rather than the chosen slice.
+//
+// The cap is read through the same repository row RecordExchangeBalance maintains, so the number
+// sizing uses and the number the panel shows as Total Equity cannot disagree. A read failure falls
+// back to the SafeMoneyUSD path rather than to the full balance: degrading toward the more
+// conservative of the two is the only safe direction when the intended limit is unknown.
+func (e *RealTrader) tradableEquityFor(ctx context.Context, rawBalance decimal.Decimal) decimal.Decimal {
+	if e.Repo != nil {
+		if ae, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), rawBalance); err == nil && ae.TradingCapUSD != nil {
+			// The reserve, not the cap itself: realized PnL accrues to the tradable slice, so a
+			// balance that has grown since the cap was set must grow the tradable figure too
+			// (CLAUDE.md: $20 of $40, then +$5, is $25 tradable — not $20 forever).
+			reserve := ae.AccountBalanceUSD.Sub(ae.EquityUSD)
+			tradable := rawBalance.Sub(reserve)
+			if tradable.IsNegative() {
+				return decimal.Zero
+			}
+			return tradable
+		}
+	}
+	return e.tradableEquity(rawBalance)
+}
+
+// tradableEquity applies SafeMoneyUSD's reserve to a raw exchange balance — the fallback for an
+// account with no explicit trading cap set. Floored at zero: a balance the reserve exceeds must
+// never report as negative equity (which would read as the account being drained, not merely
+// under the reserve).
 func (e *RealTrader) tradableEquity(rawBalance decimal.Decimal) decimal.Decimal {
 	if !e.SafeMoneyUSD.IsPositive() {
 		return rawBalance
@@ -650,13 +678,17 @@ func (e *RealTrader) openReal(
 		Leverage:   leverage,
 		Status:     "pending",
 	}
-	if levels := nonZeroLevels(action.SLPx, action.TPPx); levels.SLPx != nil || levels.TPPx != nil {
-		if levels.SLPx != nil {
-			order.SLPx = levels.SLPx
-		}
-		if levels.TPPx != nil {
-			order.TPPx = levels.TPPx
-		}
+	// The model overrides the strategy's levels only where it actually produced one. Each side is
+	// taken independently and a zero is NOT an override: an untrained-ish policy routinely emits a
+	// stop but no target (observed on the first real order, id 3 — it opened with a stop from the
+	// model and no take-profit at all, because nothing downstream re-supplies a missing target the
+	// way EnsureStop re-supplies a missing stop). Falling back per-side keeps the strategy's own
+	// target in that case instead of dropping it on the floor.
+	if levels := nonZeroLevels(action.SLPx, action.TPPx); levels.SLPx != nil {
+		order.SLPx = levels.SLPx
+	}
+	if levels := nonZeroLevels(action.SLPx, action.TPPx); levels.TPPx != nil {
+		order.TPPx = levels.TPPx
 	}
 
 	// Same validation pass as PaperTrader.evaluateStrategies, on EVERY open regardless of what
@@ -670,7 +702,18 @@ func (e *RealTrader) openReal(
 		logger.Error("refusing to open a real position with no stop-loss", "instId", e.InstID, "side", order.Side)
 		return nil, nil
 	}
+	// A position with no target never takes profit on its own: RealTrader watches SL/TP in-process
+	// (§3a) and simply has nothing to watch for on the winning side, so the trade can only ever end
+	// at its stop, at the 6h timeout, or by hand. That is strictly worse than a wrong-but-present
+	// target, so a missing one is derived from the stop's own distance via MinTPSLRatio — the same
+	// risk:reward the clamp already enforces when both levels exist. Mirrors EnsureStop's
+	// "fill it in rather than refuse" posture; refusing here would instead silently disable every
+	// signal whose model answer omitted a target.
+	clampedLevels = e.conductorClamps().EnsureTarget(order.Side, price, clampedLevels)
 	order.SLPx, order.TPPx = clampedLevels.SLPx, clampedLevels.TPPx
+	if order.TPPx == nil {
+		logger.Warn("opening a real position with no take-profit", "instId", e.InstID, "side", order.Side)
+	}
 
 	approved, err := e.RiskManager.Approve(risk.ProposedAction{
 		Leverage:             order.Leverage,
@@ -1150,15 +1193,16 @@ func (e *RealTrader) buildObservation(ctx context.Context, bar string, price dec
 		Category:          domain.CategoryUpdate,
 	}
 
-	// Ground truth from the exchange, not GetAccountEquity's bookkeeping row — real trading does
-	// not own this number the way paper trading owns its shared account (CLAUDE.md §27's plan §6:
-	// this is the one spot flagged as easy to get wrong by careless reuse). SafeMoneyUSD's reserve
-	// is subtracted before the model ever sees this number, so sizing can never draw against it.
+	// The TOTAL is ground truth from the exchange, not GetAccountEquity's bookkeeping row — real
+	// trading does not own that number the way paper trading owns its shared account (CLAUDE.md
+	// §27's plan §6: the one spot flagged as easy to get wrong by careless reuse). What the model
+	// is allowed to SIZE against is a slice of it, and the reserve is subtracted here so sizing can
+	// never draw against capital held back.
 	balances, err := e.Exchange.GetBalance(e.settleCcy())
 	if err != nil {
 		logger.Warn("real observation: get balance failed", "instId", e.InstID, "error", err)
 	} else if len(balances) > 0 {
-		obs.AccountEquityUSD = e.tradableEquity(balances[0].Eq)
+		obs.AccountEquityUSD = e.tradableEquityFor(ctx, balances[0].Eq)
 	}
 	obs.OpenExposureUSD = e.openExposureReal(ctx, logger)
 

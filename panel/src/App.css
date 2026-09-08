@@ -687,3 +687,42 @@ th.sorted {
   font-size: 10px;
   font-family: var(--font-mono, ui-monospace, monospace);
 }
+
+/* --- Manual SL/TP update dialog (real positions) ---------------------------------------- */
+
+/* A narrower variant of .modal: this dialog is two number fields and a paragraph, so the
+   order-detail modal's full width leaves it looking empty. */
+.modal-narrow {
+  max-width: 30rem;
+}
+
+.adjust-help {
+  font-size: 0.8rem;
+  line-height: 1.5;
+  margin: 0 0 1rem;
+}
+
+.adjust-fields {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 1.2rem;
+}
+
+.adjust-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.adjust-fields input {
+  width: 8rem;
+}
+
+.adjust-actions {
+  display: flex;
+  gap: 0.5rem;
+}
