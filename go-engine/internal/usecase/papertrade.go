@@ -889,11 +889,22 @@ func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signa
 	if signal.Side == strategy.Sell {
 		direction = decimal.NewFromInt(-1)
 	}
-	if signal.SLPct.IsPositive() {
+	// An explicit price wins over a percentage: 7 of the 14 strategies compute a STRUCTURAL level
+	// (CLAUDE.md §16.8 — a stop below a swing low, a target at a fair-value gap), and converting
+	// that back into a percentage of the current price would throw away the very structure that
+	// made it a level. Percentages remain the fallback for the strategies that genuinely have no
+	// structural level to report.
+	if signal.SLPx.IsPositive() {
+		v := signal.SLPx
+		slPx = &v
+	} else if signal.SLPct.IsPositive() {
 		v := price.Sub(direction.Mul(signal.SLPct).Mul(price))
 		slPx = &v
 	}
-	if signal.TPPct.IsPositive() {
+	if signal.TPPx.IsPositive() {
+		v := signal.TPPx
+		tpPx = &v
+	} else if signal.TPPct.IsPositive() {
 		v := price.Add(direction.Mul(signal.TPPct).Mul(price))
 		tpPx = &v
 	}

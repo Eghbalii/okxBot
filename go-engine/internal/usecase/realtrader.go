@@ -134,7 +134,12 @@ type RealTrader struct {
 	// unaffected by any of these — only evaluateStrategies' new-open path is gated, monitoring/
 	// closing keeps running unconditionally, same reasoning as PaperTrader's own fields.
 	TradingPaused bool
+	// OpensDisabled is read through opensDisabled() rather than directly: the affordability service
+	// (2026-09-08) can disable a token while this engine is already running, so a value captured
+	// once at construction goes stale. Guarded by opensMu since that service writes it from its own
+	// goroutine while the candle consumers read it.
 	OpensDisabled bool
+	opensMu       sync.RWMutex
 	DisableLong   bool
 	DisableShort  bool
 
@@ -418,6 +423,28 @@ func tighterPct(a, b decimal.Decimal) decimal.Decimal {
 	}
 }
 
+// opensDisabled reports whether this token is currently excluded from opening new positions.
+// Existing positions are unaffected either way — monitorOpenPositions keeps watching them.
+func (e *RealTrader) opensDisabled() bool {
+	e.opensMu.RLock()
+	defer e.opensMu.RUnlock()
+	return e.OpensDisabled
+}
+
+// SetOpensDisabled updates the per-token open gate on a RUNNING engine. Called by the
+// affordability service when the account can no longer fund a minimum lot of this instrument (or
+// can again), so a roster change takes effect immediately rather than at the next restart.
+//
+// Before this existed the flag was captured once at construction, so a token disabled seconds
+// after startup kept opening positions until someone restarted the process — observed live with
+// PUMP and PEPE, which were auto-disabled 1.5s after trader came up and went on generating open
+// attempts for the next 20 minutes.
+func (e *RealTrader) SetOpensDisabled(disabled bool) {
+	e.opensMu.Lock()
+	defer e.opensMu.Unlock()
+	e.OpensDisabled = disabled
+}
+
 func (e *RealTrader) accountMode() string {
 	if e.Mode == "" {
 		return "real"
@@ -562,7 +589,7 @@ func (e *RealTrader) evaluateStrategies(ctx context.Context, bar string, price d
 	// real-trading readiness plan, 2026-09-04): pause/stop and per-token disable both mean "open
 	// nothing new here" — existing open positions are untouched, monitorOpenPositions keeps
 	// monitoring/closing them regardless of either flag.
-	if e.TradingPaused || e.OpensDisabled {
+	if e.TradingPaused || e.opensDisabled() {
 		return nil
 	}
 
@@ -624,7 +651,13 @@ func (e *RealTrader) evaluateStrategies(ctx context.Context, bar string, price d
 		obs.Category = conductor.OpenCategory(string(signal.Side))
 		obs.Signal = e.carriedSignalFor(bar)
 
-		opened, err := e.openReal(ctx, obs, signal, open, price, a, bar, logger)
+		// resolved, not the raw signal: buildPaperOrder inside openReal derives levels from
+		// SLPct/TPPct only, so a strategy reporting a STRUCTURAL price instead (7 of the 14 do —
+		// CLAUDE.md §16.8: a stop below a swing low, a target at a fair-value gap) had its level
+		// silently discarded on every real order. ResolveLevels carries both forms, filling in
+		// whichever was not set, so passing it preserves a structural level all the way to the
+		// order while leaving percentage-based strategies unchanged.
+		opened, err := e.openReal(ctx, obs, resolved, open, price, a, bar, logger)
 		if err != nil {
 			logger.Error("failed to open real order", "strategy", s.Name(), "instId", e.InstID, "error", err)
 			continue
@@ -730,8 +763,20 @@ func (e *RealTrader) openReal(
 	// subsystem is not a safety check). Runs BEFORE the risk-manager gate: clamps answer "is this
 	// stop/target sane relative to entry," the risk manager answers "does this violate an
 	// account-wide hard limit regardless of what any upstream layer decided" (§5 of the plan doc).
-	clampedLevels := e.conductorClamps().EnsureStop(order.Side, price, order.Leverage, conductor.Levels{SLPx: order.SLPx, TPPx: order.TPPx})
-	clampedLevels = e.conductorClamps().Apply(order.Side, price, order.Leverage, clampedLevels)
+	clampedLevels := e.conductorClamps().Apply(order.Side, price, order.Leverage, conductor.Levels{SLPx: order.SLPx, TPPx: order.TPPx})
+	// EnsureStop runs AFTER Apply, not before (fixed 2026-09-08). Apply DROPS a level on the wrong
+	// side of entry, and a strategy's stop is routinely on the wrong side by the time the order
+	// actually opens: the signal is computed on a closed candle and the live price has moved since,
+	// so a long whose price has slipped below the signal's stop arrives with a stop ABOVE entry.
+	// EnsureStop only fills a level that is nil, so running it first left that stale stop in place,
+	// Apply then dropped it, and the open was refused with "no stop-loss" — observed rejecting
+	// every PUMP signal for 20 minutes straight while the strategy was emitting a perfectly good
+	// stop each time.
+	//
+	// Running it after means Apply's drop is what EnsureStop then repairs, which is the order these
+	// two were always meant to compose in: Apply decides what is usable, EnsureStop guarantees a
+	// stop exists.
+	clampedLevels = e.conductorClamps().EnsureStop(order.Side, price, order.Leverage, clampedLevels)
 	if clampedLevels.SLPx == nil {
 		logger.Error("refusing to open a real position with no stop-loss", "instId", e.InstID, "side", order.Side)
 		return nil, nil

@@ -1123,3 +1123,95 @@ func TestCloseEarly_ClosesWhenEnabled(t *testing.T) {
 		t.Fatalf("close reason: want %q, got %v", conductor.CloseReasonRLEarly, after.CloseReason)
 	}
 }
+
+// A strategy's stop is routinely on the wrong side of entry by the time the order actually opens:
+// the signal is computed on a closed candle and the live price moves before the open, so a long
+// whose price slipped below the signal's stop arrives with a stop ABOVE entry. Apply drops such a
+// level, and because EnsureStop only fills a NIL one, running EnsureStop first left the stale stop
+// in place to be dropped with nothing to replace it — refusing the open. Observed live rejecting
+// every PUMP signal for 20 minutes while the strategy emitted a perfectly good stop each time.
+func TestOpenReal_StaleWrongSideStopIsReplacedNotRefused(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	model := &fakeModelClient{action: domain.Action{
+		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
+	}}
+	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
+	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
+
+	// An ABSOLUTE stop, as the structural strategies emit (CLAUDE.md §16.8) — vwap_reversion and
+	// friends report a real price level, not a percentage. A percentage could never land on the
+	// wrong side, since ResolveLevels derives it from the same open price; only a level fixed
+	// BEFORE the price moved can. Here the stop was computed at 100 and the order opens at 95, so
+	// the stop now sits ABOVE entry for a long.
+	// Production clamp values, not the shared harness's looser ones: MinSLDistPct of 0.005 is what
+	// makes Apply reject a stop that has ended up on the wrong side, and the harness's 0.001 is
+	// slack enough to hide the whole failure.
+	rt.RLClamps.MinSLDistPct = dec("0.005")
+	rt.RLClamps.MaxSLDistPct = dec("0.05")
+	rt.RLClamps.MaxLossPct = dec("0.15")
+	rt.RLClamps.MinTPSLRatio = dec("1.5")
+
+	sig := buySignal()
+	// Clear the percentages: buildPaperOrder derives levels from SLPct/TPPct when present, which
+	// resolve against the OPEN price and so can never land on the wrong side. Only an absolute
+	// level, fixed before the price moved, reproduces the case.
+	sig.SLPct = dec("0")
+	sig.TPPct = dec("0")
+	sig.SLPx = dec("98")
+	sig.TPPx = dec("104")
+	rt.Strategies = []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: sig}, StrategyID: 1, Kind: "stub"}}
+
+	if err := rt.evaluateStrategies(context.Background(), "1m", dec("95"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies: %v", err)
+	}
+
+	open, err := rt.openPositions(context.Background())
+	if err != nil {
+		t.Fatalf("openPositions: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("the open must proceed with a replacement stop, not be refused; got %d positions", len(open))
+	}
+	if open[0].SLPx == nil {
+		t.Fatal("a stop must have been filled in after the stale one was dropped")
+	}
+	if !open[0].SLPx.LessThan(open[0].EntryPx) {
+		t.Fatalf("a long's stop must sit below entry, got sl=%s entry=%s", open[0].SLPx, open[0].EntryPx)
+	}
+}
+
+// A roster change must reach an engine that is ALREADY running. The flag used to be captured once
+// at construction, so a token auto-disabled seconds after startup kept opening positions until
+// someone restarted the process.
+func TestSetOpensDisabled_TakesEffectOnARunningEngine(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	model := &fakeModelClient{action: domain.Action{
+		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
+	}}
+	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
+	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
+
+	rt.SetOpensDisabled(true)
+	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies: %v", err)
+	}
+	if len(exchange.placedOrders) != 0 {
+		t.Fatalf("a disabled token must open nothing, got %d orders", len(exchange.placedOrders))
+	}
+
+	// And re-enabling on the running engine restores opens, so a recovering account brings its
+	// tokens back without a restart either.
+	rt.SetOpensDisabled(false)
+	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies after re-enable: %v", err)
+	}
+	if len(exchange.placedOrders) != 1 {
+		t.Fatalf("re-enabling must restore opens, got %d orders", len(exchange.placedOrders))
+	}
+}

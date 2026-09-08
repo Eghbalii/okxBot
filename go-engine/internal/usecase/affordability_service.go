@@ -65,6 +65,13 @@ type AffordabilityService struct {
 	// DryRun logs what would change without writing it — for verifying the decision on a live
 	// account before letting it act.
 	DryRun bool
+
+	// OnRosterChange is called with the full disabled set after every applied change, so running
+	// engines can update their own open gate immediately. Without it a roster change only takes
+	// effect at the next process restart, since each engine captures its token's flag once at
+	// construction — observed live: PUMP and PEPE were auto-disabled 1.5 seconds after trader
+	// started and went on attempting opens for 20 minutes.
+	OnRosterChange func(disabled []string)
 }
 
 func (s *AffordabilityService) logger() *slog.Logger {
@@ -160,6 +167,11 @@ func (s *AffordabilityService) RunOnce(ctx context.Context) error {
 	next := s.applyPlan(disabled, plan)
 	if _, err := s.Repo.SavePaperTradingConfig(ctx, s.mode(), port.PaperTradingConfigPatch{DisabledInstIDs: &next}); err != nil {
 		return fmt.Errorf("save %s trading config: %w", s.mode(), err)
+	}
+	// Notify AFTER the write succeeds: an engine must never start refusing opens on the strength of
+	// a decision that was not durably recorded, since a restart would then silently undo it.
+	if s.OnRosterChange != nil {
+		s.OnRosterChange(next)
 	}
 	return nil
 }

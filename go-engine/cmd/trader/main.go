@@ -293,6 +293,9 @@ func runRealTrader(
 
 	errCh := make(chan error, len(cfg.Trading.InstIDs)+1+len(candleDispatchers))
 	const engineStartStagger = 300 * time.Millisecond
+	// Kept so the affordability service can push roster changes into engines that are already
+	// running, rather than the change only landing at the next restart.
+	engines := make(map[string]*usecase.RealTrader, len(cfg.Trading.InstIDs))
 	for i, instID := range cfg.Trading.InstIDs {
 		strategies, err := loadRealTraderStrategyAssignments(ctx, repo, instID)
 		if err != nil {
@@ -359,6 +362,7 @@ func runRealTrader(
 
 			OrderEvents: orderEventsPub,
 		}
+		engines[instID] = engine
 		delay := time.Duration(i) * engineStartStagger
 		go func() {
 			time.Sleep(delay)
@@ -385,6 +389,13 @@ func runRealTrader(
 		SymbolMap:      cfg.Trading.SymbolMap,
 		ExecInstType:   cfg.Trading.ExecInstType,
 		MaxPositionPct: cfg.Account.MaxPositionPct,
+		// Push roster changes into the already-running engines so a disable takes effect on the
+		// next candle rather than at the next restart.
+		OnRosterChange: func(disabled []string) {
+			for instID, engine := range engines {
+				engine.SetOpensDisabled(slices.Contains(disabled, instID))
+			}
+		},
 	}
 	go func() {
 		if err := affordability.Run(ctx); err != nil && ctx.Err() == nil {
