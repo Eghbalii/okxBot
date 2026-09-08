@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"fmt"
 	"encoding/json"
 	"testing"
 	"time"
@@ -944,5 +945,108 @@ func TestCloseReal_DoesNotApplyRealizedPnLToTheAccount(t *testing.T) {
 	if !after.AccountBalanceUSD.Equal(before.AccountBalanceUSD) {
 		t.Fatalf("closing a real position must not move AccountBalanceUSD: was %s, now %s",
 			before.AccountBalanceUSD, after.AccountBalanceUSD)
+	}
+}
+
+// A close must not be recorded until the exchange confirms the flatten filled. Real order 3 was
+// written as closed with nothing having verified OKX agreed — if the flatten had failed, the
+// database would have said "flat" while a real position stayed open on the exchange.
+func TestCloseReal_FailedFlattenLeavesPositionOpenAndRecordsError(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{placeOrderErr: fmt.Errorf("okx: insufficient margin")}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	sl, tp := dec("90"), dec("110")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	o, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if err := rt.closeReal(ctx, o, dec("110"), "tp", testLogger()); err == nil {
+		t.Fatal("expected the close to fail when the exchange rejects the flatten")
+	}
+
+	after, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.ClosedAt != nil {
+		t.Fatal("a position whose flatten failed must NOT be recorded closed — it may still be open on the exchange")
+	}
+	if after.LastError == nil {
+		t.Fatal("the failure must be recorded on the order so the panel can raise it to a human")
+	}
+}
+
+// The exchange's own fill price, realized PnL and fee are what get stored — not the tick price that
+// merely triggered the close, and not a locally computed PnL. Order 3 recorded close_px=102 from a
+// stale trigger tick while the market was at 103.9.
+func TestCloseReal_PrefersExchangeReportedNumbers(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	exchange.orderStatusQueue = []domain.OrderStatus{{
+		State: "filled", AvgPx: dec("103.9"), AccFillSz: dec("1"), Sz: dec("1"),
+		Pnl: dec("0.25"), Fee: dec("-0.02"),
+	}}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	sl, tp := dec("90"), dec("110")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	o, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	// Triggered by a tick at 110, but the exchange actually filled at 103.9.
+	if err := rt.closeReal(ctx, o, dec("110"), "tp", testLogger()); err != nil {
+		t.Fatalf("closeReal: %v", err)
+	}
+
+	after, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.ClosedAt == nil {
+		t.Fatal("a confirmed flatten must record the close")
+	}
+	if after.ExchangeClosePx == nil || !after.ExchangeClosePx.Equal(dec("103.9")) {
+		t.Fatalf("ExchangeClosePx: want the exchange's own fill price 103.9, got %v", after.ExchangeClosePx)
+	}
+	if after.ClosePx == nil || !after.ClosePx.Equal(dec("103.9")) {
+		t.Fatalf("ClosePx must be the confirmed fill price, not the trigger tick: got %v", after.ClosePx)
+	}
+	if after.ExchangeRealizedPnL == nil || !after.ExchangeRealizedPnL.Equal(dec("0.25")) {
+		t.Fatalf("ExchangeRealizedPnL: want 0.25 from the exchange, got %v", after.ExchangeRealizedPnL)
+	}
+	if after.ExchangeFee == nil || !after.ExchangeFee.Equal(dec("-0.02")) {
+		t.Fatalf("ExchangeFee: want -0.02 from the exchange, got %v", after.ExchangeFee)
+	}
+}
+
+// A missing exchange figure must stay distinguishable from a genuine zero, so the panel knows when
+// to fall back to the locally computed value.
+func TestExchangeCloseNumbers_NilWhenNotReported(t *testing.T) {
+	pnl, fee := exchangeCloseNumbers(domain.OrderStatus{State: "filled"})
+	if pnl != nil || fee != nil {
+		t.Fatalf("unreported figures must be nil, got pnl=%v fee=%v", pnl, fee)
+	}
+	pnl, fee = exchangeCloseNumbers(domain.OrderStatus{State: "filled", Pnl: dec("1.5"), Fee: dec("-0.1")})
+	if pnl == nil || !pnl.Equal(dec("1.5")) || fee == nil || !fee.Equal(dec("-0.1")) {
+		t.Fatalf("reported figures must pass through, got pnl=%v fee=%v", pnl, fee)
 	}
 }

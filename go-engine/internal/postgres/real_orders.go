@@ -106,6 +106,82 @@ func (r *Repository) CloseRealOrder(ctx context.Context, id int64, closePx decim
 	return nil
 }
 
+// SetRealOrderClosing marks a close as IN FLIGHT: it records the flattening order's id and moves
+// the row to status='closing', while deliberately leaving closed_at NULL. The position stays open
+// until the exchange confirms the flatten actually filled (CloseRealOrderConfirmed below) — real
+// order 3 was recorded closed with nothing having verified OKX agreed, which is exactly the gap
+// this split exists to close. A close that fails or times out therefore leaves a row that is
+// visibly stuck in 'closing' rather than a row that lies about being flat.
+func (r *Repository) SetRealOrderClosing(ctx context.Context, id int64, closeOrderID string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE real_orders
+		SET status = 'closing',
+			exchange_close_order_id = $2,
+			last_error = NULL,
+			last_error_at = NULL
+		WHERE id = $1
+	`, id, nullableText(closeOrderID))
+	if err != nil {
+		return fmt.Errorf("mark real order %d closing: %w", id, err)
+	}
+	return nil
+}
+
+// CloseRealOrderConfirmed records a close the exchange has confirmed, storing the EXCHANGE's own
+// numbers alongside our own (2026-09-08 request). exchangePnL/exchangeFee/exchangeClosePx are
+// nil-able: a nil means OKX did not report that figure, which must stay distinguishable from a
+// genuine zero, and the panel falls back to the locally computed value only in that case.
+//
+// realizedPnL (the locally computed figure) is still written so the two remain comparable — a
+// persistent gap between them is itself worth seeing, since it means the local model of fees or
+// fill price is wrong.
+func (r *Repository) CloseRealOrderConfirmed(ctx context.Context, id int64, closePx decimal.Decimal, reason string,
+	realizedPnL decimal.Decimal, exchangePnL, exchangeFee, exchangeClosePx *decimal.Decimal) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE real_orders
+		SET closed_at = now(),
+			close_px = $2,
+			close_reason = $3,
+			realized_pnl = $4,
+			exchange_realized_pnl = $5,
+			exchange_fee = $6,
+			exchange_close_px = $7,
+			last_error = NULL,
+			last_error_at = NULL
+		WHERE id = $1
+	`, id, closePx, reason, realizedPnL, exchangePnL, exchangeFee, exchangeClosePx)
+	if err != nil {
+		return fmt.Errorf("confirm close of real order %d: %w", id, err)
+	}
+	return nil
+}
+
+// SetRealOrderError records the most recent exchange failure for an order so the panel can raise it
+// to a human. Deliberately does NOT change status: a failed close leaves the row in 'closing' and a
+// failed open leaves it in 'opening', which is what makes a stuck order visible rather than one
+// that quietly reverts to looking normal.
+func (r *Repository) SetRealOrderError(ctx context.Context, id int64, message string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE real_orders SET last_error = $2, last_error_at = now() WHERE id = $1
+	`, id, message)
+	if err != nil {
+		return fmt.Errorf("set error on real order %d: %w", id, err)
+	}
+	return nil
+}
+
+// ClearRealOrderError clears a recorded error once the condition has resolved, so a stale failure
+// does not keep alarming in the panel after a later attempt succeeded.
+func (r *Repository) ClearRealOrderError(ctx context.Context, id int64) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE real_orders SET last_error = NULL, last_error_at = NULL WHERE id = $1
+	`, id)
+	if err != nil {
+		return fmt.Errorf("clear error on real order %d: %w", id, err)
+	}
+	return nil
+}
+
 // UpdateRealOrderSLTP applies an in-trade SL/TP adjustment to an open real order. Mirrors
 // UpdatePaperOrderSLTP — the caller is responsible for any clamping before calling this.
 //
@@ -133,7 +209,11 @@ func (r *Repository) ListOpenRealOrders(ctx context.Context, instID string) ([]p
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, status, pnl_max_pct, pnl_min_pct, bar, manual_close_requested, exchange_order_id, exchange_algo_order_id
 		FROM real_orders
-		WHERE inst_id = $1 AND closed_at IS NULL AND status IN ('filled', 'partial')
+		-- 'closing' is included deliberately: a flatten is in flight but unconfirmed, so the
+		-- position is still REAL and still needs monitoring. Excluding it here would make the
+		-- engine forget a position that may well still be open on the exchange — the exact failure
+		-- this whole confirmation flow exists to prevent.
+		WHERE inst_id = $1 AND closed_at IS NULL AND status IN ('filled', 'partial', 'closing')
 		ORDER BY opened_at
 	`, instID)
 	if err != nil {
@@ -226,13 +306,15 @@ func (r *Repository) ListRealPositions(ctx context.Context, f port.PositionFilte
 			ro.opened_at, ro.closed_at, ro.close_reason, ro.close_px, ro.realized_pnl, ro.features_json, ro.status,
 			ro.bar, ro.pnl_max_pct, ro.pnl_min_pct, COALESCE(s.name, ''),
 			ro.exchange_order_id, ro.exchange_algo_order_id, ro.manual_close_requested, ro.manual_override,
+			ro.exchange_close_order_id, ro.exchange_realized_pnl, ro.exchange_fee, ro.exchange_close_px,
+			ro.last_error, ro.last_error_at,
 			-- In-place SL/TP edit count, mirroring ListPositions — backs the panel's "Updated"
 			-- column for real rows so it means the same thing in both modes.
 			(SELECT COUNT(*) FROM real_order_adjustments a WHERE a.order_id = ro.id)
 		FROM real_orders ro
 		LEFT JOIN strategies s ON s.id = ro.strategy_id
 		WHERE ($1 = '' OR ro.inst_id = $1)
-			AND ($2::boolean IS NULL OR (ro.closed_at IS NULL AND (NOT $2 OR ro.status IN ('filled','partial'))) = $2)
+			AND ($2::boolean IS NULL OR (ro.closed_at IS NULL AND (NOT $2 OR ro.status IN ('filled','partial','closing'))) = $2)
 		ORDER BY ` + orderClause
 
 	args := []any{f.InstID, f.Open}
@@ -255,7 +337,10 @@ func (r *Repository) ListRealPositions(ctx context.Context, f port.PositionFilte
 			&o.Size, &o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx,
 			&o.RealizedPnL, &o.FeaturesJSON, &o.Status, &bar,
 			&o.PnLMaxPct, &o.PnLMinPct, &o.StrategyName, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID,
-			&o.ManualCloseRequested, &o.ManualOverride, &o.AdjustmentCount); err != nil {
+			&o.ManualCloseRequested, &o.ManualOverride,
+			&o.ExchangeCloseOrderID, &o.ExchangeRealizedPnL, &o.ExchangeFee, &o.ExchangeClosePx,
+			&o.LastError, &o.LastErrorAt,
+			&o.AdjustmentCount); err != nil {
 			return nil, fmt.Errorf("scan real position: %w", err)
 		}
 		if bar != nil {

@@ -154,6 +154,13 @@ type OrderStatus struct {
 	AvgPx     decimalOrZero `json:"avgPx"`
 	AccFillSz decimalOrZero `json:"accFillSz"`
 	Sz        decimalOrZero `json:"sz"`
+	// Fee and Pnl are OKX's OWN accounting for this order (2026-09-08): Fee is negative for a
+	// charge, Pnl is the realized profit/loss the order booked. Read from the order rather than
+	// from /account/positions because a fully-closed position disappears from that endpoint
+	// immediately, while the order that closed it remains queryable. Same decimalOrZero treatment
+	// as the fields above — OKX returns "" rather than "0" before an order has filled.
+	Fee decimalOrZero `json:"fee"`
+	Pnl decimalOrZero `json:"pnl"`
 }
 
 // ToDomain converts an OrderStatus to its domain representation.
@@ -161,6 +168,7 @@ func (s OrderStatus) ToDomain() domain.OrderStatus {
 	return domain.OrderStatus{
 		InstID: s.InstID, OrdID: s.OrdID, ClOrdID: s.ClOrdID, State: s.State,
 		AvgPx: s.AvgPx.Decimal, AccFillSz: s.AccFillSz.Decimal, Sz: s.Sz.Decimal,
+		Fee: s.Fee.Decimal, Pnl: s.Pnl.Decimal,
 	}
 }
 

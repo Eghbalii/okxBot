@@ -784,8 +784,25 @@ func (e *RealTrader) openReal(
 	// this must not be assumed.
 	var finalStatus string
 	if order.ExchangeOrderID != nil {
+		// Mark the open IN FLIGHT before waiting on it, so a trader watching the panel sees the
+		// position appear as "opening" the moment the model asks for it, rather than only once it
+		// resolves seconds later (2026-09-08 request). Best-effort: this is visibility, and losing
+		// it must not abort an open the exchange has already accepted.
+		if persisted {
+			if err := e.Repo.UpdateRealOrderStatus(ctx, localID, "opening", nil, nil); err != nil {
+				logger.Warn("failed to mark real order opening", "id", localID, "error", err)
+			}
+		}
 		status, err := e.waitForFill(ctx, *order.ExchangeOrderID, logger)
 		if err != nil {
+			// Record it on the row so the panel can raise it to a human: the order IS live on the
+			// exchange and its fill is simply unconfirmed, which is exactly the state someone needs
+			// to look at rather than find in a log later.
+			if persisted {
+				if setErr := e.Repo.SetRealOrderError(ctx, localID, fmt.Sprintf("wait for fill: %v", err)); setErr != nil {
+					logger.Warn("failed to record open error", "id", localID, "error", setErr)
+				}
+			}
 			return nil, fmt.Errorf("wait for fill: %w", err)
 		}
 		switch {
@@ -1065,7 +1082,51 @@ func (e *RealTrader) closeReal(ctx context.Context, o port.RealOrder, price deci
 	return e.closeRealWith(ctx, o, price, reason, false, logger)
 }
 
+// recordCloseError persists a failed close's reason on the order and returns the error unchanged,
+// so every failure path in closeRealWith both surfaces to the panel and still propagates to its
+// caller. Persisting is best-effort: losing the record must not swallow the underlying error.
+//
+// The order's status is deliberately NOT reverted here. A failed close leaves the row in
+// 'closing', which is what makes it visibly stuck and gets a human to look at it — quietly
+// restoring 'filled' would make a position that may or may not still exist on the exchange look
+// perfectly normal, which is precisely the failure mode this whole confirmation flow exists for.
+func (e *RealTrader) recordCloseError(ctx context.Context, id int64, cause error, logger *slog.Logger) error {
+	if e.Repo != nil {
+		if err := e.Repo.SetRealOrderError(ctx, id, cause.Error()); err != nil {
+			logger.Warn("failed to record close error on real order", "id", id, "error", err)
+		}
+	}
+	logger.Error("real close failed", "id", id, "instId", e.InstID, "error", cause)
+	return cause
+}
+
+// exchangeCloseNumbers extracts OKX's own accounting for a flatten from the order status it
+// already returned — realized PnL and fee, both nil when the exchange reported nothing, since a
+// missing figure must stay distinguishable from a real zero (the panel falls back to the locally
+// computed value only when nil).
+//
+// Read from the ORDER, not from /account/positions: a fully-closed position disappears from that
+// endpoint the moment it closes, so by the time a flatten is confirmed there is nothing left there
+// to read. The order remains queryable and carries the figures that actually settled.
+func exchangeCloseNumbers(status domain.OrderStatus) (pnl, fee *decimal.Decimal) {
+	if !status.Pnl.IsZero() {
+		v := status.Pnl
+		pnl = &v
+	}
+	if !status.Fee.IsZero() {
+		v := status.Fee
+		fee = &v
+	}
+	return pnl, fee
+}
+
 func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price decimal.Decimal, reason string, skipExchange bool, logger *slog.Logger) error {
+	// exchangeClosePx/exchangeFee/exchangePnL are the EXCHANGE's own numbers, left nil when it did
+	// not report them (a skipExchange close, or a status response missing the field). nil is
+	// deliberately distinct from zero: it means "OKX did not tell us", and the panel falls back to
+	// the locally computed figure only in that case.
+	var exchangeClosePx, exchangeFee, exchangePnL *decimal.Decimal
+
 	if !skipExchange {
 		side := "sell"
 		if o.Side == "sell" {
@@ -1077,7 +1138,7 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 		}
 		inst, err := e.instrumentMeta()
 		if err != nil {
-			return fmt.Errorf("fetch instrument metadata: %w", err)
+			return e.recordCloseError(ctx, o.ID, fmt.Errorf("fetch instrument metadata: %w", err), logger)
 		}
 		sz := sizeToContracts(o.Size, closePrice, inst)
 		req := domain.OrderRequest{InstID: e.execInstID(), TdMode: e.TdMode, Side: side, OrdType: "market", Sz: sz}
@@ -1086,10 +1147,21 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 		}
 		result, err := e.Exchange.PlaceOrder(req)
 		if err != nil {
-			return fmt.Errorf("flatten position: %w", err)
+			return e.recordCloseError(ctx, o.ID, fmt.Errorf("flatten position: %w", err), logger)
 		}
 		if result != nil && result.SCode != "0" {
-			return fmt.Errorf("flatten order rejected: sCode=%s sMsg=%s", result.SCode, result.SMsg)
+			return e.recordCloseError(ctx, o.ID,
+				fmt.Errorf("flatten order rejected: sCode=%s sMsg=%s", result.SCode, result.SMsg), logger)
+		}
+
+		// Mark the close IN FLIGHT before waiting on it. This is what makes an in-progress or a
+		// stuck close visible to a trader watching the panel rather than a row that looks idle —
+		// and it records the flattening order's id, without which a close cannot be audited
+		// against OKX afterwards at all (real order 3 had no such record).
+		if result != nil {
+			if err := e.Repo.SetRealOrderClosing(ctx, o.ID, result.OrdID); err != nil {
+				logger.Warn("failed to mark real order closing", "id", o.ID, "error", err)
+			}
 		}
 
 		// CLAUDE.md §27.5: confirm the flatten actually filled before marking the DB row closed —
@@ -1103,18 +1175,30 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 		if result != nil && result.OrdID != "" {
 			status, err := e.waitForFill(ctx, result.OrdID, logger)
 			if err != nil {
-				return fmt.Errorf("wait for flatten fill: %w", err)
+				return e.recordCloseError(ctx, o.ID, fmt.Errorf("wait for flatten fill: %w", err), logger)
 			}
 			if !status.IsFilled() {
-				return fmt.Errorf("flatten order for %d not fully filled (state=%s, filled=%s/%s); "+
-					"position may still be open on the exchange, not marking closed",
-					o.ID, status.State, status.AccFillSz, status.Sz)
+				return e.recordCloseError(ctx, o.ID, fmt.Errorf(
+					"flatten order for %d not fully filled (state=%s, filled=%s/%s); "+
+						"position may still be open on the exchange, not marking closed",
+					o.ID, status.State, status.AccFillSz, status.Sz), logger)
 			}
+			// The exchange's own fill price is what the position actually closed at — preferred
+			// over the tick price that merely TRIGGERED the close, which is what produced order
+			// 3's nonsense close_px of 102 against a market trading at 103.9.
+			if status.AvgPx.IsPositive() {
+				avg := status.AvgPx
+				exchangeClosePx = &avg
+				price = avg
+			}
+			// OKX's own realized PnL and fee for this flatten, preferred over a local calculation
+			// that cannot see fees, funding, or the true fill price (2026-09-08 request).
+			exchangePnL, exchangeFee = exchangeCloseNumbers(status)
 		}
 	}
 
 	pnl := realizedPnL(asPaperOrderView(o), price)
-	if err := e.Repo.CloseRealOrder(ctx, o.ID, price, reason, pnl); err != nil {
+	if err := e.Repo.CloseRealOrderConfirmed(ctx, o.ID, price, reason, pnl, exchangePnL, exchangeFee, exchangeClosePx); err != nil {
 		return err
 	}
 	metrics.PaperOrdersClosedTotal.WithLabelValues(e.InstID, reason).Inc()

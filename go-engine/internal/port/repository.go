@@ -179,6 +179,17 @@ type PaperOrder struct {
 	// handleListPositions present RealOrder rows through the same DTO shape the panel already
 	// consumes for paper/demo positions, without inventing a second response type.
 	Status *string
+	// ExchangeCloseOrderID/ExchangeRealizedPnL/ExchangeFee/ExchangeClosePx/LastError/LastErrorAt
+	// are real-trading pass-throughs, populated only by realOrderToPosition so the panel can show
+	// the EXCHANGE's own accounting for a close and raise a failed open/close to a human
+	// (2026-09-08). Always nil for a genuine paper order — paper has no exchange.
+	ExchangeCloseOrderID *string
+	ExchangeRealizedPnL  *decimal.Decimal
+	ExchangeFee          *decimal.Decimal
+	ExchangeClosePx      *decimal.Decimal
+	LastError            *string
+	LastErrorAt          *time.Time
+
 }
 
 // RealOrder is a real-money trade placed against the exchange (CLAUDE.md, real-trading readiness
@@ -218,7 +229,35 @@ type RealOrder struct {
 	// "filled": fully filled — the normal case.
 	// "canceled": never filled before the fill timeout — no position exists; the row stays so a
 	// timed-out attempt is still visible rather than silently dropped.
+	//
+	// Two states added 2026-09-08, both meaning "a request is in flight with the exchange and its
+	// outcome is not yet known", so the panel can show a trader that something is happening rather
+	// than a row that looks idle:
+	// "opening": the open order is accepted but its fill is still being confirmed.
+	// "closing": the flattening order has been sent, its fill not yet confirmed. Until it IS
+	// confirmed the position stays OPEN (ClosedAt nil) — a close is only recorded once the
+	// exchange agrees, which is the whole point (real order 3 was recorded closed with nothing
+	// having verified that).
 	Status string
+
+	// ExchangeCloseOrderID is the flattening order's own id, the close-side counterpart to
+	// ExchangeOrderID. Without it a close cannot be audited against OKX after the fact at all.
+	ExchangeCloseOrderID *string
+
+	// ExchangeRealizedPnL/ExchangeFee/ExchangeClosePx are the EXCHANGE's own numbers for the close,
+	// preferred over anything computed locally (2026-09-08 request). A locally derived PnL from
+	// entry and exit prices silently disagrees with what the account actually moved by, since it
+	// cannot see fees, funding, the real fill price, or a partial fill. nil means the exchange did
+	// not report it, which must stay distinguishable from a genuine zero.
+	ExchangeRealizedPnL *decimal.Decimal
+	ExchangeFee         *decimal.Decimal
+	ExchangeClosePx     *decimal.Decimal
+
+	// LastError/LastErrorAt carry the most recent exchange failure for this order so the panel can
+	// raise it to a human, who then decides what to do (close it by hand, retry, investigate).
+	// Cleared on the next successful transition so a resolved error stops alarming.
+	LastError   *string
+	LastErrorAt *time.Time
 
 	PnLMaxPct decimal.Decimal
 	PnLMinPct decimal.Decimal
@@ -482,6 +521,22 @@ type Repository interface {
 	// from the panel: flags every open real position for close on its very next tick, independent
 	// of the trader process restarting. Returns how many rows were flagged.
 	RequestRealManualCloseAll(ctx context.Context) (int, error)
+	// SetRealOrderClosing records a flatten as IN FLIGHT: stores the flattening order's id and
+	// moves the row to status='closing' while leaving ClosedAt nil. The position stays open until
+	// the exchange confirms the flatten filled — real order 3 was recorded closed with nothing
+	// having verified OKX agreed, and a close that fails now leaves a row visibly stuck in
+	// 'closing' rather than one that lies about being flat.
+	SetRealOrderClosing(ctx context.Context, id int64, closeOrderID string) error
+	// CloseRealOrderConfirmed records an exchange-CONFIRMED close, storing OKX's own realized PnL,
+	// fee and fill price alongside the locally computed figures. The exchange values are nil-able:
+	// nil means it did not report that number, deliberately distinct from a genuine zero.
+	CloseRealOrderConfirmed(ctx context.Context, id int64, closePx decimal.Decimal, reason string,
+		realizedPnL decimal.Decimal, exchangePnL, exchangeFee, exchangeClosePx *decimal.Decimal) error
+	// SetRealOrderError records the latest exchange failure for an order so the panel can raise it
+	// to a human. Does NOT change status, so a stuck order stays visibly stuck.
+	SetRealOrderError(ctx context.Context, id int64, message string) error
+	// ClearRealOrderError clears a recorded error once a later attempt succeeded.
+	ClearRealOrderError(ctx context.Context, id int64) error
 	// UpdateRealOrderPnLExtremes mirrors UpdatePaperOrderPnLExtremes.
 	UpdateRealOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error
 	// ListRealPositions mirrors ListPositions for real_orders. f.Mode is ignored (every row is real

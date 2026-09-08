@@ -45,7 +45,11 @@ export interface TokenStats {
 export type PositionMode = 'paper' | 'real'
 // Fill-lifecycle status for a real order (real_orders.status) — null for paper/demo rows, which
 // have no fill lifecycle (a paper order is always instantly and fully filled).
-export type OrderStatus = 'pending' | 'partial' | 'filled' | 'canceled'
+// 'opening'/'closing' mean a request is in flight with the exchange and its outcome is not yet
+// known (2026-09-08). A 'closing' order is still an OPEN position — the close is only recorded once
+// the exchange confirms the flatten filled, so a failed close leaves a row visibly stuck in
+// 'closing' rather than one that claims to be flat.
+export type OrderStatus = 'pending' | 'opening' | 'partial' | 'filled' | 'closing' | 'canceled'
 // 'rl_early' is the model choosing to close a position before either SL or TP was touched
 // (CLAUDE.md §15.12's early-close action, gated behind paper_trading.rl_early_close).
 export type CloseReason = 'sl' | 'tp' | 'manual' | 'timeout' | 'rl_early'
@@ -97,6 +101,21 @@ export interface Position {
   FeaturesJSON: unknown
   // Status is the fill lifecycle for a real order (real_orders.status) — null for paper/demo rows.
   Status: OrderStatus | null
+  // Real-trading only. The EXCHANGE's own accounting for the close, preferred over the locally
+  // computed RealizedPnL/ClosePx wherever present (2026-09-08) — a local calculation cannot see
+  // fees, funding, or the true fill price. null means the exchange did not report it, which is
+  // deliberately distinct from a zero.
+  // The opening order's own id on OKX. Sent by the backend since real orders existed but never
+  // typed here until 2026-09-08, so nothing in the panel could show it.
+  ExchangeOrderID: string | null
+  ExchangeCloseOrderID: string | null
+  ExchangeRealizedPnL: string | null
+  ExchangeFee: string | null
+  ExchangeClosePx: string | null
+  // The most recent exchange failure for this order, surfaced as a popup so a trader can act on a
+  // stuck open or close rather than find it in a log later.
+  LastError: string | null
+  LastErrorAt: string | null
 }
 
 // PaperOrderAdjustment is one row of an order's in-trade SL/TP adjustment history (CLAUDE.md

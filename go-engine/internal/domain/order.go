@@ -41,6 +41,13 @@ type OrderStatus struct {
 	AvgPx     decimal.Decimal
 	AccFillSz decimal.Decimal // cumulative filled size so far
 	Sz        decimal.Decimal // requested size
+	// Fee and Pnl are the exchange's own accounting for this order — Fee negative for a charge,
+	// Pnl the realized profit/loss it booked. Preferred over any locally computed figure, which
+	// cannot see fees, funding, or the true fill price (2026-09-08). Zero legitimately means both
+	// "no fee/pnl" and "not reported"; callers that need to tell those apart check IsZero at the
+	// point of use rather than this type carrying a pointer for it.
+	Fee decimal.Decimal
+	Pnl decimal.Decimal
 }
 
 // IsFilled reports whether the order is fully filled.

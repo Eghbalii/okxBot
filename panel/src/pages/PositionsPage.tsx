@@ -5,6 +5,7 @@ import { usePositionAlerts } from '../hooks/usePositionAlerts'
 import { usePositionEvents } from '../hooks/usePositionEvents'
 import { usePriceStream } from '../hooks/usePriceStream'
 import AdjustPositionForm from '../components/AdjustPositionForm'
+import OrderErrorAlert from '../components/OrderErrorAlert'
 import OrderDetailModal from '../components/OrderDetailModal'
 import PaperTradingConfigBox from '../components/PaperTradingConfigBox'
 import PaperTradingStatsBox from '../components/PaperTradingStatsBox'
@@ -34,10 +35,22 @@ function closeReasonBadge(reason: CloseReason | null) {
 // still in flight or a fill smaller than requested); "filled" is the unremarkable default so it's
 // dimmed rather than colored, and "canceled" reads distinctly from a normal closed/SL/TP row since
 // it never became a position at all.
+// 'opening'/'closing' are in-flight states: a request is with the exchange and its outcome is not
+// yet known. They render as the attention-getting yellow rather than the neutral dim, because a row
+// that stays in one is exactly what a trader needs to notice — a stuck close means the position may
+// still be live on the exchange (2026-09-08).
 function statusBadge(status: OrderStatus | null) {
   if (!status || status === 'filled') return <span className="badge badge-dim">filled</span>
   const cls = status === 'canceled' ? 'badge-red' : 'badge-yellow'
-  return <span className={'badge ' + cls}>{status}</span>
+  return <span className={'badge ' + cls} title={statusHelp[status] ?? status}>{status}</span>
+}
+
+const statusHelp: Record<string, string> = {
+  pending: 'Order accepted by the exchange; fill not yet confirmed.',
+  opening: 'Open order is in flight with the exchange, waiting on confirmation.',
+  partial: 'Partially filled — a real, smaller-than-intended position exists.',
+  closing: 'Flattening order sent, waiting on the exchange to confirm. The position is still open until it does.',
+  canceled: 'Never filled before the fill timeout — no position was opened.',
 }
 
 // Date on one line, time on the other — a single "03/09/2026, 05:40:11" line was too wide for the
@@ -372,7 +385,17 @@ export default function PositionsPage() {
               const isFork = p.Variant === 'rl_adjusted'
               // Either a real in-place edit (current behaviour) or a historical shadow fork.
               const wasUpdated = p.AdjustmentCount > 0 || updatedOrderIds.has(p.ID)
-              const realized = p.RealizedPnL !== null ? Number(p.RealizedPnL) : null
+              // The EXCHANGE's own realized PnL wins wherever reported (2026-09-08): a locally
+              // computed figure cannot see fees, funding, or the true fill price, so the two can
+              // silently disagree with what the account actually moved by. null (not zero) is what
+              // "the exchange did not report it" looks like, and only then do we fall back.
+              const realized =
+                p.ExchangeRealizedPnL !== null
+                  ? Number(p.ExchangeRealizedPnL)
+                  : p.RealizedPnL !== null
+                    ? Number(p.RealizedPnL)
+                    : null
+              const realizedFromExchange = p.ExchangeRealizedPnL !== null
               const slPct = slTpPct(p, p.SLPx)
               const tpPct = slTpPct(p, p.TPPx)
               return (
@@ -423,7 +446,16 @@ export default function PositionsPage() {
                   {showClosedColumns && <td>{closeReasonBadge(p.CloseReason)}</td>}
                   <td className={'mono pnl-cell ' + pnlClass(realized ?? live?.usd ?? null)}>
                     {realized !== null ? (
-                      <div>{formatUsd(realized)}</div>
+                      <div
+                        title={
+                          realizedFromExchange
+                            ? "The exchange's own reported realized PnL"
+                            : 'Computed locally — the exchange did not report a figure for this order'
+                        }
+                      >
+                        {formatUsd(realized)}
+                        {!realizedFromExchange && p.Mode === 'real' && <span className="pnl-local-marker">*</span>}
+                      </div>
                     ) : live ? (
                       <>
                         <div>{`${live.pct >= 0 ? '+' : '−'}${Math.abs(live.pct).toFixed(2)}%`}</div>
@@ -434,8 +466,15 @@ export default function PositionsPage() {
                     )}
                   </td>
                   {showClosedColumns && (
-                    <td className="mono text-dim" title="Trading fee + funding cost/credit already subtracted into PnL">
-                      {feesDisplay(p.FeesUSD, p.FundingUSD)}
+                    <td
+                      className="mono text-dim"
+                      title={
+                        p.ExchangeFee !== null
+                          ? "The exchange's own reported fee for this order"
+                          : 'Trading fee + funding cost/credit already subtracted into PnL'
+                      }
+                    >
+                      {p.ExchangeFee !== null ? formatUsd(Number(p.ExchangeFee)) : feesDisplay(p.FeesUSD, p.FundingUSD)}
                     </td>
                   )}
                   <td className="mono pnl-cell">
@@ -510,6 +549,11 @@ export default function PositionsPage() {
           onPageSizeChange={setPageSize}
         />
       </div>
+
+      {/* Raises any real order's latest exchange failure as a modal — a failed close in particular
+          means a position may still be live on OKX while the engine has stopped trying, which only
+          a person can resolve (2026-09-08). */}
+      <OrderErrorAlert positions={rows ?? []} />
 
       {detailPosition && (
         <OrderDetailModal position={detailPosition} onClose={() => setDetailOrderId(null)} />

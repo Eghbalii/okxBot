@@ -445,6 +445,62 @@ func (r *fakeRepository) RequestRealManualCloseAll(ctx context.Context) (int, er
 	}
 	return n, nil
 }
+func (r *fakeRepository) SetRealOrderClosing(ctx context.Context, id int64, closeOrderID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok {
+		return nil
+	}
+	o.Status = "closing"
+	if closeOrderID != "" {
+		o.ExchangeCloseOrderID = &closeOrderID
+	}
+	o.LastError, o.LastErrorAt = nil, nil
+	r.realOrders[id] = o
+	return nil
+}
+
+func (r *fakeRepository) CloseRealOrderConfirmed(ctx context.Context, id int64, closePx decimal.Decimal, reason string,
+	realizedPnL decimal.Decimal, exchangePnL, exchangeFee, exchangeClosePx *decimal.Decimal) error {
+	r.mu.Lock()
+	o, ok := r.realOrders[id]
+	if ok {
+		o.ExchangeRealizedPnL = exchangePnL
+		o.ExchangeFee = exchangeFee
+		o.ExchangeClosePx = exchangeClosePx
+		o.LastError, o.LastErrorAt = nil, nil
+		r.realOrders[id] = o
+	}
+	r.mu.Unlock()
+	return r.CloseRealOrder(ctx, id, closePx, reason, realizedPnL)
+}
+
+func (r *fakeRepository) SetRealOrderError(ctx context.Context, id int64, message string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok {
+		return nil
+	}
+	now := time.Now()
+	o.LastError, o.LastErrorAt = &message, &now
+	r.realOrders[id] = o
+	return nil
+}
+
+func (r *fakeRepository) ClearRealOrderError(ctx context.Context, id int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok {
+		return nil
+	}
+	o.LastError, o.LastErrorAt = nil, nil
+	r.realOrders[id] = o
+	return nil
+}
+
 func (r *fakeRepository) UpdateRealOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -520,6 +520,12 @@ func realOrderToPosition(o port.RealOrder) port.PaperOrder {
 		ExchangeOrderID:      o.ExchangeOrderID,
 		ExchangeAlgoOrderID:  o.ExchangeAlgoOrderID,
 		Status:               &status,
+		ExchangeCloseOrderID: o.ExchangeCloseOrderID,
+		ExchangeRealizedPnL:  o.ExchangeRealizedPnL,
+		ExchangeFee:          o.ExchangeFee,
+		ExchangeClosePx:      o.ExchangeClosePx,
+		LastError:            o.LastError,
+		LastErrorAt:          o.LastErrorAt,
 	}
 }
 

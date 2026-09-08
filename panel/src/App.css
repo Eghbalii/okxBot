@@ -726,3 +726,33 @@ th.sorted {
   display: flex;
   gap: 0.5rem;
 }
+
+/* --- Exchange error alert (real orders) -------------------------------------------------- */
+
+.order-error-modal .modal-header h2 {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.order-error-detail {
+  background: var(--bg-alt, #1a1a1a);
+  border-left: 3px solid var(--red, #e5484d);
+  padding: 0.6rem 0.75rem;
+  font-size: 0.8rem;
+  word-break: break-word;
+  margin-bottom: 0.8rem;
+}
+
+.order-error-meta {
+  font-size: 0.75rem;
+  line-height: 1.6;
+  margin-bottom: 1rem;
+}
+
+/* Marks a realized PnL the panel had to compute itself because the exchange reported none — the
+   figure is an estimate that cannot account for fees, funding, or the true fill price. */
+.pnl-local-marker {
+  color: var(--text-dim);
+  margin-left: 0.15rem;
+}
