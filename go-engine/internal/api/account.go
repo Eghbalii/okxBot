@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/shopspring/decimal"
+
+	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
 // defaultEquityHistoryLimit bounds an unqualified history read so a long-running paper account
@@ -92,7 +94,23 @@ func (s *Server) handleSetAccountCap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account, err := s.Repo.SetAccountCap(r.Context(), mode, req.NewCapUSD)
+	// Real and paper mean genuinely different things by "set a cap", so this routes to two
+	// different repository operations rather than one with a mode branch inside it (2026-09-08):
+	//
+	//   paper — there is no exchange, so AccountBalanceUSD is bookkeeping this system owns and a
+	//           cap is a re-baselining of the whole account. Unchanged (CLAUDE.md §32.3).
+	//   real  — AccountBalanceUSD mirrors the exchange's own reported balance and is
+	//           RecordExchangeBalance's reconciliation anchor, so it must NEVER be overwritten
+	//           with a chosen number: the next poll would report the difference as realized PnL
+	//           that never happened. The cap instead names the tradable slice of that balance,
+	//           and the untraded remainder is a derived reserve.
+	var account port.AccountEquity
+	var err error
+	if mode == "real" {
+		account, err = s.Repo.SetTradingCap(r.Context(), mode, req.NewCapUSD)
+	} else {
+		account, err = s.Repo.SetAccountCap(r.Context(), mode, req.NewCapUSD)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

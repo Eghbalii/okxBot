@@ -40,6 +40,27 @@ type accountStubRepo struct {
 		limit int
 	}
 	historyResult []port.EquityPoint
+	// tradingCapCalls logs SetTradingCap separately from setCapCalls so a test can tell which of
+	// the two operations the handler chose for a given mode.
+	tradingCapCalls []struct {
+		mode string
+		cap  decimal.Decimal
+	}
+}
+
+// SetTradingCap records into the SAME call log as SetAccountCap but tags which one ran, so a test
+// can assert the handler routed real vs. paper to the right operation — the distinction that
+// matters here (CLAUDE.md: overwriting AccountBalanceUSD in real mode corrupts the exchange
+// reconciliation anchor).
+func (r *accountStubRepo) SetTradingCap(ctx context.Context, mode string, capUSD decimal.Decimal) (port.AccountEquity, error) {
+	r.tradingCapCalls = append(r.tradingCapCalls, struct {
+		mode string
+		cap  decimal.Decimal
+	}{mode, capUSD})
+	if r.setCapErr != nil {
+		return port.AccountEquity{}, r.setCapErr
+	}
+	return r.setCapResult, nil
 }
 
 func (r *accountStubRepo) SetAccountCap(ctx context.Context, mode string, newCapUSD decimal.Decimal) (port.AccountEquity, error) {
@@ -122,7 +143,12 @@ func TestHandleSetAccountCap_RejectsInvalidMode(t *testing.T) {
 // CLAUDE.md §31.2: real money is explicitly allowed here, unlike ApplyRealizedPnL's automatic
 // reset — an operator choosing their own real trading cap is a human decision, not the kind of
 // automatic top-up §15.7's real-mode carve-out exists to prevent.
-func TestHandleSetAccountCap_AllowsRealMode(t *testing.T) {
+//
+// Real mode routes to SetTradingCap, NOT SetAccountCap (2026-09-08). This is the routing that
+// keeps AccountBalanceUSD — RecordExchangeBalance's reconciliation anchor against the exchange's
+// own reported balance — from being overwritten with an operator-chosen number, which would make
+// the very next poll record the difference as realized PnL that never happened.
+func TestHandleSetAccountCap_RealModeRoutesToSetTradingCap(t *testing.T) {
 	repo := &accountStubRepo{setCapResult: port.AccountEquity{Mode: "real", EquityUSD: dec("500")}}
 	srv := newTestServer2(repo)
 
@@ -130,8 +156,29 @@ func TestHandleSetAccountCap_AllowsRealMode(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("expected 200 for mode=real, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if len(repo.setCapCalls) != 1 || repo.setCapCalls[0].mode != "real" {
-		t.Fatalf("expected one SetAccountCap call for mode=real, got %+v", repo.setCapCalls)
+	if len(repo.tradingCapCalls) != 1 || repo.tradingCapCalls[0].mode != "real" {
+		t.Fatalf("expected one SetTradingCap call for mode=real, got %+v", repo.tradingCapCalls)
+	}
+	if len(repo.setCapCalls) != 0 {
+		t.Fatalf("real mode must NOT call SetAccountCap (it would overwrite the exchange balance anchor), got %+v", repo.setCapCalls)
+	}
+}
+
+// The paper side of the same routing: paper has no exchange, so AccountBalanceUSD is bookkeeping
+// this system owns and a cap legitimately re-baselines the whole account (CLAUDE.md §32.3).
+func TestHandleSetAccountCap_PaperModeRoutesToSetAccountCap(t *testing.T) {
+	repo := &accountStubRepo{setCapResult: port.AccountEquity{Mode: "paper", EquityUSD: dec("40")}}
+	srv := newTestServer2(repo)
+
+	rec := doSetAccountCap(srv, map[string]any{"mode": "paper", "newCapUsd": 40})
+	if rec.Code != 200 {
+		t.Fatalf("expected 200 for mode=paper, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(repo.setCapCalls) != 1 || repo.setCapCalls[0].mode != "paper" {
+		t.Fatalf("expected one SetAccountCap call for mode=paper, got %+v", repo.setCapCalls)
+	}
+	if len(repo.tradingCapCalls) != 0 {
+		t.Fatalf("paper mode must not call SetTradingCap, got %+v", repo.tradingCapCalls)
 	}
 }
 

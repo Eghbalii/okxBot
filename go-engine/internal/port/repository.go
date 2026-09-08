@@ -268,9 +268,20 @@ type AccountEquity struct {
 	// AccountBalanceUSD is a structural invariant, since neither field in this schema ever carries
 	// unrealized PnL.
 	AccountBalanceUSD decimal.Decimal
-	ResetCount        int
-	LastResetAt       *time.Time
-	UpdatedAt         time.Time
+	// TradingCapUSD is the operator-chosen slice of the real balance this engine may trade with
+	// (2026-09-08 request), nil when no cap is set (trade the whole balance). Real mode only: it
+	// exists because a real account's total is the exchange's number, not ours, so "how much am I
+	// willing to risk" has to be a SEPARATE figure rather than an overwrite of the total.
+	//
+	// The relationship it defines is: AccountBalanceUSD = EquityUSD + reserve, where the reserve
+	// (AccountBalanceUSD - TradingCapUSD at the moment the cap was set) is untraded capital that
+	// stays put. Realized PnL accrues to BOTH the cap-derived equity and the total, so a $5 profit
+	// on a $20 cap against a $40 balance gives $25 tradable and $45 total, leaving the reserve at
+	// its original $20 — which is exactly the behavior asked for.
+	TradingCapUSD *decimal.Decimal
+	ResetCount    int
+	LastResetAt   *time.Time
+	UpdatedAt     time.Time
 }
 
 // EquityPoint is one entry in a mode's balance timeline (CLAUDE.md §15.7). Every balance change
@@ -521,6 +532,23 @@ type Repository interface {
 	// equity chart and the dynamic per-position sizing (equity / active token count) both anchor to,
 	// so this single value is the one and only definition of "the balance since I last chose one."
 	SetAccountCap(ctx context.Context, mode string, newCapUSD decimal.Decimal) (AccountEquity, error)
+	// SetTradingCap is real trading's counterpart to SetAccountCap, and deliberately a DIFFERENT
+	// operation rather than a mode branch inside it (2026-09-08 request). The distinction is what
+	// AccountBalanceUSD means per mode: in paper it is bookkeeping this system owns, so a cap
+	// change may legitimately rewrite it; in real it is the reconciliation anchor for the
+	// exchange's own reported balance — RecordExchangeBalance computes realized PnL as
+	// (raw exchange balance - stored AccountBalanceUSD), so overwriting it with a chosen number
+	// makes the next poll report the difference as a trade profit that never happened.
+	//
+	// So this sets ONLY trading_cap_usd and derives EquityUSD from it (capped at the real balance,
+	// since a cap above what the account holds cannot be honored), leaving AccountBalanceUSD
+	// strictly to the exchange. No ResetCount bump and no LastResetAt stamp: choosing how much of
+	// an existing balance to trade with is not a re-baselining of the account, and stamping it
+	// would silently truncate the panel's equity chart to the moment of the change.
+	//
+	// A reason="cap" history point IS written, so the chart can show why tradable equity stepped
+	// without a matching move in the total — the whole reason the two lines are drawn together.
+	SetTradingCap(ctx context.Context, mode string, capUSD decimal.Decimal) (AccountEquity, error)
 
 	// RecordPaperOrderAdjustment appends one entry to an order's in-trade SL/TP adjustment history
 	// (CLAUDE.md §15.4/§15.12 revision, 2026-09-02) — replaces the old shadow-fork mechanic's

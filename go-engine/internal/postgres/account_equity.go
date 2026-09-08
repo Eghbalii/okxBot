@@ -10,12 +10,12 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
-const accountEquityCols = `mode, initial_usd, equity_usd, account_balance_usd, reset_count, last_reset_at, updated_at`
+const accountEquityCols = `mode, initial_usd, equity_usd, account_balance_usd, trading_cap_usd, reset_count, last_reset_at, updated_at`
 
 func scanAccountEquity(row interface {
 	Scan(dest ...any) error
 }, ae *port.AccountEquity) error {
-	return row.Scan(&ae.Mode, &ae.InitialUSD, &ae.EquityUSD, &ae.AccountBalanceUSD, &ae.ResetCount, &ae.LastResetAt, &ae.UpdatedAt)
+	return row.Scan(&ae.Mode, &ae.InitialUSD, &ae.EquityUSD, &ae.AccountBalanceUSD, &ae.TradingCapUSD, &ae.ResetCount, &ae.LastResetAt, &ae.UpdatedAt)
 }
 
 // GetAccountEquity returns mode's current balance row, seeding it at initialUSD (plus a "seed"
@@ -34,7 +34,7 @@ func (r *Repository) GetAccountEquity(ctx context.Context, mode string, initialU
 		ON CONFLICT (mode) DO UPDATE SET mode = account_equity.mode
 		RETURNING `+accountEquityCols+`, (xmax = 0)
 	`, mode, initialUSD)
-	if err := row.Scan(&ae.Mode, &ae.InitialUSD, &ae.EquityUSD, &ae.AccountBalanceUSD, &ae.ResetCount, &ae.LastResetAt, &ae.UpdatedAt, &inserted); err != nil {
+	if err := row.Scan(&ae.Mode, &ae.InitialUSD, &ae.EquityUSD, &ae.AccountBalanceUSD, &ae.TradingCapUSD, &ae.ResetCount, &ae.LastResetAt, &ae.UpdatedAt, &inserted); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("get account equity for mode %s: %w", mode, err)
 	}
 
@@ -148,13 +148,35 @@ func (r *Repository) RecordExchangeBalance(ctx context.Context, mode string, raw
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
 
-	var previousBalance decimal.Decimal
-	if err := tx.QueryRow(ctx, `SELECT account_balance_usd FROM account_equity WHERE mode = $1`, mode).Scan(&previousBalance); err != nil {
+	var previousBalance, previousEquity decimal.Decimal
+	var previousCap *decimal.Decimal
+	if err := tx.QueryRow(ctx, `
+		SELECT account_balance_usd, equity_usd, trading_cap_usd FROM account_equity WHERE mode = $1
+	`, mode).Scan(&previousBalance, &previousEquity, &previousCap); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("record exchange balance for mode %s: no existing row (call GetAccountEquity first): %w", mode, err)
 	}
 
 	delta := rawBalanceUSD.Sub(previousBalance)
-	tradable := rawBalanceUSD.Sub(safeMoneyUSD)
+
+	// How tradable equity is derived depends on whether an explicit trading cap is set.
+	//
+	// With a cap (the 2026-09-08 model): the cap names the tradable slice at the moment it was
+	// chosen, and realized PnL accrues to that slice — so equity moves by the SAME delta the real
+	// balance just moved by, leaving the untraded reserve (balance - equity) constant. That is the
+	// requested behavior exactly: $20 traded out of a $40 balance, then +$5, gives $25 tradable and
+	// $45 total, with the reserve still $20. Deriving equity as "the cap" flat instead would pin
+	// tradable equity at $20 forever and quietly discard every gain; deriving it as
+	// "balance - reserve" is the same arithmetic stated in terms that survive the balance moving.
+	//
+	// Without a cap: fall back to SafeMoneyUSD's fixed reserve, preserving existing behavior for
+	// any account that never sets one (and for paper, which has no exchange balance to split).
+	var tradable decimal.Decimal
+	if previousCap != nil {
+		reserve := previousBalance.Sub(previousEquity)
+		tradable = rawBalanceUSD.Sub(reserve)
+	} else {
+		tradable = rawBalanceUSD.Sub(safeMoneyUSD)
+	}
 	if tradable.IsNegative() {
 		tradable = decimal.Zero
 	}
@@ -243,6 +265,60 @@ func (r *Repository) SetAccountCap(ctx context.Context, mode string, newCapUSD d
 
 	if err := tx.Commit(ctx); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("commit set account cap: %w", err)
+	}
+	return ae, nil
+}
+
+// SetTradingCap sets how much of the REAL balance this engine may trade with, without ever
+// touching AccountBalanceUSD — see the port interface's doc comment for why that separation is
+// mandatory in real mode (AccountBalanceUSD is RecordExchangeBalance's reconciliation anchor
+// against the exchange's own reported number; overwriting it makes the next poll report the
+// difference as realized PnL that never happened).
+//
+// EquityUSD becomes the cap, bounded above by the real balance — a cap larger than the account
+// actually holds cannot be honored, and silently sizing against money that isn't there is worse
+// than clamping. The untraded remainder (balance - cap) is the reserve, derived rather than
+// stored, so it can never drift out of agreement with the two numbers it sits between.
+func (r *Repository) SetTradingCap(ctx context.Context, mode string, capUSD decimal.Decimal) (port.AccountEquity, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return port.AccountEquity{}, fmt.Errorf("begin set trading cap: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+
+	var previousEquity decimal.Decimal
+	if err := tx.QueryRow(ctx, `SELECT equity_usd FROM account_equity WHERE mode = $1`, mode).Scan(&previousEquity); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("set trading cap for mode %s: no existing row (call GetAccountEquity first): %w", mode, err)
+	}
+
+	var ae port.AccountEquity
+	// LEAST() applies the "cap cannot exceed the real balance" bound in SQL rather than in Go, so
+	// the stored cap and the derived equity are decided by one expression against one snapshot of
+	// the balance — a read-then-write in Go could interleave with a concurrent RecordExchangeBalance
+	// and store a cap that was valid against a balance no longer current.
+	row := tx.QueryRow(ctx, `
+		UPDATE account_equity
+		SET trading_cap_usd = $2,
+			equity_usd = LEAST($2, account_balance_usd),
+			updated_at = now()
+		WHERE mode = $1
+		RETURNING `+accountEquityCols, mode, capUSD)
+	if err := scanAccountEquity(row, &ae); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("set trading cap for mode %s: %w", mode, err)
+	}
+
+	// reason="cap", not "reset": this re-splits a balance that did not itself move, so it must not
+	// stamp LastResetAt (which the chart's default window and "balance since I chose a baseline"
+	// both anchor to) the way a genuine re-baselining does.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO account_equity_history (mode, equity_usd, delta_usd, reason)
+		VALUES ($1, $2, $3, 'cap')
+	`, mode, ae.EquityUSD, ae.EquityUSD.Sub(previousEquity)); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("record trading cap change for mode %s: %w", mode, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("commit set trading cap: %w", err)
 	}
 	return ae, nil
 }

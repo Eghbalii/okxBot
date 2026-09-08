@@ -230,6 +230,10 @@ export interface AccountEquity {
   InitialUSD: string
   EquityUSD: string
   AccountBalanceUSD: string
+  // Operator-chosen tradable slice of the real balance (real mode only); null when no cap is set,
+  // meaning the whole balance is tradable. The untraded remainder (AccountBalanceUSD - EquityUSD)
+  // is the reserve, derived rather than stored.
+  TradingCapUSD: string | null
   ResetCount: number
   LastResetAt: string | null
   UpdatedAt: string

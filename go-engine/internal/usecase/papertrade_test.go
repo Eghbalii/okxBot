@@ -603,6 +603,28 @@ func (r *fakeRepository) SetAccountCap(ctx context.Context, mode string, newCapU
 	return ae, nil
 }
 
+// SetTradingCap mirrors the real implementation: sets ONLY the cap and the derived equity
+// (clamped to the real balance), never AccountBalanceUSD — a fake that rewrote the balance here
+// would let a test pass against behavior the real repository deliberately forbids in real mode.
+func (r *fakeRepository) SetTradingCap(ctx context.Context, mode string, capUSD decimal.Decimal) (port.AccountEquity, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ae := r.accounts[mode]
+	previous := ae.EquityUSD
+	equity := capUSD
+	if ae.AccountBalanceUSD.LessThan(equity) {
+		equity = ae.AccountBalanceUSD
+	}
+	ae.Mode = mode
+	ae.TradingCapUSD = &capUSD
+	ae.EquityUSD = equity
+	r.accounts[mode] = ae
+	r.equityPoints = append(r.equityPoints, port.EquityPoint{
+		Mode: mode, EquityUSD: equity, DeltaUSD: equity.Sub(previous), Reason: "cap",
+	})
+	return ae, nil
+}
+
 func (r *fakeRepository) ListEquityHistory(ctx context.Context, mode string, since time.Time, limit int) ([]port.EquityPoint, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -2708,5 +2730,81 @@ func TestMonitorOpenOrders_StillTightensAnOverWideStopAfterTheWideningGuard(t *t
 	got := repo.orders[id].SLPx
 	if got == nil || !got.GreaterThan(wide) {
 		t.Errorf("an over-wide stop must still be tightened up from %s, got %v", wide, got)
+	}
+}
+
+// The requested real-mode model (2026-09-08), asserted end to end through the fake repository:
+// two independent numbers — the exchange's total, and the operator-chosen slice traded with —
+// where realized PnL accrues to the slice and the untraded reserve stays put.
+//
+// The operator's own scenario, verbatim: $40 on the exchange, trade with $20; after +$5 profit
+// that reads $25 tradable against $45 total; raising the cap to $30 then takes $5 from the
+// reserve, leaving the total at $45.
+func TestSetTradingCap_PnLAccruesToCapWhileReserveStaysPut(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+		t.Fatalf("seed real account: %v", err)
+	}
+
+	ae, err := repo.SetTradingCap(ctx, "real", dec("20"))
+	if err != nil {
+		t.Fatalf("set trading cap: %v", err)
+	}
+	if !ae.EquityUSD.Equal(dec("20")) {
+		t.Fatalf("tradable equity after cap: want 20, got %s", ae.EquityUSD)
+	}
+	// The whole point of the real-mode split: the exchange's own total is untouched by a cap.
+	if !ae.AccountBalanceUSD.Equal(dec("40")) {
+		t.Fatalf("a cap must not move the real balance: want 40, got %s", ae.AccountBalanceUSD)
+	}
+
+	// +$5 realized on the exchange. The reserve (40-20=20) is what stays constant, so equity
+	// tracks the gain rather than staying pinned at the cap.
+	reserve := ae.AccountBalanceUSD.Sub(ae.EquityUSD)
+	rawBalance := dec("45")
+	wantEquity := rawBalance.Sub(reserve)
+	if !wantEquity.Equal(dec("25")) {
+		t.Fatalf("derivation wrong: want 25 tradable after +5, got %s", wantEquity)
+	}
+
+	// Raising the cap re-splits the SAME total: 5 comes out of the reserve, the total holds at 45.
+	repo.mu.Lock()
+	repo.accounts["real"] = port.AccountEquity{
+		Mode: "real", AccountBalanceUSD: rawBalance, EquityUSD: wantEquity, TradingCapUSD: ae.TradingCapUSD,
+	}
+	repo.mu.Unlock()
+
+	ae2, err := repo.SetTradingCap(ctx, "real", dec("30"))
+	if err != nil {
+		t.Fatalf("raise trading cap: %v", err)
+	}
+	if !ae2.EquityUSD.Equal(dec("30")) {
+		t.Fatalf("tradable equity after raise: want 30, got %s", ae2.EquityUSD)
+	}
+	if !ae2.AccountBalanceUSD.Equal(dec("45")) {
+		t.Fatalf("total must hold at 45 across a cap change, got %s", ae2.AccountBalanceUSD)
+	}
+	if got := ae2.AccountBalanceUSD.Sub(ae2.EquityUSD); !got.Equal(dec("15")) {
+		t.Fatalf("reserve after raising cap 20->30: want 15, got %s", got)
+	}
+}
+
+// A cap above what the account actually holds cannot be honored — sizing against money that isn't
+// there is worse than clamping, and the clamp is what keeps EquityUSD <= AccountBalanceUSD an
+// invariant rather than a hope.
+func TestSetTradingCap_ClampsToRealBalance(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+		t.Fatalf("seed real account: %v", err)
+	}
+
+	ae, err := repo.SetTradingCap(ctx, "real", dec("999"))
+	if err != nil {
+		t.Fatalf("set trading cap: %v", err)
+	}
+	if !ae.EquityUSD.Equal(dec("40")) {
+		t.Fatalf("cap above balance must clamp to the balance: want 40, got %s", ae.EquityUSD)
 	}
 }
