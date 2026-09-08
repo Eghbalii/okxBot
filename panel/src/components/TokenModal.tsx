@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api/client'
 import SortableTh from './SortableTh'
 import { formatUsd, pnlClass, tokenSymbol } from '../utils/format'
-import type { PositionMode, TokenStats } from '../api/types'
+import type { PositionMode, TokenAffordability, TokenStats } from '../api/types'
 
 type SortField = 'token' | 'positions' | 'pnlUsd' | 'pnlPct'
 
@@ -30,6 +30,38 @@ function sortRows(instIds: string[], stats: Record<string, TokenStats>, sortBy: 
 //
 // 2026-09-04: gained a sortable 24h stats table (position count + PnL$/PnL% for trades CLOSED in
 // the last 24h, CLAUDE.md) above the checkboxes, mirroring the Strategies-kind modal's own table.
+// The min-size column, plus the tag explaining WHY a token is off (2026-09-08 request).
+//
+// The distinction the tag draws is the useful one: a token that is disabled AND cannot afford one
+// lot was taken offline by the affordability service, and will come back on its own once the
+// account grows. A token disabled while perfectly affordable was turned off by a person, and will
+// stay off until a person turns it back on. Without the tag those two look identical.
+function MinSizeCell({ a }: { a: TokenAffordability | undefined }) {
+  if (!a) return <span className="text-dim">—</span>
+  if (a.unknown) {
+    return (
+      <span className="text-dim" title="Instrument or price could not be read, so no judgement was made. Such a token is never auto-disabled.">
+        unknown
+      </span>
+    )
+  }
+  const min = Number(a.minNotionalUsd)
+  const budget = Number(a.budgetUsd)
+  return (
+    <span title={`Minimum $${min.toFixed(4)} vs. a per-token budget of $${budget.toFixed(2)}`}>
+      <span className={a.affordable ? '' : 'text-red'}>${min.toFixed(min < 1 ? 4 : 2)}</span>
+      {a.autoDisabled && (
+        <span
+          className="badge badge-yellow token-auto-tag"
+          title="Disabled automatically: the account cannot fund one minimum lot of this instrument once it counts toward the per-token split. It comes back on its own as the account grows."
+        >
+          auto
+        </span>
+      )}
+    </span>
+  )
+}
+
 export default function TokenModal({
   mode,
   allInstIds,
@@ -46,6 +78,10 @@ export default function TokenModal({
   const [disabled, setDisabled] = useState<Set<string>>(new Set(disabledInstIds))
   const [stats, setStats] = useState<Record<string, TokenStats>>({})
   const [statsLoading, setStatsLoading] = useState(true)
+  // Per-token affordability: the exchange's smallest acceptable position against the current
+  // per-token budget (2026-09-08). Real mode only — paper has no exchange minimums, so the
+  // endpoint returns an empty list there and the column simply stays blank.
+  const [afford, setAfford] = useState<Record<string, TokenAffordability>>({})
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [sortBy, setSortBy] = useState<SortField>('token')
@@ -58,6 +94,12 @@ export default function TokenModal({
       .then((rows) => setStats(Object.fromEntries(rows.map((r) => [r.instId, r]))))
       .catch((err) => setError((err as Error).message))
       .finally(() => setStatsLoading(false))
+    // Affordability is fetched separately and failures are ignored: it is supporting information,
+    // and losing it must not block the token list itself from rendering.
+    api
+      .tokenAffordability(mode)
+      .then((rows) => setAfford(Object.fromEntries(rows.map((r) => [r.instId, r]))))
+      .catch(() => setAfford({}))
   }, [mode])
 
   function toggleSort(field: SortField) {
@@ -131,6 +173,9 @@ export default function TokenModal({
                   <SortableTh field="pnlPct" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
                     PnL % (24h)
                   </SortableTh>
+                  <th className="th-static" title="The exchange's smallest acceptable position for this instrument (contract value x price x min size), against the current per-token budget">
+                    Min size
+                  </th>
                   <th className="th-static">Active</th>
                 </tr>
               </thead>
@@ -148,6 +193,9 @@ export default function TokenModal({
                       </td>
                       <td className={'mono ' + pnlClass(s ? Number(s.pnlPct) : null)}>
                         {statsLoading ? '…' : `${Number(s?.pnlPct ?? 0).toFixed(2)}%`}
+                      </td>
+                      <td className="mono">
+                        <MinSizeCell a={afford[instId]} />
                       </td>
                       <td>
                         <label className="checkbox-row" style={{ margin: 0 }}>

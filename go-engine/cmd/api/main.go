@@ -16,9 +16,11 @@ import (
 
 	"github.com/eghbalii/okxBot/go-engine/internal/api"
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
+	"github.com/eghbalii/okxBot/go-engine/internal/gatewayclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )
 
 // tickEvent mirrors usecase.tickEvent's decode of the raw OKX tickers payload (CLAUDE.md §12) —
@@ -76,9 +78,21 @@ func main() {
 		TesterBaseURL:      cfg.Tester.URL,
 		PaperTraderBaseURL: cfg.PaperTrading.URL,
 		TraderBaseURL:      cfg.Trading.URL,
-		ProcessMgr:         cfg.API.ProcessMgr,
-		Units:              cfg.API.Units,
-		Logger:             logger,
+		// Read-only: Report never changes the roster, so opening the Manage Tokens modal cannot
+		// enable or disable anything. cmd/trader owns the acting half (AffordabilityService.Run).
+		Affordability: &usecase.AffordabilityService{
+			Repo:           repo,
+			Exchange:       gatewayclient.New(cfg.Gateway.URL, "api"),
+			Logger:         logger,
+			Mode:           "real",
+			AllTokens:      cfg.Trading.InstIDs,
+			SymbolMap:      cfg.Trading.SymbolMap,
+			ExecInstType:   cfg.Trading.ExecInstType,
+			MaxPositionPct: cfg.Account.MaxPositionPct,
+		},
+		ProcessMgr: cfg.API.ProcessMgr,
+		Units:      cfg.API.Units,
+		Logger:     logger,
 		// Must match what the trading services seed their account row with (CLAUDE.md §15.6) —
 		// both read through GetAccountEquity, so a different value here would seed a balance the
 		// engine never actually traded against.

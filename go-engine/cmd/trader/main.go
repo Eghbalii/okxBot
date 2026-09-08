@@ -366,6 +366,32 @@ func runRealTrader(
 		}()
 	}
 
+	// Keeps the active roster in step with what the account can actually afford (2026-09-08
+	// request): the per-token budget is equity/tokenCount, so profit can make a previously
+	// untradeable token affordable and losses can push one out. Runs in-process rather than as a
+	// cron job or separate service — it needs the same repository, exchange client, symbol map and
+	// caps this binary already has wired, and a separate deployment would duplicate all of it to
+	// no benefit.
+	//
+	// A failure here is logged, never fatal: an unchanged roster is a safe state, and taking the
+	// trading loop down because an affordability check could not read a price would be far worse
+	// than leaving the roster as it is.
+	affordability := &usecase.AffordabilityService{
+		Repo:           repo,
+		Exchange:       exchangeClient,
+		Logger:         logger,
+		Mode:           "real",
+		AllTokens:      cfg.Trading.InstIDs,
+		SymbolMap:      cfg.Trading.SymbolMap,
+		ExecInstType:   cfg.Trading.ExecInstType,
+		MaxPositionPct: cfg.Account.MaxPositionPct,
+	}
+	go func() {
+		if err := affordability.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Warn("affordability service stopped", "error", err)
+		}
+	}()
+
 	go func() { errCh <- tickDispatcher.Run(ctx) }()
 	for _, d := range candleDispatchers {
 		d := d

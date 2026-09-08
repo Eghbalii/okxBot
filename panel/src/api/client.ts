@@ -12,6 +12,7 @@ import type {
   StrategyAssignment,
   StrategyConfig,
   StrategyStats,
+  TokenAffordability,
   TokenStats,
   TesterConfig,
   TesterVersion,
@@ -202,6 +203,10 @@ export const api = {
   // "Manage tokens" modal's per-token 24h stats table (2026-09-04 request) — paper-trading only,
   // no mode param (TokenStats24h has no real-trading equivalent yet).
   tokenStats24h: (mode: PositionMode) => requestList<TokenStats>(`/paper-trading/token-stats?mode=${mode}`),
+  // Per-token exchange minimums vs. the current per-token budget, for the Manage Tokens modal's
+  // min-size column and auto-disabled tag (2026-09-08). Empty in paper mode by design.
+  tokenAffordability: (mode: PositionMode) =>
+    requestList<TokenAffordability>(`/paper-trading/affordability?mode=${mode}`),
   // Go's null-array-column columns (activeKinds/disabledInstIds/activeBars) marshal as JSON null,
   // not [] — normalized here the same way requestList does for list endpoints, so PaperTradingConfig
   // consumers can always call .length/.map on these fields without a crash (found live: an

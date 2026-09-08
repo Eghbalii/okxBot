@@ -401,6 +401,23 @@ func (e *RealTrader) evenShareOfAccount() decimal.Decimal {
 	return decimal.NewFromInt(1).Div(decimal.NewFromInt(int64(count)))
 }
 
+// tighterPct returns the smaller of two position-size ceilings, ignoring either that is unset
+// (non-positive). Used so the even-share budget and account.max_position_pct compose as two
+// independent bounds rather than one replacing the other: a safety cap must only ever be able to
+// tighten, never to loosen (the same rule §19.3 applies to the SL-distance bounds).
+func tighterPct(a, b decimal.Decimal) decimal.Decimal {
+	switch {
+	case !a.IsPositive():
+		return b
+	case !b.IsPositive():
+		return a
+	case a.LessThan(b):
+		return a
+	default:
+		return b
+	}
+}
+
 func (e *RealTrader) accountMode() string {
 	if e.Mode == "" {
 		return "real"
@@ -654,7 +671,24 @@ func (e *RealTrader) openReal(
 		return nil, nil
 	}
 
-	cfg := sizingConfig{InstID: e.InstID, MaxLeverage: e.MaxLeverage, MaxPositionPct: e.MaxPositionPct, MaxTotalExposurePct: e.MaxTotalExposurePct}
+	// The per-position ceiling is the even share of the account across the active roster
+	// (equity/tokenCount), NOT account.max_position_pct alone (2026-09-08 request): splitting the
+	// budget evenly is what keeps one token from consuming several tokens' worth of risk, which a
+	// flat 25% ceiling on a 10-token roster does not — it would let four positions commit the
+	// entire account.
+	//
+	// Whichever is TIGHTER wins, so account.max_position_pct keeps working as the hard backstop it
+	// was written to be (§15.6) and can only ever make the budget smaller, never larger. On a
+	// roster of 1-3 tokens the even share is the looser of the two and the config cap binds; from
+	// 4 tokens up the even share binds. This also makes the ceiling the model is TOLD about
+	// (buildObservation's MaxPositionPct, already the even share) the same number it is actually
+	// held to — before this they disagreed, advising 1/10 while permitting 1/4.
+	cfg := sizingConfig{
+		InstID:              e.InstID,
+		MaxLeverage:         e.MaxLeverage,
+		MaxPositionPct:      tighterPct(e.evenShareOfAccount(), e.MaxPositionPct),
+		MaxTotalExposurePct: e.MaxTotalExposurePct,
+	}
 	openOrdersView := make([]port.PaperOrder, len(openOrders))
 	for i, o := range openOrders {
 		openOrdersView[i] = asPaperOrderView(o)

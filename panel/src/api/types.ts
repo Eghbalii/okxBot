@@ -288,3 +288,26 @@ export interface EquityPoint {
   InstID: string
   CreatedAt: string
 }
+
+// One row of GET /api/paper-trading/affordability — the Manage Tokens modal's min-size column and
+// its auto-disabled tag (2026-09-08). Real mode only: paper has no exchange minimums, so the
+// endpoint returns an empty list there.
+export interface TokenAffordability {
+  instId: string
+  // The exchange's smallest acceptable position: contract value x price x min size. This is what
+  // makes a token untradeable on a small account.
+  minNotionalUsd: string
+  // The per-token budget it was judged against (equity / active token count, bounded by
+  // max_position_pct) — the same figure sizing uses.
+  budgetUsd: string
+  // Affordable at the CURRENT budget. A disabled token can read true and still be correctly
+  // disabled, because that budget exists only because it is excluded — read autoDisabled for
+  // "why is this off".
+  affordable: boolean
+  // The affordability rule is what turned this token off, as opposed to an operator.
+  autoDisabled: boolean
+  disabled: boolean
+  // The instrument or price could not be read, so no judgement was made. Such a token is never
+  // auto-disabled: a transient API failure must not take a tradeable token offline.
+  unknown: boolean
+}

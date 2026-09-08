@@ -756,3 +756,10 @@ th.sorted {
   color: var(--text-dim);
   margin-left: 0.15rem;
 }
+
+/* The "auto" tag next to a token disabled by the affordability service, distinguishing it from one
+   an operator turned off by hand. */
+.token-auto-tag {
+  margin-left: 0.4rem;
+  font-size: 0.65rem;
+}
