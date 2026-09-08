@@ -666,7 +666,16 @@ th.sorted {
 
 .balance-chart-svg {
   width: 100%;
-  height: 180px;
+  /* Height comes from the viewBox's own aspect ratio now that preserveAspectRatio is no longer
+     "none" — pinning a CSS height as well would letterbox the drawing inside it instead of
+     enlarging it. */
+  height: auto;
+  /* On a very wide screen the 1200x340 viewBox would otherwise scale past a comfortable reading
+     height (~400px at 1400px wide, growing from there), so the drawing's WIDTH is capped and the
+     height follows from the aspect ratio. Capping max-height instead would letterbox — with
+     preserveAspectRatio at its default the drawing shrinks to fit the shorter box rather than
+     simply stopping, leaving empty bands on both sides. */
+  max-width: 1340px;
   display: block;
 }
 

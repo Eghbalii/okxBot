@@ -14,8 +14,8 @@ import type { EquityPoint, PositionMode } from '../api/types'
 // operator cap change). A reset inside the window is drawn as a marker so a jump is explained
 // rather than looking like a data glitch.
 
-const HEIGHT = 180
-const PAD = { top: 12, right: 12, bottom: 22, left: 52 }
+const HEIGHT = 340
+const PAD = { top: 14, right: 14, bottom: 28, left: 58 }
 
 type Range = 'day' | 'week' | 'month' | 'year'
 
@@ -24,11 +24,15 @@ const RANGES: Range[] = ['day', 'week', 'month', 'year']
 
 // One history row is written per balance change, i.e. per closed trade — measured at ~200/day on
 // the live paper account, so a year window is tens of thousands of rows. That is a wasteful
-// payload and an unreadable SVG path (far more points than the chart has horizontal pixels), so
-// the series is thinned to a fixed budget before drawing. Thinning happens AFTER the balance walk
-// so dropped rows still contribute their delta — only the drawn resolution is reduced, never the
-// arithmetic.
-const MAX_PLOT_POINTS = 400
+// payload and an unreadable SVG path, so the series is thinned to a fixed budget before drawing.
+// Thinning happens AFTER the balance walk so dropped rows still contribute their delta — only the
+// drawn resolution is reduced, never the arithmetic.
+//
+// The budget is set a little above the viewBox's own plot width (~1080px at 1200 wide) so a dense
+// window still resolves to roughly one point per horizontal pixel: past that, extra points land on
+// pixels already drawn and only cost payload. Raised from 400, which visibly flattened real detail
+// on the month/year windows.
+const MAX_PLOT_POINTS = 1200
 
 // Keeps at most `budget` evenly-spaced entries, always including the first and last so the
 // window's own endpoints are never invented by the thinning.
@@ -39,6 +43,11 @@ function thin<T>(values: T[], budget: number): T[] {
   for (let i = 0; i < budget; i++) out.push(values[Math.round(i * stride)])
   return out
 }
+
+// How many labelled ticks the time axis gets per range. A day of HH:MM labels packs in far
+// tighter than a year of "02 Sep" dates, so this is per-range rather than one fixed count — the
+// previous flat 5 left the wider windows looking coarse.
+const RANGE_TICKS: Record<Range, number> = { day: 13, week: 8, month: 11, year: 13 }
 
 // A "day"/"week" window wants time of day; a "month"/"year" window wants the date.
 function tickLabel(ms: number, range: Range): string {
@@ -202,7 +211,7 @@ interface Series {
 // Plot renders at a fixed viewBox width and scales to its container, so the chart is responsive
 // without needing a resize observer.
 function Plot({ series, range }: { series: Series; range: Range }) {
-  const WIDTH = 900
+  const WIDTH = 1200
   const plotW = WIDTH - PAD.left - PAD.right
   const plotH = HEIGHT - PAD.top - PAD.bottom
   const { times, equities, balances, minV, maxV, minT, maxT } = series
@@ -213,12 +222,19 @@ function Plot({ series, range }: { series: Series; range: Range }) {
   const pathFor = (vals: number[]) =>
     vals.map((v, i) => `${i === 0 ? 'M' : 'L'} ${xf(times[i]).toFixed(1)} ${yf(v).toFixed(1)}`).join(' ')
 
-  // Five evenly spaced x ticks across the window, and min/mid/max on y.
-  const xTicks = Array.from({ length: 5 }, (_, i) => minT + ((maxT - minT) * i) / 4)
-  const yTicks = [minV, (minV + maxV) / 2, maxV]
+  const nx = RANGE_TICKS[range]
+  const xTicks = Array.from({ length: nx }, (_, i) => minT + ((maxT - minT) * i) / (nx - 1))
+  // Five horizontal gridlines rather than three — with the taller plot, min/mid/max alone left
+  // most of the vertical space unreferenced, so reading a value off the line meant eyeballing it.
+  const yTicks = Array.from({ length: 5 }, (_, i) => minV + ((maxV - minV) * i) / 4)
 
+  // preserveAspectRatio is deliberately left at its default ("meet") rather than "none": with
+  // "none" the viewBox is stretched independently on each axis to fill the container, which
+  // thickens vertical strokes relative to horizontal ones and makes text lean — the main reason
+  // the first version read as blurry rather than crisp. Letting it scale uniformly keeps strokes
+  // and glyphs true at any container width.
   return (
-    <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className="balance-chart-svg" preserveAspectRatio="none">
+    <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className="balance-chart-svg">
       {yTicks.map((v) => (
         <g key={v}>
           <line
@@ -234,10 +250,28 @@ function Plot({ series, range }: { series: Series; range: Range }) {
           </text>
         </g>
       ))}
-      {xTicks.map((t) => (
-        <text key={t} x={xf(t)} y={HEIGHT - 6} className="chart-axis-label" textAnchor="middle">
-          {tickLabel(t, range)}
-        </text>
+      {xTicks.map((t, i) => (
+        <g key={t}>
+          <line
+            x1={xf(t)}
+            y1={PAD.top}
+            x2={xf(t)}
+            y2={HEIGHT - PAD.bottom}
+            stroke="var(--border, #2a2a2a)"
+            strokeWidth={1}
+            opacity={0.45}
+          />
+          <text
+            x={xf(t)}
+            y={HEIGHT - 8}
+            className="chart-axis-label"
+            // The end labels would otherwise overhang the plot on both sides once the tick count
+            // goes up, so they anchor inward instead of centring.
+            textAnchor={i === 0 ? 'start' : i === xTicks.length - 1 ? 'end' : 'middle'}
+          >
+            {tickLabel(t, range)}
+          </text>
+        </g>
       ))}
       <path d={pathFor(balances)} fill="none" stroke="var(--chart-balance, #9d7bff)" strokeWidth={1.5} />
       <path d={pathFor(equities)} fill="none" stroke="var(--chart-equity, #4ea1ff)" strokeWidth={1.8} />
