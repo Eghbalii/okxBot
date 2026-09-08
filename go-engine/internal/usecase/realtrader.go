@@ -997,6 +997,24 @@ func (e *RealTrader) closeEarly(ctx context.Context, o port.RealOrder, price dec
 // monitorOpenPositions is RealTrader's SL/TP-touch and timeout check — the SAME in-process
 // tick-driven mechanism PaperTrader.monitorOpenOrders already uses (CLAUDE.md §27.3's correction:
 // no OKX conditional/algo order, this process watches its own open positions on every tick).
+// trackPnLExtremes advances an open real position's peak/trough unrealized PnL, mirroring
+// PaperTrader.trackPnLExtremes exactly (CLAUDE.md §15.11) against real_orders instead of
+// paper_orders. Only writes when a new extreme is actually reached, so a position sitting still
+// does not generate a database write on every tick.
+//
+// The distinction these columns carry is real training signal as well as display: a trade that
+// reached 90% of its target and gave it all back is a completely different lesson from one that
+// drifted sideways, and current PnL alone cannot tell them apart.
+func (e *RealTrader) trackPnLExtremes(ctx context.Context, o port.RealOrder, price decimal.Decimal, logger *slog.Logger) {
+	upl := unrealizedPnLPct(asPaperOrderView(o), price)
+	if !upl.GreaterThan(o.PnLMaxPct) && !upl.LessThan(o.PnLMinPct) {
+		return
+	}
+	if err := e.Repo.UpdateRealOrderPnLExtremes(ctx, o.ID, upl, upl); err != nil {
+		logger.Warn("failed to update real pnl extremes", "instId", e.InstID, "orderId", o.ID, "error", err)
+	}
+}
+
 func (e *RealTrader) monitorOpenPositions(ctx context.Context, price decimal.Decimal, logger *slog.Logger) error {
 	open, err := e.openPositions(ctx)
 	if err != nil {
@@ -1005,6 +1023,16 @@ func (e *RealTrader) monitorOpenPositions(ctx context.Context, price decimal.Dec
 
 	now := time.Now()
 	for _, o := range open {
+		// Track how far this position has travelled in each direction BEFORE checking for a close,
+		// mirroring PaperTrader.monitorOpenOrders (CLAUDE.md §15.11): a trade that ran deep into
+		// profit and round-tripped must still show that peak even on the tick that closes it.
+		// Best-effort — this is model input and panel display, never a reason to block a close.
+		//
+		// Missing entirely until 2026-09-08: UpdateRealOrderPnLExtremes was implemented in
+		// internal/postgres and declared on the port, but nothing ever called it, so the panel's
+		// Max/Min columns sat at 0 for every real position no matter how far it moved.
+		e.trackPnLExtremes(ctx, o, price, logger)
+
 		// A manual close request from the panel wins over everything else, same priority order as
 		// PaperTrader.monitorOpenOrders (CLAUDE.md real-trading readiness plan, 2026-09-04 — Close
 		// button wiring): the operator explicitly asked to exit right now, checked before a

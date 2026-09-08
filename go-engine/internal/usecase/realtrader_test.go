@@ -842,3 +842,51 @@ func TestOpenReal_NoTargetAnywhereStillGetsOneFromStopDistance(t *testing.T) {
 		t.Fatalf("a long's derived target must sit above entry, got tp=%s entry=%s", open[0].TPPx, open[0].EntryPx)
 	}
 }
+
+// The panel's Max/Min columns read pnl_max_pct/pnl_min_pct, which sat at 0 for every real position
+// no matter how far it moved: UpdateRealOrderPnLExtremes was implemented in internal/postgres and
+// declared on the port, but RealTrader never called it — PaperTrader has trackPnLExtremes,
+// RealTrader had no counterpart (found 2026-09-08).
+func TestMonitorOpenPositions_TracksPnLExtremes(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	// A long at 100 with levels far enough out that no tick below closes it.
+	sl, tp := dec("50"), dec("200")
+	orderID, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open real order: %v", err)
+	}
+
+	// Runs to 110 (+10% at 1x), then back down to 95 (-5%).
+	for _, px := range []string{"110", "95"} {
+		if err := rt.monitorOpenPositions(ctx, dec(px), testLogger()); err != nil {
+			t.Fatalf("monitorOpenPositions at %s: %v", px, err)
+		}
+	}
+
+	open, err := rt.openPositions(ctx)
+	if err != nil {
+		t.Fatalf("openPositions: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("expected the position to still be open, got %d", len(open))
+	}
+	got := open[0]
+	if got.ID != orderID {
+		t.Fatalf("unexpected order id %d", got.ID)
+	}
+	// The peak must survive the later move against it — that a trade reached +10% and gave it back
+	// is precisely the distinction these columns exist to record.
+	if !got.PnLMaxPct.Equal(dec("0.1")) {
+		t.Errorf("PnLMaxPct: want 0.1 (the peak, not the latest), got %s", got.PnLMaxPct)
+	}
+	if !got.PnLMinPct.Equal(dec("-0.05")) {
+		t.Errorf("PnLMinPct: want -0.05, got %s", got.PnLMinPct)
+	}
+}
