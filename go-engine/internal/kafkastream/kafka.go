@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+
+	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 )
 
 // Publisher publishes JSON-encoded events to a Kafka topic, keyed for per-key ordering (e.g. by
@@ -87,21 +89,65 @@ type Consumer struct {
 	// via NewConsumer; this exists purely so the retry tests don't have to wait through real
 	// multi-second backoffs to prove the retry COUNT/behavior is correct.
 	initialBackoff time.Duration
+
+	// MaxMessageAge drops messages older than this before they reach handler (see Run). Zero
+	// disables the check. Set by NewConsumer to defaultMaxMessageAge; overridable for a consumer
+	// that legitimately wants to process history.
+	MaxMessageAge time.Duration
+	// lastStaleLog rate-limits the stale-drop warning to one per second. Only touched from Run's
+	// single goroutine, so it needs no synchronisation.
+	lastStaleLog time.Time
+}
+
+// defaultMaxMessageAge bounds how old a message may be and still be acted on. Market data's value
+// is entirely in being current: this bus carries ticks and candle updates that drive live trading
+// decisions, so a message from minutes ago is wrong rather than merely late. Two minutes is well
+// clear of any normal processing lag (this pipeline runs at sub-second latency) while still
+// catching the failure that motivated it — a consumer resuming from a far-behind committed offset
+// after a broker restart, replaying hours of ticks into live decision code.
+const defaultMaxMessageAge = 2 * time.Minute
+
+// isStale reports whether a message published at msgTime is too old to act on. A zero time (a
+// broker that did not stamp one) is never stale: refusing to process unstamped messages would
+// silently halt the pipeline, which is far worse than the staleness this guards against.
+func (c *Consumer) isStale(msgTime time.Time) bool {
+	if c.MaxMessageAge <= 0 || msgTime.IsZero() {
+		return false
+	}
+	return time.Since(msgTime) > c.MaxMessageAge
 }
 
 // NewConsumer creates a Consumer for the given brokers, topic, and consumer group. GroupID alone
 // (no per-instrument consumer identity) is enough — kafka-go assigns this reader whichever
 // partitions the group owns; callers that need to route by instrument do so inside handler, from
 // the decoded message, same as before.
+//
+// StartOffset is LastOffset, NOT kafka-go's FirstOffset default. It applies ONLY when the group
+// has no committed offset for a partition — a group that has run before always resumes exactly
+// where it committed, so this can never skip a message an existing consumer had not yet processed.
+//
+// Why it matters (found 2026-09-08, on real money): a brand-new group otherwise replays the whole
+// retained backlog — 24h of ticks under this project's retention. Every replayed tick is fed to
+// live decision code as if it were current, so a real position was closed as a take-profit against
+// a price from three hours earlier, at a level the market had not traded at since (real order 3:
+// SOL short, TP 102.015, closed at 102 from a 13:40 tick when the market was at 103.9 and its
+// session low was 103.86). Stale market data driving a live trading decision is the failure this
+// prevents; a fresh consumer wants the CURRENT state of the world, never a recording of a past one.
+//
+// Candle topics get the same treatment, which is safe for the same reason: PaperTrader/RealTrader
+// seed their candle windows from Postgres at startup (CLAUDE.md §14), so history comes from the
+// database rather than from replaying the bus.
 func NewConsumer(brokers []string, topic, group string) *Consumer {
 	return &Consumer{
 		reader: kafka.NewReader(kafka.ReaderConfig{
-			Brokers: brokers,
-			Topic:   topic,
-			GroupID: group,
+			Brokers:     brokers,
+			Topic:       topic,
+			GroupID:     group,
+			StartOffset: kafka.LastOffset,
 		}),
-		Topic: topic,
-		Group: group,
+		Topic:         topic,
+		Group:         group,
+		MaxMessageAge: defaultMaxMessageAge,
 	}
 }
 
@@ -173,7 +219,26 @@ func (c *Consumer) Run(ctx context.Context, handler func(ctx context.Context, da
 		}
 		backoff = initialBackoff // reset after any successful fetch, so one blip doesn't keep the next unrelated one waiting longer than necessary
 
-		if err := handler(ctx, msg.Value); err != nil {
+		// Defence in depth behind StartOffset (see NewConsumer): drop a message old enough that
+		// acting on it would be acting on a price the market has long since left behind. This
+		// catches the case StartOffset cannot — a group with an ALREADY-committed but far-behind
+		// offset, e.g. after the broker itself restarts and a consumer resumes from a stale commit.
+		//
+		// Skipped messages are still committed below, so the reader advances through a backlog
+		// rather than stalling on it. Dropping is the correct action rather than processing late:
+		// this bus carries market prices, whose entire value is being current — a tick from hours
+		// ago is not "late data" to catch up on, it is wrong data (real order 3 was closed as a
+		// take-profit against a 3-hour-old price at a level the market had not traded at since).
+		if c.isStale(msg.Time) {
+			metrics.KafkaStaleMessagesTotal.WithLabelValues(c.Topic, c.Group).Inc()
+			// Logged at most once per second: draining a backlog drops thousands of messages, and
+			// a line each would bury everything else in the log.
+			if time.Since(c.lastStaleLog) > time.Second {
+				c.lastStaleLog = time.Now()
+				slog.Default().Warn("dropping stale kafka message", "topic", c.Topic, "group", c.Group,
+					"age", time.Since(msg.Time).Round(time.Second), "max", c.MaxMessageAge)
+			}
+		} else if err := handler(ctx, msg.Value); err != nil {
 			_ = err // handler is responsible for its own logging
 		}
 

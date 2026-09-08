@@ -40,6 +40,16 @@ var (
 		Help: "Cumulative realized PnL (USD) from closed paper orders, by instrument.",
 	}, []string{"inst_id"})
 
+	// KafkaStaleMessagesTotal counts messages dropped for being older than the consumer's
+	// MaxMessageAge (internal/kafkastream). A nonzero, GROWING value means a consumer is working
+	// through a backlog of market data too old to act on — normal and self-clearing right after a
+	// broker restart or a fresh consumer group, but a sustained rate means a consumer is genuinely
+	// falling behind and its instrument's decisions are being made on stale prices.
+	KafkaStaleMessagesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_kafka_stale_messages_total",
+		Help: "Kafka messages dropped for exceeding the consumer's max message age, by topic and group.",
+	}, []string{"topic", "group"})
+
 	// IngestorEventsTotal counts ticks/candles received from OKX WS, by kind (tick/candle).
 	IngestorEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "okxbot_ingestor_events_total",

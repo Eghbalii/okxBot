@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,6 +33,11 @@ type fetchResult struct {
 }
 
 func (f *fakeReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
+	// Honour cancellation the way a real reader does — without this, a test whose Run loop is
+	// bounded by a context deadline spins on the repeated last message instead of returning.
+	if err := ctx.Err(); err != nil {
+		return kafka.Message{}, err
+	}
 	i := int(atomic.AddInt32(&f.fetchCalls, 1)) - 1
 	if i >= len(f.fetchResults) {
 		i = len(f.fetchResults) - 1
@@ -289,5 +295,76 @@ func TestRun_StopsOnReaderClosed(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("Run did not stop on io.EOF — it retried a closed reader forever")
+	}
+}
+
+// Real order 3 (SOL short, 2026-09-08) was closed as a take-profit at 102 — a price the market had
+// traded at three hours earlier and nowhere near since (its session low was 103.86). Cause: a
+// consumer replaying the retained backlog fed hours-old ticks into live decision code, which read
+// them as the current price. Market data's whole value is being current, so an old tick is wrong
+// data, not late data.
+func TestRun_DropsStaleMessagesWithoutCallingHandler(t *testing.T) {
+	fresh := kafka.Message{Value: []byte(`{"instId":"SOL","last":"103.90"}`), Time: time.Now()}
+	stale := kafka.Message{Value: []byte(`{"instId":"SOL","last":"102.00"}`), Time: time.Now().Add(-3 * time.Hour)}
+
+	r := &fakeReader{fetchResults: []fetchResult{{msg: stale}, {msg: fresh}}}
+	c := &Consumer{reader: r, Topic: "okx.tickers", Group: "trader", MaxMessageAge: 2 * time.Minute}
+
+	// The fake repeats its last message once exhausted, so bound the run by time rather than by
+	// cancelling from inside the handler: the point under test is which messages reach the handler
+	// at all, and the stale one is fetched first.
+	var mu sync.Mutex
+	var seen [][]byte
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	_ = c.Run(ctx, func(_ context.Context, v []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(seen) == 0 {
+			seen = append(seen, v)
+		}
+		return nil
+	})
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(seen) != 1 {
+		t.Fatalf("expected only the fresh message to reach the handler, got %d: %s", len(seen), seen)
+	}
+	if string(seen[0]) != string(fresh.Value) {
+		t.Fatalf("wrong message delivered: %s", seen[0])
+	}
+	// The stale message must still be COMMITTED, or the reader would stall on a backlog forever
+	// instead of draining through it.
+	if got := atomic.LoadInt32(&r.commitCalls); got < 2 {
+		t.Fatalf("expected the stale message to be committed too (skipped, not stalled on), got %d commits", got)
+	}
+}
+
+func TestIsStale(t *testing.T) {
+	c := &Consumer{MaxMessageAge: time.Minute}
+	if c.isStale(time.Now()) {
+		t.Error("a just-published message must not be stale")
+	}
+	if !c.isStale(time.Now().Add(-2 * time.Minute)) {
+		t.Error("a 2-minute-old message must be stale at a 1-minute bound")
+	}
+	// A broker that stamps no time must never stall the pipeline.
+	if c.isStale(time.Time{}) {
+		t.Error("an unstamped message must not be treated as stale")
+	}
+	if (&Consumer{}).isStale(time.Now().Add(-999 * time.Hour)) {
+		t.Error("a zero MaxMessageAge disables the check entirely")
+	}
+}
+
+// A fresh consumer group must start at the END of the topic, not replay the retained backlog.
+func TestNewConsumer_StartsAtLastOffset(t *testing.T) {
+	c := NewConsumer([]string{"localhost:9092"}, "okx.tickers", "trader")
+	if got := c.reader.(*kafka.Reader).Config().StartOffset; got != kafka.LastOffset {
+		t.Fatalf("StartOffset: want LastOffset (%d) so a new group does not replay history, got %d", kafka.LastOffset, got)
+	}
+	if c.MaxMessageAge != defaultMaxMessageAge {
+		t.Fatalf("MaxMessageAge: want the default %v, got %v", defaultMaxMessageAge, c.MaxMessageAge)
 	}
 }
