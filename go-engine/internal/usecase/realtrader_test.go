@@ -890,3 +890,59 @@ func TestMonitorOpenPositions_TracksPnLExtremes(t *testing.T) {
 		t.Errorf("PnLMinPct: want -0.05, got %s", got.PnLMinPct)
 	}
 }
+
+// Real mode must NOT apply a closed trade's PnL to the stored balance: the exchange's own reported
+// balance is ground truth and already reflects it, and the reconciliation poll's
+// RecordExchangeBalance is what records that change. Doing both counts the same profit or loss
+// twice against a real account.
+//
+// This was previously "correct" only by accident — closeRealWith did call ApplyRealizedPnL, but it
+// always failed on a foreign key real order ids cannot satisfy, and the error was swallowed. This
+// test makes the behavior intentional so dropping that constraint (migration 000026) cannot
+// silently reintroduce the double-count.
+func TestCloseReal_DoesNotApplyRealizedPnLToTheAccount(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt.AccountInitialUSD = dec("40")
+
+	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	sl, tp := dec("90"), dec("110")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open real order: %v", err)
+	}
+	o, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get real order: %v", err)
+	}
+
+	before, err := repo.GetAccountEquity(ctx, "real", dec("40"))
+	if err != nil {
+		t.Fatalf("read account: %v", err)
+	}
+
+	if err := rt.closeReal(ctx, o, dec("110"), "tp", testLogger()); err != nil {
+		t.Fatalf("closeReal: %v", err)
+	}
+
+	after, err := repo.GetAccountEquity(ctx, "real", dec("40"))
+	if err != nil {
+		t.Fatalf("read account: %v", err)
+	}
+	if !after.EquityUSD.Equal(before.EquityUSD) {
+		t.Fatalf("closing a real position must not move the stored balance (the exchange balance already "+
+			"reflects it; RecordExchangeBalance observes that): was %s, now %s", before.EquityUSD, after.EquityUSD)
+	}
+	if !after.AccountBalanceUSD.Equal(before.AccountBalanceUSD) {
+		t.Fatalf("closing a real position must not move AccountBalanceUSD: was %s, now %s",
+			before.AccountBalanceUSD, after.AccountBalanceUSD)
+	}
+}

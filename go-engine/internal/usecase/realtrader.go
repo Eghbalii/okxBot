@@ -1125,12 +1125,19 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 	e.conductor().Forget(o.ID)
 	e.reportTerminalReal(ctx, o, price, pnl, reason, logger)
 
-	if e.AccountInitialUSD.IsPositive() {
-		orderID := o.ID
-		if _, _, err := e.Repo.ApplyRealizedPnL(ctx, e.accountMode(), pnl, &orderID, e.InstID); err != nil {
-			logger.Error("failed to apply realized pnl to account", "instId", e.InstID, "error", err)
-		}
-	}
+	// NOTE: no ApplyRealizedPnL here, deliberately (2026-09-08). In real mode the exchange's own
+	// reported balance is ground truth and already reflects this trade's PnL the moment it closes;
+	// the reconciliation poll's RecordExchangeBalance observes that change and records it as a
+	// reason="trade" history point. Adding pnl to the stored balance here as well would count the
+	// same profit or loss TWICE against a real account.
+	//
+	// This call used to exist and always failed, on a foreign key from account_equity_history
+	// .order_id to paper_orders(id) that real order ids can never satisfy (migration 000019 moved
+	// real orders to their own table). The failure was logged and swallowed, so the double-count it
+	// would otherwise have produced never actually happened — the constraint was accidentally
+	// holding the account correct. Removing the call is what makes that correctness intentional
+	// rather than a side effect of a broken write, and migration 000026 then drops the now-pointless
+	// constraint so the audit log can carry a real order_id at all.
 	return nil
 }
 
