@@ -999,11 +999,23 @@ func (e *RealTrader) applyRealAdjustment(ctx context.Context, o port.RealOrder, 
 	logger.Info("real sl/tp adjustment applied", "instId", e.InstID, "orderId", o.ID, "newSL", newSL, "newTP", newTP)
 }
 
-// closeEarly closes a real position at market because the model asked to (CLAUDE.md §15.12). Same
-// RLEarlyClose gate as PaperTrader's equivalent — the one lifecycle action that destroys the
-// counterfactual.
+// closeEarly closes a real position at market because the model asked to (CLAUDE.md §15.12), gated
+// on RLEarlyClose — the one lifecycle action that destroys the counterfactual, and on a real
+// account one that also spends a real fee to do it.
+//
+// For real trading that gate is trading.allow_rl_early_close, its OWN switch rather than the
+// paper_trading flag every other RL setting is shared with (2026-09-08 request), so enabling early
+// close for paper research cannot silently enable it against real capital.
+//
+// An ignored request is LOGGED and COUNTED rather than dropped in silence: the model still made
+// the decision, and "how often does it want out early, and was it right?" is exactly the evidence
+// needed to decide whether to ever turn this on. The position simply runs to its own SL/TP or
+// timeout instead.
 func (e *RealTrader) closeEarly(ctx context.Context, o port.RealOrder, price decimal.Decimal, logger *slog.Logger) {
 	if !e.RLEarlyClose {
+		metrics.RealEarlyCloseIgnoredTotal.WithLabelValues(e.InstID).Inc()
+		logger.Info("real updates: model asked to close early, ignored (trading.allow_rl_early_close is off)",
+			"instId", e.InstID, "orderId", o.ID, "price", price)
 		return
 	}
 	if err := e.closeReal(ctx, o, price, conductor.CloseReasonRLEarly, logger); err != nil {

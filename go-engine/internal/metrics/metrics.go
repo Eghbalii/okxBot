@@ -40,6 +40,15 @@ var (
 		Help: "Cumulative realized PnL (USD) from closed paper orders, by instrument.",
 	}, []string{"inst_id"})
 
+	// RealEarlyCloseIgnoredTotal counts model early-close requests real trading declined because
+	// trading.allow_rl_early_close is off (2026-09-08). A growing count is not a fault — it is the
+	// evidence for whether that action is worth enabling: pair it with how those positions
+	// actually resolved (SL, TP, or timeout) to judge whether the model was right to want out.
+	RealEarlyCloseIgnoredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_real_early_close_ignored_total",
+		Help: "Model early-close requests ignored in real trading because the action is disabled, by instrument.",
+	}, []string{"inst_id"})
+
 	// KafkaStaleMessagesTotal counts messages dropped for being older than the consumer's
 	// MaxMessageAge (internal/kafkastream). A nonzero, GROWING value means a consumer is working
 	// through a backlog of market data too old to act on — normal and self-clearing right after a

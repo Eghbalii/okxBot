@@ -1050,3 +1050,76 @@ func TestExchangeCloseNumbers_NilWhenNotReported(t *testing.T) {
 		t.Fatalf("reported figures must pass through, got pnl=%v fee=%v", pnl, fee)
 	}
 }
+
+// Real trading must ignore the model's early-close action unless its OWN switch is on — enabling
+// early close for paper-trading research must never silently enable it against real capital
+// (2026-09-08 request).
+func TestCloseEarly_IgnoredWhenDisabled(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt.RLEarlyClose = false
+
+	sl, tp := dec("90"), dec("110")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	o, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	rt.closeEarly(ctx, o, dec("105"), testLogger())
+
+	after, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.ClosedAt != nil {
+		t.Fatal("early close must be ignored while disabled — the position runs to its own SL/TP or timeout")
+	}
+	if len(exchange.placedOrders) != 0 {
+		t.Fatalf("an ignored early close must place no exchange order, got %d", len(exchange.placedOrders))
+	}
+}
+
+// With the switch on, the same request does close the position — the gate is the flag, not a
+// permanent refusal.
+func TestCloseEarly_ClosesWhenEnabled(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt.RLEarlyClose = true
+
+	sl, tp := dec("90"), dec("110")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	o, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	rt.closeEarly(ctx, o, dec("105"), testLogger())
+
+	after, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.ClosedAt == nil {
+		t.Fatal("early close must go through when enabled")
+	}
+	if after.CloseReason == nil || *after.CloseReason != conductor.CloseReasonRLEarly {
+		t.Fatalf("close reason: want %q, got %v", conductor.CloseReasonRLEarly, after.CloseReason)
+	}
+}

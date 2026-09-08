@@ -46,6 +46,19 @@ trading:
   # Off by default — flip only after RealTrader has been verified against demo (CLAUDE.md §27.7's
   # checklist gates this).
   use_conductor_lifecycle: false
+  # Real trading's OWN switch for the model's early-close action (close_reason='rl_early'),
+  # separate from paper_trading.rl_early_close (2026-09-08 request). Real trading borrows every
+  # other RL setting from the paper_trading section — the clamp bounds and update cadence are the
+  # same question for both engines — but not this one: early close destroys the counterfactual (a
+  # position closed early can never show what it would have done) and on a real account also spends
+  # a real fee. Sharing the flag would mean enabling it for paper research silently enabled it
+  # against real capital.
+  #
+  # While off, the model may still ASK to close early; the request is logged and counted
+  # (okxbot_real_early_close_ignored_total) and the position runs to its own SL/TP or timeout
+  # instead. That count, paired with how those positions actually resolved, is the evidence for
+  # whether to ever turn this on.
+  allow_rl_early_close: false
   # Real-trading readiness plan, 2026-09-04 operator decision: a reserve subtracted from the
   # exchange's reported real balance before RealTrader ever sizes a position or records equity for
   # the panel — capital that must stay untouched even if every open position were liquidated,

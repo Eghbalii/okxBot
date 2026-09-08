@@ -345,9 +345,13 @@ func runRealTrader(
 
 			RLUpdatePnLThresholdPct: cfg.PaperTrading.RLUpdatePnLThresholdPct,
 			RLUpdateMaxInterval:     cfg.PaperTrading.RLUpdateMaxInterval,
-			RLEarlyClose:            cfg.PaperTrading.RLEarlyClose,
-			RLClamps:                clamps,
-			MaxOpenDuration:         cfg.PaperTrading.RLMaxOpenDuration,
+			// NOT cfg.PaperTrading.RLEarlyClose: real trading has its own switch for this one action
+			// (2026-09-08 request), so turning early close on for paper research cannot silently turn
+			// it on against real capital. Every OTHER RL setting is still shared with paper_trading —
+			// see the note above on why that sharing is deliberate.
+			RLEarlyClose:    realEarlyCloseAllowed(cfg),
+			RLClamps:        clamps,
+			MaxOpenDuration: cfg.PaperTrading.RLMaxOpenDuration,
 
 			// CLAUDE.md §27.5: bounds how long a placed order (open or the flattening close order)
 			// is given to fill before it's canceled and given up on, no retry/re-price.
@@ -384,6 +388,16 @@ func runRealTrader(
 // §23) — a separate copy rather than an import specifically so a future field added to one config
 // section doesn't silently also need to change the other's caller; both map their own
 // cfg.*.RLClamps into conductor.Clamps field-by-field.
+// realEarlyCloseAllowed reads real trading's OWN early-close switch, deliberately NOT
+// paper_trading.rl_early_close (2026-09-08 request). Extracted as a named function rather than
+// left as a field read inside main()'s struct literal for the same reason buildRealTraderClamps
+// was: a value buried in a large literal is exactly what got silently dropped in the incident that
+// left every real position uncapped, so the mapping gets a test that fails if it ever points back
+// at the paper flag.
+func realEarlyCloseAllowed(cfg *config.Config) bool {
+	return cfg.Trading.AllowRLEarlyClose
+}
+
 func buildRealTraderClamps(cfg *config.Config) conductor.Clamps {
 	return conductor.Clamps{
 		MinSLDistPct: cfg.PaperTrading.RLClamps.MinSLDistPct,
