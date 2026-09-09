@@ -121,6 +121,14 @@ func (c *Client) do(method, path string, body any, out any) error {
 		return fmt.Errorf("decode response %s %s: %w (raw: %s)", method, path, err, string(respBody))
 	}
 	if env.Code != "0" {
+		// OKX's code=1 means "one or more items in this batch failed", and its top-level msg is
+		// EMPTY — the actual reason is in data[].sMsg. Reporting only the envelope turned a
+		// perfectly specific rejection ("Parameter newTpTriggerPxType error") into a bare
+		// "code=1 msg=", which cost two rounds of debugging on 2026-09-10 before the real message
+		// was recovered by replaying the request by hand.
+		if detail := firstItemError(env.Data); detail != "" {
+			return fmt.Errorf("okx api error %s %s: code=%s %s", method, path, env.Code, detail)
+		}
 		return fmt.Errorf("okx api error %s %s: code=%s msg=%s", method, path, env.Code, env.Msg)
 	}
 	if out != nil && len(env.Data) > 0 {
@@ -135,4 +143,25 @@ func sign(prehash, secret string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(prehash))
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// firstItemError extracts the first per-item failure from an OKX batch response's data array.
+// Returns "" when the payload carries no such detail, so the caller falls back to the envelope.
+func firstItemError(data json.RawMessage) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var items []struct {
+		SCode string `json:"sCode"`
+		SMsg  string `json:"sMsg"`
+	}
+	if err := json.Unmarshal(data, &items); err != nil {
+		return ""
+	}
+	for _, it := range items {
+		if it.SCode != "" && it.SCode != "0" {
+			return fmt.Sprintf("sCode=%s sMsg=%s", it.SCode, it.SMsg)
+		}
+	}
+	return ""
 }

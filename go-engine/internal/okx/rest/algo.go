@@ -41,13 +41,22 @@ func (c *Client) PlaceAlgoOrder(req domain.AlgoOrderRequest) (string, error) {
 	if req.PosSide != "" {
 		body["posSide"] = req.PosSide
 	}
+	// triggerPxType is sent explicitly rather than left to OKX's default. It is REQUIRED whenever a
+	// take-profit side is present — omitting it is rejected with "Parameter newTpTriggerPxType
+	// error" (2026-09-10, found on the amend path, where it made every SL/TP edit fail and, on the
+	// place path, silently cost every position its take-profit). "last" matches how this system
+	// evaluates its own levels: the in-process monitor compares against the last traded price, so
+	// the exchange and the backup agree on what counts as a touch. Mark price would have them
+	// disagree at exactly the moment it matters.
 	if req.SLTriggerPx.IsPositive() {
 		body["slTriggerPx"] = req.SLTriggerPx.String()
 		body["slOrdPx"] = "-1"
+		body["slTriggerPxType"] = "last"
 	}
 	if req.TPTriggerPx.IsPositive() {
 		body["tpTriggerPx"] = req.TPTriggerPx.String()
 		body["tpOrdPx"] = "-1"
+		body["tpTriggerPxType"] = "last"
 	}
 	if _, ok := body["slTriggerPx"]; !ok {
 		if _, ok := body["tpTriggerPx"]; !ok {
@@ -82,16 +91,22 @@ func (c *Client) AmendAlgoOrder(req domain.AlgoOrderAmend) error {
 		"instId": req.InstID,
 		"algoId": req.AlgoID,
 	}
+	// See PlaceAlgoOrder above for why the trigger type is explicit — this is the call that
+	// surfaced the requirement.
 	if req.SLTriggerPx.IsPositive() {
 		body["newSlTriggerPx"] = req.SLTriggerPx.String()
 		body["newSlOrdPx"] = "-1"
+		body["newSlTriggerPxType"] = "last"
 	}
 	if req.TPTriggerPx.IsPositive() {
 		body["newTpTriggerPx"] = req.TPTriggerPx.String()
 		body["newTpOrdPx"] = "-1"
+		body["newTpTriggerPxType"] = "last"
 	}
-	if len(body) == 2 {
-		return fmt.Errorf("algo amend needs at least one of slTriggerPx/tpTriggerPx")
+	if _, hasSL := body["newSlTriggerPx"]; !hasSL {
+		if _, hasTP := body["newTpTriggerPx"]; !hasTP {
+			return fmt.Errorf("algo amend needs at least one of slTriggerPx/tpTriggerPx")
+		}
 	}
 
 	var results []algoOrderResult
