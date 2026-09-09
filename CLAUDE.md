@@ -4754,3 +4754,38 @@ confirms both the formula and the corrected prices rather than merely making the
 
 `account_equity` needed no correction: real mode records the exchange's own reported balance each
 poll (§35.4) rather than summing these rows, so it was never affected by the wrong PnL.
+
+### 36.3 The token fix broke every config save (2026-09-10)
+
+Resuming real trading from the panel failed with:
+
+```
+column "auto_disabled_inst_ids" is of type text[] but expression is of type text (SQLSTATE 42804)
+```
+
+A regression from §36.1's own fix. The new column is bound inside
+`coalesce($11, '{}')`, and a NULL parameter inside `coalesce` gives Postgres no target column to
+infer a type from — so it typed the `'{}'` literal as `text` and rejected the whole expression
+against a `text[]` column. The three array columns beside it are bound bare (`$4`/`$5`/`$6`), where
+the target column *is* available to infer from, which is why only the new one broke.
+
+The blast radius was every save the panel makes whose patch does not itself set auto-disabled —
+resume, pause, long/short, timeframes, active strategies. Fixed by casting both binds explicitly
+(`$11::text[]`, `coalesce(..., '{}'::text[])`).
+
+**`internal/postgres` had no tests at all**, and that is precisely how this shipped: every caller is
+covered through `fakeRepository`, and a fake cannot reproduce Postgres's type inference — the Go
+code was correct, the SQL was not. Added `paper_trading_config_test.go`, which runs against a real
+database and skips cleanly without one. A mocked version of that test would have passed against the
+broken SQL, which is the whole reason it is written this way.
+
+Verified the type rule directly on the server before deploying, rather than reasoning about it:
+
+```
+select pg_typeof(coalesce(NULL, '{}'))               -> text
+select pg_typeof(coalesce(NULL::text[], '{}'::text[])) -> text[]
+```
+
+Rebuilt all three services that link the function (`api`, `paper-trader`, and `trader` via
+`AffordabilityService`). The affordability caller never failed because it always sets the field —
+which also means the bug was invisible to the one path that exercised the new column most often.
