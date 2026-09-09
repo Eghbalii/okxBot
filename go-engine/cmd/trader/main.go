@@ -222,7 +222,20 @@ func runRealTrader(
 	// Global per-kind "active strategies" toggle, scoped to mode=real — bulk-applied BEFORE
 	// loadRealTraderStrategyAssignments reads them below, mirroring cmd/paper-trader's own
 	// sequencing exactly. A no-op when ActiveKinds is empty (no restriction configured).
-	if err := repo.SetAssignmentsEnabledForKinds(ctx, "real", ptCfg.ActiveKinds); err != nil {
+	// Reuses PaperTrading.Bars/CandleLimit/RLClamps/RLUpdate*/RLEarlyClose/RLMaxOpenDuration —
+	// real trading does not need its own separate bar-list or clamp config section (CLAUDE.md §27's
+	// plan §2's own note): the decision-vs-context bar split and the clamp bounds are the same
+	// question for both engines, and duplicating the config key would just risk the two drifting.
+	// active_bars overrides which timeframes strategies DECIDE on, same as PaperTrader's own field.
+	decisionBars := cfg.PaperTrading.Bars
+	if len(ptCfg.ActiveBars) > 0 {
+		decisionBars = ptCfg.ActiveBars
+	}
+	if len(decisionBars) == 0 {
+		logger.Error("paper_trading.bars is empty; RealTrader needs at least one decision bar")
+		os.Exit(1)
+	}
+	if err := repo.SetAssignmentsEnabledForKinds(ctx, "real", ptCfg.ActiveKinds, cfg.Trading.InstIDs, decisionBars); err != nil {
 		logger.Error("failed to apply real-mode active-strategy-kinds restriction", "error", err)
 		os.Exit(1)
 	}
@@ -247,19 +260,6 @@ func runRealTrader(
 		logger.Info("real trading_state=stopped: flagged open real positions for close")
 	}
 
-	// Reuses PaperTrading.Bars/CandleLimit/RLClamps/RLUpdate*/RLEarlyClose/RLMaxOpenDuration —
-	// real trading does not need its own separate bar-list or clamp config section (CLAUDE.md §27's
-	// plan §2's own note): the decision-vs-context bar split and the clamp bounds are the same
-	// question for both engines, and duplicating the config key would just risk the two drifting.
-	// active_bars overrides which timeframes strategies DECIDE on, same as PaperTrader's own field.
-	decisionBars := cfg.PaperTrading.Bars
-	if len(ptCfg.ActiveBars) > 0 {
-		decisionBars = ptCfg.ActiveBars
-	}
-	if len(decisionBars) == 0 {
-		logger.Error("paper_trading.bars is empty; RealTrader needs at least one decision bar")
-		os.Exit(1)
-	}
 	candleBars := cfg.Ingestion.Bars
 	if len(candleBars) == 0 {
 		candleBars = decisionBars

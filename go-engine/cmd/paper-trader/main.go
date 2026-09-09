@@ -107,7 +107,7 @@ func main() {
 	// Global per-kind "active strategies" toggle (CLAUDE.md): bulk-applied to strategy_assignments
 	// BEFORE loadStrategyAssignments reads them below, so ListAssignments(enabledOnly=true) picks
 	// up the result with no change needed to that function. A no-op when ActiveKinds is empty.
-	if err := repo.SetAssignmentsEnabledForKinds(ctx, "paper", ptCfg.ActiveKinds); err != nil {
+	if err := repo.SetAssignmentsEnabledForKinds(ctx, "paper", ptCfg.ActiveKinds, cfg.Trading.InstIDs, paperTradingBars); err != nil {
 		logger.Error("failed to apply active-strategy-kinds restriction", "error", err)
 		os.Exit(1)
 	}

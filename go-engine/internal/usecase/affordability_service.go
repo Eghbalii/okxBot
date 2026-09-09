@@ -158,6 +158,10 @@ func (s *AffordabilityService) RunOnce(ctx context.Context) error {
 	for _, t := range cfg.DisabledInstIDs {
 		disabled[t] = true
 	}
+	autoDisabled := make(map[string]bool, len(cfg.AutoDisabledInstIDs))
+	for _, t := range cfg.AutoDisabledInstIDs {
+		autoDisabled[t] = true
+	}
 
 	instruments, prices := s.marketData(logger)
 	if len(instruments) == 0 {
@@ -167,7 +171,7 @@ func (s *AffordabilityService) RunOnce(ctx context.Context) error {
 		return nil
 	}
 
-	plan := s.plan(instruments, prices, disabled, equity)
+	plan := s.plan(instruments, prices, disabled, autoDisabled, equity)
 	if !plan.Changed() {
 		logger.Debug("affordability: roster already correct", "budget", plan.BudgetUSD.StringFixed(4),
 			"unaffordable", plan.Unaffordable)
@@ -182,7 +186,14 @@ func (s *AffordabilityService) RunOnce(ctx context.Context) error {
 	}
 
 	next := s.applyPlan(disabled, plan)
-	if _, err := s.Repo.SavePaperTradingConfig(ctx, s.mode(), port.PaperTradingConfigPatch{DisabledInstIDs: &next}); err != nil {
+	// The auto-disabled set is written in the SAME call as the roster it explains. Writing them
+	// separately would leave a window where a token is disabled with no record of who disabled it,
+	// and a crash inside that window would strand it as apparently-manual forever.
+	nextAuto := s.applyPlanAuto(autoDisabled, plan)
+	if _, err := s.Repo.SavePaperTradingConfig(ctx, s.mode(), port.PaperTradingConfigPatch{
+		DisabledInstIDs:     &next,
+		AutoDisabledInstIDs: &nextAuto,
+	}); err != nil {
 		return fmt.Errorf("save %s trading config: %w", s.mode(), err)
 	}
 	// Notify AFTER the write succeeds: an engine must never start refusing opens on the strength of
@@ -216,6 +227,7 @@ func (s *AffordabilityService) plan(
 	instruments map[string]domain.Instrument,
 	prices map[string]decimal.Decimal,
 	startDisabled map[string]bool,
+	autoDisabled map[string]bool,
 	equity decimal.Decimal,
 ) AffordabilityPlan {
 	type candidate struct {
@@ -278,21 +290,59 @@ func (s *AffordabilityService) plan(
 			unaffordable = append(unaffordable, tok)
 		}
 	}
-	return s.diffFrom(startDisabled, final, settledBudget, unaffordable)
+	return s.diffFrom(startDisabled, final, autoDisabled, settledBudget, unaffordable)
 }
 
 // diffFrom expresses a converged disabled-set as changes against the original one.
-func (s *AffordabilityService) diffFrom(original, final map[string]bool, budget decimal.Decimal, unaffordable []string) AffordabilityPlan {
+//
+// autoDisabled is the set this service turned off itself. A token disabled by a PERSON is never
+// proposed for re-enabling (2026-09-09): a manually-disabled token is affordable in the normal
+// case, so before this guard existed the service re-enabled it on its very next pass — which ran at
+// trader startup, i.e. seconds after the panel's own Save triggered a restart. The operator's
+// choice was not being lost on the way to the database, it was being correctly saved and then
+// overruled, which is why it looked like the checkbox simply did nothing.
+//
+// This is the single place ToEnable is produced, so guarding here covers every path into it.
+func (s *AffordabilityService) diffFrom(original, final map[string]bool, autoDisabled map[string]bool, budget decimal.Decimal, unaffordable []string) AffordabilityPlan {
 	plan := AffordabilityPlan{BudgetUSD: budget, Unaffordable: unaffordable}
 	for _, t := range s.AllTokens {
 		switch {
 		case final[t] && !original[t]:
 			plan.ToDisable = append(plan.ToDisable, t)
 		case !final[t] && original[t]:
+			if !autoDisabled[t] {
+				// Disabled by a person. Only a person turns it back on.
+				continue
+			}
 			plan.ToEnable = append(plan.ToEnable, t)
 		}
 	}
 	return plan
+}
+
+// applyPlanAuto maintains the set this service claims as its own: tokens it just disabled are
+// added, tokens it just re-enabled are dropped. A token an operator disables is never added here —
+// the panel does not write this field at all — which is precisely what keeps a manual choice
+// exempt from automatic re-enabling.
+func (s *AffordabilityService) applyPlanAuto(autoDisabled map[string]bool, plan AffordabilityPlan) []string {
+	next := make(map[string]bool, len(autoDisabled))
+	for k, v := range autoDisabled {
+		next[k] = v
+	}
+	for _, t := range plan.ToDisable {
+		next[t] = true
+	}
+	for _, t := range plan.ToEnable {
+		delete(next, t)
+	}
+	out := make([]string, 0, len(next))
+	for t, on := range next {
+		if on {
+			out = append(out, t)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // applyPlan produces the new disabled list, sorted so a config write is stable and a diff between
@@ -418,18 +468,15 @@ func (s *AffordabilityService) Report(ctx context.Context) (AffordabilityReport,
 
 	instruments, prices := s.marketData(s.logger())
 
-	// The set the admission rule would settle on, so AutoDisabled reflects the real decision rather
-	// than a per-token budget comparison that cannot account for a token's own dilution.
-	settled := s.plan(instruments, prices, disabled, equity)
-	admitted := make(map[string]bool, len(s.AllTokens))
-	for _, tok := range s.AllTokens {
-		admitted[tok] = !disabled[tok]
-	}
-	for _, tok := range settled.ToDisable {
-		admitted[tok] = false
-	}
-	for _, tok := range settled.ToEnable {
-		admitted[tok] = true
+	// AutoDisabled is now READ, not inferred (2026-09-09). It used to be derived as "disabled and
+	// not admissible", which cannot distinguish a token this service turned off from one a person
+	// turned off — and got the manual case wrong precisely when it mattered, since a manually
+	// disabled token is normally affordable and so was reported as an operator choice only by
+	// accident of the arithmetic. The service now records its own decisions, so the panel can state
+	// the fact instead of guessing at it.
+	autoDisabled := make(map[string]bool, len(cfg.AutoDisabledInstIDs))
+	for _, t := range cfg.AutoDisabledInstIDs {
+		autoDisabled[t] = true
 	}
 
 	report := AffordabilityReport{BudgetUSD: budget, Tokens: make([]TokenAffordability, 0, len(s.AllTokens))}
@@ -445,9 +492,10 @@ func (s *AffordabilityService) Report(ctx context.Context) (AffordabilityReport,
 		aff := CanAfford(inst, price, budget, s.leverage())
 		row.MinNotionalUSD = aff.MinNotionalUSD
 		row.Affordable = aff.Affordable
-		// Ask the actual admission rule rather than inferring from Affordable, so the panel's tag
-		// matches what the service would really do on its next pass.
-		row.AutoDisabled = row.Disabled && !admitted[tok]
+		// The recorded fact: this service disabled it, so this service will re-enable it once the
+		// account can afford it. A disabled token WITHOUT this tag was turned off by a person and
+		// stays off until a person turns it back on.
+		row.AutoDisabled = autoDisabled[tok]
 		report.Tokens = append(report.Tokens, row)
 	}
 	return report, nil

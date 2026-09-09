@@ -111,7 +111,7 @@ func TestAffordabilityService_AccountsForFreedBudget(t *testing.T) {
 		"BTC": dec("78350"), "ETH": dec("2480"), "SOL": dec("103"), "XRP": dec("1.42"),
 	}
 
-	plan := s.plan(instruments, prices, map[string]bool{}, dec("20"))
+	plan := s.plan(instruments, prices, map[string]bool{}, map[string]bool{}, dec("20"))
 
 	if len(plan.ToDisable) != 1 || plan.ToDisable[0] != "BTC" {
 		t.Fatalf("only BTC should end up disabled, got %+v", plan.ToDisable)
@@ -129,7 +129,7 @@ func TestAffordabilityService_ReEnablesAsEquityGrows(t *testing.T) {
 	}
 	prices := map[string]decimal.Decimal{"BTC": dec("78350"), "ETH": dec("2480"), "SOL": dec("103")}
 
-	plan := s.plan(instruments, prices, map[string]bool{"BTC": true}, dec("100"))
+	plan := s.plan(instruments, prices, map[string]bool{"BTC": true}, map[string]bool{"BTC": true}, dec("100"))
 	if len(plan.ToEnable) != 1 || plan.ToEnable[0] != "BTC" {
 		t.Fatalf("BTC must be re-enabled once affordable, got %+v", plan.ToEnable)
 	}
@@ -155,7 +155,7 @@ func TestAffordabilityService_NoChangeWhenAlreadyCorrect(t *testing.T) {
 		"TRUMP": dec("2.24"), "DOGE": dec("0.0896"),
 	}
 
-	plan := s.plan(instruments, prices, map[string]bool{"BTC": true}, dec("20"))
+	plan := s.plan(instruments, prices, map[string]bool{"BTC": true}, map[string]bool{"BTC": true}, dec("20"))
 	if plan.Changed() {
 		t.Fatalf("already-correct roster must propose no change, got disable=%+v enable=%+v",
 			plan.ToDisable, plan.ToEnable)
@@ -201,7 +201,7 @@ func TestAffordabilityService_RealRosterHasNoOscillation(t *testing.T) {
 	}
 	s := &AffordabilityService{MaxLeverage: dec("1"), AllTokens: tokens, MaxPositionPct: dec("0.25")}
 
-	plan := s.plan(instruments, prices, map[string]bool{}, dec("20"))
+	plan := s.plan(instruments, prices, map[string]bool{}, map[string]bool{}, dec("20"))
 
 	disabled := map[string]bool{}
 	for _, t := range plan.ToDisable {
@@ -239,13 +239,13 @@ func TestAffordabilityService_IsIdempotent(t *testing.T) {
 	}
 	s := &AffordabilityService{MaxLeverage: dec("1"), AllTokens: tokens, MaxPositionPct: dec("0.25")}
 
-	first := s.plan(instruments, prices, map[string]bool{}, dec("20"))
+	first := s.plan(instruments, prices, map[string]bool{}, map[string]bool{}, dec("20"))
 	settled := map[string]bool{}
 	for _, t := range first.ToDisable {
 		settled[t] = true
 	}
 
-	second := s.plan(instruments, prices, settled, dec("20"))
+	second := s.plan(instruments, prices, settled, settled, dec("20"))
 	if second.Changed() {
 		t.Fatalf("a settled roster must be stable, but a second pass proposed disable=%v enable=%v",
 			second.ToDisable, second.ToEnable)
@@ -296,9 +296,63 @@ func TestAffordabilityService_LiveRosterNeedsNoDisablesAtRealLeverage(t *testing
 	}
 	s := &AffordabilityService{AllTokens: tokens, MaxPositionPct: dec("0.25"), MaxLeverage: dec("10")}
 
-	plan := s.plan(instruments, prices, map[string]bool{}, dec("20"))
+	plan := s.plan(instruments, prices, map[string]bool{}, map[string]bool{}, dec("20"))
 
 	if len(plan.ToDisable) != 0 {
 		t.Fatalf("at 10x every token clears its minimum on a $20 account; disabled %v", plan.ToDisable)
+	}
+}
+
+// The reported bug, 2026-09-09: unchecking a token in the panel appeared to do nothing — Save
+// persisted it correctly, and the trader restart that Save triggers put the token straight back.
+//
+// The cause was not a lost write. AffordabilityService re-enables any disabled token that is
+// affordable, and a manually disabled token is affordable by definition in the normal case, so the
+// operator's choice was correctly saved and then immediately overruled. A token disabled by a
+// PERSON must now survive every pass until a person turns it back on.
+func TestPlan_DoesNotReEnableAManuallyDisabledToken(t *testing.T) {
+	s := &AffordabilityService{MaxLeverage: dec("1"), AllTokens: []string{"BTC", "ETH", "SOL"}}
+	instruments := map[string]domain.Instrument{
+		"BTC": inst("0.0001", "1"), "ETH": inst("0.001", "1"), "SOL": inst("0.01", "1"),
+	}
+	prices := map[string]decimal.Decimal{"BTC": dec("78350"), "ETH": dec("2480"), "SOL": dec("103")}
+
+	// BTC is disabled and perfectly affordable at this equity — the case that used to be re-enabled
+	// on the spot. The auto-disabled set is EMPTY: nothing here was this service's doing.
+	plan := s.plan(instruments, prices, map[string]bool{"BTC": true}, map[string]bool{}, dec("100"))
+
+	if len(plan.ToEnable) != 0 {
+		t.Fatalf("a manually disabled token must never be re-enabled automatically, got %+v", plan.ToEnable)
+	}
+}
+
+// The other half of the same rule: a token THIS SERVICE disabled is still re-enabled once the
+// account can afford it again. The fix must not turn automatic disabling into a one-way door.
+func TestPlan_StillReEnablesItsOwnAutoDisabledToken(t *testing.T) {
+	s := &AffordabilityService{MaxLeverage: dec("1"), AllTokens: []string{"BTC", "ETH", "SOL"}}
+	instruments := map[string]domain.Instrument{
+		"BTC": inst("0.0001", "1"), "ETH": inst("0.001", "1"), "SOL": inst("0.01", "1"),
+	}
+	prices := map[string]decimal.Decimal{"BTC": dec("78350"), "ETH": dec("2480"), "SOL": dec("103")}
+
+	plan := s.plan(instruments, prices, map[string]bool{"BTC": true}, map[string]bool{"BTC": true}, dec("100"))
+
+	if len(plan.ToEnable) != 1 || plan.ToEnable[0] != "BTC" {
+		t.Fatalf("an auto-disabled token must come back once affordable, got %+v", plan.ToEnable)
+	}
+}
+
+// applyPlanAuto maintains the service's own ledger: what it disables it claims, what it re-enables
+// it releases. A manual entry is never added, which is what keeps it exempt on the next pass.
+func TestApplyPlanAuto_ClaimsItsOwnDisablesAndReleasesItsOwnEnables(t *testing.T) {
+	s := &AffordabilityService{AllTokens: []string{"BTC", "ETH", "SOL"}}
+
+	got := s.applyPlanAuto(
+		map[string]bool{"ETH": true},
+		AffordabilityPlan{ToDisable: []string{"SOL"}, ToEnable: []string{"ETH"}},
+	)
+
+	if len(got) != 1 || got[0] != "SOL" {
+		t.Fatalf("want the newly auto-disabled SOL only (ETH released), got %v", got)
 	}
 }

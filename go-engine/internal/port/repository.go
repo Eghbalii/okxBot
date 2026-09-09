@@ -111,18 +111,18 @@ type PaperOrder struct {
 	// one strategy can be assigned to several bars for the same instrument (CLAUDE.md §9) and the
 	// assignment table alone can't say which bar THIS particular order came from. Empty for orders
 	// opened before this field existed.
-	Bar          string
-	Side         string // "buy" or "sell"
-	EntryPx      decimal.Decimal
-	SLPx         *decimal.Decimal
-	TPPx         *decimal.Decimal
-	Size         decimal.Decimal
-	Leverage     decimal.Decimal
-	OpenedAt     time.Time
-	ClosedAt     *time.Time
-	CloseReason  *string // "sl", "tp", "manual", "timeout"
-	ClosePx      *decimal.Decimal
-	RealizedPnL  *decimal.Decimal
+	Bar         string
+	Side        string // "buy" or "sell"
+	EntryPx     decimal.Decimal
+	SLPx        *decimal.Decimal
+	TPPx        *decimal.Decimal
+	Size        decimal.Decimal
+	Leverage    decimal.Decimal
+	OpenedAt    time.Time
+	ClosedAt    *time.Time
+	CloseReason *string // "sl", "tp", "manual", "timeout"
+	ClosePx     *decimal.Decimal
+	RealizedPnL *decimal.Decimal
 	// FeesUSD (trading fee) and FundingUSD (accrued funding cost/credit, positive = cost) are both
 	// already subtracted into RealizedPnL (2026-09-06), stored separately so the panel's
 	// closed-positions view can show which one actually moved a trade's PnL. Nil for still-open
@@ -189,7 +189,6 @@ type PaperOrder struct {
 	ExchangeClosePx      *decimal.Decimal
 	LastError            *string
 	LastErrorAt          *time.Time
-
 }
 
 // RealOrder is a real-money trade placed against the exchange (CLAUDE.md, real-trading readiness
@@ -203,18 +202,18 @@ type PaperOrder struct {
 // Mirrors PaperOrder field-for-field except: no ParentOrderID/Variant (real trading has no
 // shadow-fork mechanic, §27.3) and no Mode (redundant by construction), plus the new Status field.
 type RealOrder struct {
-	ID         int64
-	InstID     string
-	StrategyID *int64
-	Bar        string
-	Side       string // "buy" or "sell"
-	EntryPx    decimal.Decimal
-	SLPx       *decimal.Decimal
-	TPPx       *decimal.Decimal
-	Size       decimal.Decimal
-	Leverage   decimal.Decimal
-	OpenedAt   time.Time
-	ClosedAt   *time.Time
+	ID           int64
+	InstID       string
+	StrategyID   *int64
+	Bar          string
+	Side         string // "buy" or "sell"
+	EntryPx      decimal.Decimal
+	SLPx         *decimal.Decimal
+	TPPx         *decimal.Decimal
+	Size         decimal.Decimal
+	Leverage     decimal.Decimal
+	OpenedAt     time.Time
+	ClosedAt     *time.Time
 	CloseReason  *string // "sl", "tp", "manual", "timeout", "rl_early"
 	ClosePx      *decimal.Decimal
 	RealizedPnL  *decimal.Decimal
@@ -365,8 +364,14 @@ type PaperTradingConfig struct {
 	DisableShort    bool
 	ActiveKinds     []string // empty = no per-kind restriction
 	DisabledInstIDs []string // empty = no token disabled
-	ActiveBars      []string // empty = use paper_trading.bars from config.yaml as-is
-	UpdatedAt       time.Time
+	// AutoDisabledInstIDs is the subset of DisabledInstIDs that the affordability service turned
+	// off, as opposed to a person (2026-09-09). The distinction is load-bearing, not cosmetic:
+	// AffordabilityService re-enables a disabled token once it becomes affordable again, and
+	// without this it re-enabled MANUALLY disabled tokens too — which are affordable by definition
+	// in the normal case, so an operator's choice was overruled within seconds of being saved.
+	AutoDisabledInstIDs []string
+	ActiveBars          []string // empty = use paper_trading.bars from config.yaml as-is
+	UpdatedAt           time.Time
 }
 
 // PaperTradingConfigPatch is SavePaperTradingConfig's input — nil fields leave the corresponding
@@ -379,7 +384,10 @@ type PaperTradingConfigPatch struct {
 	DisableShort    *bool
 	ActiveKinds     *[]string
 	DisabledInstIDs *[]string
-	ActiveBars      *[]string
+	// AutoDisabledInstIDs is written only by AffordabilityService; the panel never sets it, so an
+	// operator's save leaves it untouched and cannot accidentally claim a manual choice as its own.
+	AutoDisabledInstIDs *[]string
+	ActiveBars          *[]string
 }
 
 // ParamChange is one recorded strategy parameter-change event (CLAUDE.md §16): either
@@ -657,7 +665,14 @@ type Repository interface {
 	// assignments whose strategy's Kind is in activeKinds are enabled — the global per-kind "active
 	// strategies" toggle, scoped to one mode. A no-op when activeKinds is empty (no restriction
 	// configured).
-	SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string) error
+	//
+	// It also CREATES the assignments an activated kind is missing, across instIDs x bars, from
+	// that kind's origin strategy (2026-09-09). Enabling alone is not enough: a kind with no rows
+	// for this mode has nothing to enable, so activating it in the panel silently did nothing —
+	// the kind read as active in the config while being absent from the roster the engine loads.
+	// Existing rows are never touched by the create step, so a per-token assignment an operator
+	// disabled on the Strategies page stays disabled.
+	SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string, instIDs, bars []string) error
 
 	// SaveFundingRates upserts a batch of funding-rate periods (2026-09-06's funding-cost service).
 	// Upsert on (inst_id, funding_time) so re-polling an already-stored period is a safe no-op —

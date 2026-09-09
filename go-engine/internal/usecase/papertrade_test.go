@@ -248,7 +248,7 @@ func (r *fakeRepository) SavePaperTradingConfig(ctx context.Context, mode string
 	r.paperTradingConfig[mode] = &c
 	return c, nil
 }
-func (r *fakeRepository) SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string) error {
+func (r *fakeRepository) SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string, instIDs, bars []string) error {
 	return nil
 }
 func (r *fakeRepository) SaveFundingRates(ctx context.Context, rates []port.FundingRate) error {

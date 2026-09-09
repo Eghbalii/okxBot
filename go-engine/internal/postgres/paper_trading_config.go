@@ -7,7 +7,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
-const paperTradingConfigCols = `trading_state, disable_long, disable_short, active_kinds, disabled_inst_ids, active_bars, updated_at`
+const paperTradingConfigCols = `trading_state, disable_long, disable_short, active_kinds, disabled_inst_ids, auto_disabled_inst_ids, active_bars, updated_at`
 
 // GetPaperTradingConfig returns mode's panel-editable control-box config (CLAUDE.md real-trading
 // readiness plan, 2026-09-04 — paper_trading_config is now one row per mode, PK on mode, replacing
@@ -22,7 +22,7 @@ func (r *Repository) GetPaperTradingConfig(ctx context.Context, mode string) (po
 		INSERT INTO paper_trading_config (mode) VALUES ($1)
 		ON CONFLICT (mode) DO UPDATE SET mode = paper_trading_config.mode
 		RETURNING `+paperTradingConfigCols, mode).
-		Scan(&c.TradingState, &c.DisableLong, &c.DisableShort, &c.ActiveKinds, &c.DisabledInstIDs, &c.ActiveBars, &c.UpdatedAt)
+		Scan(&c.TradingState, &c.DisableLong, &c.DisableShort, &c.ActiveKinds, &c.DisabledInstIDs, &c.AutoDisabledInstIDs, &c.ActiveBars, &c.UpdatedAt)
 	if err != nil {
 		return port.PaperTradingConfig{}, fmt.Errorf("get paper trading config for mode %s: %w", mode, err)
 	}
@@ -45,11 +45,15 @@ func (r *Repository) SavePaperTradingConfig(ctx context.Context, mode string, pa
 	if patch.ActiveBars != nil {
 		activeBars = *patch.ActiveBars
 	}
+	var autoDisabled any
+	if patch.AutoDisabledInstIDs != nil {
+		autoDisabled = *patch.AutoDisabledInstIDs
+	}
 
 	var c port.PaperTradingConfig
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO paper_trading_config (mode, trading_state, disable_long, disable_short, active_kinds, disabled_inst_ids, active_bars, updated_at)
-		VALUES ($7, coalesce($1, 'running'), coalesce($2, false), coalesce($3, false), $4, $5, $6, now())
+		INSERT INTO paper_trading_config (mode, trading_state, disable_long, disable_short, active_kinds, disabled_inst_ids, active_bars, auto_disabled_inst_ids, updated_at)
+		VALUES ($7, coalesce($1, 'running'), coalesce($2, false), coalesce($3, false), $4, $5, $6, coalesce($11, '{}'), now())
 		ON CONFLICT (mode) DO UPDATE SET
 			trading_state = coalesce($1, paper_trading_config.trading_state),
 			disable_long = coalesce($2, paper_trading_config.disable_long),
@@ -57,12 +61,14 @@ func (r *Repository) SavePaperTradingConfig(ctx context.Context, mode string, pa
 			active_kinds = CASE WHEN $8 THEN $4 ELSE paper_trading_config.active_kinds END,
 			disabled_inst_ids = CASE WHEN $9 THEN $5 ELSE paper_trading_config.disabled_inst_ids END,
 			active_bars = CASE WHEN $10 THEN $6 ELSE paper_trading_config.active_bars END,
+			auto_disabled_inst_ids = CASE WHEN $12 THEN $11 ELSE paper_trading_config.auto_disabled_inst_ids END,
 			updated_at = now()
 		RETURNING `+paperTradingConfigCols,
 		patch.TradingState, patch.DisableLong, patch.DisableShort,
 		activeKinds, disabledInstIDs, activeBars, mode,
-		patch.ActiveKinds != nil, patch.DisabledInstIDs != nil, patch.ActiveBars != nil).
-		Scan(&c.TradingState, &c.DisableLong, &c.DisableShort, &c.ActiveKinds, &c.DisabledInstIDs, &c.ActiveBars, &c.UpdatedAt)
+		patch.ActiveKinds != nil, patch.DisabledInstIDs != nil, patch.ActiveBars != nil,
+		autoDisabled, patch.AutoDisabledInstIDs != nil).
+		Scan(&c.TradingState, &c.DisableLong, &c.DisableShort, &c.ActiveKinds, &c.DisabledInstIDs, &c.AutoDisabledInstIDs, &c.ActiveBars, &c.UpdatedAt)
 	if err != nil {
 		return port.PaperTradingConfig{}, fmt.Errorf("save paper trading config for mode %s: %w", mode, err)
 	}
@@ -92,7 +98,7 @@ func (r *Repository) RequestManualCloseAll(ctx context.Context) (int, error) {
 // without touching any row) when activeKinds is empty: an empty restriction means "no restriction
 // configured," preserving today's per-assignment-managed behavior for anyone who has never touched
 // this control.
-func (r *Repository) SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string) error {
+func (r *Repository) SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string, instIDs, bars []string) error {
 	if len(activeKinds) == 0 {
 		return nil
 	}
@@ -104,6 +110,34 @@ func (r *Repository) SetAssignmentsEnabledForKinds(ctx context.Context, mode str
 	`, activeKinds, mode)
 	if err != nil {
 		return fmt.Errorf("set assignments enabled for kinds %v (mode %s): %w", activeKinds, mode, err)
+	}
+
+	// Create the rows a newly-activated kind needs, rather than only flipping rows that already
+	// exist (2026-09-09: the operator activated trend_confluence for real mode and saw no signals
+	// all day). The UPDATE above can only enable an assignment that is already there, and real mode
+	// had assignments for just two kinds — so selecting a third in the panel reported success,
+	// wrote activeKinds, and then had nothing to enable. The kind was "active" in the config and
+	// entirely absent from the roster the engine actually loads.
+	//
+	// Rows are created from the ORIGIN strategy of each kind (§11.3's locked template) across the
+	// given instruments and bars, and only where one does not already exist — CreateAssignment's
+	// ON CONFLICT would otherwise re-enable a per-token assignment an operator had deliberately
+	// turned off from the Strategies page, which is a different setting from this global per-kind
+	// switch and must not be overwritten by it.
+	if len(instIDs) == 0 || len(bars) == 0 {
+		return nil
+	}
+	_, err = r.pool.Exec(ctx, `
+		INSERT INTO strategy_assignments (strategy_id, inst_id, bar, enabled, mode)
+		SELECT s.id, inst.inst_id, bar.bar, true, $4
+		FROM strategies s
+		CROSS JOIN unnest($2::text[]) AS inst(inst_id)
+		CROSS JOIN unnest($3::text[]) AS bar(bar)
+		WHERE s.kind = ANY($1) AND s.is_origin
+		ON CONFLICT (strategy_id, inst_id, bar, mode) DO NOTHING
+	`, activeKinds, instIDs, bars, mode)
+	if err != nil {
+		return fmt.Errorf("create missing assignments for kinds %v (mode %s): %w", activeKinds, mode, err)
 	}
 	return nil
 }
