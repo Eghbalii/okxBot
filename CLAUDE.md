@@ -4616,3 +4616,61 @@ build, then `start` them again.
 socket with a 1006 abnormal closure and the client re-authenticated and resubscribed **1.2 seconds
 later**, unattended. That is the behavior the 5s REST poll exists to back up, now observed working
 rather than assumed.
+
+## 36. Two panel controls that saved successfully and did nothing (2026-09-09)
+
+Both reported the same way — "I click Save, come out of the box, and nothing happened" — and both
+turned out to be real, with different causes. Neither was a lost write: in both cases the panel
+sent the right request, `cmd/api` stored it correctly, and something downstream then ignored or
+undid it. That shape is worth remembering, because the instinct is to go looking at the frontend.
+
+### 36.1 Unchecking a token was saved, then immediately overruled
+
+`disabled_inst_ids` was ONE list with no record of who wrote each entry, and
+`AffordabilityService` re-enables any disabled token that has become affordable again (§35's
+roster logic). A manually disabled token is affordable **by definition** in the normal case — that
+is why a person is disabling it rather than the service — so the service's next pass turned it
+straight back on. That pass runs at `cmd/trader` startup, and the panel's Save triggers a restart,
+so the re-enable landed within seconds of every save. The operator's decision was not lost, it was
+reversed by a service that could not tell a person's choice from its own.
+
+**Fix**: `auto_disabled_inst_ids` (migration `000030`) records the service's own entries, and
+`diffFrom` proposes re-enabling only tokens in that set. The panel never writes the column, so a
+manual choice survives every pass until a person reverses it. `applyPlanAuto` maintains the ledger
+(claim what it disables, release what it re-enables), written in the SAME `SavePaperTradingConfig`
+call as the roster it explains — writing them separately would leave a window where a token is
+disabled with nothing recording who did it.
+
+Backfill is deliberately **empty** rather than a copy of `disabled_inst_ids`: existing entries have
+unknown provenance, and treating unknown as manual can only leave a token off until someone turns
+it on, whereas guessing "auto" would re-enable tokens a person had deliberately disabled — the very
+bug being fixed.
+
+**The panel's `auto` tag was part of the same defect.** It was *inferred* as "disabled AND not
+admissible", which cannot distinguish the two cases and got the manual one wrong exactly when it
+mattered. It now reports the recorded fact.
+
+### 36.2 Activating a strategy kind created nothing to run
+
+`trend_confluence` was activated for real mode and produced no signals all day.
+`SetAssignmentsEnabledForKinds` only ever ran an `UPDATE` — it flipped `enabled` on
+`strategy_assignments` rows that already existed. Real mode had rows for exactly two kinds
+(`stepped_trailing`, `vwap_reversion`, 10 instruments × 1 bar each), so selecting a third wrote
+`active_kinds`, reported success, and had **nothing to enable**. The kind read as active in the
+config while being entirely absent from the roster the engine loads — no error anywhere, because
+nothing was wrong from the UPDATE's point of view.
+
+**Fix**: the same call now also CREATES the missing rows, from each kind's locked origin strategy
+(§11.3) across the configured instruments × decision bars, with `ON CONFLICT DO NOTHING`. The
+conflict clause matters as much as the insert: `CreateAssignment`'s own `DO UPDATE SET enabled`
+would re-enable a per-token assignment an operator had deliberately disabled on the Strategies
+page, which is a *different, finer-grained* setting that this global per-kind switch must not
+overwrite.
+
+`cmd/trader`'s `decisionBars` computation moved above the call so the real bar list is available to
+it, rather than defaulting to something the engine would not then decide on.
+
+**The general lesson in both**: a control that writes config is only half a feature. The other half
+is whether anything downstream actually consumes what was written, and whether something else is
+free to overwrite it. Both bugs sat in that gap, and both looked identical from the panel — a
+successful save followed by no observable change.
