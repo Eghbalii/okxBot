@@ -4674,3 +4674,83 @@ it, rather than defaulting to something the engine would not then decide on.
 is whether anything downstream actually consumes what was written, and whether something else is
 free to overwrite it. Both bugs sat in that gap, and both looked identical from the panel — a
 successful save followed by no observable change.
+
+## 37. An exchange-executed stop recorded as a manual close (2026-09-09)
+
+Reported as three separate observations about real orders 39 and 40: the close data was missing,
+the reason said `manual` when it should have said `sl`, and trying to close them by hand from the
+panel returned an error. All three came from the same place, and one of them was masking a
+materially wrong number in the trade history.
+
+**What actually happened.** The exchange-side stop-loss (§35) worked exactly as designed — verified
+against OKX directly, both algo orders read `state: effective, actualSide: sl`. OKX triggered the
+stop and closed the positions. What failed was how this system *recorded* that.
+
+`reconcile`'s stale-close branch predates §35. It was written when the only way a position could
+vanish from OKX without this system closing it was a person doing it in the OKX app, so it recorded
+`conductor.CloseReasonManual` and — having no live tick on that path — used the order's own **entry
+price** as the close price. Once the stop lives on the exchange, that assumption is wrong in the
+most common case.
+
+The consequence was not cosmetic. A close price equal to the entry price implies a trade that went
+nowhere, so the recorded loss was **~15x smaller than the real one**:
+
+| | recorded | OKX's actual |
+|---|---|---|
+| order 39 close px | 0.00000358 (= entry) | 0.000003527 |
+| order 39 PnL | −0.018 | **−0.265** |
+| order 40 PnL | −0.019 | **−0.292** |
+
+These rows are also the model's reward signal (§15.12), so this taught the policy that two
+stopped-out trades were nearly free.
+
+**The fix: ask the exchange instead of assuming.** OKX's algo-order response carries `actualSide`
+("sl"/"tp") and `ordId` — the ordinary order the trigger created, which holds the true fill price,
+realized PnL and fee. Both fields were being decoded away. `closeFactsFromExchange` now reads them
+and records the real reason and real numbers. A position that vanished **without** its protective
+order firing is still recorded as `manual`, so the original behavior is kept as the fallback rather
+than deleted — a guess is never substituted for an answer.
+
+### 37.1 Closing was not idempotent
+
+Found while investigating, not reported: **real order 38 was closed twice**, by two reconciliation
+passes 3 seconds apart. `CloseRealOrderConfirmed`'s `UPDATE` had no `closed_at IS NULL` condition,
+so the second write replaced a −0.014 loss with a +0.472 gain. Both figures were wrong, but the
+point is that the second write should never have been allowed to land.
+
+The guard is a **conditional UPDATE, not a mutex**. §35.4's `reconcileMu` only serializes passes
+within one instrument's engine; each instrument has its own engine, several paths reach the close
+(tick monitor, reconcile, manual, timeout), and after a restart a second *process* can race the
+first. The database covers all of that atomically; an in-process lock covers none of it. Zero rows
+affected returns `port.ErrOrderAlreadyClosed`, which the caller treats as "someone else already did
+this" and stops — rather than going on to deliver a duplicate reward or publish a duplicate close
+event, both of which really happened on order 38.
+
+### 37.2 The panel error, and why it was correct
+
+The manual-close error was `real order 39 is not open` — accurate, and useless. OKX's stop had
+already closed the position, and the panel was still showing a Close button for it.
+
+**This was NOT the 5-second poll**, which was my first answer and was wrong. The close events *were*
+published to `okx.paper-order-events` and the panel's WebSocket bridge *did* fire — verified by
+reading the topic back. The real window is much smaller: orders 40 and 39 closed 2 seconds apart,
+and a click landing in that window races a close that is already in flight. No amount of WebSocket
+pushing removes that race; it can only be made legible.
+
+So the message now says what is actually true — "position #39 is already closed (sl, at …) —
+nothing to close" — and is **logged server-side**. Previously it existed only as a browser alert,
+which is why there was no record to look up when it was reported.
+
+### 37.3 Correcting the history
+
+Orders 38, 39 and 40 were corrected in place from OKX's own records, after backing the rows up to
+`real_orders_backup_20260910`. 39 and 40 got their real reason (`sl`), close price, exchange PnL and
+fee; 38's stored close price already matched OKX (its algo order reads `canceled` — it never fired,
+so its `manual` reason was genuinely correct) and only its exchange figures were missing.
+
+`realized_pnl` was recomputed for 39/40 from the corrected close price using the code's own formula,
+and **independently reproduced OKX's numbers to the cent** (−0.265 and −0.2919) — which is what
+confirms both the formula and the corrected prices rather than merely making the columns agree.
+
+`account_equity` needed no correction: real mode records the exchange's own reported balance each
+poll (§35.4) rather than summing these rows, so it was never affected by the wrong PnL.
