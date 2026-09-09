@@ -63,9 +63,10 @@ type fakeExchangeClient struct {
 	algoSeq int
 	// algoStatus, when set, is what GetAlgoOrder reports; unset means a live order carrying the
 	// most recently placed triggers.
-	algoStatus   *domain.AlgoOrderStatus
-	getAlgoErr   error
-	getAlgoCalls int
+	algoStatus      *domain.AlgoOrderStatus
+	algoStatusQueue []domain.AlgoOrderStatus
+	getAlgoErr      error
+	getAlgoCalls    int
 }
 
 func (f *fakeExchangeClient) PlaceAlgoOrder(req domain.AlgoOrderRequest) (string, error) {
@@ -95,6 +96,13 @@ func (f *fakeExchangeClient) CancelAlgoOrder(instID, algoID string) error {
 
 func (f *fakeExchangeClient) GetAlgoOrder(instID, algoID string) (domain.AlgoOrderStatus, error) {
 	f.getAlgoCalls++
+	// algoStatusQueue lets a test script a SEQUENCE of responses — needed to reproduce OKX
+	// populating actualSide a moment after the trigger, which no single fixed response can model.
+	if len(f.algoStatusQueue) > 0 {
+		next := f.algoStatusQueue[0]
+		f.algoStatusQueue = f.algoStatusQueue[1:]
+		return next, nil
+	}
 	if f.getAlgoErr != nil {
 		return domain.AlgoOrderStatus{}, f.getAlgoErr
 	}

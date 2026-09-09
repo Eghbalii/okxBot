@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/shopspring/decimal"
 
@@ -284,10 +285,32 @@ func (e *RealTrader) closeFactsFromExchange(o port.RealOrder, logger *slog.Logge
 		return reason, closePx, nil, nil
 	}
 	triggered, ok := algo.TriggeredReason()
+	if !ok && algo.State == "effective" {
+		// The order HAS fired but OKX has not filled in actualSide/ordId yet — observed on real
+		// order 43 (2026-09-10), where the reconciliation poll read the algo order about a second
+		// after the trigger and got state="effective" with an empty actualSide, then recorded the
+		// close as manual. The same read moments later carried actualSide="sl".
+		//
+		// Retrying briefly is the whole fix: this is a close being recorded once, and getting the
+		// reason and the real close price wrong is not worth avoiding a one-second wait on a path
+		// that already only runs when a position has just disappeared from the exchange.
+		for attempt := 0; attempt < 3 && !ok; attempt++ {
+			time.Sleep(500 * time.Millisecond)
+			if algo, err = e.Exchange.GetAlgoOrder(e.execInstID(), *o.ExchangeAlgoOrderID); err != nil {
+				break
+			}
+			triggered, ok = algo.TriggeredReason()
+		}
+	}
 	if !ok {
-		// Flat on the exchange but the protective order did not fire — a genuine manual close in
-		// the OKX app, a liquidation, or something else outside this system. The original
-		// assumption is the right one here, which is exactly why it is kept rather than removed.
+		// Either the protective order genuinely did not fire — a manual close in the OKX app, a
+		// liquidation, something outside this system — or OKX never filled in which side fired.
+		// The original assumption is right for the first case and the honest answer for the
+		// second, which is exactly why it is kept rather than removed.
+		if algo.State == "effective" {
+			logger.Warn("protective order fired but the exchange never reported which side; recording as a manual close",
+				"id", o.ID, "instId", e.InstID, "algoId", *o.ExchangeAlgoOrderID)
+		}
 		return reason, closePx, nil, nil
 	}
 	reason = triggered

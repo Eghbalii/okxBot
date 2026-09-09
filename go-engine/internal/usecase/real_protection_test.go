@@ -434,3 +434,41 @@ func TestCloseReal_SecondCloseDoesNotOverwriteTheFirst(t *testing.T) {
 			*first.CloseReason, *first.ClosePx, *second.CloseReason, *second.ClosePx)
 	}
 }
+
+// OKX reports state="effective" the moment a protective order fires, but fills in WHICH side fired
+// (actualSide) a beat later. Real order 43 (2026-09-10) was read in exactly that window and
+// recorded as a manual close at its entry price — minutes after the code meant to prevent that
+// shipped. The read is retried rather than accepting the first empty answer.
+func TestCloseFacts_RetriesUntilTheExchangeReportsWhichSideFired(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		algoStatusQueue: []domain.AlgoOrderStatus{
+			{State: "effective", AlgoID: "algo-1"},                                       // fired, side not filled in yet
+			{State: "effective", AlgoID: "algo-1", ActualSide: "sl", OrdID: "close-ord"}, // now it is
+		},
+		orderStatus: &domain.OrderStatus{
+			State: "filled", AvgPx: dec("2443.14"), AccFillSz: dec("1"),
+			Pnl: dec("-0.31"), Fee: dec("-0.004"),
+		},
+	}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	sl, contracts, algo := dec("2443.14"), dec("1"), "algo-1"
+	order := port.RealOrder{
+		ID: 43, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("2456.11"),
+		SLPx: &sl, Size: dec("10"), Leverage: dec("9.46"),
+		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
+	}
+
+	reason, closePx, exPnL, _ := rt.closeFactsFromExchange(order, testLogger())
+
+	if reason != "sl" {
+		t.Errorf("the retry must recover the real reason, got %q", reason)
+	}
+	if !closePx.Equal(dec("2443.14")) {
+		t.Errorf("close price must be the exchange's fill, got %v", closePx)
+	}
+	if exPnL == nil || !exPnL.Equal(dec("-0.31")) {
+		t.Errorf("the exchange's PnL must be recorded, got %v", exPnL)
+	}
+}

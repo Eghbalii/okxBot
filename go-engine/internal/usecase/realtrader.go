@@ -368,7 +368,18 @@ func (e *RealTrader) instrumentOrZero() domain.Instrument {
 // DefaultReconcileInterval is the reconciliation poll's cadence when RealTrader.ReconcileInterval
 // is unset.
 //
-// 5 seconds since 2026-09-09 (explicit operator request), down from the 1 minute set on 2026-09-03.
+// 20 seconds. It was set to 5 on 2026-09-09 (operator request) and raised on 2026-09-10 after that
+// cadence produced OKX "50011 Too Many Requests" on /account/positions and /account/balance: this
+// poll runs PER INSTRUMENT, so a 10-token roster issues 20 account-class calls every interval, and
+// both endpoints are account-wide — every one of those calls fetches the same data.
+//
+// The rate limiting was not harmless. A reconciliation pass that cannot read positions cannot
+// detect drift, and one that cannot read the protective order falls back to recording a close as
+// manual — which is how real order 43 was mis-recorded minutes after the code to prevent exactly
+// that had shipped.
+//
+// 20s is the compromise, not the ideal. The right fix is one account-wide poll shared across
+// instruments rather than N identical ones; that is a larger change than a constant.
 // The poll's job grew: it no longer only catches bookkeeping drift (a manual close on OKX's own
 // UI, a liquidation), it also verifies that every open position's protective order is still
 // resting on the exchange and re-places it when it is not. A minute of running unprotected is a
@@ -381,7 +392,7 @@ func (e *RealTrader) instrumentOrZero() domain.Instrument {
 //
 // The private WebSocket (positions/orders/account push) is the better primary for this and is
 // wired separately; this poll remains as the backup that does not depend on a socket staying up.
-const DefaultReconcileInterval = 5 * time.Second
+const DefaultReconcileInterval = 20 * time.Second
 
 func (e *RealTrader) reconcileInterval() time.Duration {
 	if e.ReconcileInterval > 0 {
