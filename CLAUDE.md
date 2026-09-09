@@ -4414,3 +4414,133 @@ unaffected throughout. `cmd/trader` itself was rebuilt and confirmed to compile 
 **deliberately not started** — `use_conductor_lifecycle` remains off, `okx-gateway` still runs
 demo credentials (§33.5) — flipping either is real-capital-risk territory reserved for an explicit,
 separate go/no-go decision, not something this deploy pass does on its own judgment.
+
+## 35. SL/TP now rests on the EXCHANGE, not only in our own process (2026-09-09)
+
+Reported by the operator against real order 33: its stop-loss was never settled on the exchange.
+Correctly identified as a red flag rather than a one-off — and it was not a bug in the sense of
+code doing the wrong thing, it was the **design** doing exactly what §27.3's own "§3a correction"
+(2026-09-03) had specified: real trading watched SL/TP with an in-process tick monitor, the same
+mechanism paper trading uses, and deliberately placed no resting conditional order on OKX.
+
+**That decision is now reversed** (explicit operator instruction: "we should do it on exchange
+always"). The reasoning for the reversal is worth stating plainly, because the original call was
+not unreasonable in isolation: an in-process monitor works only while this process is alive,
+connected, and receiving ticks. A crash, a deploy, an OOM (§16.10 has one on record), a stalled
+Kafka consumer (§28 has one on record), or a network partition leaves real capital running with
+**no protection at all** — and nothing anywhere reports the position as unprotected, because a
+position with no stop looks exactly like a position with a stop right up until it doesn't. Every
+one of those failure modes has already happened to this project at least once. The exchange's own
+conditional order survives all of them, because it does not depend on this process existing.
+
+### 35.1 What was built
+
+- **`internal/okx/rest/algo.go`** — `PlaceAlgoOrder` / `AmendAlgoOrder` / `CancelAlgoOrder` /
+  `GetAlgoOrder` over OKX's `order-algo`, `amend-algos`, `cancel-algos` endpoints, plus
+  `domain.AlgoOrderRequest`/`AlgoOrderAmend`/`AlgoOrderStatus` and the matching wire types. The
+  wire shapes were **not invented here**: `cmd/okx-apitest/okxraw.go` had already exercised them
+  against the real account (§33), deliberately holding them outside the production client until
+  they were actually needed. That is now.
+- Routed through `cmd/okx-gateway` like every other OKX call (`ClassTrade` for the three mutating
+  calls, `ClassAccount` for the read), so real trading keeps its rate-limit priority (§27.1) and
+  the credentials stay in one process.
+- **`internal/usecase/real_protection.go`** — the lifecycle: `placeProtection`, `amendProtection`,
+  `cancelProtection`, `ensureProtection`.
+
+**Both levels ride on ONE conditional order**, not two. OKX treats a conditional carrying both
+`slTriggerPx` and `tpTriggerPx` as OCO, so whichever fires cancels the other. Two separate orders
+would leave the losing side resting after the winner filled — a live order on an account that
+believes it is flat, free to open a brand-new position in the opposite direction. `slOrdPx`/
+`tpOrdPx` are `"-1"` (market on trigger) rather than a limit price: a limit stop can fail to fill
+in exactly the fast move that triggered it.
+
+### 35.2 Where it hooks in, and why the ordering is what it is
+
+| Point | Behavior |
+|---|---|
+| **Open** (`openReal`) | Rest SL/TP on the exchange right after the entry fills. **If it cannot be placed, the position is CLOSED again immediately.** |
+| **Model adjustment** (`applyRealAdjustment`) | Amend the exchange **first**; a failure aborts the whole adjustment, leaving both sides at the old level. |
+| **Panel edit** (`handleAdjustPosition`) | Same ordering. No resting order, or no exchange client → refuse (409/503) rather than write locally. |
+| **Close** (`closeRealWith`) | Cancel the resting order on **every** close, including `sl`/`tp`. |
+| **Verify** (`reconcile`) | Re-check every open position's protective order; re-place any that vanished. |
+
+- **Flattening an unprotectable position** was the operator's explicit choice over keeping it and
+  retrying. It costs a round-trip fee on a rare failure; holding an unprotected leveraged position
+  costs an unbounded loss. If that close ALSO fails, `risk.Manager.Halt` fires — an unprotected
+  position that will not flatten is the one state worth stopping everything for. Note this runs
+  even when the DB insert failed: the position is live on the exchange either way, and losing our
+  record of it is a bookkeeping problem while running it without a stop is a capital one.
+- **Exchange-before-database on every edit.** If the row were written first and the amend then
+  failed, OKX would keep enforcing the OLD stop while this system believed the new one was in
+  force. Both-old and both-new are coherent states; the dangerous one is the level actually
+  protecting real money being the one nobody is looking at. This is the same reasoning as
+  `closeRealWith`'s existing exchange-first flatten.
+- **Cancel on `sl`/`tp` closes too**, which looks redundant and is not: a stop touch detected by
+  the in-process monitor is *this system's* view of why the position closed, not evidence the
+  exchange's own order fired — the backup exists precisely for the case where it did not.
+  Cancelling an already-triggered order is a harmless no-op; leaving a live one is not.
+- **A failed verification READ never triggers a re-place.** Unknown is not absent, and re-placing
+  on an unreadable status would risk two protective orders on one position, which on a hedge-mode
+  account can close it twice — the opposite of protection.
+- **`ensureProtection` does not escalate to a close** the way `openReal` does. A close is right at
+  open time, when the position was just acquired and can be undone cheaply; force-flattening a
+  running position because one API call failed would turn a transient exchange problem into a
+  realized loss.
+
+`ExchangeAlgoOrderID` / `exchange_algo_order_id` / `SetRealOrderExchangeAlgoOrderID` — added in
+§27.7's commit 3 and left as documented dead code when §3a's correction landed — are now live and
+load-bearing. No migration was needed.
+
+### 35.3 The in-process monitor stays, as a backup
+
+Explicit operator decision ("exchange and verify"). The exchange order is **primary**; the tick
+monitor's close path is unchanged and still fires. This is the same defence-in-depth posture as
+the 15% loss cap living in three independent places (§19.2/§19.3/§23) — no single layer is trusted
+as the boundary.
+
+### 35.4 Private WebSocket for position sync (operator's request)
+
+`reconcileInterval` dropped **60s → 5s**, because the poll's job grew: it no longer only catches
+bookkeeping drift, it also bounds how long a position can run unprotected.
+
+On top of that, §27.4's long-deferred stretch goal finally landed: **`internal/okx/ws/private.go`**,
+a reconnecting client for `wss://.../ws/v5/private` subscribed to the account's `positions`/`orders`
+channels. A fill, liquidation, triggered stop, or manual close from OKX's own app now reaches the
+trading process in roughly the time the message takes to arrive.
+
+- **It runs in `cmd/okx-gateway`, not `cmd/trader`.** The private WS needs credentials, and the
+  gateway is the only process holding them (§27.1) — giving `cmd/trader` its own socket would hand
+  back exactly what was deliberately moved out of it. Events are republished onto a new
+  `okx.account-events` Kafka topic; `cmd/trader` consumes it and calls the new
+  `RealTrader.ReconcileNow` for the named instrument.
+- **The events carry no position DATA, only which instrument changed.** Reconciliation re-reads
+  both sides authoritatively; shipping OKX's payload across would create a second, independently
+  decoded view of a position, free to disagree with the one the trading logic actually acts on.
+  "Something changed on BTC, go look" is the whole message.
+- **Login is awaited before subscribing.** Subscribing first gets the subscription silently
+  rejected — a connected socket that never pushes anything, the same silent-gap failure shape as
+  §9's mis-cased bar name. Note the login timestamp is **unix seconds**, not REST's ISO8601
+  milliseconds; getting that wrong fails as an unhelpful "login failed" that names nothing.
+- **`reconcile` is now serialized** (`reconcileMu`). It previously had one caller on a fixed ticker
+  and could not overlap with itself; a pushed event can now trigger a pass while the periodic one
+  is mid-flight, and both read-then-act on the same difference — the §16.9 race class exactly.
+  Covered by a `-race` regression test that releases two passes from one channel and asserts a
+  single close (mutation-checked: removing the lock fails it with 2).
+- The poll **stays** underneath the socket. A WebSocket can be connected and silently stale, and
+  this entire section exists because a component being up is not evidence it is working (§27.6's
+  own "push plus periodic REST reconciliation is a defence-in-depth pair, not a case for picking
+  only one").
+
+### 35.5 A fake that had diverged from reality
+
+`fakeExchangeClient.GetOrder`'s default reported a **filled** order with `AccFillSz = 0` — which no
+exchange does. `order.Contracts` is derived from exactly that field, and it is what the protective
+order is sized to, so every test position was unprotectable in a way production never is. Fixed the
+fake rather than weakening the assertion, the same call §17 made for `SaveCandle`.
+
+**Every new test is mutation-checked** — each one was run against the code with its own fix
+reverted and confirmed to fail. 571 Go tests pass under `-race` (was 548).
+
+**Alerting**: `okxbot_real_protection_missing_total` is the one to watch. Any nonzero value means a
+live position was found unprotected, which should be impossible if placement and cancellation both
+work. `okxbot_real_unprotected_closed_total` counts positions flattened for want of protection.
