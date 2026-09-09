@@ -197,9 +197,14 @@ func (f *fakeExchangeClient) GetFundingRateHistory(instID string, limit int) ([]
 type fakeModelClient struct {
 	action  domain.Action
 	lastObs domain.Observation // captured so tests can assert what the model was actually asked
+	// predictCalls counts how many decisions were actually asked for. Some paths are worth
+	// asserting were never REACHED, not merely that they produced no effect — an unusable answer
+	// and a question never asked look identical downstream but are not the same behavior.
+	predictCalls int
 }
 
 func (f *fakeModelClient) Predict(ctx context.Context, obs domain.Observation) (*domain.Action, error) {
+	f.predictCalls++
 	f.lastObs = obs
 	a := f.action
 	return &a, nil

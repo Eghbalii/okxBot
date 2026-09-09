@@ -553,7 +553,12 @@ func (r *fakeRepository) ListRealPositions(ctx context.Context, f port.PositionF
 			continue
 		}
 		if f.Open != nil {
-			isOpenPosition := o.ClosedAt == nil && (o.Status == "filled" || o.Status == "partial")
+			// Mirrors internal/postgres's own query, which includes 'closing' — an order whose
+			// flatten is in flight is still an open position on the exchange. The fake omitted it,
+			// which quietly hid a state the production code genuinely encounters (a fake that
+			// diverges from its real counterpart weakens every test using it, CLAUDE.md §17).
+			isOpenPosition := o.ClosedAt == nil &&
+				(o.Status == "filled" || o.Status == "partial" || o.Status == "closing")
 			if *f.Open {
 				if !isOpenPosition {
 					continue
@@ -949,8 +954,8 @@ func TestRealizedPnLWithFunding_OutsideWindowNotCounted(t *testing.T) {
 	opened := time.Now().Add(-time.Hour)
 	closed := time.Now()
 	repo.fundingRates = []port.FundingRate{
-		{InstID: "BTC", FundingTime: opened.Add(-time.Minute), FundingRate: dec("0.01")},  // before open
-		{InstID: "BTC", FundingTime: closed.Add(time.Minute), FundingRate: dec("0.01")},   // after close
+		{InstID: "BTC", FundingTime: opened.Add(-time.Minute), FundingRate: dec("0.01")}, // before open
+		{InstID: "BTC", FundingTime: closed.Add(time.Minute), FundingRate: dec("0.01")},  // after close
 	}
 	order := port.PaperOrder{
 		InstID: "BTC", Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("10"), OpenedAt: opened,

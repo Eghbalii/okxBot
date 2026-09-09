@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
@@ -277,3 +278,47 @@ func TestReconcile_ConcurrentPassesCloseAStalePositionOnlyOnce(t *testing.T) {
 		t.Fatalf("the stale position must be closed exactly once, got %d closed rows", closed)
 	}
 }
+
+// A position whose flatten is already in flight ('closing') is still listed as open — the real
+// Postgres query includes that status, since the exchange position genuinely still exists until
+// the flatten fills. Asking the model to move its levels then is pointless work on a position
+// already on its way out, and would amend an order about to be cancelled.
+//
+// 'closing' rather than 'opening' here is deliberate: ListRealPositions filters 'opening' out on
+// its own, so a test using it would pass with or without the guard and prove nothing.
+func TestRunUpdates_SkipsPositionsThatAreNotHoldingExposure(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionUpdate, SLPx: dec("98")}}
+	rt := newTestRealTrader(repo, exchange, model, nil)
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+
+	sl := dec("95")
+	repo.realOrders[1] = port.RealOrder{
+		ID: 1, InstID: rt.InstID, Side: "buy", Status: "closing", EntryPx: dec("100"),
+		SLPx: &sl, Size: dec("10"), Leverage: dec("1"), ExchangeAlgoOrderID: algoIDPtr("a1"),
+	}
+
+	// The conductor returns false the first time it sees an order (it has no prior PnL to compare
+	// against), so one priming pass is needed before the update path is genuinely reachable —
+	// without it this test would pass whether the guard exists or not.
+	rt.conductor().ShouldUpdate(1, dec("0"), time.Now().Add(-time.Hour))
+
+	rt.runUpdates(context.Background(), "1m", dec("100"), testLogger())
+
+	// The model must not even be CONSULTED. amendProtection would refuse an order with no resting
+	// protective order anyway, so asserting only on the amend count would pass with or without the
+	// guard — the behavior that actually differs is whether a decision was requested at all.
+	if model.predictCalls != 0 {
+		t.Errorf("a closing position must not be sent to the model, got %d predict calls", model.predictCalls)
+	}
+	if len(exchange.amendedAlgoOrders) != 0 {
+		t.Errorf("a closing position must not produce an exchange amend, got %d", len(exchange.amendedAlgoOrders))
+	}
+	if repo.realOrders[1].SLPx == nil || !repo.realOrders[1].SLPx.Equal(sl) {
+		t.Errorf("a closing position's stored stop must be untouched, got %v", repo.realOrders[1].SLPx)
+	}
+}
+
+// algoIDPtr is a small helper for fixtures that need a resting-order id.
+func algoIDPtr(id string) *string { return &id }

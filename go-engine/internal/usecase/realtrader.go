@@ -1196,6 +1196,14 @@ func (e *RealTrader) runUpdates(ctx context.Context, bar string, price decimal.D
 		if o.ManualOverride {
 			continue
 		}
+		// A position still being opened has no resting protective order yet, so any level the model
+		// proposed could not be pushed to the exchange and applyRealAdjustment would refuse it
+		// anyway (2026-09-09). Skipping here avoids spending a model call on a decision that cannot
+		// be carried out, and avoids logging an alarming "no resting order to amend" for what is
+		// just an order that has not finished filling.
+		if o.Status != "filled" && o.Status != "partial" {
+			continue
+		}
 
 		pnl := unrealizedPnLPct(asPaperOrderView(o), price)
 		if !e.conductor().ShouldUpdate(o.ID, pnl, now) {
