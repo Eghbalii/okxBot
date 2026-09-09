@@ -1652,6 +1652,32 @@ func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
 				"instId", e.InstID, "localSide", localSide, "remoteSide", remoteSide, "remotePosSide", remote.PosSide)
 			e.RiskManager.Halt(fmt.Sprintf("reconcile: side mismatch on %s (local %s, exchange %s)",
 				e.InstID, localSide, remoteSide))
+			break
+		}
+
+		// A position that agrees with the exchange can still be one this engine has stopped
+		// watching. SL/TP execution is tick-driven and in-process (§27.3), so it stops entirely
+		// whenever the process does — and the position keeps running on the exchange with real
+		// money behind it and nothing enforcing its stop.
+		//
+		// Real order 33 (PEPE, 2026-09-09): its stop sat at -14.7% of margin, price breached it and
+		// reached -19.6% while the trader was down for 15 minutes, and nothing closed it. It only
+		// exited because the operator had already requested a manual close — by then back at -8.7%,
+		// so the loss happened to be smaller, but that was luck, not the system working.
+		//
+		// This is the check that makes "verify against the exchange" mean something for a position
+		// that already exists: the poll re-runs the same SL/TP touch test against the exchange's
+		// own mark price, so a stop breached during any gap is acted on at the next poll instead of
+		// waiting for a tick that may never be evaluated. Uses MarkPx, which reconcile already
+		// fetches and previously ignored.
+		if remote.MarkPx.IsPositive() {
+			if reason, hit := closeReason(asPaperOrderView(local[0]), remote.MarkPx); hit {
+				logger.Warn("reconcile: position is past its own SL/TP but was never closed; closing now",
+					"instId", e.InstID, "id", local[0].ID, "reason", reason, "markPx", remote.MarkPx)
+				if err := e.closeReal(ctx, local[0], remote.MarkPx, reason, logger); err != nil {
+					logger.Error("reconcile: failed to close a position past its level", "id", local[0].ID, "error", err)
+				}
+			}
 		}
 	}
 

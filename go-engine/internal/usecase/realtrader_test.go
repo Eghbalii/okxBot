@@ -1458,3 +1458,87 @@ func TestCloseReal_LegacyRowFallsBackToEntryPriceSizing(t *testing.T) {
 		t.Fatalf("legacy fallback must size at the entry price: want 2, got %s", got)
 	}
 }
+
+// A position whose stop was breached while the engine was not watching must close on the very next
+// reconciliation poll, not wait for a tick (2026-09-09 request: closing must be verified against
+// the exchange, not only driven by the local tick feed).
+//
+// Real order 33's numbers: PEPE long, entry 0.00000362, stop 0.0000035659 (-14.7% of margin at
+// 9.87x). The trader was down for 15 minutes, price breached the stop and reached -19.6%, and
+// nothing closed it. Reconcile saw the position, agreed it matched the exchange, checked only the
+// side, and moved on. It exited 18 minutes later only because a manual close had been requested —
+// by then back at -8.7%, so the realized loss was smaller than the breach, which was luck.
+func TestReconcile_ClosesAPositionAlreadyPastItsStop(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	entry := dec("0.00000362")
+	sl := dec("0.0000035659802313184517469")
+	tp := dec("0.000003820187702322006")
+	contracts := dec("5")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: entry, SLPx: &sl, TPPx: &tp,
+		Size: dec("1.83"), Leverage: dec("9.8719062805175779"), Contracts: &contracts,
+		Status: "filled", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// The exchange reports the same position, at the price it actually reached: 0.000003548, well
+	// below the stop.
+	exchange.positions = []domain.Position{{
+		InstID: rt.execInstID(), PosSide: "long", Pos: dec("5"),
+		AvgPx: entry, MarkPx: dec("0.000003548"),
+	}}
+
+	rt.reconcile(ctx, testLogger())
+
+	after, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.ClosedAt == nil {
+		t.Fatal("a position past its stop must be closed by the reconciliation poll — the tick-driven " +
+			"check does not run while the process is down, which is exactly when this matters")
+	}
+	if after.CloseReason == nil || *after.CloseReason != "sl" {
+		t.Fatalf("close reason: want sl, got %v", after.CloseReason)
+	}
+}
+
+// A position comfortably inside its levels must be left alone — this check exists to catch a missed
+// stop, not to second-guess a healthy position on every poll.
+func TestReconcile_LeavesAHealthyPositionOpen(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	sl, tp := dec("90"), dec("110")
+	contracts := dec("1")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("10"), Leverage: dec("1"), Contracts: &contracts,
+		Status: "filled", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	exchange.positions = []domain.Position{{
+		InstID: rt.execInstID(), PosSide: "long", Pos: dec("1"),
+		AvgPx: dec("100"), MarkPx: dec("101"), // between the levels
+	}}
+
+	rt.reconcile(ctx, testLogger())
+
+	after, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.ClosedAt != nil {
+		t.Fatal("a position inside its own levels must not be closed by reconciliation")
+	}
+}
