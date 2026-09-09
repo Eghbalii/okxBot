@@ -27,25 +27,36 @@ func (s *traderService) routes() http.Handler {
 
 // handleRestart exits this process so Docker's restart policy relaunches it reading whatever
 // config (use_conductor_lifecycle, strategy_assignments mode='real', paper_trading_config
-// mode='real') was just saved — identical mechanism to cmd/paper-trader's own handleRestart, with
-// one deliberate difference: this exits with status 1, not 0.
+// mode='real') was just saved — identical mechanism to cmd/paper-trader's own handleRestart.
 //
-// cmd/trader's compose service uses restart: on-failure:5 (not paper-trader's unless-stopped) —
-// on purpose, so a genuinely missing/misconfigured okx-gateway at startup doesn't crash-loop
-// forever (CLAUDE.md §27.1's docker-compose.yml comment). on-failure only relaunches on a
-// NONZERO exit code, so the os.Exit(0) this handler originally used (copied verbatim from
-// paper-trader, whose unless-stopped policy makes exit code irrelevant) meant a panel Resume
-// click here would save trading_state='running' to Postgres, self-exit cleanly, and then just...
-// stay dead — Docker correctly saw a successful exit and did nothing. Found live 2026-09-05: the
-// container sat Exited(0) for 12 minutes after a Resume click, with trading_state='running' in
-// the DB the whole time and no process left to read it. Exit(1) makes this restart count as a
-// failure for on-failure's purposes without touching the cap (this is one restart, not five) or
-// reopening the missing-gateway crash-loop concern the comment above is actually about.
+// Exits 0, and the compose service uses restart: unless-stopped (changed 2026-09-09).
+//
+// The history here is worth keeping, because the previous two attempts each fixed one failure by
+// creating another:
+//
+//  1. Originally exit(0) under on-failure:5 — copied from paper-trader, whose unless-stopped policy
+//     makes the exit code irrelevant. on-failure only relaunches on a NONZERO exit, so a Resume
+//     click saved trading_state='running' and then sat Exited(0) forever with no process to read
+//     it (found live 2026-09-05, 12 minutes dead).
+//  2. Then exit(1) under on-failure:5, on the reasoning that a nonzero exit would relaunch without
+//     touching the retry cap. That reasoning was simply wrong: Docker's on-failure:N counts EVERY
+//     nonzero exit toward N and only resets after a sufficiently long successful run. Six panel
+//     restarts exhausted the five retries and the trader stayed dead — found 2026-09-09 with two
+//     real positions open on the exchange, both flagged for manual close, both still losing (PEPE
+//     -9.5%, BTC -5.3%) because nothing was alive to close them.
+//
+// The lesson is that exit code and restart policy have to be chosen together, not one at a time.
+// on-failure existed to stop a misconfigured startup (a missing gateway, real money without
+// allow_real_money) from crash-looping forever — but those are exactly the cases that DO exit
+// nonzero and SHOULD stop retrying, while an operator-requested restart is a clean, successful
+// exit that should always relaunch. unless-stopped + exit(0) gives both: cmd/trader's startup
+// guards still exit(1), and Docker's default backoff already spaces a genuine crash-loop out
+// rather than spinning, so the cap was never the thing protecting against it.
 func (s *traderService) handleRestart(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("restart requested via panel; exiting for the container's restart policy to relaunch")
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "restarting"})
 	go func() {
-		os.Exit(1)
+		os.Exit(0)
 	}()
 }
 

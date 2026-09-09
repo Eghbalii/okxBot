@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -103,5 +105,52 @@ func TestRealEarlyCloseAllowed_IsIndependentOfPaperFlag(t *testing.T) {
 func TestRealEarlyCloseAllowed_DefaultsOff(t *testing.T) {
 	if realEarlyCloseAllowed(&config.Config{}) {
 		t.Error("allow_rl_early_close must default to false")
+	}
+}
+
+// The restart handler's exit code and the compose restart policy have to agree, and getting that
+// pair wrong has now broken real trading twice in different directions:
+//
+//	exit(0) + on-failure:5      -> a panel Resume left the container Exited(0) forever
+//	exit(1) + on-failure:5      -> every panel restart burned a retry; six exhausted the cap and
+//	                               the trader stayed dead with two real positions open and losing
+//	exit(0) + unless-stopped    -> correct: an operator restart always relaunches, while the
+//	                               startup guards still exit(1) and stop a genuine crash loop
+//
+// os.Exit cannot be exercised from a test, so this asserts the pairing at the source level. That
+// is weaker than a behavioural test, but it is the value that actually regressed — twice — and a
+// mismatch here is invisible until real money is already exposed.
+func TestRestartHandlerExitCodeMatchesRestartPolicy(t *testing.T) {
+	handler, err := os.ReadFile("handlers.go")
+	if err != nil {
+		t.Fatalf("read handlers.go: %v", err)
+	}
+	if !strings.Contains(string(handler), "os.Exit(0)") {
+		t.Error("handleRestart must exit 0: unless-stopped relaunches a clean exit, and a nonzero " +
+			"exit would count toward any capped policy as if the operator's restart were a crash")
+	}
+
+	compose, err := os.ReadFile("../../../docker-compose.yml")
+	if err != nil {
+		t.Skipf("docker-compose.yml not readable from here: %v", err)
+	}
+	traderIdx := strings.Index(string(compose), "\n  trader:")
+	if traderIdx < 0 {
+		t.Fatal("could not locate the trader service in docker-compose.yml")
+	}
+	// Read only as far as the next service, so this cannot accidentally match a neighbour's policy.
+	rest := string(compose)[traderIdx+1:]
+	if next := strings.Index(rest[1:], "\n  "); next > 0 {
+		if end := strings.Index(rest, "\n\n"); end > 0 {
+			rest = rest[:end]
+		}
+	}
+	if strings.Contains(rest, "restart: on-failure") {
+		t.Error("trader must not use a capped restart policy: the panel's Restart button is a " +
+			"process exit, so a cap counts operator actions as failures and eventually refuses " +
+			"to bring real trading back up")
+	}
+	if !strings.Contains(rest, "restart: unless-stopped") {
+		t.Error("trader should use restart: unless-stopped so an operator-requested restart always relaunches")
 	}
 }

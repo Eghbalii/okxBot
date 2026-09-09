@@ -153,12 +153,18 @@ services:
 
   trader:
     logging: *default-logging
-    # NOT unless-stopped: cmd/trader exits immediately if it can't reach okx-gateway for mode
-    # detection at startup (CLAUDE.md §27.1) — an always-restart policy would turn a genuinely
-    # absent/misconfigured gateway into an endless crash loop burning CPU and log volume.
-    # on-failure with a cap still recovers from transient startup races (e.g. gateway not yet
-    # ready) or genuine crashes.
-    restart: on-failure:5
+    # unless-stopped since 2026-09-09, replacing on-failure:5. The cap was protecting against a
+    # crash loop from a missing/misconfigured okx-gateway at startup (CLAUDE.md §27.1), but it
+    # counted the panel's own Restart button toward the same five retries — every Resume/Save &
+    # Apply click is a process exit. Six clicks exhausted it and the trader stayed dead with two
+    # real positions open on the exchange, both flagged for manual close and both still losing,
+    # because nothing was alive to close them.
+    #
+    # The startup guards still exit(1) and Docker's default restart backoff already spaces a
+    # genuine crash loop out rather than spinning on it, so the cap was never what protected
+    # against that — it only ever capped legitimate restarts. handleRestart now exits 0, which
+    # unless-stopped relaunches; see its own comment for why the two must be chosen together.
+    restart: unless-stopped
     build:
       context: ./go-engine
       dockerfile: Dockerfile.trader
