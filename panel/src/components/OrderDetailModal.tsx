@@ -139,7 +139,47 @@ const AdjustmentHistory = memo(function AdjustmentHistory({ orderId, mode }: { o
   )
 })
 
-export default function OrderDetailModal({
+// Memoized on the fields this view actually renders, NOT on object identity (2026-09-09).
+//
+// PositionsPage holds a live price stream feeding ~45 ticks/second across the token roster, and
+// every tick re-renders the page, which recomputes `detailPosition` from the poll data and hands
+// this modal a brand-new object. The result was the whole modal rebuilding 45 times a second —
+// far too fast to read as anything but a flicker.
+//
+// The comparison is explicit rather than a shallow prop check, since the object is new every time
+// and a shallow check would always miss. It lists the fields rendered here, so a value that
+// genuinely changed (a close landing, an SL/TP edit, a status transition) still updates
+// immediately, while a tick that changed nothing about THIS order re-renders nothing.
+//
+// onClose is deliberately excluded: PositionsPage passes an inline arrow, so it is a new function
+// on every render and comparing it would defeat the memo entirely. It only ever calls
+// setDetailOrderId(null), which is stable in behaviour even when its identity is not.
+function orderDetailPropsEqual(
+  prev: { position: Position },
+  next: { position: Position },
+): boolean {
+  const a = prev.position
+  const b = next.position
+  return (
+    a.ID === b.ID &&
+    a.Mode === b.Mode &&
+    a.Status === b.Status &&
+    a.SLPx === b.SLPx &&
+    a.TPPx === b.TPPx &&
+    a.ClosedAt === b.ClosedAt &&
+    a.CloseReason === b.CloseReason &&
+    a.ClosePx === b.ClosePx &&
+    a.RealizedPnL === b.RealizedPnL &&
+    a.Size === b.Size &&
+    a.Leverage === b.Leverage &&
+    a.EntryPx === b.EntryPx &&
+    a.AdjustmentCount === b.AdjustmentCount &&
+    a.ExchangeOrderID === b.ExchangeOrderID &&
+    a.ExchangeCloseOrderID === b.ExchangeCloseOrderID
+  )
+}
+
+function OrderDetailModal({
   position,
   onClose,
 }: {
@@ -310,3 +350,5 @@ function RawLeg({
     </div>
   )
 }
+
+export default memo(OrderDetailModal, orderDetailPropsEqual)

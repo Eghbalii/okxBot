@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import type { Position } from '../api/types'
 import { tokenSymbol, trimPrice } from '../utils/format'
 
@@ -12,7 +12,7 @@ import { tokenSymbol, trimPrice } from '../utils/format'
 // the loss side, positive to the profit side (e.g. -5 on a 10x position means "move to a 5% loss
 // of margin," a 0.5% price move from entry). Unclamped on the backend: an explicit operator/admin
 // action is trusted directly, unlike the model's own automated edits.
-export default function AdjustPositionForm({
+function AdjustPositionForm({
   position,
   onCancel,
   onSubmit,
@@ -93,3 +93,24 @@ export default function AdjustPositionForm({
     </div>
   )
 }
+
+// Memoized on the fields this form reads, for the same reason OrderDetailModal is: the positions
+// page re-renders on every live price tick (~45/second) and hands this a new position object each
+// time. React preserves the typed SL/TP input across re-renders, so nothing was being lost — but
+// re-rendering a form 45 times a second while someone types in it is wasteful and can make the
+// inputs feel unresponsive.
+//
+// onCancel/onSubmit are excluded deliberately: both are inline arrows from the parent, so they are
+// new on every render and comparing them would defeat the memo. Their behaviour is stable even
+// though their identity is not.
+export default memo(AdjustPositionForm, (prev, next) => {
+  const a = prev.position
+  const b = next.position
+  return (
+    a.ID === b.ID &&
+    a.Side === b.Side &&
+    a.EntryPx === b.EntryPx &&
+    a.Leverage === b.Leverage &&
+    a.InstID === b.InstID
+  )
+})
