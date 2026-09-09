@@ -19,10 +19,10 @@ func (r *Repository) OpenRealOrder(ctx context.Context, o port.RealOrder) (int64
 	}
 	var id int64
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO real_orders (inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, features_json, status, bar, exchange_order_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		INSERT INTO real_orders (inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, features_json, status, bar, exchange_order_id, contracts)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id
-	`, o.InstID, o.StrategyID, o.Side, o.EntryPx, o.SLPx, o.TPPx, o.Size, o.Leverage, o.FeaturesJSON, status, o.Bar, o.ExchangeOrderID).Scan(&id)
+	`, o.InstID, o.StrategyID, o.Side, o.EntryPx, o.SLPx, o.TPPx, o.Size, o.Leverage, o.FeaturesJSON, status, o.Bar, o.ExchangeOrderID, o.Contracts).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("open real order for %s: %w", o.InstID, err)
 	}
@@ -43,14 +43,14 @@ func (r *Repository) GetRealOrder(ctx context.Context, id int64) (port.RealOrder
 			-- when one was stored — which made the panel's raw-record view unable to fetch the close
 			-- leg at all. ListRealPositions already selected them; only this path was behind.
 			exchange_close_order_id, exchange_realized_pnl, exchange_fee, exchange_close_px,
-			last_error, last_error_at, exchange_open_raw, exchange_close_raw
+			last_error, last_error_at, exchange_open_raw, exchange_close_raw, contracts
 		FROM real_orders WHERE id = $1
 	`, id).Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size,
 		&o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx, &o.RealizedPnL,
 		&o.FeaturesJSON, &o.Status, &bar, &o.PnLMaxPct, &o.PnLMinPct,
 		&o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.ManualOverride,
 		&o.ExchangeCloseOrderID, &o.ExchangeRealizedPnL, &o.ExchangeFee, &o.ExchangeClosePx,
-		&o.LastError, &o.LastErrorAt, &o.ExchangeOpenRaw, &o.ExchangeCloseRaw)
+		&o.LastError, &o.LastErrorAt, &o.ExchangeOpenRaw, &o.ExchangeCloseRaw, &o.Contracts)
 	if err != nil {
 		return port.RealOrder{}, fmt.Errorf("get real order %d: %w", id, err)
 	}
@@ -64,14 +64,17 @@ func (r *Repository) GetRealOrder(ctx context.Context, id int64) (port.RealOrder
 // entryPx/size are nil-able: a "canceled" transition passes neither (nothing to correct); a
 // "filled"/"partial" transition passes both, correcting the provisional pre-fill price/size to the
 // exchange-confirmed values.
-func (r *Repository) UpdateRealOrderStatus(ctx context.Context, id int64, status string, entryPx *decimal.Decimal, size *decimal.Decimal) error {
+func (r *Repository) UpdateRealOrderStatus(ctx context.Context, id int64, status string, entryPx *decimal.Decimal, size *decimal.Decimal, contracts *decimal.Decimal) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE real_orders
 		SET status = $2,
 			entry_px = COALESCE($3, entry_px),
-			size = COALESCE($4, size)
+			size = COALESCE($4, size),
+			-- The exchange-confirmed contract count. COALESCE so a status-only transition (marking
+			-- an order "opening") cannot blank a count already recorded.
+			contracts = COALESCE($5, contracts)
 		WHERE id = $1
-	`, id, status, entryPx, size)
+	`, id, status, entryPx, size, contracts)
 	if err != nil {
 		return fmt.Errorf("update real order %d status: %w", id, err)
 	}
@@ -250,7 +253,7 @@ func (r *Repository) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tp
 // position (it isn't one yet).
 func (r *Repository) ListOpenRealOrders(ctx context.Context, instID string) ([]port.RealOrder, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, status, pnl_max_pct, pnl_min_pct, bar, manual_close_requested, exchange_order_id, exchange_algo_order_id
+		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, status, pnl_max_pct, pnl_min_pct, bar, manual_close_requested, exchange_order_id, exchange_algo_order_id, contracts
 		FROM real_orders
 		-- 'closing' is included deliberately: a flatten is in flight but unconfirmed, so the
 		-- position is still REAL and still needs monitoring. Excluding it here would make the
@@ -268,7 +271,7 @@ func (r *Repository) ListOpenRealOrders(ctx context.Context, instID string) ([]p
 	for rows.Next() {
 		var o port.RealOrder
 		var bar *string
-		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.OpenedAt, &o.FeaturesJSON, &o.Status, &o.PnLMaxPct, &o.PnLMinPct, &bar, &o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID); err != nil {
+		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.OpenedAt, &o.FeaturesJSON, &o.Status, &o.PnLMaxPct, &o.PnLMinPct, &bar, &o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.Contracts); err != nil {
 			return nil, fmt.Errorf("scan real order: %w", err)
 		}
 		if bar != nil {
@@ -350,7 +353,7 @@ func (r *Repository) ListRealPositions(ctx context.Context, f port.PositionFilte
 			ro.bar, ro.pnl_max_pct, ro.pnl_min_pct, COALESCE(s.name, ''),
 			ro.exchange_order_id, ro.exchange_algo_order_id, ro.manual_close_requested, ro.manual_override,
 			ro.exchange_close_order_id, ro.exchange_realized_pnl, ro.exchange_fee, ro.exchange_close_px,
-			ro.last_error, ro.last_error_at,
+			ro.last_error, ro.last_error_at, ro.contracts,
 			-- In-place SL/TP edit count, mirroring ListPositions — backs the panel's "Updated"
 			-- column for real rows so it means the same thing in both modes.
 			(SELECT COUNT(*) FROM real_order_adjustments a WHERE a.order_id = ro.id)
@@ -382,7 +385,7 @@ func (r *Repository) ListRealPositions(ctx context.Context, f port.PositionFilte
 			&o.PnLMaxPct, &o.PnLMinPct, &o.StrategyName, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID,
 			&o.ManualCloseRequested, &o.ManualOverride,
 			&o.ExchangeCloseOrderID, &o.ExchangeRealizedPnL, &o.ExchangeFee, &o.ExchangeClosePx,
-			&o.LastError, &o.LastErrorAt,
+			&o.LastError, &o.LastErrorAt, &o.Contracts,
 			&o.AdjustmentCount); err != nil {
 			return nil, fmt.Errorf("scan real position: %w", err)
 		}

@@ -954,7 +954,7 @@ func (e *RealTrader) openReal(
 		// resolves seconds later (2026-09-08 request). Best-effort: this is visibility, and losing
 		// it must not abort an open the exchange has already accepted.
 		if persisted {
-			if err := e.Repo.UpdateRealOrderStatus(ctx, localID, "opening", nil, nil); err != nil {
+			if err := e.Repo.UpdateRealOrderStatus(ctx, localID, "opening", nil, nil, nil); err != nil {
 				logger.Warn("failed to mark real order opening", "id", localID, "error", err)
 			}
 		}
@@ -986,6 +986,12 @@ func (e *RealTrader) openReal(
 			if filled := marginFromFill(status, order.EntryPx, order.Leverage, e.instrumentOrZero()); filled.IsPositive() {
 				order.Size = filled
 			}
+			// The contract count the exchange actually filled. This — not a size re-derived from a
+			// price — is what the flatten closes.
+			if status.AccFillSz.IsPositive() {
+				filledSz := status.AccFillSz
+				order.Contracts = &filledSz
+			}
 		case status.AccFillSz.IsPositive():
 			// Partially filled within the timeout window: a real, smaller-than-intended position
 			// exists on the exchange (canceled by waitForFill's timeout path for the remainder), so
@@ -1007,6 +1013,8 @@ func (e *RealTrader) openReal(
 			} else {
 				order.Size = order.Size.Mul(status.AccFillSz).Div(sz)
 			}
+			filledSz := status.AccFillSz
+			order.Contracts = &filledSz
 		default:
 			// Never filled at all before the timeout — canceled. The pending row STAYS (per the
 			// plan's design: a timed-out attempt is still visible, not silently dropped) with
@@ -1029,11 +1037,12 @@ func (e *RealTrader) openReal(
 	}
 
 	if persisted {
-		var entryPxPtr, sizePtr *decimal.Decimal
+		var entryPxPtr, sizePtr, contractsPtr *decimal.Decimal
 		if finalStatus == "filled" || finalStatus == "partial" {
 			entryPxPtr, sizePtr = &order.EntryPx, &order.Size
+			contractsPtr = order.Contracts
 		}
-		if err := e.Repo.UpdateRealOrderStatus(ctx, localID, finalStatus, entryPxPtr, sizePtr); err != nil {
+		if err := e.Repo.UpdateRealOrderStatus(ctx, localID, finalStatus, entryPxPtr, sizePtr, contractsPtr); err != nil {
 			logger.Warn("failed to update real order status", "id", localID, "instId", e.InstID, "status", finalStatus, "error", err)
 		}
 		if err := e.Repo.SetRealOrderFeatures(ctx, localID, order.FeaturesJSON); err != nil {
@@ -1335,18 +1344,30 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 		if o.Side == "sell" {
 			side = "buy"
 		}
-		closePrice := o.EntryPx
-		if price.IsPositive() {
-			closePrice = price
-		}
+		// No close-price selection here any more: the flatten closes a contract COUNT, which no
+		// price enters into. Choosing a price was only ever input to the size derivation that
+		// caused the under-close.
 		inst, err := e.instrumentMeta()
 		if err != nil {
 			return e.recordCloseError(ctx, o.ID, fmt.Errorf("fetch instrument metadata: %w", err), logger)
 		}
-		// Same margin AND leverage the open used — sizing the flatten off margin alone would
-		// send an order 1/leverage the size of the position it is meant to close.
-		sz := sizeToContracts(o.Size, o.Leverage, closePrice, inst)
-		req := domain.OrderRequest{InstID: e.execInstID(), TdMode: e.TdMode, Side: side, OrdType: "market", Sz: sz}
+		// Close exactly the contracts the exchange filled on the open. Re-deriving a count from the
+		// stored margin is what broke here (2026-09-09): the open is sized at the ENTRY price and
+		// the flatten was sizing at the CURRENT one, so a position whose price had moved favourably
+		// bought fewer contracts for the same margin and the flatten under-closed by one — BTC
+		// closed 1 of 2, ETH 5 of 6, DOGE 20 of 21. Each left a live remainder on the exchange
+		// behind a row that recorded a complete close, and the untracked positions that produced
+		// halted real trading for three hours.
+		//
+		// Falls back to the derivation only for rows opened before the count was recorded, since
+		// those genuinely have nothing better — and at the ENTRY price, which is at least the price
+		// the position was actually sized at.
+		sz := o.Contracts
+		if sz == nil || !sz.IsPositive() {
+			derived := sizeToContracts(o.Size, o.Leverage, o.EntryPx, inst)
+			sz = &derived
+		}
+		req := domain.OrderRequest{InstID: e.execInstID(), TdMode: e.TdMode, Side: side, OrdType: "market", Sz: *sz}
 		if e.PosMode == "long_short" {
 			req.PosSide = posSideFor(signedNotionalForSide(o.Side))
 		}

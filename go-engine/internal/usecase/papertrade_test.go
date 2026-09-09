@@ -341,7 +341,7 @@ func (r *fakeRepository) GetRealOrder(ctx context.Context, id int64) (port.RealO
 	}
 	return o, nil
 }
-func (r *fakeRepository) UpdateRealOrderStatus(ctx context.Context, id int64, status string, entryPx *decimal.Decimal, size *decimal.Decimal) error {
+func (r *fakeRepository) UpdateRealOrderStatus(ctx context.Context, id int64, status string, entryPx, size, contracts *decimal.Decimal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
@@ -354,6 +354,11 @@ func (r *fakeRepository) UpdateRealOrderStatus(ctx context.Context, id int64, st
 	}
 	if size != nil {
 		o.Size = *size
+	}
+	// COALESCE semantics, matching the real SQL: a status-only transition must not blank a count
+	// already recorded.
+	if contracts != nil {
+		o.Contracts = contracts
 	}
 	r.realOrders[id] = o
 	return nil

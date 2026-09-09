@@ -259,6 +259,13 @@ type RealOrder struct {
 	LastError   *string
 	LastErrorAt *time.Time
 
+	// Contracts is how many contracts the exchange actually filled when this position opened. The
+	// flatten closes exactly this rather than re-deriving a count from the stored margin at the
+	// current price — a derivation that under-closed by one contract on every position whose price
+	// had moved favourably (2026-09-09), leaving a live remainder on the exchange behind a database
+	// row that claimed to be flat. nil for rows predating the column.
+	Contracts *decimal.Decimal
+
 	// ExchangeOpenRaw/ExchangeCloseRaw are OKX's own order records, captured verbatim at the moment
 	// each leg reached a terminal state (2026-09-09). Stored rather than re-fetched: the engine
 	// already reads them as part of the fill-confirmation it must do anyway, so every later view is
@@ -504,7 +511,7 @@ type Repository interface {
 	// UpdateRealOrderStatus transitions a real order's fill status once PlaceOrder's outcome is
 	// known: "filled" or "partial" (entryPx/size non-nil, corrected to the exchange-confirmed
 	// avgPx/filled size) or "canceled" (both nil — the entry never filled, no position exists).
-	UpdateRealOrderStatus(ctx context.Context, id int64, status string, entryPx *decimal.Decimal, size *decimal.Decimal) error
+	UpdateRealOrderStatus(ctx context.Context, id int64, status string, entryPx, size, contracts *decimal.Decimal) error
 	// SetRealOrderFeatures records the decision-time observation snapshot, mirroring how
 	// FeaturesJSON is set on PaperOrder — called once the fill/partial/canceled outcome is known.
 	SetRealOrderFeatures(ctx context.Context, id int64, featuresJSON json.RawMessage) error

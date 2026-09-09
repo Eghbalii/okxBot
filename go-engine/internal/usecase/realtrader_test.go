@@ -1384,3 +1384,77 @@ func TestCloseReal_ExchangeRecordFailureDoesNotAffectTheClose(t *testing.T) {
 		t.Fatal("a failed capture must store nothing rather than a partial or fabricated record")
 	}
 }
+
+// The flatten must close exactly the contracts the exchange filled, never a count re-derived from
+// a price (2026-09-09 incident). Real order 11's numbers: opened 2 BTC contracts at 78863.3, and
+// the close path — sizing the same margin at the CURRENT price of 79258.5 — computed 1. It closed
+// 1, left 1 live on OKX behind a row recording a complete close, and the untracked position that
+// produced halted real trading for three hours. ETH (5 of 6) and DOGE (20 of 21) failed the same
+// way: whenever price moves in a position's favour, the same margin buys fewer contracts.
+func TestCloseReal_ClosesTheContractsActuallyOpened(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	inst := domain.Instrument{CtVal: dec("0.0001"), LotSz: dec("1"), MinSz: dec("1")}
+	exchange := &fakeExchangeClient{instrument: &inst}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	contracts := dec("2")
+	sl, tp := dec("70000"), dec("90000")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("78863.3"), SLPx: &sl, TPPx: &tp,
+		Size: dec("1.6124186773046364"), Leverage: dec("9.7819879055023189"),
+		Contracts: &contracts, Status: "filled", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	o, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	// Closing at a price ABOVE entry — the favourable move that triggered the under-close.
+	if err := rt.closeReal(ctx, o, dec("79258.5"), "tp", testLogger()); err != nil {
+		t.Fatalf("closeReal: %v", err)
+	}
+
+	if len(exchange.placedOrders) != 1 {
+		t.Fatalf("expected exactly one flattening order, got %d", len(exchange.placedOrders))
+	}
+	if got := exchange.placedOrders[0].Sz; !got.Equal(dec("2")) {
+		t.Fatalf("flatten size: want 2 contracts (what was opened), got %s — a short flatten leaves "+
+			"a live remainder on the exchange behind a row that claims to be flat", got)
+	}
+}
+
+// Rows opened before the contract count was recorded have nothing better to fall back on, but the
+// fallback must at least size at the ENTRY price — the price the position was actually opened at —
+// rather than the current one.
+func TestCloseReal_LegacyRowFallsBackToEntryPriceSizing(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	inst := domain.Instrument{CtVal: dec("0.0001"), LotSz: dec("1"), MinSz: dec("1")}
+	exchange := &fakeExchangeClient{instrument: &inst}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	sl, tp := dec("70000"), dec("90000")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("78863.3"), SLPx: &sl, TPPx: &tp,
+		Size: dec("1.6124186773046364"), Leverage: dec("9.7819879055023189"),
+		Status: "filled", OpenedAt: time.Now(), // no Contracts — a pre-migration row
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	o, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if err := rt.closeReal(ctx, o, dec("79258.5"), "tp", testLogger()); err != nil {
+		t.Fatalf("closeReal: %v", err)
+	}
+	if got := exchange.placedOrders[0].Sz; !got.Equal(dec("2")) {
+		t.Fatalf("legacy fallback must size at the entry price: want 2, got %s", got)
+	}
+}
