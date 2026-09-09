@@ -4578,3 +4578,41 @@ zero reconnects or errors in the following minutes; `GET /order/algo` routed thr
 OKX and came back with OKX's own `51000 Parameter algoId error` for a deliberately fake id —
 proving the whole path (consumer header → rate limiter → REST client → OKX) works end to end rather
 than merely returning a plausible-looking local error.
+
+### 35.7 Deploy completed 2026-09-09 — and what "one at a time" actually has to mean here
+
+`trader` and `api` were rebuilt and restarted; both binaries were verified to genuinely contain the
+new code by `strings`-grepping the running container for a string unique to it (`"rested sl/tp on
+the exchange"` in trader, the manual-edit refusal message in api) rather than trusting that a
+successful build was deployed. All 16 services up afterwards, zero ERROR/panic lines across
+trader/api/gateway/paper-trader/ingestor in the following minutes.
+
+**§31's "one service at a time" rule was found to be necessary but NOT sufficient.** Building
+`trader` and `api` together drove free memory to 266MB and was aborted. Building `api` *alone*
+then still killed **Kafka** — the broker restarted (`Up 45 seconds`) at 534MB against its 768MB cap
+(§16.10's limit), and `cmd/trader` logged a burst of `connection refused` on every topic until it
+came back. Nothing was lost (real trading was paused with no open positions, and the trader
+correctly discarded the ticks that went stale during the outage — `dropping stale kafka message
+... age=2m48s max=2m0s`, working as designed), but on a live account that same restart would have
+interrupted the tick feed the backup SL/TP monitor runs on.
+
+The real constraint is not the number of concurrent builds, it is **absolute free memory against
+what the resident services already hold**: Kafka (574MB) + Grafana (369MB) + rl-service (348MB) is
+~1.3GB of the 3.9GB box before a Go compiler starts. What finally worked was
+`docker compose stop grafana prometheus` first (monitoring tier, not trading-critical — 2.1GB free),
+build, then `start` them again.
+
+**Deployment procedure for this box, going forward:**
+1. Check free memory first. Under ~1.5GB, stop `grafana`/`prometheus` before building.
+2. Build ONE service. Never two.
+3. Watch **Kafka's own container status**, not just load average — it is the first thing to die and
+   its death is what actually reaches the trading loop. Load average is a lagging, misleading signal
+   here; it peaked at 11 during a build that harmed nothing, while the run that killed Kafka looked
+   milder.
+4. Restart `panel` after redeploying `api` (§18.2's nginx-caches-the-old-IP rule).
+5. Verify the new code is actually in the running container, not merely that the build exited 0.
+
+**The private WebSocket's reconnect proved itself in production the same evening**: OKX closed the
+socket with a 1006 abnormal closure and the client re-authenticated and resubscribed **1.2 seconds
+later**, unattended. That is the behavior the 5s REST poll exists to back up, now observed working
+rather than assumed.
