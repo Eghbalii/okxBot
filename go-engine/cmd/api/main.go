@@ -98,6 +98,7 @@ func main() {
 		// the trader keeps its rate-limit priority over both.
 		Protection:    gatewayclient.New(cfg.Gateway.URL, "api"),
 		ExecInstIDFor: okx.SymbolMap(cfg.Trading.SymbolMap).Resolve,
+		ExecInstType:  cfg.Trading.ExecInstType,
 		ProcessMgr:    cfg.API.ProcessMgr,
 		Units:         cfg.API.Units,
 		Logger:        logger,

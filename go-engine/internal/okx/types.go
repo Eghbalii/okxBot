@@ -193,13 +193,16 @@ type Instrument struct {
 	LotSz    decimalOrZero `json:"lotSz"`
 	MinSz    decimalOrZero `json:"minSz"`
 	CtValCcy string        `json:"ctValCcy"`
+	// TickSz is the price increment every price sent to OKX must be a multiple of. It was not
+	// decoded until 2026-09-10, which is why SL/TP prices derived from a percentage were rejected.
+	TickSz decimalOrZero `json:"tickSz"`
 }
 
 // ToDomain converts an Instrument to its domain representation.
 func (i Instrument) ToDomain() domain.Instrument {
 	return domain.Instrument{
 		InstID: i.InstID, CtVal: i.CtVal.Decimal, LotSz: i.LotSz.Decimal, MinSz: i.MinSz.Decimal,
-		CtValCcy: i.CtValCcy,
+		CtValCcy: i.CtValCcy, TickSz: i.TickSz.Decimal,
 	}
 }
 

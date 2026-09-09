@@ -356,6 +356,13 @@ services:
       TESTER_SERVICE_URL: http://strategy-tester:8092
       PAPER_TRADER_SERVICE_URL: http://paper-trader:8093
       TRADER_SERVICE_URL: http://trader:8095
+      # cmd/api calls the gateway for two things: amending a real position's resting SL/TP when an
+      # operator edits it from the panel (CLAUDE.md §35), and the Manage Tokens modal's
+      # affordability column. Without this the client falls back to config's own
+      # http://localhost:8094 default, which inside this container is its OWN loopback rather than
+      # the gateway — a manual SL/TP edit then failed with "connection refused" (2026-09-10), the
+      # same class of mistake already documented for cmd/trader's KAFKA_BROKERS below.
+      OKX_GATEWAY_URL: http://okx-gateway:8094
       API_ADDR: "0.0.0.0:8090" # container-internal bind; only reachable via the OpenVPN network in prod, see CLAUDE.md §11
       API_PROCESS_MANAGER: docker
     ports:
@@ -369,6 +376,8 @@ services:
       timescaledb:
         condition: service_started
       rl-service:
+        condition: service_started
+      okx-gateway:
         condition: service_started
 
   panel:

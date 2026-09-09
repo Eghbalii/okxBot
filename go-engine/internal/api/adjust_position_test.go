@@ -68,6 +68,14 @@ func (s *stubRepo) RecordRealOrderAdjustment(ctx context.Context, orderID int64,
 type stubAmender struct {
 	amends []domain.AlgoOrderAmend
 	err    error
+	tickSz decimal.Decimal
+}
+
+// tickSz defaults to zero, which RoundPriceToTick treats as "no tick reported" and passes the
+// price through unchanged — so tests that do not care about rounding keep their exact expected
+// prices, and a test that does care sets it explicitly.
+func (a *stubAmender) GetInstrument(instType, instID string) (domain.Instrument, error) {
+	return domain.Instrument{InstID: instID, TickSz: a.tickSz}, nil
 }
 
 func (a *stubAmender) AmendAlgoOrder(req domain.AlgoOrderAmend) error {
@@ -382,5 +390,34 @@ func TestHandleAdjustPosition_RefusesWhenThereIsNoRestingOrder(t *testing.T) {
 	}
 	if len(repo.updateSLTPCalls) != 0 {
 		t.Errorf("nothing must be written locally, got %d writes", len(repo.updateSLTPCalls))
+	}
+}
+
+// A manually-entered percentage converts to a price with arbitrary decimals, and OKX rejects any
+// level that is not a multiple of the instrument's tick — with a bare "code=1" naming nothing
+// (2026-09-10, the error the operator hit). The price must be snapped before it is sent.
+func TestHandleAdjustPosition_RoundsThePriceToTheInstrumentTick(t *testing.T) {
+	repo := &stubRepo{order: port.RealOrder{
+		ID: 1, InstID: "SOL", Side: "buy",
+		EntryPx: dec("101.84"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
+	}}
+	// SOL's real tick. -14% of margin at 10x is 101.84 - 1.42576 = 100.41424, five decimals.
+	amender := &stubAmender{tickSz: dec("0.01")}
+	srv := newTestServer(repo)
+	srv.Protection = amender
+
+	rec := doAdjust(srv, "1", adjustPositionRequest{SLPct: floatPtr(-14)})
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(amender.amends) != 1 {
+		t.Fatalf("expected one amend, got %d", len(amender.amends))
+	}
+	if got := amender.amends[0].SLTriggerPx; !got.Equal(dec("100.41")) {
+		t.Errorf("the exchange must receive a tick-aligned price 100.41, got %v", got)
+	}
+	// The stored level must match what the exchange is enforcing, not the unrounded request.
+	if stored := repo.updateSLTPCalls[0].sl; stored == nil || !stored.Equal(dec("100.41")) {
+		t.Errorf("the stored stop must be the rounded one, got %v", stored)
 	}
 }

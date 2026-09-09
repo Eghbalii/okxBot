@@ -29,7 +29,7 @@ type tokenAffordabilityView struct {
 	// opposed to an operator. That is the distinction the panel's tag draws, and it cannot be
 	// derived from Affordable alone for the reason above.
 	AutoDisabled bool `json:"autoDisabled"`
-	Disabled   bool `json:"disabled"`
+	Disabled     bool `json:"disabled"`
 	// Unknown marks a token whose instrument or price could not be read. Such a token is never
 	// auto-disabled (a transient API failure must not take a tradeable token offline), and the
 	// panel shows it as unknown rather than implying it was judged.

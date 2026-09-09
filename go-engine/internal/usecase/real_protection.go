@@ -70,11 +70,15 @@ func (e *RealTrader) protectionRequest(o port.RealOrder) (domain.AlgoOrderReques
 		// the production client.
 		req.PosSide = posSideFor(signedNotionalForSide(o.Side))
 	}
+	// Every price sent to the exchange must sit on the instrument's tick (2026-09-10). A level
+	// derived from a percentage lands on an arbitrary number of decimals — 100.41424 against SOL's
+	// 0.01 tick — and OKX rejects the whole request with a bare "code=1" that names nothing.
+	inst := e.instrumentOrZero()
 	if o.SLPx != nil && o.SLPx.IsPositive() {
-		req.SLTriggerPx = *o.SLPx
+		req.SLTriggerPx = inst.RoundPriceToTick(*o.SLPx)
 	}
 	if o.TPPx != nil && o.TPPx.IsPositive() {
-		req.TPTriggerPx = *o.TPPx
+		req.TPTriggerPx = inst.RoundPriceToTick(*o.TPPx)
 	}
 	if !req.SLTriggerPx.IsPositive() && !req.TPTriggerPx.IsPositive() {
 		return domain.AlgoOrderRequest{}, false
@@ -146,11 +150,13 @@ func (e *RealTrader) amendProtection(ctx context.Context, o port.RealOrder, newS
 		InstID: e.execInstID(),
 		AlgoID: *o.ExchangeAlgoOrderID,
 	}
+	// Rounded to the instrument's tick for the same reason as protectionRequest above.
+	inst := e.instrumentOrZero()
 	if newSL != nil && newSL.IsPositive() {
-		req.SLTriggerPx = *newSL
+		req.SLTriggerPx = inst.RoundPriceToTick(*newSL)
 	}
 	if newTP != nil && newTP.IsPositive() {
-		req.TPTriggerPx = *newTP
+		req.TPTriggerPx = inst.RoundPriceToTick(*newTP)
 	}
 	if !req.SLTriggerPx.IsPositive() && !req.TPTriggerPx.IsPositive() {
 		return fmt.Errorf("order %d: refusing to amend a protective order to no levels at all", o.ID)

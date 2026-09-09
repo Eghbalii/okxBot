@@ -45,6 +45,9 @@ type Server struct {
 	// ExecInstIDFor maps a market-data symbol ("BTC") to the instrument real orders actually
 	// execute against (CLAUDE.md §33.4). Nil falls back to the symbol itself.
 	ExecInstIDFor func(symbol string) (string, error)
+	// ExecInstType is the instType those instruments live under ("FUTURES"), needed to read their
+	// price tick when rounding a manually-edited SL/TP.
+	ExecInstType string
 	// TraderBaseURL is cmd/trader's own restart-only HTTP surface (CLAUDE.md real-trading readiness
 	// plan, 2026-09-04) — used the same way PaperTraderBaseURL is: only the restart action needs to
 	// reach the running process, everything else (config reads/writes) hits Postgres directly.
@@ -817,11 +820,20 @@ func (s *Server) handleAdjustPosition(w http.ResponseWriter, r *http.Request) {
 	amend.InstID = instID
 	// Both sides are always sent, so the exchange ends up holding exactly this position's current
 	// levels rather than the result of a sequence of partial edits.
+	// Snapped to the instrument's price tick before it reaches OKX (2026-09-10): a percentage the
+	// operator types converts to a price with arbitrary decimals, and OKX rejects an off-tick level
+	// outright. The ROUNDED price is also what gets stored, so the panel shows the level the
+	// exchange is actually enforcing rather than the one that was asked for.
+	inst := s.tickRounder(s.ExecInstType, o.InstID)
 	if newSL != nil && newSL.IsPositive() {
-		amend.SLTriggerPx = *newSL
+		rounded := inst.RoundPriceToTick(*newSL)
+		newSL = &rounded
+		amend.SLTriggerPx = rounded
 	}
 	if newTP != nil && newTP.IsPositive() {
-		amend.TPTriggerPx = *newTP
+		rounded := inst.RoundPriceToTick(*newTP)
+		newTP = &rounded
+		amend.TPTriggerPx = rounded
 	}
 	if err := s.Protection.AmendAlgoOrder(amend); err != nil {
 		writeError(w, http.StatusBadGateway, "the exchange rejected the new levels, nothing was changed: "+err.Error())
