@@ -29,6 +29,23 @@ type ExchangeClient interface {
 	// BTC-USD_UM_XPERP instrument, whose CtVal/LotSz differ sharply from the classic SWAP
 	// instruments this codebase otherwise assumes a multiplier of 1 for).
 	GetInstrument(instType, instID string) (domain.Instrument, error)
+	// PlaceAlgoOrder places a resting conditional stop-loss/take-profit order on the exchange,
+	// returning OKX's algoId. This is what makes a real position's protection survive this process
+	// (2026-09-09 request): before it, SL/TP lived only as columns this service's own tick monitor
+	// watched, so a crash, restart, deploy, or stalled tick feed left real capital unprotected.
+	PlaceAlgoOrder(req domain.AlgoOrderRequest) (string, error)
+	// AmendAlgoOrder moves an already-resting conditional order's trigger price(s) in place — the
+	// exchange-side half of every SL/TP change, whether the model made it or an operator did from
+	// the panel, so the exchange never holds a level this system has since moved on from.
+	AmendAlgoOrder(req domain.AlgoOrderAmend) error
+	// CancelAlgoOrder removes a resting conditional order — called whenever the position it
+	// protects is closed by another route, so a flattened position cannot leave a live protective
+	// order behind that would later open a NEW position in the opposite direction.
+	CancelAlgoOrder(instID, algoID string) error
+	// GetAlgoOrder reports whether a protective order is still resting on the exchange. The
+	// exchange is primary for SL/TP, so this is the check that keeps that trust honest rather than
+	// assuming a once-successful placement stays valid forever.
+	GetAlgoOrder(instID, algoID string) (domain.AlgoOrderStatus, error)
 	// GetFundingRateHistory fetches recent settled funding periods for one instrument (CLAUDE.md,
 	// 2026-09-06) — an unauthenticated public endpoint, but routed through the same client/gateway
 	// path as every other OKX call for consistency. Oldest-first.

@@ -57,3 +57,68 @@ func (s OrderStatus) IsFilled() bool { return s.State == "filled" }
 // fully filled or canceled. "partially_filled" is NOT terminal: OKX keeps that state only while
 // the remainder is still live and could still fill or later be canceled.
 func (s OrderStatus) IsTerminal() bool { return s.State == "filled" || s.State == "canceled" }
+
+// AlgoOrderRequest is a request to place a resting conditional (stop-loss / take-profit) order on
+// the exchange — OKX's POST /api/v5/trade/order-algo with ordType "conditional".
+//
+// This is what makes a real position's protection live on the EXCHANGE rather than only in this
+// process (2026-09-09 request: "we should set sl/tp on exchange always"). Before it, a real
+// position's SL/TP existed solely as columns in real_orders that RealTrader's own tick monitor
+// watched — so any interruption of this service (crash, restart, deploy, network partition, the
+// Kafka tick feed stalling) left real capital running with no protection whatsoever, which is
+// exactly the exposure the exchange-side order removes.
+//
+// Side is the CLOSING side — the opposite of the entry side — since this order is what flattens
+// the position when a trigger fires. PosSide, in hedge mode, is the side of the POSITION being
+// closed, not this order's own side.
+//
+// SLTriggerPx and TPTriggerPx are both optional and both may be set on one order: OKX treats a
+// conditional order carrying both as OCO (one-cancels-other), so whichever triggers first cancels
+// the other automatically — one resting order protects both sides of the trade, and there is never
+// a window where a filled stop leaves a stale target behind.
+type AlgoOrderRequest struct {
+	InstID  string
+	TdMode  string // "cross" or "isolated"
+	Side    string // the CLOSING side: opposite of the position's entry side
+	PosSide string // the POSITION's side ("long"/"short") in hedge mode; empty in net mode
+	Sz      decimal.Decimal
+	// SLTriggerPx/TPTriggerPx are trigger prices. A zero value means "this side is not set" and is
+	// omitted from the request, so one order can carry a stop only, a target only, or both.
+	SLTriggerPx decimal.Decimal
+	TPTriggerPx decimal.Decimal
+}
+
+// AlgoOrderAmend updates an already-resting conditional order's trigger prices in place — OKX's
+// POST /api/v5/trade/amend-algos. Used for both the model's in-trade SL/TP adjustments and the
+// operator's manual panel edits, so a level changed anywhere is changed on the exchange too rather
+// than only in this system's own bookkeeping.
+//
+// A zero trigger price means "leave this side alone", so a stop-only move does not disturb the
+// target sharing the same order.
+type AlgoOrderAmend struct {
+	InstID      string
+	AlgoID      string
+	SLTriggerPx decimal.Decimal
+	TPTriggerPx decimal.Decimal
+}
+
+// AlgoOrderStatus is a resting conditional order's current state on the exchange — the
+// verification half of "the exchange holds the protection" (2026-09-09): a successful placement is
+// not assumed to stay valid forever, it is re-checked, and a protective order that has vanished is
+// re-placed rather than silently trusted.
+//
+// State "" means OKX reported no such order at all — already triggered and filled, or canceled.
+// That is a legitimate answer, not an error, and is deliberately distinguishable from a failed
+// request so a caller never treats "the stop is gone" as "the network hiccuped".
+type AlgoOrderStatus struct {
+	AlgoID      string
+	InstID      string
+	State       string // "live", "effective" (triggered), "canceled", "order_failed", or "" when absent
+	SLTriggerPx decimal.Decimal
+	TPTriggerPx decimal.Decimal
+}
+
+// IsLive reports whether the conditional order is still resting on the exchange and will fire if
+// its trigger is reached. Anything else — triggered, canceled, failed, or absent — means the
+// position it protected is no longer protected by it.
+func (s AlgoOrderStatus) IsLive() bool { return s.State == "live" }

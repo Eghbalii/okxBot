@@ -29,6 +29,13 @@ type exchangeClient interface {
 	GetOrderRaw(instID, ordID string) (json.RawMessage, error)
 	GetInstrument(instType, instID string) (domain.Instrument, error)
 	GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error)
+	// The resting SL/TP (conditional "algo") order calls — the exchange-side protection every real
+	// position now carries (2026-09-09). Routed through the gateway like every other trade action
+	// so they share the trader's priority rate-limit budget rather than competing outside it.
+	PlaceAlgoOrder(req domain.AlgoOrderRequest) (string, error)
+	AmendAlgoOrder(req domain.AlgoOrderAmend) error
+	CancelAlgoOrder(instID, algoID string) error
+	GetAlgoOrder(instID, algoID string) (domain.AlgoOrderStatus, error)
 }
 
 type service struct {
@@ -58,6 +65,10 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("GET /instrument", s.handleGetInstrument)
 	mux.HandleFunc("GET /funding-rate-history", s.handleGetFundingRateHistory)
 	mux.HandleFunc("POST /leverage", s.handleSetLeverage)
+	mux.HandleFunc("POST /order/algo", s.handlePlaceAlgoOrder)
+	mux.HandleFunc("POST /order/algo/amend", s.handleAmendAlgoOrder)
+	mux.HandleFunc("POST /order/algo/cancel", s.handleCancelAlgoOrder)
+	mux.HandleFunc("GET /order/algo", s.handleGetAlgoOrder)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -339,4 +350,86 @@ func (s *service) handleSetLeverage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handlePlaceAlgoOrder places a resting SL/TP order. ClassTrade, not ClassAccount: it is a
+// mutating trade action competing for the same OKX-side budget as order placement, and it is on
+// the critical path of opening a position — a real position is not considered protected until this
+// call has succeeded, so it must not queue behind bulk market-data traffic.
+func (s *service) handlePlaceAlgoOrder(w http.ResponseWriter, r *http.Request) {
+	var req domain.AlgoOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	var algoID string
+	err := s.call(r.Context(), gateway.ClassTrade, r, func() error {
+		var innerErr error
+		algoID, innerErr = s.client.PlaceAlgoOrder(req)
+		return innerErr
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"algoId": algoID})
+}
+
+// handleAmendAlgoOrder moves a resting SL/TP order's trigger price(s).
+func (s *service) handleAmendAlgoOrder(w http.ResponseWriter, r *http.Request) {
+	var req domain.AlgoOrderAmend
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	err := s.call(r.Context(), gateway.ClassTrade, r, func() error {
+		return s.client.AmendAlgoOrder(req)
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleCancelAlgoOrder removes a resting SL/TP order.
+func (s *service) handleCancelAlgoOrder(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InstID string `json:"instId"`
+		AlgoID string `json:"algoId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	err := s.call(r.Context(), gateway.ClassTrade, r, func() error {
+		return s.client.CancelAlgoOrder(req.InstID, req.AlgoID)
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleGetAlgoOrder reports a resting SL/TP order's state. ClassAccount — a read, like order
+// status, not a mutating trade action.
+func (s *service) handleGetAlgoOrder(w http.ResponseWriter, r *http.Request) {
+	instID := r.URL.Query().Get("instId")
+	algoID := r.URL.Query().Get("algoId")
+	if algoID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("algoId is required"))
+		return
+	}
+	var status domain.AlgoOrderStatus
+	err := s.call(r.Context(), gateway.ClassAccount, r, func() error {
+		var innerErr error
+		status, innerErr = s.client.GetAlgoOrder(instID, algoID)
+		return innerErr
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
 }

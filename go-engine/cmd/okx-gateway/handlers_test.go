@@ -352,3 +352,14 @@ func TestIsRetryableOKXError(t *testing.T) {
 		}
 	}
 }
+
+// The resting SL/TP (algo) order calls, added when real positions gained exchange-side protection
+// (2026-09-09). Stubbed: this fake's tests exercise routing and rate limiting, not order content.
+func (f *fakeExchange) PlaceAlgoOrder(req domain.AlgoOrderRequest) (string, error) {
+	return "algo-1", nil
+}
+func (f *fakeExchange) AmendAlgoOrder(req domain.AlgoOrderAmend) error { return nil }
+func (f *fakeExchange) CancelAlgoOrder(instID, algoID string) error    { return nil }
+func (f *fakeExchange) GetAlgoOrder(instID, algoID string) (domain.AlgoOrderStatus, error) {
+	return domain.AlgoOrderStatus{AlgoID: algoID, InstID: instID, State: "live"}, nil
+}

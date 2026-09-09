@@ -40,6 +40,46 @@ var (
 		Help: "Cumulative realized PnL (USD) from closed paper orders, by instrument.",
 	}, []string{"inst_id"})
 
+	// The exchange-side SL/TP protection counters (2026-09-09). These exist because the failure
+	// this mechanism prevents is SILENT: a real position running without a stop looks exactly like
+	// one running with a stop, right up until it doesn't. RealProtectionMissingTotal is the one to
+	// alert on — any nonzero value means a live position was found unprotected, which should be
+	// impossible if placement and cancellation are both working.
+	RealProtectionPlacedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_real_protection_placed_total",
+		Help: "Resting SL/TP (algo) orders successfully placed on the exchange, by instrument.",
+	}, []string{"inst_id"})
+
+	RealProtectionFailedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_real_protection_failed_total",
+		Help: "Failed attempts to rest an SL/TP order on the exchange, by instrument.",
+	}, []string{"inst_id"})
+
+	RealProtectionAmendedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_real_protection_amended_total",
+		Help: "Resting SL/TP orders successfully amended on the exchange, by instrument.",
+	}, []string{"inst_id"})
+
+	RealProtectionAmendFailedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_real_protection_amend_failed_total",
+		Help: "Failed attempts to amend a resting SL/TP order, by instrument.",
+	}, []string{"inst_id"})
+
+	// RealProtectionMissingTotal counts open real positions found with no live protective order on
+	// the exchange during verification — each one a position that was running unprotected.
+	RealProtectionMissingTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_real_protection_missing_total",
+		Help: "Open real positions found without a live exchange-side SL/TP order, by instrument.",
+	}, []string{"inst_id"})
+
+	// RealUnprotectedClosedTotal counts positions flattened immediately after opening because their
+	// protection could not be placed — the deliberate "never hold an unprotected real position"
+	// response (2026-09-09 decision).
+	RealUnprotectedClosedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_real_unprotected_closed_total",
+		Help: "Real positions closed immediately because exchange-side SL/TP could not be placed.",
+	}, []string{"inst_id"})
+
 	// RealEarlyCloseIgnoredTotal counts model early-close requests real trading declined because
 	// trading.allow_rl_early_close is off (2026-09-08). A growing count is not a fault — it is the
 	// evidence for whether that action is worth enabling: pair it with how those positions

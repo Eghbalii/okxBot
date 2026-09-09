@@ -194,3 +194,35 @@ func (c *Client) GetFundingRateHistory(instID string, limit int) ([]domain.Fundi
 	err := c.do(context.Background(), http.MethodGet, path, nil, &out)
 	return out, err
 }
+
+// PlaceAlgoOrder places a resting SL/TP order through the gateway, returning OKX's algoId
+// (2026-09-09: every real position's protection lives on the exchange, not only in the trading
+// process's own memory).
+func (c *Client) PlaceAlgoOrder(req domain.AlgoOrderRequest) (string, error) {
+	var out struct {
+		AlgoID string `json:"algoId"`
+	}
+	if err := c.do(context.Background(), http.MethodPost, "/order/algo", req, &out); err != nil {
+		return "", err
+	}
+	return out.AlgoID, nil
+}
+
+// AmendAlgoOrder moves a resting SL/TP order's trigger price(s) through the gateway.
+func (c *Client) AmendAlgoOrder(req domain.AlgoOrderAmend) error {
+	return c.do(context.Background(), http.MethodPost, "/order/algo/amend", req, nil)
+}
+
+// CancelAlgoOrder removes a resting SL/TP order through the gateway.
+func (c *Client) CancelAlgoOrder(instID, algoID string) error {
+	body := map[string]string{"instId": instID, "algoId": algoID}
+	return c.do(context.Background(), http.MethodPost, "/order/algo/cancel", body, nil)
+}
+
+// GetAlgoOrder reports a resting SL/TP order's state through the gateway.
+func (c *Client) GetAlgoOrder(instID, algoID string) (domain.AlgoOrderStatus, error) {
+	var out domain.AlgoOrderStatus
+	path := "/order/algo?" + url.Values{"instId": {instID}, "algoId": {algoID}}.Encode()
+	err := c.do(context.Background(), http.MethodGet, path, nil, &out)
+	return out, err
+}

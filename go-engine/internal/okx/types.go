@@ -202,3 +202,28 @@ func (i Instrument) ToDomain() domain.Instrument {
 		CtValCcy: i.CtValCcy,
 	}
 }
+
+// AlgoOrderStatus mirrors a single entry of the GET /api/v5/trade/order-algo response data array —
+// a resting conditional (stop-loss/take-profit) order's current state on the exchange.
+//
+// Trigger prices use decimalOrZero for the same reason OrderStatus's fill fields do: OKX returns
+// "" rather than "0" for a side that was never set, and a one-sided order (a stop with no target)
+// is the normal case here, not an edge one.
+type AlgoOrderStatus struct {
+	AlgoID      string        `json:"algoId"`
+	InstID      string        `json:"instId"`
+	State       string        `json:"state"`
+	SLTriggerPx decimalOrZero `json:"slTriggerPx"`
+	TPTriggerPx decimalOrZero `json:"tpTriggerPx"`
+}
+
+// ToDomain converts an AlgoOrderStatus to its domain representation.
+func (s AlgoOrderStatus) ToDomain() domain.AlgoOrderStatus {
+	return domain.AlgoOrderStatus{
+		AlgoID:      s.AlgoID,
+		InstID:      s.InstID,
+		State:       s.State,
+		SLTriggerPx: s.SLTriggerPx.Decimal,
+		TPTriggerPx: s.TPTriggerPx.Decimal,
+	}
+}
