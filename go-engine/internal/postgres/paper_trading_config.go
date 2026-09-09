@@ -45,6 +45,12 @@ func (r *Repository) SavePaperTradingConfig(ctx context.Context, mode string, pa
 	if patch.ActiveBars != nil {
 		activeBars = *patch.ActiveBars
 	}
+	// Explicitly cast to text[] in the SQL below, unlike the three columns above. Those are bound
+	// bare ($4/$5/$6) and Postgres infers their type from the target column; this one is wrapped in
+	// coalesce, and a NULL parameter inside coalesce has no column to infer from — Postgres then
+	// types the '{}' literal as text and rejects the whole expression against a text[] column
+	// ("column is of type text[] but expression is of type text", 2026-09-10). Every save with no
+	// auto-disabled patch failed, which is every save the panel makes.
 	var autoDisabled any
 	if patch.AutoDisabledInstIDs != nil {
 		autoDisabled = *patch.AutoDisabledInstIDs
@@ -53,7 +59,7 @@ func (r *Repository) SavePaperTradingConfig(ctx context.Context, mode string, pa
 	var c port.PaperTradingConfig
 	err := r.pool.QueryRow(ctx, `
 		INSERT INTO paper_trading_config (mode, trading_state, disable_long, disable_short, active_kinds, disabled_inst_ids, active_bars, auto_disabled_inst_ids, updated_at)
-		VALUES ($7, coalesce($1, 'running'), coalesce($2, false), coalesce($3, false), $4, $5, $6, coalesce($11, '{}'), now())
+		VALUES ($7, coalesce($1, 'running'), coalesce($2, false), coalesce($3, false), $4, $5, $6, coalesce($11::text[], '{}'::text[]), now())
 		ON CONFLICT (mode) DO UPDATE SET
 			trading_state = coalesce($1, paper_trading_config.trading_state),
 			disable_long = coalesce($2, paper_trading_config.disable_long),
@@ -61,7 +67,7 @@ func (r *Repository) SavePaperTradingConfig(ctx context.Context, mode string, pa
 			active_kinds = CASE WHEN $8 THEN $4 ELSE paper_trading_config.active_kinds END,
 			disabled_inst_ids = CASE WHEN $9 THEN $5 ELSE paper_trading_config.disabled_inst_ids END,
 			active_bars = CASE WHEN $10 THEN $6 ELSE paper_trading_config.active_bars END,
-			auto_disabled_inst_ids = CASE WHEN $12 THEN $11 ELSE paper_trading_config.auto_disabled_inst_ids END,
+			auto_disabled_inst_ids = CASE WHEN $12 THEN $11::text[] ELSE paper_trading_config.auto_disabled_inst_ids END,
 			updated_at = now()
 		RETURNING `+paperTradingConfigCols,
 		patch.TradingState, patch.DisableLong, patch.DisableShort,
