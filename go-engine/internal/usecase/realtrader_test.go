@@ -1215,3 +1215,84 @@ func TestSetOpensDisabled_TakesEffectOnARunningEngine(t *testing.T) {
 		t.Fatalf("re-enabling must restore opens, got %d orders", len(exchange.placedOrders))
 	}
 }
+
+// A confirmed close must leave the row in a settled state, not the in-flight 'closing' marker
+// SetRealOrderClosing wrote while the flatten was pending. Real order 5 (SOL) showed the bug: the
+// flatten filled on OKX, closed_at was set, no error was recorded, and the exchange reported flat —
+// but status stayed 'closing' forever, so the panel displayed a completed close as stuck.
+func TestCloseReal_ConfirmedCloseClearsTheClosingStatus(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	sl, tp := dec("90"), dec("110")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	o, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if err := rt.closeReal(ctx, o, dec("110"), "manual", testLogger()); err != nil {
+		t.Fatalf("closeReal: %v", err)
+	}
+
+	after, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.ClosedAt == nil {
+		t.Fatal("a confirmed flatten must record the close")
+	}
+	if after.Status == "closing" {
+		t.Fatal("a confirmed close must not leave the row reading 'closing' — the panel shows that as stuck")
+	}
+	if after.Status != "filled" {
+		t.Fatalf("status after a confirmed close: want filled, got %q", after.Status)
+	}
+}
+
+// The open-side fill state does NOT survive a close, and this documents that rather than pretending
+// otherwise: SetRealOrderClosing overwrites status with 'closing' on the way in, so by the time the
+// exchange confirms there is nothing left to restore. Recording "this opened partially filled"
+// durably needs its own column; status on a closed row is display-only.
+func TestCloseReal_ConfirmedCloseSettlesEvenAPartialFill(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	sl, tp := dec("90"), dec("110")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("10"), Leverage: dec("1"), Status: "partial", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	o, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if err := rt.closeReal(ctx, o, dec("110"), "manual", testLogger()); err != nil {
+		t.Fatalf("closeReal: %v", err)
+	}
+
+	after, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.Status == "closing" {
+		t.Fatal("a confirmed close must never leave the row reading 'closing'")
+	}
+	if after.Status != "filled" {
+		t.Fatalf("status after a confirmed close: want filled, got %q", after.Status)
+	}
+}

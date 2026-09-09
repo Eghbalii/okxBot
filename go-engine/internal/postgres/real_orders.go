@@ -146,6 +146,18 @@ func (r *Repository) CloseRealOrderConfirmed(ctx context.Context, id int64, clos
 			exchange_realized_pnl = $5,
 			exchange_fee = $6,
 			exchange_close_px = $7,
+			-- Back to a settled fill state. SetRealOrderClosing moved the row to 'closing' while the
+			-- flatten was in flight, and leaving it there after the exchange confirmed the fill made
+			-- a completed close read as permanently stuck in the panel (observed on real order 5:
+			-- closed_at set, no error, flat on OKX, still displaying "closing").
+			--
+			-- Unconditional rather than only-when-'closing': the open-side fill state this would
+			-- otherwise preserve is already gone by this point, since SetRealOrderClosing overwrote
+			-- it on the way in. Faithfully recording that a position opened partially filled needs a
+			-- column of its own, not a status this path can restore — and status on a CLOSED row is
+			-- display-only (nothing branches on it), so claiming 'partial' here would be inventing
+			-- information rather than keeping it.
+			status = 'filled',
 			last_error = NULL,
 			last_error_at = NULL
 		WHERE id = $1

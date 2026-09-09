@@ -469,6 +469,9 @@ func (r *fakeRepository) CloseRealOrderConfirmed(ctx context.Context, id int64, 
 		o.ExchangeRealizedPnL = exchangePnL
 		o.ExchangeFee = exchangeFee
 		o.ExchangeClosePx = exchangeClosePx
+		// Mirrors the real SQL: settle to 'filled' once the exchange confirms. A fake that skipped
+		// this would let a test pass against behavior the real repository does not have.
+		o.Status = "filled"
 		o.LastError, o.LastErrorAt = nil, nil
 		r.realOrders[id] = o
 	}
