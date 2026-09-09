@@ -48,6 +48,65 @@ type fakeExchangeClient struct {
 	// field keep computing the exact same order sizes as before GetInstrument existed.
 	instrument       *domain.Instrument
 	getInstrumentErr error
+
+	// The resting SL/TP (algo) order calls — the exchange-side protection every real position
+	// carries since 2026-09-09. Recorded rather than merely counted so a test can assert the
+	// TRIGGER PRICES that actually reached the exchange, which is the entire property at stake:
+	// a stop stored locally but never pushed is the bug this whole mechanism exists to remove.
+	placedAlgoOrders  []domain.AlgoOrderRequest
+	amendedAlgoOrders []domain.AlgoOrderAmend
+	canceledAlgoIDs   []string
+	placeAlgoErr      error
+	amendAlgoErr      error
+	cancelAlgoErr     error
+	// algoSeq gives each placed algo order its own id, so a test can tell one from another.
+	algoSeq int
+	// algoStatus, when set, is what GetAlgoOrder reports; unset means a live order carrying the
+	// most recently placed triggers.
+	algoStatus   *domain.AlgoOrderStatus
+	getAlgoErr   error
+	getAlgoCalls int
+}
+
+func (f *fakeExchangeClient) PlaceAlgoOrder(req domain.AlgoOrderRequest) (string, error) {
+	if f.placeAlgoErr != nil {
+		return "", f.placeAlgoErr
+	}
+	f.placedAlgoOrders = append(f.placedAlgoOrders, req)
+	f.algoSeq++
+	return fmt.Sprintf("algo-%d", f.algoSeq), nil
+}
+
+func (f *fakeExchangeClient) AmendAlgoOrder(req domain.AlgoOrderAmend) error {
+	if f.amendAlgoErr != nil {
+		return f.amendAlgoErr
+	}
+	f.amendedAlgoOrders = append(f.amendedAlgoOrders, req)
+	return nil
+}
+
+func (f *fakeExchangeClient) CancelAlgoOrder(instID, algoID string) error {
+	if f.cancelAlgoErr != nil {
+		return f.cancelAlgoErr
+	}
+	f.canceledAlgoIDs = append(f.canceledAlgoIDs, algoID)
+	return nil
+}
+
+func (f *fakeExchangeClient) GetAlgoOrder(instID, algoID string) (domain.AlgoOrderStatus, error) {
+	f.getAlgoCalls++
+	if f.getAlgoErr != nil {
+		return domain.AlgoOrderStatus{}, f.getAlgoErr
+	}
+	if f.algoStatus != nil {
+		return *f.algoStatus, nil
+	}
+	status := domain.AlgoOrderStatus{AlgoID: algoID, InstID: instID, State: "live"}
+	if n := len(f.placedAlgoOrders); n > 0 {
+		status.SLTriggerPx = f.placedAlgoOrders[n-1].SLTriggerPx
+		status.TPTriggerPx = f.placedAlgoOrders[n-1].TPTriggerPx
+	}
+	return status, nil
 }
 
 func (f *fakeExchangeClient) GetTicker(instID string) (domain.Ticker, error) {
@@ -104,7 +163,16 @@ func (f *fakeExchangeClient) GetOrder(instID, ordID string) (domain.OrderStatus,
 	if f.orderStatus != nil {
 		return *f.orderStatus, nil
 	}
-	return domain.OrderStatus{InstID: instID, OrdID: ordID, State: "filled"}, nil
+	// A default fill reports a real filled SIZE, not just the state. A filled order with
+	// AccFillSz=0 does not exist on the exchange, and a fake that models one silently weakens every
+	// test that depends on fill-derived values — order.Contracts (what a flatten closes and what
+	// the exchange-side protective order is sized to) is derived from exactly this field, so the
+	// old zero made every test position unprotectable in a way production never is.
+	sz := decimal.NewFromInt(1)
+	if n := len(f.placedOrders); n > 0 && f.placedOrders[n-1].Sz.IsPositive() {
+		sz = f.placedOrders[n-1].Sz
+	}
+	return domain.OrderStatus{InstID: instID, OrdID: ordID, State: "filled", AccFillSz: sz, Sz: sz}, nil
 }
 func (f *fakeExchangeClient) GetInstrument(instType, instID string) (domain.Instrument, error) {
 	if f.getInstrumentErr != nil {

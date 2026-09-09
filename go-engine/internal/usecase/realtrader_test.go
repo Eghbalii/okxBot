@@ -2,8 +2,8 @@ package usecase
 
 import (
 	"context"
-	"fmt"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -185,28 +185,38 @@ func TestEvaluateStrategies_PendingOrderDoesNotBlockASecondOpen(t *testing.T) {
 	}
 }
 
-// TestApplyRealAdjustment_EditsInPlaceNoExchangeCall confirms the no-fork SL/TP edit is purely
-// local: computeAdjustedLevels' result is persisted via UpdateRealOrderSLTP + one
-// RecordRealOrderAdjustment row, with ZERO exchange calls — the corrected 2026-09-03 design (no
-// resting algo order to amend).
-func TestApplyRealAdjustment_EditsInPlaceNoExchangeCall(t *testing.T) {
+// TestApplyRealAdjustment_AmendsTheExchangeThenPersists confirms the SL/TP edit reaches the
+// EXCHANGE, not just the database (2026-09-09 request). This test previously asserted the exact
+// opposite — that an adjustment made ZERO exchange calls — which is the behavior real order 33
+// exposed as unsafe: a stop moved only locally leaves OKX holding the old one.
+func TestApplyRealAdjustment_AmendsTheExchangeThenPersists(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
 	rt := newTestRealTrader(repo, exchange, nil, nil)
 
 	sl := dec("95")
-	order := port.RealOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, Size: dec("10"), Leverage: dec("1")}
+	algoID := "algo-7"
+	order := port.RealOrder{
+		ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl,
+		Size: dec("10"), Leverage: dec("1"), ExchangeAlgoOrderID: &algoID,
+	}
 	repo.realOrders[1] = order
 
 	// Proposed SL=98 is a 3% move from the current 95 at price 100 — no per-step size cap anymore
 	// (removed 2026-09-04, explicit operator decision), so it applies in full since it's in the
-	// risk-reducing direction for a long (98 > 95), same as PaperTrader.applyAdjustment would
-	// produce via the identical shared computeAdjustedLevels.
+	// risk-reducing direction for a long (98 > 95).
 	action := &domain.Action{Action: domain.ActionUpdate, SLPx: dec("98")}
 	rt.applyRealAdjustment(context.Background(), order, action, dec("100"), testLogger())
 
-	if len(exchange.placedOrders) != 0 {
-		t.Errorf("expected zero exchange calls for an in-place SL/TP edit, got %d", len(exchange.placedOrders))
+	if len(exchange.amendedAlgoOrders) != 1 {
+		t.Fatalf("expected the adjustment to amend the resting exchange order once, got %d", len(exchange.amendedAlgoOrders))
+	}
+	amend := exchange.amendedAlgoOrders[0]
+	if amend.AlgoID != algoID {
+		t.Errorf("amended the wrong algo order: want %q, got %q", algoID, amend.AlgoID)
+	}
+	if !amend.SLTriggerPx.Equal(dec("98")) {
+		t.Errorf("the exchange must receive the NEW stop 98, got %v", amend.SLTriggerPx)
 	}
 	updated := repo.realOrders[1]
 	if updated.SLPx == nil || !updated.SLPx.Equal(dec("98")) {
@@ -218,6 +228,35 @@ func TestApplyRealAdjustment_EditsInPlaceNoExchangeCall(t *testing.T) {
 	}
 	if adjustments[0].Source != "model" {
 		t.Errorf("expected source=model, got %q", adjustments[0].Source)
+	}
+}
+
+// A failed exchange amend must leave the LOCAL levels unchanged too. The two states that matter
+// are "both old" and "both new"; the state this guards against is the exchange holding the old
+// stop while the database claims the new one, which would hide an unprotected level behind a row
+// that looks correct.
+func TestApplyRealAdjustment_ExchangeAmendFailureLeavesLevelsUnchanged(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{amendAlgoErr: context.DeadlineExceeded}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	sl := dec("95")
+	algoID := "algo-7"
+	order := port.RealOrder{
+		ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl,
+		Size: dec("10"), Leverage: dec("1"), ExchangeAlgoOrderID: &algoID,
+	}
+	repo.realOrders[1] = order
+
+	action := &domain.Action{Action: domain.ActionUpdate, SLPx: dec("98")}
+	rt.applyRealAdjustment(context.Background(), order, action, dec("100"), testLogger())
+
+	updated := repo.realOrders[1]
+	if updated.SLPx == nil || !updated.SLPx.Equal(dec("95")) {
+		t.Errorf("a failed exchange amend must leave the stored stop at 95, got %v", updated.SLPx)
+	}
+	if adjustments, _ := repo.ListRealOrderAdjustments(context.Background(), 1); len(adjustments) != 0 {
+		t.Errorf("a failed amend must record no adjustment row, got %d", len(adjustments))
 	}
 }
 

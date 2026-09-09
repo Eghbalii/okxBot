@@ -147,6 +147,13 @@ type RealTrader struct {
 	candles   map[string][]domain.Candle
 
 	openMu sync.Mutex
+	// reconcileMu serializes reconciliation passes. Before the private WebSocket, reconcile had a
+	// single caller on a fixed ticker and could not overlap with itself; now a pushed position
+	// event can trigger a pass while the periodic one is mid-flight. Both read the local and remote
+	// state and then act on the difference, so two concurrent passes could each observe the same
+	// stale-open position and each close it — the same read-then-act race openMu guards on the open
+	// path (CLAUDE.md §16.9).
+	reconcileMu sync.Mutex
 
 	// rlAdjustMu/lastRLAdjustAt throttle runUpdates to RLAdjustInterval cadence, mirroring
 	// PaperTrader's identical throttle exactly (CLAUDE.md §15.9's MidPrice-freshness fix) — found
@@ -358,11 +365,22 @@ func (e *RealTrader) instrumentOrZero() domain.Instrument {
 }
 
 // DefaultReconcileInterval is the reconciliation poll's cadence when RealTrader.ReconcileInterval
-// is unset — 1 minute, the operator's explicit figure (2026-09-03): frequent enough to catch drift
-// (a manual close on OKX's own UI, a liquidation) within a bounded window, deliberately NOT tied to
-// the tick feed's cadence, since SL/TP execution itself is driven by the live tick stream, not by
-// this poll — the poll exists only to keep bookkeeping honest, never to drive the trading loop.
-const DefaultReconcileInterval = time.Minute
+// is unset.
+//
+// 5 seconds since 2026-09-09 (explicit operator request), down from the 1 minute set on 2026-09-03.
+// The poll's job grew: it no longer only catches bookkeeping drift (a manual close on OKX's own
+// UI, a liquidation), it also verifies that every open position's protective order is still
+// resting on the exchange and re-places it when it is not. A minute of running unprotected is a
+// long time on a leveraged position, and this is now the mechanism that bounds it.
+//
+// The rate-limit cost is real but modest and deliberately accounted for: two account-class calls
+// (GetPositions, GetBalance) plus one per open position with a protective order to verify, against
+// the gateway's account-class budget — and the trader is the gateway's priority consumer, so this
+// cannot starve order placement (CLAUDE.md §27.1).
+//
+// The private WebSocket (positions/orders/account push) is the better primary for this and is
+// wired separately; this poll remains as the backup that does not depend on a socket staying up.
+const DefaultReconcileInterval = 5 * time.Second
 
 func (e *RealTrader) reconcileInterval() time.Duration {
 	if e.ReconcileInterval > 0 {
@@ -1060,6 +1078,40 @@ func (e *RealTrader) openReal(
 		return nil, nil
 	}
 
+	// Rest the stop and target on the EXCHANGE before treating this position as open (2026-09-09
+	// request: "we should set sl/tp on exchange always"). Until this existed the levels lived only
+	// in real_orders, watched by this process's own tick monitor — so any interruption of this
+	// service left real capital running unprotected, which is what real order 33 exposed.
+	//
+	// A position that cannot be protected is CLOSED again immediately rather than kept. That costs
+	// a round-trip fee on a rare failure; holding an unprotected real position costs an unbounded
+	// loss, and "keep it and hope the retry works" is exactly the posture this change removes.
+	// Note this runs even when the DB insert failed (persisted == false). The position is LIVE on
+	// the exchange either way, and a live position is exactly what must not go unprotected — losing
+	// our own record of it is a bookkeeping problem, running it without a stop is a capital one.
+	// placeProtection skips only the algoId write in that case, which openReal has nowhere to store
+	// anyway.
+	{
+		algoID, protErr := e.placeProtection(ctx, order, logger)
+		if protErr != nil {
+			metrics.RealUnprotectedClosedTotal.WithLabelValues(e.InstID).Inc()
+			logger.Error("could not rest sl/tp on the exchange for a just-opened real position; closing it immediately",
+				"id", order.ID, "instId", e.InstID, "error", protErr)
+			if closeErr := e.closeReal(ctx, order, price, conductor.CloseReasonManual, logger); closeErr != nil {
+				// Now genuinely dangerous: an unprotected position that also would not flatten.
+				// Halt so nothing new is opened alongside it and a human is drawn to it — the same
+				// escalation reconcile uses for an untracked position.
+				logger.Error("FAILED TO CLOSE AN UNPROTECTED REAL POSITION; halting real trading",
+					"id", order.ID, "instId", e.InstID, "error", closeErr)
+				if e.RiskManager != nil {
+					e.RiskManager.Halt(fmt.Sprintf("unprotected real position %d could not be closed: %v", order.ID, closeErr))
+				}
+			}
+			return nil, nil
+		}
+		order.ExchangeAlgoOrderID = &algoID
+	}
+
 	metrics.PaperOrdersOpenedTotal.WithLabelValues(a.Kind, e.InstID, order.Side).Inc()
 	logger.Info("opened real order", "id", order.ID, "instId", e.InstID, "side", order.Side,
 		"entry", order.EntryPx, "size", order.Size, "leverage", order.Leverage, "exchangeOrderId", order.ExchangeOrderID)
@@ -1177,6 +1229,17 @@ func (e *RealTrader) runUpdates(ctx context.Context, bar string, price decimal.D
 func (e *RealTrader) applyRealAdjustment(ctx context.Context, o port.RealOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
 	newSL, newTP, changed := computeAdjustedLevels(asPaperOrderView(o), action, price)
 	if !changed {
+		return
+	}
+	// The EXCHANGE is amended first, and a failure aborts the whole adjustment (2026-09-09).
+	// Ordering matters: if the local row were written first and the amend then failed, the exchange
+	// would still be holding the OLD stop while this system believed the new one was in force —
+	// a silent divergence, and the more dangerous direction of the two, since the level actually
+	// protecting real money would be the one nobody was looking at. Leaving both at the old level
+	// is a coherent state; the next adjustment simply tries again.
+	if err := e.amendProtection(ctx, o, newSL, newTP, logger); err != nil {
+		logger.Error("real updates: could not move the exchange's resting sl/tp; leaving levels unchanged",
+			"instId", e.InstID, "orderId", o.ID, "error", err)
 		return
 	}
 	if err := e.Repo.UpdateRealOrderSLTP(ctx, o.ID, newSL, newTP, false); err != nil {
@@ -1430,6 +1493,18 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 	}
 	// After the close is durably recorded: the flatten has filled, so its record is final.
 	e.captureExchangeRecord(ctx, o.ID, "close", closeOrdID, logger)
+	// Remove the resting protective order now that it guards nothing (2026-09-09). Runs AFTER the
+	// close is recorded and is best-effort: a leftover conditional order must never make a
+	// completed close look failed. It matters even though OKX prunes orphaned conditionals itself,
+	// because the failure mode of a stale one — triggering and OPENING a position on an account
+	// that believes it is flat — is not something to leave to cleanup semantics.
+	//
+	// Cancelled on EVERY close, including an SL/TP one. A stop touch detected by the in-process
+	// backup monitor does not mean the exchange's own order fired — the backup exists precisely for
+	// the case where it did not — so skipping the cancel on reason "sl"/"tp" would be reasoning
+	// from this system's view of why the position closed rather than from the exchange's. Cancelling
+	// an order that has already triggered is a harmless no-op; leaving a live one behind is not.
+	e.cancelProtection(ctx, o, logger)
 	metrics.PaperOrdersClosedTotal.WithLabelValues(e.InstID, reason).Inc()
 	metrics.PaperOrdersRealizedPnL.WithLabelValues(e.InstID).Add(pnl.InexactFloat64())
 	logger.Info("closed real order", "id", o.ID, "instId", e.InstID, "reason", reason, "closePx", price, "pnl", pnl)
@@ -1592,10 +1667,37 @@ func (e *RealTrader) runReconcileLoop(ctx context.Context, logger *slog.Logger) 
 	}
 }
 
+// ReconcileNow runs one reconciliation pass immediately, outside the periodic loop's own cadence.
+//
+// This is what the private WebSocket calls when OKX pushes a position/order/account event for this
+// instrument (2026-09-09): the push says "something changed", and reconcile is already the code
+// that works out what and responds to it. Routing the push through the same path rather than
+// giving the socket its own parallel handling means there is ONE definition of how this system
+// responds to a position change — a second one would be free to drift from it, and the drift would
+// only show up when the two disagreed about a real position.
+//
+// Safe to call concurrently with the periodic loop: reconcile re-reads both sides before acting,
+// so a redundant pass is a no-op rather than a double-close.
+func (e *RealTrader) ReconcileNow(ctx context.Context, logger *slog.Logger) {
+	if logger == nil {
+		logger = e.Logger
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	e.reconcile(ctx, logger)
+}
+
 // reconcile is the one-shot comparison runReconcileLoop calls on each tick of its own ticker.
 // Exported as a method (not folded into the loop) so tests can call it directly without waiting on
 // a real ticker.
 func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
+	// Held for the whole pass, not just the read: the decision made here is derived from both
+	// sides' state, so releasing between reading and acting would leave exactly the window a
+	// second caller could act on the same difference.
+	e.reconcileMu.Lock()
+	defer e.reconcileMu.Unlock()
+
 	remotePositions, err := e.Exchange.GetPositions(e.execInstType())
 	if err != nil {
 		logger.Warn("reconcile: get positions failed", "instId", e.InstID, "error", err)
@@ -1614,6 +1716,13 @@ func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
 		logger.Warn("reconcile: list local open positions failed", "instId", e.InstID, "error", err)
 		return
 	}
+
+	// Verify every open position still has a live protective order on the exchange, and re-place
+	// any that has gone missing (2026-09-09). The exchange holds the stop, so this is what keeps
+	// that trust honest — an algo order can be cancelled from OKX's own UI or lost to a margin-mode
+	// change, neither of which produces any signal in this process. Runs before the drift
+	// comparison below so a position about to be reported as drifted is still checked.
+	e.ensureProtection(ctx, local, logger)
 
 	switch {
 	case remote == nil && len(local) > 0:

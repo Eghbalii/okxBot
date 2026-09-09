@@ -18,6 +18,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/gatewayclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
@@ -91,9 +92,15 @@ func main() {
 			MaxPositionPct: cfg.Account.MaxPositionPct,
 			MaxLeverage:    cfg.Risk.MaxLeverage,
 		},
-		ProcessMgr: cfg.API.ProcessMgr,
-		Units:      cfg.API.Units,
-		Logger:     logger,
+		// The panel's manual SL/TP edit amends the position's resting order on the exchange before
+		// touching the database (2026-09-09), so cmd/api needs its own gateway client for that one
+		// call. Same gateway, same "api" consumer identity as the affordability reporter above —
+		// the trader keeps its rate-limit priority over both.
+		Protection:    gatewayclient.New(cfg.Gateway.URL, "api"),
+		ExecInstIDFor: okx.SymbolMap(cfg.Trading.SymbolMap).Resolve,
+		ProcessMgr:    cfg.API.ProcessMgr,
+		Units:         cfg.API.Units,
+		Logger:        logger,
 		// Must match what the trading services seed their account row with (CLAUDE.md §15.6) —
 		// both read through GetAccountEquity, so a different value here would seed a balance the
 		// engine never actually traded against.

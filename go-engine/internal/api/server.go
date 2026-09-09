@@ -13,6 +13,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
@@ -35,6 +36,14 @@ type Server struct {
 	// simply makes that endpoint return an empty list, so cmd/api still runs anywhere the exchange
 	// client isn't wired.
 	Affordability affordabilityReporter
+	// Protection amends a real position's resting SL/TP order on the exchange, so an operator's
+	// manual edit from the panel reaches OKX in real time rather than only this system's database
+	// (2026-09-09 request). Optional: nil makes a manual adjustment fail loudly rather than
+	// silently write a level the exchange does not have — see handleAdjustPosition.
+	Protection protectionAmender
+	// ExecInstIDFor maps a market-data symbol ("BTC") to the instrument real orders actually
+	// execute against (CLAUDE.md §33.4). Nil falls back to the symbol itself.
+	ExecInstIDFor func(symbol string) (string, error)
 	// TraderBaseURL is cmd/trader's own restart-only HTTP surface (CLAUDE.md real-trading readiness
 	// plan, 2026-09-04) — used the same way PaperTraderBaseURL is: only the restart action needs to
 	// reach the running process, everything else (config reads/writes) hits Postgres directly.
@@ -697,10 +706,10 @@ type adjustPositionRequest struct {
 // nothing else automated: the percentage the operator enters converts straight to a price via
 // priceFromMarginPct (entry price + leverage, no clamp), full stop.
 //
-// Writes directly: UpdatePaperOrderSLTP + RecordPaperOrderAdjustment(source="manual"). Purely
-// local, no exchange call — RealTrader's own tick-driven monitor picks up the new levels on its
-// next tick, same as it would for a model-driven change (§3a's correction: no resting exchange-
-// side order to amend).
+// Amends the resting SL/TP order on the EXCHANGE first, then writes UpdateRealOrderSLTP +
+// RecordRealOrderAdjustment(source="manual") (2026-09-09 request). This handler used to be purely
+// local, on the since-reversed assumption that there was no exchange-side order to amend — which
+// is exactly what left real positions protected only by this system's own tick monitor.
 //
 // Also sets manual_override (2026-09-06, explicit operator request): once an operator has edited a
 // position's SL/TP by hand, RealTrader.runUpdates skips it permanently — the model is never asked
@@ -758,6 +767,44 @@ func (s *Server) handleAdjustPosition(w http.ResponseWriter, r *http.Request) {
 	if req.TPPct != nil {
 		px := priceFromMarginPct(o.EntryPx, o.Leverage, o.Side, decimal.NewFromFloat(*req.TPPct))
 		newTP = &px
+	}
+
+	// The EXCHANGE is amended BEFORE the local row (2026-09-09 request: a panel edit must reach
+	// OKX in real time). Ordering is deliberate and matches the model's own adjustment path: if the
+	// database were written first and the amend then failed, the exchange would keep enforcing the
+	// OLD stop while the panel showed the new one — the operator would believe they had moved their
+	// protection when they had not, which is strictly worse than the edit visibly failing.
+	//
+	// A position with no resting order, or an unconfigured exchange client, is a hard failure here
+	// rather than a local-only write for the same reason.
+	if o.ExchangeAlgoOrderID == nil || *o.ExchangeAlgoOrderID == "" {
+		writeError(w, http.StatusConflict,
+			"this position has no resting stop/target on the exchange to move; it may still be opening")
+		return
+	}
+	if s.Protection == nil {
+		writeError(w, http.StatusServiceUnavailable,
+			"no exchange connection configured; refusing to change levels the exchange would not receive")
+		return
+	}
+	amend := domain.AlgoOrderAmend{AlgoID: *o.ExchangeAlgoOrderID}
+	instID, err := s.execInstID(o.InstID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	amend.InstID = instID
+	// Both sides are always sent, so the exchange ends up holding exactly this position's current
+	// levels rather than the result of a sequence of partial edits.
+	if newSL != nil && newSL.IsPositive() {
+		amend.SLTriggerPx = *newSL
+	}
+	if newTP != nil && newTP.IsPositive() {
+		amend.TPTriggerPx = *newTP
+	}
+	if err := s.Protection.AmendAlgoOrder(amend); err != nil {
+		writeError(w, http.StatusBadGateway, "the exchange rejected the new levels, nothing was changed: "+err.Error())
+		return
 	}
 
 	if err := s.Repo.UpdateRealOrderSLTP(r.Context(), id, newSL, newTP, true); err != nil {

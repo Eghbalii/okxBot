@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http/httptest"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
@@ -60,12 +62,36 @@ func (s *stubRepo) RecordRealOrderAdjustment(ctx context.Context, orderID int64,
 	return nil
 }
 
+// stubAmender records the amends that reached the "exchange", so a test can assert the trigger
+// prices actually sent — the property that matters since 2026-09-09: an operator's panel edit must
+// change the level OKX is enforcing, not just the row the panel displays.
+type stubAmender struct {
+	amends []domain.AlgoOrderAmend
+	err    error
+}
+
+func (a *stubAmender) AmendAlgoOrder(req domain.AlgoOrderAmend) error {
+	if a.err != nil {
+		return a.err
+	}
+	a.amends = append(a.amends, req)
+	return nil
+}
+
 func newTestServer(repo *stubRepo) *Server {
 	return &Server{
-		Repo:   repo,
-		Logger: slog.Default(),
+		Repo:       repo,
+		Protection: &stubAmender{},
+		Logger:     slog.Default(),
 	}
 }
+
+// testAlgoID is the resting protective order every fixture position carries. A real open position
+// always has one (openReal closes any position it cannot protect), so a fixture without one would
+// be testing a state production does not produce.
+const testAlgoID = "algo-test-1"
+
+func algoID() *string { id := testAlgoID; return &id }
 
 // doAdjust defaults to ?mode=real (every pre-existing test in this file exercises the real-mode
 // path); doAdjustMode lets a test override it (e.g. to exercise the paper-mode-rejected case).
@@ -87,7 +113,7 @@ func floatPtr(f float64) *float64 { return &f }
 func TestHandleAdjustPosition_MovesSLIntoLoss(t *testing.T) {
 	repo := &stubRepo{order: port.RealOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
-		EntryPx: dec("100"), Leverage: dec("10"),
+		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
 	srv := newTestServer(repo)
 
@@ -111,7 +137,7 @@ func TestHandleAdjustPosition_MovesSLIntoLoss(t *testing.T) {
 func TestHandleAdjustPosition_BringsSLIntoProfit(t *testing.T) {
 	repo := &stubRepo{order: port.RealOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
-		EntryPx: dec("100"), Leverage: dec("10"),
+		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
 	srv := newTestServer(repo)
 
@@ -130,7 +156,7 @@ func TestHandleAdjustPosition_BringsSLIntoProfit(t *testing.T) {
 func TestHandleAdjustPosition_ShortSideDirectionIsMirrored(t *testing.T) {
 	repo := &stubRepo{order: port.RealOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "sell",
-		EntryPx: dec("100"), Leverage: dec("10"),
+		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
 	srv := newTestServer(repo)
 
@@ -154,7 +180,7 @@ func TestHandleAdjustPosition_ShortSideDirectionIsMirrored(t *testing.T) {
 func TestHandleAdjustPosition_IsDeliberatelyUnclamped(t *testing.T) {
 	repo := &stubRepo{order: port.RealOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
-		EntryPx: dec("100"), Leverage: dec("10"),
+		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
 	srv := newTestServer(repo)
 
@@ -176,7 +202,7 @@ func TestHandleAdjustPosition_IsDeliberatelyUnclamped(t *testing.T) {
 func TestHandleAdjustPosition_BringsSLPastEntryIntoProfit(t *testing.T) {
 	repo := &stubRepo{order: port.RealOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
-		EntryPx: dec("100"), Leverage: dec("20"),
+		EntryPx: dec("100"), Leverage: dec("20"), ExchangeAlgoOrderID: algoID(),
 	}}
 	srv := newTestServer(repo)
 
@@ -252,7 +278,7 @@ func TestHandleAdjustPosition_RejectsEmptyBody(t *testing.T) {
 func TestHandleAdjustPosition_SetsManualOverride(t *testing.T) {
 	repo := &stubRepo{order: port.RealOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
-		EntryPx: dec("100"), Leverage: dec("10"),
+		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
 	srv := newTestServer(repo)
 
@@ -287,5 +313,74 @@ func TestPriceFromMarginPct_TableDriven(t *testing.T) {
 				t.Errorf("priceFromMarginPct(100, %s, %q, %s) = %s, want %s", c.leverage, c.side, c.pct, got, c.expectedPrice)
 			}
 		})
+	}
+}
+
+// An operator's manual edit must reach the EXCHANGE, not just the database (2026-09-09 request).
+// Before this, the handler wrote the new level locally and OKX kept enforcing the old one — the
+// operator would believe they had moved their stop when they had not.
+func TestHandleAdjustPosition_AmendsTheExchangeOrder(t *testing.T) {
+	repo := &stubRepo{order: port.RealOrder{
+		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
+		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
+	}}
+	amender := &stubAmender{}
+	srv := newTestServer(repo)
+	srv.Protection = amender
+
+	rec := doAdjust(srv, "1", adjustPositionRequest{SLPct: floatPtr(-5)})
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(amender.amends) != 1 {
+		t.Fatalf("expected exactly 1 exchange amend, got %d", len(amender.amends))
+	}
+	if amender.amends[0].AlgoID != testAlgoID {
+		t.Errorf("amended the wrong order: want %q, got %q", testAlgoID, amender.amends[0].AlgoID)
+	}
+	// -5% of margin at 10x is a 0.5% price move below entry.
+	if !amender.amends[0].SLTriggerPx.Equal(dec("99.5")) {
+		t.Errorf("the exchange must receive the new stop 99.5, got %v", amender.amends[0].SLTriggerPx)
+	}
+}
+
+// A rejected amend must leave the stored levels untouched. The dangerous state is the exchange
+// holding one stop while the panel displays another, so a failure changes nothing at all.
+func TestHandleAdjustPosition_ExchangeRejectionChangesNothing(t *testing.T) {
+	repo := &stubRepo{order: port.RealOrder{
+		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
+		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
+	}}
+	srv := newTestServer(repo)
+	srv.Protection = &stubAmender{err: errors.New("rejected")}
+
+	rec := doAdjust(srv, "1", adjustPositionRequest{SLPct: floatPtr(-5)})
+	if rec.Code != 502 {
+		t.Fatalf("expected 502 when the exchange rejects the amend, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(repo.updateSLTPCalls) != 0 {
+		t.Errorf("a rejected amend must not write the new level locally, got %d writes", len(repo.updateSLTPCalls))
+	}
+	if len(repo.adjustmentsRecorded) != 0 {
+		t.Errorf("a rejected amend must record no adjustment row, got %d", len(repo.adjustmentsRecorded))
+	}
+}
+
+// A position with no resting protective order cannot have its levels moved on the exchange, so the
+// edit is refused rather than written locally — the same "never record a level the exchange does
+// not have" rule as the rejection case above.
+func TestHandleAdjustPosition_RefusesWhenThereIsNoRestingOrder(t *testing.T) {
+	repo := &stubRepo{order: port.RealOrder{
+		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
+		EntryPx: dec("100"), Leverage: dec("10"),
+	}}
+	srv := newTestServer(repo)
+
+	rec := doAdjust(srv, "1", adjustPositionRequest{SLPct: floatPtr(-5)})
+	if rec.Code != 409 {
+		t.Fatalf("expected 409 with no resting order, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(repo.updateSLTPCalls) != 0 {
+		t.Errorf("nothing must be written locally, got %d writes", len(repo.updateSLTPCalls))
 	}
 }
