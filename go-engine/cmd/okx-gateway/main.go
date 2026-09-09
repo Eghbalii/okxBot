@@ -22,8 +22,10 @@ import (
 
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/gateway"
+	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx/ws"
 )
 
 func main() {
@@ -49,6 +51,38 @@ func main() {
 		limiter:   gateway.NewLimiter(limits),
 		retry:     gateway.DefaultRetryPolicy(),
 		simulated: cfg.OKX.Simulated,
+	}
+
+	// The private WebSocket: OKX's own push of this account's position/order/balance changes,
+	// republished onto the event bus for cmd/trader (2026-09-09 request). It lives here because
+	// this is the only process holding OKX credentials (§27.1) — see accountstream.go.
+	//
+	// Optional and never fatal: if it cannot connect, real trading continues on the reconciliation
+	// poll alone, which is the backup this is layered on top of rather than a replacement for.
+	// Skipped entirely without credentials, so a demo/unconfigured deployment does not spin a
+	// socket that can only ever fail to authenticate.
+	if cfg.OKX.APIKey != "" && len(cfg.Kafka.Brokers) > 0 {
+		stream := &accountStream{
+			client: &ws.PrivateClient{
+				URL:        cfg.OKX.PrivateWSURL,
+				APIKey:     cfg.OKX.APIKey,
+				APISecret:  cfg.OKX.APISecret,
+				Passphrase: cfg.OKX.APIPassphrase,
+				Channels:   []string{"positions", "orders"},
+				InstType:   cfg.Trading.ExecInstType,
+				Logger:     logger,
+			},
+			publisher:      kafkastream.NewPublisher(cfg.Kafka.Brokers, TopicAccountEvents),
+			instIDToSymbol: reverseSymbolMap(cfg.Trading.SymbolMap),
+			logger:         logger,
+		}
+		go func() {
+			if err := stream.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("private account stream stopped; real trading falls back to the reconciliation poll", "error", err)
+			}
+		}()
+	} else {
+		logger.Info("private account stream disabled (no OKX credentials or no kafka brokers configured)")
 	}
 
 	addr := envOr("GATEWAY_ADDR", "0.0.0.0:8094")

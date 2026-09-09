@@ -145,6 +145,14 @@ services:
       OKX_API_SECRET: ${OKX_API_SECRET}
       OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE}
       OKX_SIMULATED_TRADING: ${OKX_SIMULATED_TRADING:-1}
+      # Needed since 2026-09-09: the gateway also runs OKX's private WebSocket (this is the only
+      # process with credentials) and republishes the account's position/order pushes onto
+      # okx.account-events for cmd/trader. Without this the client falls back to its own
+      # localhost:9092 default, which inside this container is its OWN loopback, not kafka — the
+      # exact mistake already made once for cmd/trader's own consumer (see its comment below).
+      KAFKA_BROKERS: kafka:9092
+    depends_on:
+      - kafka
     ports:
       - "8094:8094"
       - "9105:9105"

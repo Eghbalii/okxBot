@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -402,6 +403,41 @@ func runRealTrader(
 		if err := affordability.Run(ctx); err != nil && ctx.Err() == nil {
 			logger.Warn("affordability service stopped", "error", err)
 		}
+	}()
+
+	// Account events pushed by OKX's private WebSocket, republished onto the bus by cmd/okx-gateway
+	// (2026-09-09 request: keep positions synced with the exchange, ideally by socket rather than
+	// polling). Each event names an instrument whose position/order state just changed on the
+	// exchange; the response is to reconcile THAT instrument immediately, which is the same code
+	// the periodic poll runs — one definition of how this system responds to a position change,
+	// reached faster.
+	//
+	// The 5-second reconciliation poll keeps running underneath: a socket can be connected and
+	// silently stale, and this whole change exists because a component being up is not evidence it
+	// is working.
+	accountConsumer := kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.account-events", "trader")
+	defer accountConsumer.Close()
+	go func() {
+		errCh <- accountConsumer.Run(ctx, func(ctx context.Context, data []byte) error {
+			var event struct {
+				Channel string `json:"channel"`
+				InstID  string `json:"instId"`
+			}
+			if err := json.Unmarshal(data, &event); err != nil {
+				logger.Warn("could not decode account event", "error", err)
+				return nil
+			}
+			engine, ok := engines[event.InstID]
+			if !ok {
+				// An event for an instrument this process does not trade — another roster, or an
+				// instrument disabled since. Nothing to reconcile, and not an error.
+				return nil
+			}
+			logger.Info("exchange pushed an account change; reconciling now",
+				"channel", event.Channel, "instId", event.InstID)
+			engine.ReconcileNow(ctx, logger)
+			return nil
+		})
 	}()
 
 	go func() { errCh <- tickDispatcher.Run(ctx) }()
