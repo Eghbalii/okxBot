@@ -4544,3 +4544,37 @@ reverted and confirmed to fail. 571 Go tests pass under `-race` (was 548).
 **Alerting**: `okxbot_real_protection_missing_total` is the one to watch. Any nonzero value means a
 live position was found unprotected, which should be impossible if placement and cancellation both
 work. `okxbot_real_unprotected_closed_total` counts positions flattened for want of protection.
+
+### 35.6 Deployed 2026-09-09 — and the EEA host caught the private WebSocket too
+
+Deployed onto a genuinely clean slate: zero open real positions and `real` mode `paused` (the
+operator had closed everything and paused before reporting the bug), which is the safest possible
+moment for a change of this kind — no live position had to be migrated onto exchange-side
+protection.
+
+**§33.1's EEA-routing trap recurred, on the socket this time.** The gateway's private WS failed to
+authenticate with `60032: API key doesn't exist` — the WS twin of the REST `50119` that §33.1
+already documents, and just as misleading: the key is fine, the HOST is wrong. Only
+`rest_base_url` had been switched to `my.okx.com` back then; `private_ws_url` still pointed at
+`ws.okx.com`. Fixed to `wss://wseea.okx.com:8443/ws/v5/private` (which resolves to the same
+Cloudflare endpoints as `my.okx.com`, consistent with being its EEA counterpart) and the socket
+connected immediately.
+
+Worth being precise about which sockets this affects: the **authenticated** one only. The public
+and business WS URLs are unauthenticated and work from anywhere, which is exactly why this went
+unnoticed for months — every other socket in this project was fine. `config.example.yaml` now
+carries the EEA hosts as inline comments on all three URLs so the next person does not have to
+rediscover it a third time.
+
+**Config safety on this deploy** (§31's lesson applied): only the 25 files the commits actually
+touched were transferred, as an explicit file list — never a `tar czf` of the tree — and the
+server's `config.yaml` md5 was checked before and after the transfer to prove it was untouched.
+The one config edit (`private_ws_url`) was made in place on the server with `sed` and verified by
+diffing everything EXCEPT that line to confirm nothing else moved. The pre-deploy backup went to
+`/opt/okxBot/config.yaml.bak.20260909`, not `/tmp`, since §31's backup was lost to exactly that.
+
+Verified live after deploy: private WS `connected`, `channels=[positions orders]`, `instType=FUTURES`,
+zero reconnects or errors in the following minutes; `GET /order/algo` routed through the gateway to
+OKX and came back with OKX's own `51000 Parameter algoId error` for a deliberately fake id —
+proving the whole path (consumer header → rate limiter → REST client → OKX) works end to end rather
+than merely returning a plausible-looking local error.

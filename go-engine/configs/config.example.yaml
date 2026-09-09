@@ -2,9 +2,18 @@
 # as postgres/redis below — see CLAUDE.md §12 for why Kafka is the internal event bus.
 
 okx:
-  rest_base_url: "https://www.okx.com"
+  # EEA-HOSTED DEPLOYMENTS MUST USE THE EEA HOSTS. OKX routes European traffic to my.okx.com /
+  # wseea.okx.com, and a perfectly valid API key used against www.okx.com / ws.okx.com from an EEA
+  # server is rejected as "API key doesn't exist" (REST code 50119, WS code 60032) — an error that
+  # names the wrong problem entirely and sends you looking at the key. This bit REST once
+  # (CLAUDE.md §33.1) and then the private WebSocket again on 2026-09-09, because only the REST URL
+  # had been switched. The server's own config.yaml uses the EEA hosts; these defaults do not.
+  rest_base_url: "https://www.okx.com"       # EEA: https://my.okx.com
   public_ws_url: "wss://ws.okx.com:8443/ws/v5/public"
-  private_ws_url: "wss://ws.okx.com:8443/ws/v5/private"
+  # private_ws_url is the AUTHENTICATED socket (account positions/orders pushes, CLAUDE.md §35.4),
+  # so it is subject to the EEA routing above — unlike the public/business sockets, which are
+  # unauthenticated and work from anywhere.
+  private_ws_url: "wss://ws.okx.com:8443/ws/v5/private"  # EEA: wss://wseea.okx.com:8443/ws/v5/private
 
 trading:
   # Short internal symbols, NOT OKX's own instId (CLAUDE.md §27, 2026-09-04 design): this bot only
