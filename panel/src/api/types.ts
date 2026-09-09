@@ -323,3 +323,11 @@ export interface ExchangeOrderRaw {
   openOrderId?: string
   closeOrderId?: string
 }
+
+// POST /api/system/cleanup — what a disk-cleanup run reclaimed. Build cache only: images and
+// volumes are deliberately never touched (the RL model's replay buffer and the database live in
+// volumes, and an image with no running container is still needed at the next deploy).
+export interface CleanupResult {
+  buildCacheBytes: number
+  error?: string
+}

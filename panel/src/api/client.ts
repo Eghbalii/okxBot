@@ -12,6 +12,7 @@ import type {
   StrategyAssignment,
   StrategyConfig,
   StrategyStats,
+  CleanupResult,
   ExchangeOrderRaw,
   TokenAffordability,
   TokenStats,
@@ -208,6 +209,9 @@ export const api = {
   // min-size column and auto-disabled tag (2026-09-08). Empty in paper mode by design.
   // OKX's own untouched record for both legs of a real position, fetched live rather than served
   // from stored columns — the stored fields are a chosen few, this is everything the exchange knows.
+  // Reclaims the Docker build cache. Build cache only — see the endpoint's own doc comment for
+  // why images/volumes are deliberately not touched.
+  cleanupDisk: () => request<CleanupResult>('/system/cleanup', { method: 'POST' }),
   exchangeOrderRaw: (id: number) =>
     request<ExchangeOrderRaw>(`/positions/${id}/exchange-order`),
   tokenAffordability: (mode: PositionMode) =>

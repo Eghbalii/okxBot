@@ -156,6 +156,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/paper-trading/token-stats", s.handleTokenStats24h)
 	mux.HandleFunc("GET /api/paper-trading/affordability", s.handleTokenAffordability)
 	mux.HandleFunc("GET /api/positions/{id}/exchange-order", s.handleOrderExchangeRaw)
+	mux.HandleFunc("POST /api/system/cleanup", s.handleDiskCleanup)
 	mux.HandleFunc("GET /api/paper-trading/config", s.handleGetPaperTradingConfig)
 	mux.HandleFunc("PUT /api/paper-trading/config", s.handleSavePaperTradingConfig)
 	mux.HandleFunc("POST /api/paper-trading/restart", s.handleRestartTrading)
