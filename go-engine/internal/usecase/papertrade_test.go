@@ -479,6 +479,25 @@ func (r *fakeRepository) CloseRealOrderConfirmed(ctx context.Context, id int64, 
 	return r.CloseRealOrder(ctx, id, closePx, reason, realizedPnL)
 }
 
+func (r *fakeRepository) SetRealOrderExchangeRaw(ctx context.Context, id int64, leg string, raw json.RawMessage) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok {
+		return nil
+	}
+	switch leg {
+	case "open":
+		o.ExchangeOpenRaw = raw
+	case "close":
+		o.ExchangeCloseRaw = raw
+	default:
+		return fmt.Errorf("unknown order leg %q", leg)
+	}
+	r.realOrders[id] = o
+	return nil
+}
+
 func (r *fakeRepository) SetRealOrderError(ctx context.Context, id int64, message string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

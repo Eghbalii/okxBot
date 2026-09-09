@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -17,6 +19,12 @@ type fakeExchangeClient struct {
 	ticker    domain.Ticker
 	positions []domain.Position
 	balances  []domain.Balance
+
+	// getOrderRawErr, when set, makes the optional raw-record fetch fail — the capture path must
+	// degrade to storing nothing rather than affecting the trade.
+	getOrderRawErr error
+	// ordSeq gives each placed order its own id (see PlaceOrder).
+	ordSeq int
 
 	placedOrders   []domain.OrderRequest
 	leverageCalls  []domain.LeverageChange
@@ -59,7 +67,10 @@ func (f *fakeExchangeClient) PlaceOrder(req domain.OrderRequest) (*domain.OrderR
 	if f.placeOrderErr != nil {
 		return nil, f.placeOrderErr
 	}
-	return &domain.OrderResult{SCode: "0", OrdID: "fake-ord-id"}, nil
+	// A distinct id per order, as the real exchange returns — a constant would make an open and
+	// its own flatten indistinguishable, which hides any bug that confuses the two legs.
+	f.ordSeq++
+	return &domain.OrderResult{SCode: "0", OrdID: fmt.Sprintf("fake-ord-id-%d", f.ordSeq)}, nil
 }
 func (f *fakeExchangeClient) SetLeverage(req domain.LeverageChange) error {
 	f.leverageCalls = append(f.leverageCalls, req)
@@ -69,6 +80,17 @@ func (f *fakeExchangeClient) CancelOrder(instID, ordID string) error {
 	f.cancelOrderCalls = append(f.cancelOrderCalls, ordID)
 	return f.cancelOrderErr
 }
+
+// GetOrderRaw makes the fake satisfy the optional rawOrderFetcher capability, so tests can
+// exercise the exchange-record capture path. Returns a payload identifiably keyed by the ids it
+// was asked for, so a test can prove the RIGHT leg's record was stored.
+func (f *fakeExchangeClient) GetOrderRaw(instID, ordID string) (json.RawMessage, error) {
+	if f.getOrderRawErr != nil {
+		return nil, f.getOrderRawErr
+	}
+	return json.RawMessage(`{"instId":"` + instID + `","ordId":"` + ordID + `","captured":true}`), nil
+}
+
 func (f *fakeExchangeClient) GetOrder(instID, ordID string) (domain.OrderStatus, error) {
 	f.getOrderCalls++
 	if f.getOrderErr != nil {

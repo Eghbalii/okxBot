@@ -1301,3 +1301,86 @@ func TestCloseReal_ConfirmedCloseSettlesEvenAPartialFill(t *testing.T) {
 		t.Fatalf("status after a confirmed close: want filled, got %q", after.Status)
 	}
 }
+
+// The exchange's own record for each leg is captured ONCE, when that leg reaches a terminal state
+// and its record is final (2026-09-09 request: "don't call it each time — when the system reads
+// it, save the JSON there"). Every later view is then a row read rather than a live API call
+// against a rate-limit budget shared with real trading.
+func TestCloseReal_CapturesExchangeRecordsForBothLegs(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	model := &fakeModelClient{action: domain.Action{
+		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
+	}}
+	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
+	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
+
+	if err := rt.evaluateStrategies(ctx, "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies: %v", err)
+	}
+	open, err := rt.openPositions(ctx)
+	if err != nil || len(open) != 1 {
+		t.Fatalf("expected 1 open position, got %d (err %v)", len(open), err)
+	}
+	if len(open[0].ExchangeOpenRaw) == 0 {
+		t.Fatal("the open leg's exchange record must be captured once the fill is confirmed")
+	}
+
+	if err := rt.closeReal(ctx, open[0], dec("110"), "manual", testLogger()); err != nil {
+		t.Fatalf("closeReal: %v", err)
+	}
+	after, err := repo.GetRealOrder(ctx, open[0].ID)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if len(after.ExchangeCloseRaw) == 0 {
+		t.Fatal("the close leg's exchange record must be captured once the flatten is confirmed")
+	}
+	// Both legs must be stored, and stored separately — a capture that overwrote the other leg
+	// would leave the order with only half its history.
+	if len(after.ExchangeOpenRaw) == 0 {
+		t.Fatal("capturing the close must not clear the open leg's record")
+	}
+	if string(after.ExchangeOpenRaw) == string(after.ExchangeCloseRaw) {
+		t.Fatal("the two legs are different orders and must not store the same record")
+	}
+}
+
+// Capturing an audit record is best-effort by design: a failure must degrade the audit trail, never
+// the trade it describes.
+func TestCloseReal_ExchangeRecordFailureDoesNotAffectTheClose(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{getOrderRawErr: fmt.Errorf("okx: rate limited")}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	sl, tp := dec("90"), dec("110")
+	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	o, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if err := rt.closeReal(ctx, o, dec("110"), "manual", testLogger()); err != nil {
+		t.Fatalf("a failed record capture must not fail the close: %v", err)
+	}
+	after, err := repo.GetRealOrder(ctx, id)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.ClosedAt == nil {
+		t.Fatal("the close must be recorded even when the exchange record could not be captured")
+	}
+	if len(after.ExchangeCloseRaw) != 0 {
+		t.Fatal("a failed capture must store nothing rather than a partial or fabricated record")
+	}
+}

@@ -286,6 +286,41 @@ func sizeToContracts(marginUSD, leverage, price decimal.Decimal, inst domain.Ins
 	return contracts
 }
 
+// rawOrderFetcher is implemented by exchange clients that can return OKX's untouched order
+// payload. Declared as an OPTIONAL capability rather than added to port.ExchangeClient so the
+// several existing implementations (and every test fake) don't all have to grow a method only the
+// record-capture path uses — a client without it simply captures nothing, which degrades the audit
+// trail rather than the trade.
+type rawOrderFetcher interface {
+	GetOrderRaw(instID, ordID string) (json.RawMessage, error)
+}
+
+// captureExchangeRecord stores OKX's own record for one leg of an order ("open" or "close"), so
+// the panel can show the full exchange-side truth later without a live API call (2026-09-09
+// request). Called once per leg, at the point the leg has reached a terminal state and its record
+// is final.
+//
+// Entirely best-effort: every failure path here logs and returns. An order's record is an audit
+// nicety, and losing it must never affect the position it describes — which is also why this runs
+// AFTER the close is durably recorded, never before.
+func (e *RealTrader) captureExchangeRecord(ctx context.Context, orderID int64, leg, exchangeOrdID string, logger *slog.Logger) {
+	if e.Repo == nil || orderID == 0 || exchangeOrdID == "" {
+		return
+	}
+	fetcher, ok := e.Exchange.(rawOrderFetcher)
+	if !ok {
+		return
+	}
+	raw, err := fetcher.GetOrderRaw(e.execInstID(), exchangeOrdID)
+	if err != nil {
+		logger.Warn("could not capture exchange order record", "id", orderID, "leg", leg, "ordId", exchangeOrdID, "error", err)
+		return
+	}
+	if err := e.Repo.SetRealOrderExchangeRaw(ctx, orderID, leg, raw); err != nil {
+		logger.Warn("could not store exchange order record", "id", orderID, "leg", leg, "error", err)
+	}
+}
+
 // marginFromFill converts the exchange's own filled contract count back into the margin figure
 // this system stores as an order's Size — the inverse of sizeToContracts (2026-09-09 request:
 // "if the size changes after the position opens, the database must be updated with the exchange's
@@ -1004,6 +1039,11 @@ func (e *RealTrader) openReal(
 		if err := e.Repo.SetRealOrderFeatures(ctx, localID, order.FeaturesJSON); err != nil {
 			logger.Warn("failed to set real order features", "id", localID, "instId", e.InstID, "error", err)
 		}
+		// The open order has reached a terminal state here, so its exchange record is final —
+		// capture it once now rather than re-fetching it on every later view (2026-09-09).
+		if order.ExchangeOrderID != nil {
+			e.captureExchangeRecord(ctx, localID, "open", *order.ExchangeOrderID, logger)
+		}
 	}
 	order.Status = finalStatus
 
@@ -1286,6 +1326,9 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 	// deliberately distinct from zero: it means "OKX did not tell us", and the panel falls back to
 	// the locally computed figure only in that case.
 	var exchangeClosePx, exchangeFee, exchangePnL *decimal.Decimal
+	// The flattening order's id, kept so its exchange record can be captured after the close is
+	// durably recorded — never before, since an audit record must not be able to affect the close.
+	var closeOrdID string
 
 	if !skipExchange {
 		side := "sell"
@@ -1321,6 +1364,7 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 		// and it records the flattening order's id, without which a close cannot be audited
 		// against OKX afterwards at all (real order 3 had no such record).
 		if result != nil {
+			closeOrdID = result.OrdID
 			if err := e.Repo.SetRealOrderClosing(ctx, o.ID, result.OrdID); err != nil {
 				logger.Warn("failed to mark real order closing", "id", o.ID, "error", err)
 			}
@@ -1363,6 +1407,8 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 	if err := e.Repo.CloseRealOrderConfirmed(ctx, o.ID, price, reason, pnl, exchangePnL, exchangeFee, exchangeClosePx); err != nil {
 		return err
 	}
+	// After the close is durably recorded: the flatten has filled, so its record is final.
+	e.captureExchangeRecord(ctx, o.ID, "close", closeOrdID, logger)
 	metrics.PaperOrdersClosedTotal.WithLabelValues(e.InstID, reason).Inc()
 	metrics.PaperOrdersRealizedPnL.WithLabelValues(e.InstID).Add(pnl.InexactFloat64())
 	logger.Info("closed real order", "id", o.ID, "instId", e.InstID, "reason", reason, "closePx", price, "pnl", pnl)
@@ -1471,7 +1517,7 @@ func (e *RealTrader) buildObservation(ctx context.Context, bar string, price dec
 		// sizeFromModelAction as the hard ceiling.
 		MaxPositionPct: e.evenShareOfAccount(),
 		MaxLeverage:    e.MaxLeverage,
-		Category:          domain.CategoryUpdate,
+		Category:       domain.CategoryUpdate,
 	}
 
 	// The TOTAL is ground truth from the exchange, not GetAccountEquity's bookkeeping row — real

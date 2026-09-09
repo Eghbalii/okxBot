@@ -153,45 +153,40 @@ export default function OrderDetailModal({
   const modelSized = position.Leverage !== '1' && position.Leverage !== '1.0'
 
 // OKX's own record for both legs, rendered as raw JSON (2026-09-09 request: "show me the whole
-// JSON, not a few parameters you picked"). Fetched on demand rather than with the modal, since it
-// costs two live exchange calls against a shared rate-limit budget and most views of an order do
-// not need it.
+// JSON, not a few parameters you picked").
 //
-// Deliberately unformatted beyond indentation: the value here is that nothing was interpreted or
+// Served from what the engine already captured at each leg's terminal state, not fetched live —
+// so opening this modal costs a row read rather than two exchange calls against a rate-limit
+// budget shared with real trading, and shows the same bytes every time.
+//
+// Deliberately unformatted beyond indentation: the value is that nothing was interpreted or
 // dropped on the way through, so picking fields out to display would defeat the purpose.
 function ExchangeRawJSON({ orderId }: { orderId: number }) {
   const [data, setData] = useState<ExchangeOrderRaw | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
 
-  function load() {
-    setLoading(true)
-    setError(null)
+  useEffect(() => {
+    let cancelled = false
     api
       .exchangeOrderRaw(orderId)
-      .then(setData)
-      .catch((err) => setError((err as Error).message))
-      .finally(() => setLoading(false))
-  }
+      .then((d) => {
+        if (!cancelled) setData(d)
+      })
+      .catch((err) => {
+        if (!cancelled) setError((err as Error).message)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [orderId])
 
-  if (!data && !loading && !error) {
-    return (
-      <button onClick={load} className="raw-json-load">
-        Load full record from the exchange
-      </button>
-    )
-  }
-  if (loading) return <div className="text-dim">Fetching from OKX…</div>
   if (error) return <div className="error-banner">{error}</div>
-  if (!data) return null
+  if (!data) return <div className="text-dim">Loading…</div>
 
   return (
     <div className="raw-json-wrap">
       <RawLeg label="Open order" id={data.openOrderId} body={data.open} error={data.openError} />
       <RawLeg label="Close order" id={data.closeOrderId} body={data.close} error={data.closeError} />
-      <button onClick={load} className="raw-json-load">
-        Refresh
-      </button>
     </div>
   )
 }
@@ -223,7 +218,7 @@ function RawLeg({
         {label} <span className="text-dim mono">{id}</span>
       </div>
       {error ? (
-        <div className="error-banner">{error}</div>
+        <div className="text-dim">{error}</div>
       ) : (
         <pre className="raw-json mono">{JSON.stringify(body, null, 2)}</pre>
       )}

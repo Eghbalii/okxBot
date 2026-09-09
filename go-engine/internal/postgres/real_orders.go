@@ -43,14 +43,14 @@ func (r *Repository) GetRealOrder(ctx context.Context, id int64) (port.RealOrder
 			-- when one was stored — which made the panel's raw-record view unable to fetch the close
 			-- leg at all. ListRealPositions already selected them; only this path was behind.
 			exchange_close_order_id, exchange_realized_pnl, exchange_fee, exchange_close_px,
-			last_error, last_error_at
+			last_error, last_error_at, exchange_open_raw, exchange_close_raw
 		FROM real_orders WHERE id = $1
 	`, id).Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size,
 		&o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx, &o.RealizedPnL,
 		&o.FeaturesJSON, &o.Status, &bar, &o.PnLMaxPct, &o.PnLMinPct,
 		&o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.ManualOverride,
 		&o.ExchangeCloseOrderID, &o.ExchangeRealizedPnL, &o.ExchangeFee, &o.ExchangeClosePx,
-		&o.LastError, &o.LastErrorAt)
+		&o.LastError, &o.LastErrorAt, &o.ExchangeOpenRaw, &o.ExchangeCloseRaw)
 	if err != nil {
 		return port.RealOrder{}, fmt.Errorf("get real order %d: %w", id, err)
 	}
@@ -172,6 +172,29 @@ func (r *Repository) CloseRealOrderConfirmed(ctx context.Context, id int64, clos
 	`, id, closePx, reason, realizedPnL, exchangePnL, exchangeFee, exchangeClosePx)
 	if err != nil {
 		return fmt.Errorf("confirm close of real order %d: %w", id, err)
+	}
+	return nil
+}
+
+// SetRealOrderExchangeRaw stores OKX's own record for one leg of an order. leg is "open" or
+// "close"; anything else is rejected rather than silently writing to the wrong column, since a
+// typo would otherwise overwrite the other leg's record with this one's.
+func (r *Repository) SetRealOrderExchangeRaw(ctx context.Context, id int64, leg string, raw json.RawMessage) error {
+	var column string
+	switch leg {
+	case "open":
+		column = "exchange_open_raw"
+	case "close":
+		column = "exchange_close_raw"
+	default:
+		return fmt.Errorf("unknown order leg %q (want open or close)", leg)
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `UPDATE real_orders SET `+column+` = $2 WHERE id = $1`, id, []byte(raw))
+	if err != nil {
+		return fmt.Errorf("store %s exchange record for real order %d: %w", leg, id, err)
 	}
 	return nil
 }

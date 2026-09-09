@@ -259,6 +259,17 @@ type RealOrder struct {
 	LastError   *string
 	LastErrorAt *time.Time
 
+	// ExchangeOpenRaw/ExchangeCloseRaw are OKX's own order records, captured verbatim at the moment
+	// each leg reached a terminal state (2026-09-09). Stored rather than re-fetched: the engine
+	// already reads them as part of the fill-confirmation it must do anyway, so every later view is
+	// a row read instead of a live API call competing with real trading for rate-limit budget.
+	//
+	// Kept as raw JSON deliberately — the value is that nothing was interpreted or dropped, so
+	// modelling them as a struct would defeat the purpose and need widening every time OKX adds a
+	// field. nil means never captured, which is distinct from an empty object.
+	ExchangeOpenRaw  json.RawMessage
+	ExchangeCloseRaw json.RawMessage
+
 	PnLMaxPct decimal.Decimal
 	PnLMinPct decimal.Decimal
 
@@ -532,6 +543,10 @@ type Repository interface {
 	// nil means it did not report that number, deliberately distinct from a genuine zero.
 	CloseRealOrderConfirmed(ctx context.Context, id int64, closePx decimal.Decimal, reason string,
 		realizedPnL decimal.Decimal, exchangePnL, exchangeFee, exchangeClosePx *decimal.Decimal) error
+	// SetRealOrderExchangeRaw stores OKX's own record for one leg of a real order ("open" or
+	// "close"), captured when that leg reached a terminal state. Best-effort by contract: losing
+	// the record must never fail the trade it describes.
+	SetRealOrderExchangeRaw(ctx context.Context, id int64, leg string, raw json.RawMessage) error
 	// SetRealOrderError records the latest exchange failure for an order so the panel can raise it
 	// to a human. Does NOT change status, so a stuck order stays visibly stuck.
 	SetRealOrderError(ctx context.Context, id int64, message string) error

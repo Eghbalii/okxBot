@@ -13,7 +13,6 @@ import (
 
 	"github.com/shopspring/decimal"
 
-	"github.com/eghbalii/okxBot/go-engine/internal/okx"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
@@ -31,12 +30,6 @@ type Server struct {
 	// Repo instead, same as every other cmd/api handler, since that data must stay readable/
 	// writable even when cmd/paper-trader itself happens to be down or mid-restart.
 	PaperTraderBaseURL string
-	// Exchange is used only for read-only, on-demand exchange lookups the panel asks for (an
-	// order's full raw record). Optional: nil makes those endpoints report unavailable rather
-	// than failing the whole service, since cmd/api's core job needs no exchange access at all.
-	Exchange exchangeReader
-	// SymbolMap resolves a short internal symbol to the instId OKX knows it by (CLAUDE.md §33.4).
-	SymbolMap okx.SymbolMap
 	// Affordability answers "can this account afford to trade this token", for the Manage Tokens
 	// modal's minimum-size column and its auto-disabled tag (2026-09-08 request). Optional: nil
 	// simply makes that endpoint return an empty list, so cmd/api still runs anywhere the exchange
