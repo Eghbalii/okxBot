@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import type { PaperOrderAdjustment, Position, PositionMode } from '../api/types'
-import { tokenSymbol, trimPrice } from '../utils/format'
+import { formatDateTime, formatUsd, pnlClass, tokenSymbol, trimPrice } from '../utils/format'
 
 // The decision-time observation persisted on the order (CLAUDE.md §15.3) — what the model was
 // ASKED. Only the fields this view compares are typed; the rest of the payload is ignored.
@@ -152,6 +152,103 @@ export default function OrderDetailModal({
   // 1x order is the tell that the strategy's own sizing stood.
   const modelSized = position.Leverage !== '1' && position.Leverage !== '1.0'
 
+// What the EXCHANGE reported about this order, as distinct from what this system decided or
+// computed (2026-09-09 request). Everything above it in the modal is decision-time data — the
+// strategy's signal, the model's answer, the levels we chose. This block is the other half: what
+// OKX actually did with it.
+//
+// The distinction matters because the two can legitimately disagree, and only seeing them side by
+// side makes that visible. Real order 3's locally computed PnL read +$0.363 while the account
+// actually moved +$0.00126 — the local formula treated a USD notional as a position size, ~288x
+// off. Any figure OKX reported is therefore shown as authoritative and the locally computed one is
+// shown beside it, rather than the panel silently picking one.
+//
+// Real orders only: paper trading has no exchange leg, so every field here would be empty.
+function ExchangeDetails({ position }: { position: Position }) {
+  if (position.Mode !== 'real') return null
+
+  const localPnL = position.RealizedPnL !== null ? Number(position.RealizedPnL) : null
+  const exPnL = position.ExchangeRealizedPnL !== null ? Number(position.ExchangeRealizedPnL) : null
+  // Only worth flagging once both numbers exist and actually differ beyond rounding — a gap here
+  // means the local model of fees or fill price is wrong, which is worth seeing rather than hiding.
+  const pnlDisagrees =
+    localPnL !== null && exPnL !== null && Math.abs(localPnL - exPnL) > 0.000001
+
+  return (
+    <>
+      <h3 style={{ marginTop: '1rem' }}>Exchange report</h3>
+
+      {position.LastError && (
+        <div className="error-banner exchange-error">
+          <strong>Exchange error</strong>
+          <div className="mono exchange-error-text">{position.LastError}</div>
+          <div className="text-dim">{formatDateTime(position.LastErrorAt)}</div>
+        </div>
+      )}
+
+      <table>
+        <thead>
+          <tr>
+            <th style={{ width: '34%' }}>Field</th>
+            <th style={{ width: '33%' }}>Exchange (OKX)</th>
+            <th style={{ width: '33%' }}>Computed locally</th>
+          </tr>
+        </thead>
+        <tbody>
+          <Row
+            label="Fill status"
+            strategy={fmt(position.Status)}
+            model={position.ClosedAt ? 'closed' : 'open'}
+          />
+          <Row
+            label="Close price"
+            strategy={fmtPrice(position.ExchangeClosePx)}
+            model={fmtPrice(position.ClosePx)}
+          />
+          <Row
+            label="Realized PnL"
+            strategy={exPnL !== null ? formatUsd(exPnL) : '—'}
+            model={localPnL !== null ? formatUsd(localPnL) : '—'}
+          />
+          <Row
+            label="Fee"
+            strategy={position.ExchangeFee !== null ? formatUsd(Number(position.ExchangeFee)) : '—'}
+            model={position.FeesUSD !== null ? formatUsd(-Number(position.FeesUSD)) : '—'}
+          />
+          <Row label="Close reason" strategy="—" model={fmt(position.CloseReason)} />
+        </tbody>
+      </table>
+
+      {pnlDisagrees && (
+        <div className="text-dim exchange-note">
+          The exchange's realized PnL differs from the locally computed figure by{' '}
+          <span className={'mono ' + pnlClass(exPnL! - localPnL!)}>
+            {formatUsd(exPnL! - localPnL!)}
+          </span>
+          . The exchange's number is authoritative — it accounts for fees, funding and the true fill
+          price, which the local calculation cannot see.
+        </div>
+      )}
+
+      <div className="stat-row" style={{ marginTop: '0.75rem' }}>
+        <span className="text-dim">Open order id</span>
+        <span className="mono exchange-id">{position.ExchangeOrderID || '—'}</span>
+      </div>
+      <div className="stat-row">
+        <span className="text-dim">Close order id</span>
+        <span className="mono exchange-id">{position.ExchangeCloseOrderID || '—'}</span>
+      </div>
+      <div className="stat-row">
+        <span className="text-dim">Opened / closed</span>
+        <span className="mono">
+          {formatDateTime(position.OpenedAt)}
+          {position.ClosedAt ? ` → ${formatDateTime(position.ClosedAt)}` : ' → still open'}
+        </span>
+      </div>
+    </>
+  )
+}
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -216,6 +313,8 @@ export default function OrderDetailModal({
             )}
           </span>
         </div>
+        <ExchangeDetails position={position} />
+
         <h3 style={{ marginTop: '1rem' }}>Adjustment history</h3>
         <AdjustmentHistory orderId={position.ID} mode={position.Mode} />
       </div>

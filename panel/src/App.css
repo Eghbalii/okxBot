@@ -763,3 +763,31 @@ th.sorted {
   margin-left: 0.4rem;
   font-size: 0.65rem;
 }
+
+/* --- Exchange report (order detail modal, real orders) ----------------------------------- */
+
+.exchange-error {
+  margin-bottom: 0.75rem;
+}
+
+.exchange-error-text {
+  font-size: 0.8rem;
+  margin: 0.35rem 0;
+  word-break: break-word;
+}
+
+/* Order ids are long and have no natural break point; let them wrap rather than widening the
+   modal or overflowing it. */
+.exchange-id {
+  font-size: 0.8rem;
+  word-break: break-all;
+  text-align: right;
+}
+
+.exchange-note {
+  font-size: 0.78rem;
+  line-height: 1.5;
+  margin-top: 0.6rem;
+  padding-left: 0.6rem;
+  border-left: 2px solid var(--border, #2a2a2a);
+}
