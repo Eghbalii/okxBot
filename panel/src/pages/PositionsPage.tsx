@@ -261,9 +261,11 @@ export default function PositionsPage() {
     }
   }
 
-  // Manual SL/TP edit for a real position (CLAUDE.md §27's real-trading plan §3b, 2026-09-03) —
-  // purely local on the backend (no exchange call), so the new levels are visible on the very next
-  // poll rather than needing the WebSocket refresh close() uses.
+  // Manual SL/TP edit for a real position (CLAUDE.md §27's real-trading plan §3b, §35 for the
+  // exchange leg). The backend amends the position's resting SL/TP order on OKX BEFORE writing the
+  // new levels locally (2026-09-09), so a rejection leaves both sides at the old level and this
+  // surfaces as a failed edit rather than a level the panel shows and the exchange never received.
+  // Errors keep the modal open so the operator can retry or correct the value.
   async function submitAdjust(id: number, slPct: string, tpPct: string) {
     const body: { slPct?: number; tpPct?: number } = {}
     if (slPct.trim() !== '') body.slPct = Number(slPct)

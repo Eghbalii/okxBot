@@ -12,6 +12,11 @@ import { tokenSymbol, trimPrice } from '../utils/format'
 // the loss side, positive to the profit side (e.g. -5 on a 10x position means "move to a 5% loss
 // of margin," a 0.5% price move from entry). Unclamped on the backend: an explicit operator/admin
 // action is trusted directly, unlike the model's own automated edits.
+//
+// The edit is applied to the resting SL/TP order on the EXCHANGE first and only then stored
+// locally (CLAUDE.md §35), so what this dialog reports as saved is what OKX is actually enforcing.
+// A position still opening has no resting order yet and the backend refuses the edit rather than
+// recording a level the exchange never received.
 function AdjustPositionForm({
   position,
   onCancel,
