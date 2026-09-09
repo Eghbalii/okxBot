@@ -2,9 +2,14 @@ package api
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
@@ -19,6 +24,14 @@ type positionsStubRepo struct {
 	requestManualClose     []int64
 	requestRealManualClose []int64
 	realManualCloseErr     error
+	// realOrder backs GetRealOrder, which handleClosePosition consults when a close is refused so
+	// it can say WHY (already closed, and by what) instead of only "not open".
+	realOrder    port.RealOrder
+	realOrderErr error
+}
+
+func (r *positionsStubRepo) GetRealOrder(ctx context.Context, id int64) (port.RealOrder, error) {
+	return r.realOrder, r.realOrderErr
 }
 
 func (r *positionsStubRepo) ListPositions(ctx context.Context, f port.PositionFilter) ([]port.PaperOrder, error) {
@@ -140,5 +153,51 @@ func TestHandleClosePosition_MissingModeRejected(t *testing.T) {
 	srv.handleClosePosition(rec, req)
 	if rec.Code != 400 {
 		t.Fatalf("expected 400 for a missing mode, got %d", rec.Code)
+	}
+}
+
+// A Close click that lands just after the exchange's own stop-loss fired must say so (2026-09-09).
+// The operator hit exactly this on real orders 39 and 40: OKX's stop closed the position, the panel
+// had not refreshed yet, and the click came back with the bare "real order 39 is not open" — which
+// reads like a fault and leaves them unsure whether the position is still open.
+func TestHandleClosePosition_ExplainsThatThePositionAlreadyClosed(t *testing.T) {
+	closedAt := time.Date(2026, 9, 9, 19, 50, 23, 0, time.UTC)
+	reason := "sl"
+	repo := &positionsStubRepo{
+		realManualCloseErr: errors.New("real order 39 is not open"),
+		realOrder:          port.RealOrder{ID: 39, ClosedAt: &closedAt, CloseReason: &reason},
+	}
+	srv := &Server{Repo: repo, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	req := httptest.NewRequest("POST", "/api/positions/39/close?mode=real", nil)
+	req.SetPathValue("id", "39")
+	rec := httptest.NewRecorder()
+	srv.handleClosePosition(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("want 409, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "already closed") || !strings.Contains(body, "sl") {
+		t.Errorf("the message must say the position is already closed and how; got %s", body)
+	}
+}
+
+// When the order genuinely cannot be read back, the original error still surfaces rather than being
+// replaced by a friendlier message that would be a guess.
+func TestHandleClosePosition_KeepsTheRawErrorWhenTheOrderCannotBeRead(t *testing.T) {
+	repo := &positionsStubRepo{
+		realManualCloseErr: errors.New("real order 99 is not open"),
+		realOrderErr:       errors.New("no such order"),
+	}
+	srv := &Server{Repo: repo, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	req := httptest.NewRequest("POST", "/api/positions/99/close?mode=real", nil)
+	req.SetPathValue("id", "99")
+	rec := httptest.NewRecorder()
+	srv.handleClosePosition(rec, req)
+
+	if !strings.Contains(rec.Body.String(), "is not open") {
+		t.Errorf("want the underlying error, got %s", rec.Body.String())
 	}
 }

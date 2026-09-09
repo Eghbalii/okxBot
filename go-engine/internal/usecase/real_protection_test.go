@@ -322,3 +322,115 @@ func TestRunUpdates_SkipsPositionsThatAreNotHoldingExposure(t *testing.T) {
 
 // algoIDPtr is a small helper for fixtures that need a resting-order id.
 func algoIDPtr(id string) *string { return &id }
+
+// The bug behind real orders 39 and 40 (2026-09-09): OKX's own stop-loss closed the position, and
+// the reconciliation poll recorded it as a MANUAL close at the position's ENTRY price with no
+// close data at all. The reason was wrong, and because a close price equal to entry implies a trade
+// that went nowhere, the recorded loss was ~15x smaller than the real one (-0.018 against OKX's
+// actual -0.265).
+//
+// The exchange knew all of this and was never asked.
+func TestReconcile_RecordsAnExchangeStopLossAsSLWithItsRealNumbers(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		// Flat on the exchange, with the protective order showing it fired.
+		algoStatus: &domain.AlgoOrderStatus{
+			State: "effective", ActualSide: "sl", OrdID: "close-ord-1", AlgoID: "algo-1",
+		},
+		// The order the trigger created: the real fill price, PnL and fee.
+		orderStatus: &domain.OrderStatus{
+			State: "filled", AvgPx: dec("0.000003527"), AccFillSz: dec("5"),
+			Pnl: dec("-0.265"), Fee: dec("-0.0088"),
+		},
+	}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	sl, contracts, algo := dec("0.000003527"), dec("5"), "algo-1"
+	repo.realOrders[1] = port.RealOrder{
+		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("0.00000358"),
+		SLPx: &sl, Size: dec("1.81"), Leverage: dec("9.88"),
+		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
+	}
+
+	rt.reconcile(context.Background(), testLogger())
+
+	got := repo.realOrders[1]
+	if got.ClosedAt == nil {
+		t.Fatal("the position must be closed locally once the exchange reports flat")
+	}
+	if got.CloseReason == nil || *got.CloseReason != "sl" {
+		t.Errorf("a stop-loss the exchange executed must be recorded as sl, got %v", got.CloseReason)
+	}
+	// The close price must be the exchange's FILL price, not the entry price.
+	if got.ClosePx == nil || !got.ClosePx.Equal(dec("0.000003527")) {
+		t.Errorf("close price must come from the exchange (0.000003527), got %v", got.ClosePx)
+	}
+	if got.ExchangeRealizedPnL == nil || !got.ExchangeRealizedPnL.Equal(dec("-0.265")) {
+		t.Errorf("the exchange's own realized PnL must be recorded, got %v", got.ExchangeRealizedPnL)
+	}
+	if got.ExchangeFee == nil || !got.ExchangeFee.Equal(dec("-0.0088")) {
+		t.Errorf("the exchange's own fee must be recorded, got %v", got.ExchangeFee)
+	}
+}
+
+// A position that vanished from the exchange WITHOUT its protective order firing is still a manual
+// close — someone closed it in the OKX app, or it was liquidated. The fix must not relabel those,
+// which is why the old behavior is kept as the fallback rather than removed.
+func TestReconcile_KeepsManualWhenTheProtectiveOrderDidNotFire(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		algoStatus: &domain.AlgoOrderStatus{State: "canceled", AlgoID: "algo-1"},
+	}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	sl, contracts, algo := dec("95"), dec("5"), "algo-1"
+	repo.realOrders[1] = port.RealOrder{
+		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
+		SLPx: &sl, Size: dec("10"), Leverage: dec("1"),
+		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
+	}
+
+	rt.reconcile(context.Background(), testLogger())
+
+	if got := repo.realOrders[1]; got.CloseReason == nil || *got.CloseReason != "manual" {
+		t.Errorf("a close the protective order did not cause must stay manual, got %v", got.CloseReason)
+	}
+}
+
+// Closing is idempotent. Real order 38 was closed twice by two reconciliation passes 3 seconds
+// apart, and the second write replaced a -0.014 loss with a +0.472 gain — both wrong, but the
+// second should never have landed. The guard is in the database, so it holds across engines and
+// across processes, which an in-process mutex cannot.
+func TestCloseReal_SecondCloseDoesNotOverwriteTheFirst(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+
+	contracts := dec("5")
+	order := port.RealOrder{
+		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
+		Size: dec("10"), Leverage: dec("1"), Contracts: &contracts,
+	}
+	repo.realOrders[1] = order
+
+	if err := rt.closeReal(context.Background(), order, dec("110"), "tp", testLogger()); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	first := repo.realOrders[1]
+
+	// A second close of the SAME order, as a racing pass would attempt. It must not error (the
+	// position is closed, which is what the caller wanted) and must not change the outcome.
+	if err := rt.closeReal(context.Background(), order, dec("90"), "sl", testLogger()); err != nil {
+		t.Fatalf("a second close must be a no-op, not an error: %v", err)
+	}
+	second := repo.realOrders[1]
+
+	if first.CloseReason == nil || second.CloseReason == nil || first.ClosePx == nil || second.ClosePx == nil {
+		t.Fatalf("both reads must show a closed order, got first=%v/%v second=%v/%v",
+			first.CloseReason, first.ClosePx, second.CloseReason, second.ClosePx)
+	}
+	if *second.CloseReason != *first.CloseReason || !second.ClosePx.Equal(*first.ClosePx) {
+		t.Fatalf("the first close must stand: was (%s @ %v), became (%s @ %v)",
+			*first.CloseReason, *first.ClosePx, *second.CloseReason, *second.ClosePx)
+	}
+}

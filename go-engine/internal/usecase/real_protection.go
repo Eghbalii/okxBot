@@ -10,6 +10,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
 // Exchange-side stop-loss / take-profit for real positions (2026-09-09 request).
@@ -243,4 +244,76 @@ func (e *RealTrader) ensureProtection(ctx context.Context, open []port.RealOrder
 				"id", o.ID, "instId", e.InstID, "error", err)
 		}
 	}
+}
+
+// closeFactsFromExchange answers "why did this position close, and at what price" by asking the
+// exchange, for a position found already flat by the reconciliation poll.
+//
+// This exists because the answer used to be assumed. The stale-close path predates exchange-side
+// SL/TP (§35) and was written when the only way a position could vanish from OKX without this
+// system closing it was a human doing it in the OKX app — so it recorded conductor.CloseReasonManual
+// and, having no live tick to hand, used the order's own ENTRY price as the close price.
+//
+// Once the stop lives on the exchange, that assumption is wrong in the most common case. Real
+// orders 39 and 40 (2026-09-09) were closed by OKX's own stop-loss and recorded as manual closes at
+// their entry price, with no close data at all — which also made the recorded loss ~15x smaller
+// than the real one (-0.018 against an actual -0.265), because a close price equal to the entry
+// price implies a trade that went nowhere.
+//
+// Falls back to the old behavior (manual, at entry price) only when the exchange cannot tell us
+// otherwise: an order with no protective order recorded, an unreadable algo order, or one that did
+// not fire. A guess is never substituted for an answer.
+func (e *RealTrader) closeFactsFromExchange(o port.RealOrder, logger *slog.Logger) (
+	reason string, closePx decimal.Decimal, exchangePnL, exchangeFee *decimal.Decimal,
+) {
+	reason, closePx = conductor.CloseReasonManual, o.EntryPx
+
+	if o.ExchangeAlgoOrderID == nil || *o.ExchangeAlgoOrderID == "" {
+		return reason, closePx, nil, nil
+	}
+	algo, err := e.Exchange.GetAlgoOrder(e.execInstID(), *o.ExchangeAlgoOrderID)
+	if err != nil {
+		logger.Warn("reconcile: could not read the protective order to determine why the position closed",
+			"id", o.ID, "instId", e.InstID, "algoId", *o.ExchangeAlgoOrderID, "error", err)
+		return reason, closePx, nil, nil
+	}
+	triggered, ok := algo.TriggeredReason()
+	if !ok {
+		// Flat on the exchange but the protective order did not fire — a genuine manual close in
+		// the OKX app, a liquidation, or something else outside this system. The original
+		// assumption is the right one here, which is exactly why it is kept rather than removed.
+		return reason, closePx, nil, nil
+	}
+	reason = triggered
+
+	// The trigger created an ordinary order to flatten the position, and THAT order carries what
+	// actually happened: fill price, realized PnL, fee. Without it the close price would still be
+	// the entry price and the outcome would still be wrong, just labelled correctly.
+	if algo.OrdID == "" {
+		logger.Warn("reconcile: protective order fired but named no resulting order; close price unavailable",
+			"id", o.ID, "instId", e.InstID, "reason", reason)
+		return reason, closePx, nil, nil
+	}
+	status, err := e.Exchange.GetOrder(e.execInstID(), algo.OrdID)
+	if err != nil {
+		logger.Warn("reconcile: could not read the order the protective trigger created",
+			"id", o.ID, "instId", e.InstID, "ordId", algo.OrdID, "error", err)
+		return reason, closePx, nil, nil
+	}
+	if status.AvgPx.IsPositive() {
+		closePx = status.AvgPx
+	}
+	exchangePnL, exchangeFee = exchangeCloseNumbers(status)
+	logger.Info("reconcile: the exchange's own protective order closed this position",
+		"id", o.ID, "instId", e.InstID, "reason", reason, "closePx", closePx,
+		"exchangeOrdId", algo.OrdID, "exchangePnl", exchangePnL)
+	return reason, closePx, exchangePnL, exchangeFee
+}
+
+// exchangeCloseFacts carries a close's numbers when the EXCHANGE closed the position and this
+// system therefore has no flatten of its own to read them from. Nil fields mean OKX did not report
+// that figure, which stays distinct from a real zero.
+type exchangeCloseFacts struct {
+	PnL *decimal.Decimal
+	Fee *decimal.Decimal
 }

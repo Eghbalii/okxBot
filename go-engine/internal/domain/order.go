@@ -116,6 +116,34 @@ type AlgoOrderStatus struct {
 	State       string // "live", "effective" (triggered), "canceled", "order_failed", or "" when absent
 	SLTriggerPx decimal.Decimal
 	TPTriggerPx decimal.Decimal
+	// ActualSide is which half of an OCO order actually fired: "sl" or "tp" (empty until it does).
+	// This is the exchange telling us WHY the position closed, and without it a stop-loss that
+	// OKX executed was being recorded as an operator's manual close (2026-09-09).
+	ActualSide string
+	// OrdID is the ordinary order the trigger created to flatten the position. It carries the real
+	// fill price, realized PnL and fee — the close data that is otherwise missing entirely, since
+	// the position was closed by the exchange and never passed through this system's own flatten.
+	OrdID string
+}
+
+// TriggeredReason maps a fired conditional order onto this system's own close_reason vocabulary,
+// returning ok=false when the order has not fired. "sl"/"tp" match the reasons the in-process
+// monitor already records for the same events, so a stop is recorded identically whether the
+// exchange executed it or this process did.
+func (s AlgoOrderStatus) TriggeredReason() (string, bool) {
+	if s.State != "effective" {
+		return "", false
+	}
+	switch s.ActualSide {
+	case "sl":
+		return "sl", true
+	case "tp":
+		return "tp", true
+	default:
+		// Fired, but OKX did not say which side. Reporting a guess would be worse than reporting
+		// nothing: the caller falls back to its own close reason rather than inventing one.
+		return "", false
+	}
 }
 
 // IsLive reports whether the conditional order is still resting on the exchange and will fire if

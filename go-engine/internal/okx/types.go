@@ -215,6 +215,11 @@ type AlgoOrderStatus struct {
 	State       string        `json:"state"`
 	SLTriggerPx decimalOrZero `json:"slTriggerPx"`
 	TPTriggerPx decimalOrZero `json:"tpTriggerPx"`
+	// actualSide/ordId are populated once the order fires: which half of the OCO triggered, and
+	// the ordinary order it created to flatten the position. Both were being discarded, which is
+	// why an exchange-executed stop-loss was recorded as a manual close with no close data.
+	ActualSide string `json:"actualSide"`
+	OrdID      string `json:"ordId"`
 }
 
 // ToDomain converts an AlgoOrderStatus to its domain representation.
@@ -225,5 +230,7 @@ func (s AlgoOrderStatus) ToDomain() domain.AlgoOrderStatus {
 		State:       s.State,
 		SLTriggerPx: s.SLTriggerPx.Decimal,
 		TPTriggerPx: s.TPTriggerPx.Decimal,
+		ActualSide:  s.ActualSide,
+		OrdID:       s.OrdID,
 	}
 }

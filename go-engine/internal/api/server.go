@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -667,7 +668,27 @@ func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
 	}
 	if mode == "real" {
 		if err := s.Repo.RequestRealManualClose(r.Context(), id); err != nil {
-			writeError(w, http.StatusConflict, err.Error())
+			// "not open" is overwhelmingly "it closed a moment ago", not "no such order" — most
+			// often the exchange's own stop-loss fired between the panel rendering the Close button
+			// and the operator clicking it (2026-09-09: exactly what happened with real orders 39
+			// and 40). The bare repository error said only "real order 39 is not open", which
+			// leaves the operator to guess whether their close failed or was unnecessary, and reads
+			// like a fault when nothing is wrong.
+			//
+			// It is also LOGGED here. This error previously existed only as a browser alert, so
+			// when the operator reported it there was no server-side record to look up at all.
+			msg := err.Error()
+			status := http.StatusConflict
+			if o, getErr := s.Repo.GetRealOrder(r.Context(), id); getErr == nil && o.ClosedAt != nil {
+				reason := "manual"
+				if o.CloseReason != nil {
+					reason = *o.CloseReason
+				}
+				msg = fmt.Sprintf("position #%d is already closed (%s, at %s) — nothing to close",
+					id, reason, o.ClosedAt.UTC().Format(time.RFC3339))
+			}
+			s.Logger.Warn("panel close request refused", "id", id, "mode", mode, "error", err, "shown", msg)
+			writeError(w, status, msg)
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})

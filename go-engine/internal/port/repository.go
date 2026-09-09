@@ -5,6 +5,7 @@ package port
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -353,6 +354,15 @@ type EquityPoint struct {
 	InstID    string
 	CreatedAt time.Time
 }
+
+// ErrOrderAlreadyClosed is returned by CloseRealOrderConfirmed when the order was already closed
+// by another path — a second reconciliation pass, the tick monitor racing reconcile, or a second
+// process after a restart. It is a normal outcome of concurrent close paths, not a failure: the
+// position IS closed, and the caller simply was not the one that closed it.
+//
+// Callers must treat it as "someone else already did this" and stop, rather than continuing on to
+// deliver a duplicate reward to the model or publish a duplicate close event.
+var ErrOrderAlreadyClosed = errors.New("order is already closed")
 
 // PaperTradingConfig is the panel-editable control-box config for cmd/paper-trader (CLAUDE.md):
 // pause/stop trading, disable one signal direction, restrict which strategy kinds/timeframes/

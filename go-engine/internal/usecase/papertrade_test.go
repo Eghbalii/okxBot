@@ -390,6 +390,10 @@ func (r *fakeRepository) CloseRealOrder(ctx context.Context, id int64, closePx d
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o := r.realOrders[id]
+	// Same idempotency guard as the real SQL — see CloseRealOrderConfirmed below.
+	if o.ClosedAt != nil {
+		return fmt.Errorf("real order %d: %w", id, port.ErrOrderAlreadyClosed)
+	}
 	now := o.OpenedAt
 	o.ClosedAt = &now
 	o.CloseReason = &reason
@@ -470,6 +474,14 @@ func (r *fakeRepository) CloseRealOrderConfirmed(ctx context.Context, id int64, 
 	realizedPnL decimal.Decimal, exchangePnL, exchangeFee, exchangeClosePx *decimal.Decimal) error {
 	r.mu.Lock()
 	o, ok := r.realOrders[id]
+	// Mirrors the real SQL's "WHERE ... AND closed_at IS NULL": closing is idempotent, so a second
+	// close of the same order changes nothing and reports ErrOrderAlreadyClosed. A fake without
+	// this guard would let a test pass against a double-close the real repository refuses — which
+	// is exactly the bug that overwrote real order 38's outcome.
+	if ok && o.ClosedAt != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("real order %d: %w", id, port.ErrOrderAlreadyClosed)
+	}
 	if ok {
 		o.ExchangeRealizedPnL = exchangePnL
 		o.ExchangeFee = exchangeFee

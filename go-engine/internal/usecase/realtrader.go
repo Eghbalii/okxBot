@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -1359,7 +1360,7 @@ func (e *RealTrader) monitorOpenPositions(ctx context.Context, price decimal.Dec
 // detected close, see reconcile), skipExchange lets the flattening order be skipped since there is
 // nothing left to close on OKX's side — the DB/reward/audit consequences are identical either way.
 func (e *RealTrader) closeReal(ctx context.Context, o port.RealOrder, price decimal.Decimal, reason string, logger *slog.Logger) error {
-	return e.closeRealWith(ctx, o, price, reason, false, logger)
+	return e.closeRealWith(ctx, o, price, reason, false, nil, logger)
 }
 
 // recordCloseError persists a failed close's reason on the order and returns the error unchanged,
@@ -1400,7 +1401,7 @@ func exchangeCloseNumbers(status domain.OrderStatus) (pnl, fee *decimal.Decimal)
 	return pnl, fee
 }
 
-func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price decimal.Decimal, reason string, skipExchange bool, logger *slog.Logger) error {
+func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price decimal.Decimal, reason string, skipExchange bool, facts *exchangeCloseFacts, logger *slog.Logger) error {
 	// exchangeClosePx/exchangeFee/exchangePnL are the EXCHANGE's own numbers, left nil when it did
 	// not report them (a skipExchange close, or a status response missing the field). nil is
 	// deliberately distinct from zero: it means "OKX did not tell us", and the panel falls back to
@@ -1409,6 +1410,19 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 	// The flattening order's id, kept so its exchange record can be captured after the close is
 	// durably recorded — never before, since an audit record must not be able to affect the close.
 	var closeOrdID string
+
+	// A caller that already learned the exchange's numbers passes them in (reconcile, for a
+	// position the exchange's own stop-loss closed — there is no flatten of ours to read them
+	// from). price is then the exchange's real fill price, so exchangeClosePx is that same number
+	// rather than nil: the panel must show a close price that came from OKX, not one this system
+	// inferred.
+	if facts != nil {
+		exchangePnL, exchangeFee = facts.PnL, facts.Fee
+		if price.IsPositive() {
+			px := price
+			exchangeClosePx = &px
+		}
+	}
 
 	if !skipExchange {
 		side := "sell"
@@ -1497,6 +1511,16 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 
 	pnl := realizedPnL(asPaperOrderView(o), price)
 	if err := e.Repo.CloseRealOrderConfirmed(ctx, o.ID, price, reason, pnl, exchangePnL, exchangeFee, exchangeClosePx); err != nil {
+		// Another path closed it first (a second reconciliation pass, the tick monitor racing
+		// reconcile, a second process after a restart). The position IS closed and this caller
+		// simply was not the one that closed it, so it stops here rather than going on to deliver
+		// a duplicate reward to the model or publish a duplicate close event — both of which
+		// really happened on real order 38, closed twice 3 seconds apart.
+		if errors.Is(err, port.ErrOrderAlreadyClosed) {
+			logger.Info("real order was already closed by another path; nothing to do",
+				"id", o.ID, "instId", e.InstID, "reason", reason)
+			return nil
+		}
 		return err
 	}
 	// After the close is durably recorded: the flatten has filled, so its record is final.
@@ -1741,10 +1765,11 @@ func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
 		logger.Warn("reconcile: exchange reports flat but local state shows an open position; closing locally",
 			"instId", e.InstID, "localOrders", len(local))
 		for _, o := range local {
-			// No live tick price is available on this path; use the order's own entry price as the
-			// best available estimate for the realized-PnL calculation rather than blocking the
-			// close on having a fresher number.
-			if err := e.closeRealWith(ctx, o, o.EntryPx, conductor.CloseReasonManual, true, logger); err != nil {
+			// Ask the exchange why this position closed and at what price, instead of assuming a
+			// manual close at the entry price (2026-09-09) — see closeFactsFromExchange.
+			reason, closePx, exPnL, exFee := e.closeFactsFromExchange(o, logger)
+			facts := &exchangeCloseFacts{PnL: exPnL, Fee: exFee}
+			if err := e.closeRealWith(ctx, o, closePx, reason, true, facts, logger); err != nil {
 				logger.Error("reconcile: failed to close locally-stale position", "id", o.ID, "error", err)
 			}
 		}

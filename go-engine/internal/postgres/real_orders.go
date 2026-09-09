@@ -106,13 +106,17 @@ func (r *Repository) SetRealOrderExchangeAlgoOrderID(ctx context.Context, id int
 
 // CloseRealOrder marks a real order closed with its realized outcome. Mirrors ClosePaperOrder.
 func (r *Repository) CloseRealOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error {
-	_, err := r.pool.Exec(ctx, `
+	tag, err := r.pool.Exec(ctx, `
 		UPDATE real_orders
 		SET closed_at = now(), close_px = $2, close_reason = $3, realized_pnl = $4
-		WHERE id = $1
+		WHERE id = $1 AND closed_at IS NULL
 	`, id, closePx, reason, realizedPnL)
 	if err != nil {
 		return fmt.Errorf("close real order %d: %w", id, err)
+	}
+	// Guarded for the same reason as CloseRealOrderConfirmed below — see the note there.
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("real order %d: %w", id, port.ErrOrderAlreadyClosed)
 	}
 	return nil
 }
@@ -148,7 +152,7 @@ func (r *Repository) SetRealOrderClosing(ctx context.Context, id int64, closeOrd
 // fill price is wrong.
 func (r *Repository) CloseRealOrderConfirmed(ctx context.Context, id int64, closePx decimal.Decimal, reason string,
 	realizedPnL decimal.Decimal, exchangePnL, exchangeFee, exchangeClosePx *decimal.Decimal) error {
-	_, err := r.pool.Exec(ctx, `
+	tag, err := r.pool.Exec(ctx, `
 		UPDATE real_orders
 		SET closed_at = now(),
 			close_px = $2,
@@ -171,10 +175,27 @@ func (r *Repository) CloseRealOrderConfirmed(ctx context.Context, id int64, clos
 			status = 'filled',
 			last_error = NULL,
 			last_error_at = NULL
-		WHERE id = $1
+		WHERE id = $1 AND closed_at IS NULL
 	`, id, closePx, reason, realizedPnL, exchangePnL, exchangeFee, exchangeClosePx)
 	if err != nil {
 		return fmt.Errorf("confirm close of real order %d: %w", id, err)
+	}
+	// "AND closed_at IS NULL" is what makes closing an order idempotent (2026-09-09). Without it
+	// this UPDATE overwrote an already-closed row's outcome: real order 38 was closed twice by two
+	// reconciliation passes 3 seconds apart, and the second write replaced a -0.014 loss with a
+	// +0.472 gain. Both numbers were wrong, but the point is that the second write should never
+	// have been allowed to land at all.
+	//
+	// The guard lives in the database rather than in Go because the callers cannot see each other:
+	// each instrument has its own engine, several paths reach this close (tick monitor, reconcile,
+	// manual, timeout), and after a restart a second PROCESS can race the first. An in-process
+	// mutex cannot cover any of that; a conditional UPDATE covers all of it atomically.
+	//
+	// Zero rows affected is reported as ErrOrderAlreadyClosed rather than silently succeeding: a
+	// caller that thinks it closed a position when another path already did should not go on to
+	// deliver a second reward to the model or publish a second close event.
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("real order %d: %w", id, port.ErrOrderAlreadyClosed)
 	}
 	return nil
 }
