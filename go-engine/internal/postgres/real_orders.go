@@ -37,12 +37,20 @@ func (r *Repository) GetRealOrder(ctx context.Context, id int64) (port.RealOrder
 		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at,
 			closed_at, close_reason, close_px, realized_pnl, features_json, status, bar,
 			pnl_max_pct, pnl_min_pct, manual_close_requested, exchange_order_id, exchange_algo_order_id,
-			manual_override
+			manual_override,
+			-- Added 2026-09-09: this read was written before the exchange-truth columns existed and
+			-- never picked them up, so a single-order fetch silently reported no close order id even
+			-- when one was stored — which made the panel's raw-record view unable to fetch the close
+			-- leg at all. ListRealPositions already selected them; only this path was behind.
+			exchange_close_order_id, exchange_realized_pnl, exchange_fee, exchange_close_px,
+			last_error, last_error_at
 		FROM real_orders WHERE id = $1
 	`, id).Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size,
 		&o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx, &o.RealizedPnL,
 		&o.FeaturesJSON, &o.Status, &bar, &o.PnLMaxPct, &o.PnLMinPct,
-		&o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.ManualOverride)
+		&o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.ManualOverride,
+		&o.ExchangeCloseOrderID, &o.ExchangeRealizedPnL, &o.ExchangeFee, &o.ExchangeClosePx,
+		&o.LastError, &o.LastErrorAt)
 	if err != nil {
 		return port.RealOrder{}, fmt.Errorf("get real order %d: %w", id, err)
 	}

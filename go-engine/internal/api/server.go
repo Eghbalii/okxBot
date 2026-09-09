@@ -13,6 +13,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/eghbalii/okxBot/go-engine/internal/okx"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
@@ -30,6 +31,12 @@ type Server struct {
 	// Repo instead, same as every other cmd/api handler, since that data must stay readable/
 	// writable even when cmd/paper-trader itself happens to be down or mid-restart.
 	PaperTraderBaseURL string
+	// Exchange is used only for read-only, on-demand exchange lookups the panel asks for (an
+	// order's full raw record). Optional: nil makes those endpoints report unavailable rather
+	// than failing the whole service, since cmd/api's core job needs no exchange access at all.
+	Exchange exchangeReader
+	// SymbolMap resolves a short internal symbol to the instId OKX knows it by (CLAUDE.md §33.4).
+	SymbolMap okx.SymbolMap
 	// Affordability answers "can this account afford to trade this token", for the Manage Tokens
 	// modal's minimum-size column and its auto-disabled tag (2026-09-08 request). Optional: nil
 	// simply makes that endpoint return an empty list, so cmd/api still runs anywhere the exchange
@@ -40,8 +47,8 @@ type Server struct {
 	// reach the running process, everything else (config reads/writes) hits Postgres directly.
 	TraderBaseURL string
 	ProcessMgr    string
-	Units              []string
-	Logger             *slog.Logger
+	Units         []string
+	Logger        *slog.Logger
 
 	// AccountInitialUSD seeds a mode's account row on first read, matching what the trading
 	// services are configured with (CLAUDE.md §15.6) — cmd/api must not invent a different starting
@@ -155,6 +162,7 @@ func (s *Server) Routes() http.Handler {
 	// Backs the "Manage tokens" modal's per-token 24h position count/PnL table (2026-09-04 request).
 	mux.HandleFunc("GET /api/paper-trading/token-stats", s.handleTokenStats24h)
 	mux.HandleFunc("GET /api/paper-trading/affordability", s.handleTokenAffordability)
+	mux.HandleFunc("GET /api/positions/{id}/exchange-order", s.handleOrderExchangeRaw)
 	mux.HandleFunc("GET /api/paper-trading/config", s.handleGetPaperTradingConfig)
 	mux.HandleFunc("PUT /api/paper-trading/config", s.handleSavePaperTradingConfig)
 	mux.HandleFunc("POST /api/paper-trading/restart", s.handleRestartTrading)

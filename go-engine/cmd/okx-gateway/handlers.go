@@ -24,6 +24,9 @@ type exchangeClient interface {
 	SetLeverage(req domain.LeverageChange) error
 	CancelOrder(instID, ordID string) error
 	GetOrder(instID, ordID string) (domain.OrderStatus, error)
+	// GetOrderRaw returns OKX's payload untouched, for the panel's exchange-report view — the
+	// typed GetOrder above stays the trading loop's interface.
+	GetOrderRaw(instID, ordID string) (json.RawMessage, error)
 	GetInstrument(instType, instID string) (domain.Instrument, error)
 	GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error)
 }
@@ -51,6 +54,7 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("POST /order", s.handlePlaceOrder)
 	mux.HandleFunc("POST /order/cancel", s.handleCancelOrder)
 	mux.HandleFunc("GET /order", s.handleGetOrder)
+	mux.HandleFunc("GET /order/raw", s.handleGetOrderRaw)
 	mux.HandleFunc("GET /instrument", s.handleGetInstrument)
 	mux.HandleFunc("GET /funding-rate-history", s.handleGetFundingRateHistory)
 	mux.HandleFunc("POST /leverage", s.handleSetLeverage)
@@ -225,6 +229,28 @@ func (s *service) handleCancelOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleGetOrderRaw proxies OKX's order-status payload through untouched, for the panel's
+// exchange-report view (2026-09-09). Same rate-limit class as the typed GetOrder — it is the same
+// upstream call, so it must draw from the same budget rather than opening a second, unaccounted
+// path to the same endpoint.
+func (s *service) handleGetOrderRaw(w http.ResponseWriter, r *http.Request) {
+	instID := r.URL.Query().Get("instId")
+	ordID := r.URL.Query().Get("ordId")
+	var raw json.RawMessage
+	err := s.call(r.Context(), gateway.ClassAccount, r, func() error {
+		var innerErr error
+		raw, innerErr = s.client.GetOrderRaw(instID, ordID)
+		return innerErr
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
 }
 
 func (s *service) handleGetOrder(w http.ResponseWriter, r *http.Request) {

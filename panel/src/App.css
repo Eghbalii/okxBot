@@ -791,3 +791,42 @@ th.sorted {
   padding-left: 0.6rem;
   border-left: 2px solid var(--border, #2a2a2a);
 }
+
+/* --- Raw exchange record (order detail modal) --------------------------------------------- */
+
+.raw-json-heading {
+  margin: 1rem 0 0.5rem;
+  font-size: 0.85rem;
+}
+
+.raw-json-load {
+  font-size: 0.78rem;
+}
+
+.raw-json-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.raw-json-label {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 0.3rem;
+}
+
+/* The payload is shown verbatim, so it must scroll on both axes rather than wrap (which would
+   reorder nothing but make a long value hard to read) or stretch the modal. */
+.raw-json {
+  background: var(--bg-alt, #1a1a1a);
+  border: 1px solid var(--border, #2a2a2a);
+  border-radius: 3px;
+  padding: 0.6rem 0.75rem;
+  margin: 0;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  max-height: 18rem;
+  overflow: auto;
+}

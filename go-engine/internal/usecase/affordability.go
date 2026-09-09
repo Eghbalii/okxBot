@@ -15,24 +15,30 @@ import (
 // a token generates signals that can only ever be declined at sizing time, which is noise in the
 // logs and a strategy slot spent on nothing.
 //
-// Leverage deliberately plays NO part here. Sizing converts notional to contracts as
-// notional/price/ctVal, with leverage never entering — it decides how much MARGIN is locked for a
-// given notional, not how large a position can be. A token unaffordable at 1x is equally
-// unaffordable at 10x.
+// Leverage is central here, and getting that wrong is what made this service disable half the
+// roster for no reason (corrected 2026-09-09). Sizing opens a position of margin x leverage, so
+// leverage is exactly what decides whether a small account can reach an instrument's minimum
+// contract at all — a token unaffordable at 1x is often perfectly affordable at 10x.
 type Affordability struct {
 	// MinNotionalUSD is the smallest notional the exchange will accept for this instrument:
 	// CtVal * price * MinSz.
 	MinNotionalUSD decimal.Decimal
-	// BudgetUSD is the per-token budget this check was made against, kept so a caller can explain
-	// the decision rather than only report it.
+	// BudgetUSD is the per-token MARGIN budget this check was made against, kept so a caller can
+	// explain the decision rather than only report it.
 	BudgetUSD decimal.Decimal
-	Affordable bool
+	// BuyingPowerUSD is BudgetUSD x leverage — the position size that margin can actually open,
+	// and the figure MinNotionalUSD is compared against.
+	BuyingPowerUSD decimal.Decimal
+	Affordable     bool
 }
 
-// PerTokenBudget is the notional one token may commit: the account's tradable equity split evenly
+// PerTokenBudget is the MARGIN one token may commit: the account's tradable equity split evenly
 // across the active roster, then bounded by any hard per-position ceiling (account.max_position_pct)
 // that is tighter still. Returns zero when there is nothing to trade with, which callers must treat
 // as "affordable: nothing" rather than dividing by it.
+//
+// Margin, not notional — see BuyingPower below for the distinction, which is what makes an
+// instrument affordable or not.
 func PerTokenBudget(equityUSD decimal.Decimal, tokenCount int, maxPositionPct decimal.Decimal) decimal.Decimal {
 	if !equityUSD.IsPositive() || tokenCount <= 0 {
 		return decimal.Zero
@@ -62,15 +68,34 @@ func MinNotionalFor(inst domain.Instrument, price decimal.Decimal) decimal.Decim
 	return ctVal.Mul(price).Mul(minSz)
 }
 
-// CanAfford reports whether budgetUSD covers at least one minimum lot of inst at price.
-func CanAfford(inst domain.Instrument, price, budgetUSD decimal.Decimal) Affordability {
+// BuyingPower converts a margin budget into the position notional it can actually open. This is
+// the correction that made the whole affordability question meaningful (2026-09-09): a margin
+// budget was previously compared directly against an instrument's minimum NOTIONAL, which asks
+// whether the account could buy the contract outright — not whether it can open a leveraged
+// position in it, which is the question that decides whether a token is tradeable.
+//
+// $2 of margin at 10x opens a $20 position, so a $11.52 ZEC contract is comfortably affordable;
+// comparing $2 against $11.52 declared it impossible. Five of ten tokens were disabled on that
+// basis, none of them actually unaffordable.
+func BuyingPower(marginUSD, leverage decimal.Decimal) decimal.Decimal {
+	if !leverage.IsPositive() {
+		leverage = decimal.NewFromInt(1)
+	}
+	return marginUSD.Mul(leverage)
+}
+
+// CanAfford reports whether a margin budget, at the given leverage, covers at least one minimum
+// lot of inst at price.
+func CanAfford(inst domain.Instrument, price, budgetUSD, leverage decimal.Decimal) Affordability {
 	minNotional := MinNotionalFor(inst, price)
+	power := BuyingPower(budgetUSD, leverage)
 	return Affordability{
 		MinNotionalUSD: minNotional,
 		BudgetUSD:      budgetUSD,
-		// Strictly "budget >= one lot". A budget exactly equal to one lot is affordable: sizing
-		// floors to whole lots, so it buys exactly one.
-		Affordable: budgetUSD.IsPositive() && minNotional.IsPositive() && budgetUSD.GreaterThanOrEqual(minNotional),
+		BuyingPowerUSD: power,
+		// Strictly "buying power >= one lot". A budget exactly equal to one lot is affordable:
+		// sizing floors to whole lots, so it buys exactly one.
+		Affordable: power.IsPositive() && minNotional.IsPositive() && power.GreaterThanOrEqual(minNotional),
 	}
 }
 
@@ -108,6 +133,7 @@ func PlanAffordability(
 	currentlyDisabled map[string]bool,
 	allTokens []string,
 	budget decimal.Decimal,
+	leverage decimal.Decimal,
 ) AffordabilityPlan {
 	plan := AffordabilityPlan{BudgetUSD: budget}
 	for _, tok := range allTokens {
@@ -116,7 +142,7 @@ func PlanAffordability(
 		if !hasInst || !hasPrice || !price.IsPositive() {
 			continue
 		}
-		aff := CanAfford(inst, price, budget)
+		aff := CanAfford(inst, price, budget, leverage)
 		disabled := currentlyDisabled[tok]
 		switch {
 		case !aff.Affordable:

@@ -163,6 +163,17 @@ func (c *Client) GetOrder(instID, ordID string) (domain.OrderStatus, error) {
 	return out, err
 }
 
+// GetOrderRaw returns OKX's own order payload untouched, for the panel's exchange-report view.
+// Decoding into json.RawMessage rather than a struct is the whole point — nothing is dropped.
+func (c *Client) GetOrderRaw(instID, ordID string) (json.RawMessage, error) {
+	var out json.RawMessage
+	path := "/order/raw?" + url.Values{"instId": {instID}, "ordId": {ordID}}.Encode()
+	if err := c.do(context.Background(), http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *Client) SetLeverage(req domain.LeverageChange) error {
 	return c.do(context.Background(), http.MethodPost, "/leverage", req, nil)
 }

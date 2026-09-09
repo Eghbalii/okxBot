@@ -20,13 +20,13 @@ import (
 // fakeExchange is a hand-rolled exchangeClient recording calls, matching this repo's existing
 // fake-over-mock-library convention (e.g. internal/usecase/trade_test.go).
 type fakeExchange struct {
-	ticker      domain.Ticker
-	positions   []domain.Position
-	balances    []domain.Balance
-	candles     []domain.Candle
-	orderResult *domain.OrderResult
-	orderStatus domain.OrderStatus
-	instrument  domain.Instrument
+	ticker       domain.Ticker
+	positions    []domain.Position
+	balances     []domain.Balance
+	candles      []domain.Candle
+	orderResult  *domain.OrderResult
+	orderStatus  domain.OrderStatus
+	instrument   domain.Instrument
 	fundingRates []domain.FundingRate
 
 	placeOrderCalls    int
@@ -87,6 +87,10 @@ func (f *fakeExchange) CancelOrder(instID, ordID string) error {
 	f.cancelOrderCalls++
 	return f.maybeFail()
 }
+func (f *fakeExchange) GetOrderRaw(instID, ordID string) (json.RawMessage, error) {
+	return json.RawMessage(`{"instId":"` + instID + `","ordId":"` + ordID + `"}`), nil
+}
+
 func (f *fakeExchange) GetOrder(instID, ordID string) (domain.OrderStatus, error) {
 	f.getOrderCalls++
 	if err := f.maybeFail(); err != nil {

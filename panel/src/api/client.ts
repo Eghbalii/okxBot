@@ -12,6 +12,7 @@ import type {
   StrategyAssignment,
   StrategyConfig,
   StrategyStats,
+  ExchangeOrderRaw,
   TokenAffordability,
   TokenStats,
   TesterConfig,
@@ -205,6 +206,10 @@ export const api = {
   tokenStats24h: (mode: PositionMode) => requestList<TokenStats>(`/paper-trading/token-stats?mode=${mode}`),
   // Per-token exchange minimums vs. the current per-token budget, for the Manage Tokens modal's
   // min-size column and auto-disabled tag (2026-09-08). Empty in paper mode by design.
+  // OKX's own untouched record for both legs of a real position, fetched live rather than served
+  // from stored columns — the stored fields are a chosen few, this is everything the exchange knows.
+  exchangeOrderRaw: (id: number) =>
+    request<ExchangeOrderRaw>(`/positions/${id}/exchange-order`),
   tokenAffordability: (mode: PositionMode) =>
     requestList<TokenAffordability>(`/paper-trading/affordability?mode=${mode}`),
   // Go's null-array-column columns (activeKinds/disabledInstIds/activeBars) marshal as JSON null,

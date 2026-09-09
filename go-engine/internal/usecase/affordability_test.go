@@ -31,7 +31,7 @@ func TestCanAfford_RealRosterNumbers(t *testing.T) {
 		{"TRUMP", "0.1", "2.24", true},    // 0.224
 	}
 	for _, c := range cases {
-		got := CanAfford(inst(c.ctVal, "1"), dec(c.price), budget)
+		got := CanAfford(inst(c.ctVal, "1"), dec(c.price), budget, dec("1"))
 		if got.Affordable != c.affordable {
 			t.Errorf("%s: minNotional=%s budget=%s — affordable %v, want %v",
 				c.name, got.MinNotionalUSD.StringFixed(4), budget, got.Affordable, c.affordable)
@@ -41,7 +41,7 @@ func TestCanAfford_RealRosterNumbers(t *testing.T) {
 
 // A budget exactly equal to one lot buys exactly one lot, since sizing floors to whole lots.
 func TestCanAfford_ExactlyOneLotIsAffordable(t *testing.T) {
-	got := CanAfford(inst("0.01", "1"), dec("100"), dec("1"))
+	got := CanAfford(inst("0.01", "1"), dec("100"), dec("1"), dec("1"))
 	if !got.Affordable {
 		t.Fatalf("a budget exactly equal to one lot (%s) must be affordable", got.MinNotionalUSD)
 	}
@@ -71,7 +71,7 @@ func TestPlanAffordability_MissingDataLeavesTokenUntouched(t *testing.T) {
 	instruments := map[string]domain.Instrument{"SOL": inst("0.01", "1")}
 	prices := map[string]decimal.Decimal{"SOL": dec("100")}
 
-	plan := PlanAffordability(instruments, prices, map[string]bool{}, []string{"SOL", "BTC"}, dec("2"))
+	plan := PlanAffordability(instruments, prices, map[string]bool{}, []string{"SOL", "BTC"}, dec("2"), dec("1"))
 	for _, tok := range append(append([]string{}, plan.ToDisable...), plan.ToEnable...) {
 		if tok == "BTC" {
 			t.Fatal("a token with no instrument/price data must not be disabled or enabled")
@@ -86,13 +86,13 @@ func TestPlanAffordability_ReEnablesWhenBudgetGrows(t *testing.T) {
 	prices := map[string]decimal.Decimal{"ETH": dec("2480")} // one lot = 2.48
 
 	// $2 budget: unaffordable, and already disabled — no change proposed.
-	plan := PlanAffordability(instruments, prices, map[string]bool{"ETH": true}, []string{"ETH"}, dec("2"))
+	plan := PlanAffordability(instruments, prices, map[string]bool{"ETH": true}, []string{"ETH"}, dec("2"), dec("1"))
 	if len(plan.ToEnable) != 0 || len(plan.ToDisable) != 0 {
 		t.Fatalf("already-correct state must propose no change, got %+v", plan)
 	}
 
 	// $4 budget after some profit: now affordable, so bring it back.
-	plan = PlanAffordability(instruments, prices, map[string]bool{"ETH": true}, []string{"ETH"}, dec("4"))
+	plan = PlanAffordability(instruments, prices, map[string]bool{"ETH": true}, []string{"ETH"}, dec("4"), dec("1"))
 	if len(plan.ToEnable) != 1 || plan.ToEnable[0] != "ETH" {
 		t.Fatalf("a now-affordable token must be re-enabled, got %+v", plan.ToEnable)
 	}
@@ -102,7 +102,7 @@ func TestPlanAffordability_ReEnablesWhenBudgetGrows(t *testing.T) {
 // it frees up: $20 across 4 tokens is $5 each, which cannot afford BTC ($7.83) — but with BTC out
 // the remaining 3 get $6.67 each and all fit.
 func TestAffordabilityService_AccountsForFreedBudget(t *testing.T) {
-	s := &AffordabilityService{AllTokens: []string{"BTC", "ETH", "SOL", "XRP"}}
+	s := &AffordabilityService{MaxLeverage: dec("1"), AllTokens: []string{"BTC", "ETH", "SOL", "XRP"}}
 	instruments := map[string]domain.Instrument{
 		"BTC": inst("0.0001", "1"), "ETH": inst("0.001", "1"),
 		"SOL": inst("0.01", "1"), "XRP": inst("1", "1"),
@@ -123,7 +123,7 @@ func TestAffordabilityService_AccountsForFreedBudget(t *testing.T) {
 
 // Growing the account brings tokens back, against the settled roster the same way.
 func TestAffordabilityService_ReEnablesAsEquityGrows(t *testing.T) {
-	s := &AffordabilityService{AllTokens: []string{"BTC", "ETH", "SOL"}}
+	s := &AffordabilityService{MaxLeverage: dec("1"), AllTokens: []string{"BTC", "ETH", "SOL"}}
 	instruments := map[string]domain.Instrument{
 		"BTC": inst("0.0001", "1"), "ETH": inst("0.001", "1"), "SOL": inst("0.01", "1"),
 	}
@@ -145,7 +145,7 @@ func TestAffordabilityService_NoChangeWhenAlreadyCorrect(t *testing.T) {
 	// $7.835 lot. An earlier version used a 2-token roster and failed — correctly, since $20
 	// across 2 tokens is $10 each and BTC genuinely IS affordable there. The code was right and
 	// the expectation was wrong.
-	s := &AffordabilityService{AllTokens: []string{"BTC", "SOL", "XRP", "TRUMP", "DOGE"}}
+	s := &AffordabilityService{MaxLeverage: dec("1"), AllTokens: []string{"BTC", "SOL", "XRP", "TRUMP", "DOGE"}}
 	instruments := map[string]domain.Instrument{
 		"BTC": inst("0.0001", "1"), "SOL": inst("0.01", "1"), "XRP": inst("1", "1"),
 		"TRUMP": inst("0.1", "1"), "DOGE": inst("10", "1"),
@@ -165,7 +165,7 @@ func TestAffordabilityService_NoChangeWhenAlreadyCorrect(t *testing.T) {
 // applyPlan must return a sorted list — an unsorted one makes every save look like a change even
 // when the set is identical.
 func TestApplyPlan_SortedAndStable(t *testing.T) {
-	s := &AffordabilityService{AllTokens: []string{"BTC", "ETH", "SOL", "ZEC"}}
+	s := &AffordabilityService{MaxLeverage: dec("1"), AllTokens: []string{"BTC", "ETH", "SOL", "ZEC"}}
 	got := s.applyPlan(map[string]bool{"ZEC": true}, AffordabilityPlan{ToDisable: []string{"ETH", "BTC"}})
 	want := []string{"BTC", "ETH", "ZEC"}
 	if len(got) != len(want) {
@@ -199,7 +199,7 @@ func TestAffordabilityService_RealRosterHasNoOscillation(t *testing.T) {
 		"XRP": dec("1.4233"), "DOGE": dec("0.08963"), "HYPE": dec("84.189"), "TRUMP": dec("2.24"),
 		"PEPE": dec("0.000003644"), "PUMP": dec("0.0044090"),
 	}
-	s := &AffordabilityService{AllTokens: tokens, MaxPositionPct: dec("0.25")}
+	s := &AffordabilityService{MaxLeverage: dec("1"), AllTokens: tokens, MaxPositionPct: dec("0.25")}
 
 	plan := s.plan(instruments, prices, map[string]bool{}, dec("20"))
 
@@ -237,7 +237,7 @@ func TestAffordabilityService_IsIdempotent(t *testing.T) {
 		"BTC": dec("78350"), "ETH": dec("2480.2"), "SOL": dec("103.06"),
 		"XRP": dec("1.4233"), "PEPE": dec("0.000003644"),
 	}
-	s := &AffordabilityService{AllTokens: tokens, MaxPositionPct: dec("0.25")}
+	s := &AffordabilityService{MaxLeverage: dec("1"), AllTokens: tokens, MaxPositionPct: dec("0.25")}
 
 	first := s.plan(instruments, prices, map[string]bool{}, dec("20"))
 	settled := map[string]bool{}
@@ -249,5 +249,56 @@ func TestAffordabilityService_IsIdempotent(t *testing.T) {
 	if second.Changed() {
 		t.Fatalf("a settled roster must be stable, but a second pass proposed disable=%v enable=%v",
 			second.ToDisable, second.ToEnable)
+	}
+}
+
+// Leverage is what decides whether a small account can reach an instrument's minimum contract at
+// all. Judging affordability on the raw margin budget (the original bug, 2026-09-09) declared five
+// of ten live tokens permanently untradeable when none of them were: ZEC's minimum contract is
+// ~$11.52, and a $2 margin share at 10x is $20 of buying power.
+func TestCanAfford_LeverageDecidesReachability(t *testing.T) {
+	zec := inst("0.01", "1")
+	price := dec("1151.78") // one contract = $11.52
+	budget := dec("2")
+
+	if CanAfford(zec, price, budget, dec("1")).Affordable {
+		t.Error("at 1x, $2 cannot reach an $11.52 contract")
+	}
+	if !CanAfford(zec, price, budget, dec("10")).Affordable {
+		t.Error("at 10x, $2 of margin is $20 of buying power and reaches it comfortably")
+	}
+}
+
+func TestBuyingPower(t *testing.T) {
+	if got := BuyingPower(dec("2"), dec("10")); !got.Equal(dec("20")) {
+		t.Errorf("2 margin at 10x: want 20, got %s", got)
+	}
+	// An unset leverage must read as 1x rather than collapsing buying power to zero.
+	if got := BuyingPower(dec("2"), decimal.Zero); !got.Equal(dec("2")) {
+		t.Errorf("zero leverage must behave as 1x: want 2, got %s", got)
+	}
+}
+
+// The live roster, with the numbers that actually matter: $20 cap across 10 tokens is $2 each, and
+// at the configured 10x ceiling every token clears its own minimum — so nothing should be disabled.
+func TestAffordabilityService_LiveRosterNeedsNoDisablesAtRealLeverage(t *testing.T) {
+	tokens := []string{"BTC", "ETH", "SOL", "ZEC", "XRP", "DOGE", "HYPE", "TRUMP", "PEPE", "PUMP"}
+	instruments := map[string]domain.Instrument{
+		"BTC": inst("0.0001", "1"), "ETH": inst("0.001", "1"), "SOL": inst("0.01", "1"),
+		"ZEC": inst("0.01", "1"), "XRP": inst("1", "1"), "DOGE": inst("10", "1"),
+		"HYPE": inst("0.1", "1"), "TRUMP": inst("0.1", "1"), "PEPE": inst("1000000", "1"),
+		"PUMP": inst("1000", "1"),
+	}
+	prices := map[string]decimal.Decimal{
+		"BTC": dec("78350"), "ETH": dec("2480.2"), "SOL": dec("103.06"), "ZEC": dec("1151.78"),
+		"XRP": dec("1.4233"), "DOGE": dec("0.08963"), "HYPE": dec("84.189"), "TRUMP": dec("2.24"),
+		"PEPE": dec("0.000003644"), "PUMP": dec("0.0044090"),
+	}
+	s := &AffordabilityService{AllTokens: tokens, MaxPositionPct: dec("0.25"), MaxLeverage: dec("10")}
+
+	plan := s.plan(instruments, prices, map[string]bool{}, dec("20"))
+
+	if len(plan.ToDisable) != 0 {
+		t.Fatalf("at 10x every token clears its minimum on a $20 account; disabled %v", plan.ToDisable)
 	}
 }

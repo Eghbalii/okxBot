@@ -257,11 +257,26 @@ func (e *RealTrader) instrumentMeta() (domain.Instrument, error) {
 // never request more notional than what was actually sized/approved by the risk manager upstream.
 // A CtVal of zero (unset/misconfigured instrument metadata) is treated as 1 — the pre-2026-09-04
 // implicit assumption — rather than dividing by zero.
-func sizeToContracts(notionalUSD, price decimal.Decimal, inst domain.Instrument) decimal.Decimal {
+func sizeToContracts(marginUSD, leverage, price decimal.Decimal, inst domain.Instrument) decimal.Decimal {
 	ctVal := inst.CtVal
 	if !ctVal.IsPositive() {
 		ctVal = decimal.NewFromInt(1)
 	}
+	// Margin x leverage is the POSITION's notional — the whole point of leverage is that $2 of
+	// margin at 10x controls $20 of the instrument. Sizing off margin alone (the original bug,
+	// found 2026-09-09) opened every real position at 1/leverage of its intended size: order 5
+	// asked for $1.87 of margin at 9.44x, i.e. a $17.66 position, and got $1.03 — one contract
+	// instead of seventeen.
+	//
+	// Three symptoms traced back to this one line, which is why it looked like several bugs:
+	// realized PnL came in far under what the local formula predicted (the formula was right, the
+	// position was 17x too small); expensive tokens fell below their own minimum contract value and
+	// were declined at sizing time; and the affordability service then disabled five of them for a
+	// budget ceiling that was never real.
+	if !leverage.IsPositive() {
+		leverage = decimal.NewFromInt(1)
+	}
+	notionalUSD := marginUSD.Mul(leverage)
 	baseUnits := notionalUSD.Div(price)
 	contracts := baseUnits.Div(ctVal)
 	if inst.LotSz.IsPositive() {
@@ -269,6 +284,42 @@ func sizeToContracts(notionalUSD, price decimal.Decimal, inst domain.Instrument)
 		contracts = lots.Mul(inst.LotSz)
 	}
 	return contracts
+}
+
+// marginFromFill converts the exchange's own filled contract count back into the margin figure
+// this system stores as an order's Size — the inverse of sizeToContracts (2026-09-09 request:
+// "if the size changes after the position opens, the database must be updated with the exchange's
+// own position data at that moment").
+//
+// contracts x CtVal x fillPrice is the position's real notional; dividing by leverage gives the
+// margin backing it. Returns zero when anything needed is missing or non-positive, so a caller can
+// treat that as "no better number available" and keep what it had rather than overwriting a good
+// value with a bad one.
+func marginFromFill(status domain.OrderStatus, fillPx, leverage decimal.Decimal, inst domain.Instrument) decimal.Decimal {
+	if !status.AccFillSz.IsPositive() || !fillPx.IsPositive() {
+		return decimal.Zero
+	}
+	ctVal := inst.CtVal
+	if !ctVal.IsPositive() {
+		ctVal = decimal.NewFromInt(1)
+	}
+	if !leverage.IsPositive() {
+		leverage = decimal.NewFromInt(1)
+	}
+	return status.AccFillSz.Mul(ctVal).Mul(fillPx).Div(leverage)
+}
+
+// instrumentOrZero returns the cached instrument metadata, or a zero value if it could not be
+// fetched.
+// Unlike instrumentMeta this never errors: its callers are correcting a stored figure after an
+// order is already live, where a metadata failure should leave the existing value alone rather
+// than abort anything.
+func (e *RealTrader) instrumentOrZero() domain.Instrument {
+	inst, err := e.instrumentMeta()
+	if err != nil {
+		return domain.Instrument{}
+	}
+	return inst
 }
 
 // DefaultReconcileInterval is the reconciliation poll's cadence when RealTrader.ReconcileInterval
@@ -817,7 +868,7 @@ func (e *RealTrader) openReal(
 	if err != nil {
 		return nil, fmt.Errorf("fetch instrument metadata: %w", err)
 	}
-	sz := sizeToContracts(order.Size, price, inst)
+	sz := sizeToContracts(order.Size, order.Leverage, price, inst)
 	if sz.IsZero() || (inst.MinSz.IsPositive() && sz.LessThan(inst.MinSz)) {
 		logger.Info("real open: sized order below instrument minimum, declining",
 			"instId", e.execInstID(), "sz", sz, "minSz", inst.MinSz)
@@ -890,6 +941,16 @@ func (e *RealTrader) openReal(
 			if status.AvgPx.IsPositive() {
 				order.EntryPx = status.AvgPx
 			}
+			// Re-derive margin from what the exchange ACTUALLY filled, not what was requested
+			// (2026-09-09 request). sizeToContracts floors to a whole lot, so the filled position is
+			// almost never exactly the requested notional — order 5 asked for $17.66 and 17
+			// contracts is $17.50. Storing the request rather than the fill is what made the local
+			// PnL disagree with the exchange's own even on a clean full fill, and it is the number
+			// every downstream consumer (PnL, exposure caps, the model's observation) reads as "how
+			// big is this position".
+			if filled := marginFromFill(status, order.EntryPx, order.Leverage, e.instrumentOrZero()); filled.IsPositive() {
+				order.Size = filled
+			}
 		case status.AccFillSz.IsPositive():
 			// Partially filled within the timeout window: a real, smaller-than-intended position
 			// exists on the exchange (canceled by waitForFill's timeout path for the remainder), so
@@ -899,9 +960,17 @@ func (e *RealTrader) openReal(
 			logger.Warn("real open: order partially filled before timeout/cancel",
 				"instId", e.InstID, "ordId", *order.ExchangeOrderID,
 				"requestedSz", sz, "filledSz", status.AccFillSz)
-			order.Size = order.Size.Mul(status.AccFillSz).Div(sz)
 			if status.AvgPx.IsPositive() {
 				order.EntryPx = status.AvgPx
+			}
+			// Derived from the contracts actually filled, the same way the full-fill branch does,
+			// rather than scaling the requested margin by a fill ratio — both reach the same number
+			// on a clean fill, but deriving from contracts is correct even when the request itself
+			// was rounded, and keeps one definition of "size" instead of two.
+			if filled := marginFromFill(status, order.EntryPx, order.Leverage, e.instrumentOrZero()); filled.IsPositive() {
+				order.Size = filled
+			} else {
+				order.Size = order.Size.Mul(status.AccFillSz).Div(sz)
 			}
 		default:
 			// Never filled at all before the timeout — canceled. The pending row STAYS (per the
@@ -1231,7 +1300,9 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 		if err != nil {
 			return e.recordCloseError(ctx, o.ID, fmt.Errorf("fetch instrument metadata: %w", err), logger)
 		}
-		sz := sizeToContracts(o.Size, closePrice, inst)
+		// Same margin AND leverage the open used — sizing the flatten off margin alone would
+		// send an order 1/leverage the size of the position it is meant to close.
+		sz := sizeToContracts(o.Size, o.Leverage, closePrice, inst)
 		req := domain.OrderRequest{InstID: e.execInstID(), TdMode: e.TdMode, Side: side, OrdType: "market", Sz: sz}
 		if e.PosMode == "long_short" {
 			req.PosSide = posSideFor(signedNotionalForSide(o.Side))

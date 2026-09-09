@@ -78,6 +78,10 @@ func main() {
 		TesterBaseURL:      cfg.Tester.URL,
 		PaperTraderBaseURL: cfg.PaperTrading.URL,
 		TraderBaseURL:      cfg.Trading.URL,
+		// Read-only exchange access for the panel's raw order-record view. cmd/api takes the
+		// narrow exchangeReader interface, so it cannot place or cancel anything.
+		Exchange:  gatewayclient.New(cfg.Gateway.URL, "api"),
+		SymbolMap: cfg.Trading.SymbolMap,
 		// Read-only: Report never changes the roster, so opening the Manage Tokens modal cannot
 		// enable or disable anything. cmd/trader owns the acting half (AffordabilityService.Run).
 		Affordability: &usecase.AffordabilityService{
@@ -89,6 +93,7 @@ func main() {
 			SymbolMap:      cfg.Trading.SymbolMap,
 			ExecInstType:   cfg.Trading.ExecInstType,
 			MaxPositionPct: cfg.Account.MaxPositionPct,
+			MaxLeverage:    cfg.Risk.MaxLeverage,
 		},
 		ProcessMgr: cfg.API.ProcessMgr,
 		Units:      cfg.API.Units,

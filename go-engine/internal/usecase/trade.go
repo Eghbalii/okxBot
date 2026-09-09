@@ -350,7 +350,11 @@ func (t *Trader) execute(
 	if err != nil {
 		return fmt.Errorf("fetch instrument metadata: %w", err)
 	}
-	sz := sizeToContracts(deltaNotional.Abs(), mid, inst)
+	// Leverage 1 deliberately: deltaNotional is ALREADY a position notional here (this path
+	// computes a target exposure directly), unlike RealTrader's own call site which passes margin
+	// and needs leverage applied to reach the notional. Passing the real leverage would multiply a
+	// notional that already accounts for it.
+	sz := sizeToContracts(deltaNotional.Abs(), decimal.NewFromInt(1), mid, inst)
 	if sz.IsZero() || (inst.MinSz.IsPositive() && sz.LessThan(inst.MinSz)) {
 		return nil
 	}

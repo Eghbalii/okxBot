@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
-import type { PaperOrderAdjustment, Position, PositionMode } from '../api/types'
+import type { ExchangeOrderRaw, PaperOrderAdjustment, Position, PositionMode } from '../api/types'
 import { formatDateTime, formatUsd, pnlClass, tokenSymbol, trimPrice } from '../utils/format'
 
 // The decision-time observation persisted on the order (CLAUDE.md §15.3) — what the model was
@@ -152,6 +152,85 @@ export default function OrderDetailModal({
   // 1x order is the tell that the strategy's own sizing stood.
   const modelSized = position.Leverage !== '1' && position.Leverage !== '1.0'
 
+// OKX's own record for both legs, rendered as raw JSON (2026-09-09 request: "show me the whole
+// JSON, not a few parameters you picked"). Fetched on demand rather than with the modal, since it
+// costs two live exchange calls against a shared rate-limit budget and most views of an order do
+// not need it.
+//
+// Deliberately unformatted beyond indentation: the value here is that nothing was interpreted or
+// dropped on the way through, so picking fields out to display would defeat the purpose.
+function ExchangeRawJSON({ orderId }: { orderId: number }) {
+  const [data, setData] = useState<ExchangeOrderRaw | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  function load() {
+    setLoading(true)
+    setError(null)
+    api
+      .exchangeOrderRaw(orderId)
+      .then(setData)
+      .catch((err) => setError((err as Error).message))
+      .finally(() => setLoading(false))
+  }
+
+  if (!data && !loading && !error) {
+    return (
+      <button onClick={load} className="raw-json-load">
+        Load full record from the exchange
+      </button>
+    )
+  }
+  if (loading) return <div className="text-dim">Fetching from OKX…</div>
+  if (error) return <div className="error-banner">{error}</div>
+  if (!data) return null
+
+  return (
+    <div className="raw-json-wrap">
+      <RawLeg label="Open order" id={data.openOrderId} body={data.open} error={data.openError} />
+      <RawLeg label="Close order" id={data.closeOrderId} body={data.close} error={data.closeError} />
+      <button onClick={load} className="raw-json-load">
+        Refresh
+      </button>
+    </div>
+  )
+}
+
+function RawLeg({
+  label,
+  id,
+  body,
+  error,
+}: {
+  label: string
+  id?: string
+  body: Record<string, unknown> | null
+  error?: string
+}) {
+  // No id recorded at all is the normal case for a still-open position's close leg — say so
+  // plainly rather than rendering an empty box that reads as a failure.
+  if (!id) {
+    return (
+      <div className="raw-json-leg">
+        <div className="raw-json-label">{label}</div>
+        <div className="text-dim">No exchange order id recorded.</div>
+      </div>
+    )
+  }
+  return (
+    <div className="raw-json-leg">
+      <div className="raw-json-label">
+        {label} <span className="text-dim mono">{id}</span>
+      </div>
+      {error ? (
+        <div className="error-banner">{error}</div>
+      ) : (
+        <pre className="raw-json mono">{JSON.stringify(body, null, 2)}</pre>
+      )}
+    </div>
+  )
+}
+
 // What the EXCHANGE reported about this order, as distinct from what this system decided or
 // computed (2026-09-09 request). Everything above it in the modal is decision-time data — the
 // strategy's signal, the model's answer, the levels we chose. This block is the other half: what
@@ -229,6 +308,9 @@ function ExchangeDetails({ position }: { position: Position }) {
           price, which the local calculation cannot see.
         </div>
       )}
+
+      <h4 className="raw-json-heading">Full exchange record</h4>
+      <ExchangeRawJSON orderId={position.ID} />
 
       <div className="stat-row" style={{ marginTop: '0.75rem' }}>
         <span className="text-dim">Open order id</span>

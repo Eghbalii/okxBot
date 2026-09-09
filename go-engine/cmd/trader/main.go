@@ -389,6 +389,7 @@ func runRealTrader(
 		SymbolMap:      cfg.Trading.SymbolMap,
 		ExecInstType:   cfg.Trading.ExecInstType,
 		MaxPositionPct: cfg.Account.MaxPositionPct,
+		MaxLeverage:    cfg.Risk.MaxLeverage,
 		// Push roster changes into the already-running engines so a disable takes effect on the
 		// next candle rather than at the next restart.
 		OnRosterChange: func(disabled []string) {

@@ -311,3 +311,15 @@ export interface TokenAffordability {
   // auto-disabled: a transient API failure must not take a tradeable token offline.
   unknown: boolean
 }
+
+// GET /api/positions/{id}/exchange-order — OKX's own record for both legs of a real position,
+// exactly as the exchange returned it (2026-09-09). Each leg is independent: an open position has
+// no close leg, and either lookup can fail on its own without invalidating the other.
+export interface ExchangeOrderRaw {
+  open: Record<string, unknown> | null
+  close: Record<string, unknown> | null
+  openError?: string
+  closeError?: string
+  openOrderId?: string
+  closeOrderId?: string
+}

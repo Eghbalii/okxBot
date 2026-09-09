@@ -59,6 +59,13 @@ type AffordabilityService struct {
 	// as sizing applies it, so this service judges affordability against the budget sizing will
 	// actually use rather than a looser one.
 	MaxPositionPct decimal.Decimal
+	// MaxLeverage is the ceiling the model's own leverage choice is mapped into (risk.max_leverage).
+	// Affordability is judged at this maximum deliberately: the question is whether a token is
+	// EVER tradeable at this account size, and a token the model could open at 10x should not be
+	// taken offline because it would be unaffordable at the 1x it might also choose. Sizing then
+	// declines the individual order if the model happens to pick a leverage too low to reach one
+	// contract — a per-order decision, not a reason to disable the token for everyone.
+	MaxLeverage decimal.Decimal
 	// Interval defaults to DefaultAffordabilityInterval.
 	Interval time.Duration
 
@@ -86,6 +93,16 @@ func (s *AffordabilityService) interval() time.Duration {
 		return s.Interval
 	}
 	return DefaultAffordabilityInterval
+}
+
+// leverage is the figure affordability is judged at — the configured maximum, defaulting to 1x
+// when unset so an unconfigured service errs toward declaring MORE tokens unaffordable rather than
+// fewer.
+func (s *AffordabilityService) leverage() decimal.Decimal {
+	if s.MaxLeverage.IsPositive() {
+		return s.MaxLeverage
+	}
+	return decimal.NewFromInt(1)
 }
 
 func (s *AffordabilityService) mode() string {
@@ -234,7 +251,9 @@ func (s *AffordabilityService) plan(
 		// The budget if this token and every cheaper one were active.
 		count := i + 1 + unknownActive
 		budget := PerTokenBudget(equity, count, s.MaxPositionPct)
-		if budget.LessThan(c.minNotional) {
+		// Buying power, not the raw margin budget: a $2 margin share at 10x opens a $20 position,
+		// which is what an instrument's minimum notional has to be compared against.
+		if BuyingPower(budget, s.leverage()).LessThan(c.minNotional) {
 			// Too expensive at its own implied budget — and since the list is sorted ascending and
 			// each later token is dearer while the budget only shrinks, nothing after it can fit
 			// either.
@@ -423,7 +442,7 @@ func (s *AffordabilityService) Report(ctx context.Context) (AffordabilityReport,
 			report.Tokens = append(report.Tokens, row)
 			continue
 		}
-		aff := CanAfford(inst, price, budget)
+		aff := CanAfford(inst, price, budget, s.leverage())
 		row.MinNotionalUSD = aff.MinNotionalUSD
 		row.Affordable = aff.Affordable
 		// Ask the actual admission rule rather than inferring from Affordable, so the panel's tag

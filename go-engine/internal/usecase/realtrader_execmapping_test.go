@@ -22,7 +22,7 @@ func TestSizeToContracts_ConvertsThroughCtValAndRoundsToLotSize(t *testing.T) {
 	inst := domain.Instrument{CtVal: dec("0.0001"), LotSz: dec("1")}
 
 	// $40 notional at $80,000/BTC = 0.0005 BTC = 5 contracts exactly.
-	got := sizeToContracts(dec("40"), dec("80000"), inst)
+	got := sizeToContracts(dec("40"), dec("1"), dec("80000"), inst)
 	want := dec("5")
 	if !got.Equal(want) {
 		t.Errorf("sizeToContracts = %s, want %s", got, want)
@@ -33,7 +33,7 @@ func TestSizeToContracts_RoundsDownToLotSizeNeverUp(t *testing.T) {
 	// $44 notional at $80,000/BTC = 0.00055 BTC = 5.5 contracts — must round DOWN to 5, never up
 	// to 6 (which would exceed the notional the risk manager actually approved).
 	inst := domain.Instrument{CtVal: dec("0.0001"), LotSz: dec("1")}
-	got := sizeToContracts(dec("44"), dec("80000"), inst)
+	got := sizeToContracts(dec("44"), dec("1"), dec("80000"), inst)
 	want := dec("5")
 	if !got.Equal(want) {
 		t.Errorf("sizeToContracts = %s, want %s (must round down)", got, want)
@@ -43,7 +43,7 @@ func TestSizeToContracts_RoundsDownToLotSizeNeverUp(t *testing.T) {
 func TestSizeToContracts_FractionalLotSize(t *testing.T) {
 	// Classic SWAP shape: CtVal=0.01 BTC, LotSz=0.01 contracts.
 	inst := domain.Instrument{CtVal: dec("0.01"), LotSz: dec("0.01")}
-	got := sizeToContracts(dec("800"), dec("80000"), inst)
+	got := sizeToContracts(dec("800"), dec("1"), dec("80000"), inst)
 	want := dec("1") // 800/80000 = 0.01 BTC / 0.01 CtVal = 1 contract
 	if !got.Equal(want) {
 		t.Errorf("sizeToContracts = %s, want %s", got, want)
@@ -53,7 +53,7 @@ func TestSizeToContracts_FractionalLotSize(t *testing.T) {
 func TestSizeToContracts_ZeroCtValTreatedAsOne(t *testing.T) {
 	// Defensive: an unset/misconfigured instrument must not divide by zero.
 	inst := domain.Instrument{CtVal: decimal.Zero, LotSz: decimal.Zero}
-	got := sizeToContracts(dec("100"), dec("50"), inst)
+	got := sizeToContracts(dec("100"), dec("1"), dec("50"), inst)
 	want := dec("2") // 100/50 / 1 = 2, no lot rounding since LotSz is not positive
 	if !got.Equal(want) {
 		t.Errorf("sizeToContracts = %s, want %s", got, want)
@@ -168,5 +168,57 @@ func TestOpenReal_ConvertsSizeThroughInstrumentMetadata(t *testing.T) {
 	}
 	if sz.IsZero() {
 		t.Error("placed order Sz is zero — sizing conversion likely broken")
+	}
+}
+
+// The bug that made every real position 1/leverage of its intended size (2026-09-09): margin was
+// converted straight to contracts with leverage never applied, so $2 of margin at 10x opened a $2
+// position instead of the $20 one leverage exists to provide.
+//
+// These are order 5's real numbers: $1.87 of margin at 9.44x against SOL (CtVal 0.01, LotSz 1) at
+// 102.93 is a $17.66 position — 17 contracts. It opened 1.
+func TestSizeToContracts_AppliesLeverageToReachNotional(t *testing.T) {
+	inst := domain.Instrument{CtVal: dec("0.01"), LotSz: dec("1"), MinSz: dec("1")}
+	got := sizeToContracts(dec("1.87"), dec("9.44"), dec("102.93"), inst)
+	if !got.Equal(dec("17")) {
+		t.Fatalf("sizeToContracts with leverage = %s contracts, want 17 (a $17.66 position, not $1.03)", got)
+	}
+}
+
+// Leverage multiplies the position, so the same margin at 10x buys ten times what it does at 1x.
+func TestSizeToContracts_ScalesWithLeverage(t *testing.T) {
+	inst := domain.Instrument{CtVal: dec("1"), LotSz: dec("1")}
+	one := sizeToContracts(dec("100"), dec("1"), dec("10"), inst)
+	ten := sizeToContracts(dec("100"), dec("10"), dec("10"), inst)
+	if !one.Equal(dec("10")) {
+		t.Fatalf("1x: want 10 contracts, got %s", one)
+	}
+	if !ten.Equal(dec("100")) {
+		t.Fatalf("10x: want 100 contracts (10x the 1x size), got %s", ten)
+	}
+}
+
+// A missing/zero leverage must behave as 1x rather than sizing the position to zero — the same
+// defensive fallback CtVal already had.
+func TestSizeToContracts_ZeroLeverageTreatedAsOne(t *testing.T) {
+	inst := domain.Instrument{CtVal: dec("1"), LotSz: dec("1")}
+	got := sizeToContracts(dec("100"), decimal.Zero, dec("10"), inst)
+	if !got.Equal(dec("10")) {
+		t.Fatalf("zero leverage must size as 1x: want 10, got %s", got)
+	}
+}
+
+// The expensive tokens the affordability service disabled were never actually unaffordable — they
+// only looked that way because sizing ignored leverage. ZEC's minimum contract is ~$11.52; a $2
+// budget at 10x is $20 of buying power, which clears it comfortably.
+func TestSizeToContracts_LeverageClearsTheContractMinimum(t *testing.T) {
+	inst := domain.Instrument{CtVal: dec("0.01"), LotSz: dec("1"), MinSz: dec("1")}
+	price := dec("1151.78") // ZEC: one contract = 0.01 * 1151.78 = $11.52
+
+	if got := sizeToContracts(dec("2"), dec("1"), price, inst); !got.IsZero() {
+		t.Fatalf("at 1x a $2 budget cannot afford one $11.52 contract, got %s", got)
+	}
+	if got := sizeToContracts(dec("2"), dec("10"), price, inst); !got.Equal(dec("1")) {
+		t.Fatalf("at 10x a $2 budget affords one contract, got %s", got)
 	}
 }

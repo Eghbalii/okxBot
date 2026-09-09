@@ -577,14 +577,19 @@ func TestOpenReal_PartialFillRecordsActualSize(t *testing.T) {
 	if open[0].Status != "partial" {
 		t.Errorf("expected Status=partial, got %q", open[0].Status)
 	}
-	// The RL sizing pass sizes to equity(1000) * SizePct(0.5) = 500 USD notional before this fix
-	// would have applied. AccFillSz(2.5)/Sz(5) = 50% actually filled, so the persisted size must be
-	// half of whatever the requested notional was — computed independently here (not derived from
-	// open[0].Size itself, which would make the check tautological).
-	requestedNotional := dec("1000").Mul(dec("0.5"))
-	wantSize := requestedNotional.Mul(dec("0.5")) // 50% fill ratio
+	// Size is MARGIN throughout this codebase, not notional — realizedPnLWithFunding derives the
+	// notional as Size x Leverage, so the two cannot both be Size. Since 2026-09-09 it is derived
+	// from what the exchange actually filled rather than by scaling the request:
+	//
+	//   AccFillSz(2.5) x CtVal(1, unset in this fixture) x AvgPx(100) = $250 notional
+	//   margin = 250 / leverage(5.5, from LeverageFrac 0.5 against MaxLeverage 10) = $45.45
+	//
+	// Computed independently here rather than read back from open[0].Size, which would make the
+	// check tautological.
+	lev := dec("1").Add(dec("0.5").Mul(dec("10").Sub(dec("1")))) // 5.5
+	wantSize := dec("2.5").Mul(dec("100")).Div(lev)
 	if !open[0].Size.Sub(wantSize).Abs().LessThan(dec("0.01")) {
-		t.Errorf("expected recorded size ~%s (50%% of the %s requested notional), got %s", wantSize, requestedNotional, open[0].Size)
+		t.Errorf("expected recorded size ~%s (margin backing the filled 2.5 contracts at 100), got %s", wantSize, open[0].Size)
 	}
 	if !open[0].EntryPx.Equal(dec("100")) {
 		t.Errorf("expected EntryPx=100 (the confirmed AvgPx), got %s", open[0].EntryPx)
