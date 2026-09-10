@@ -104,6 +104,21 @@ var (
 		Help: "Model early-close requests ignored in real trading because the action is disabled, by instrument.",
 	}, []string{"inst_id"})
 
+	// PaperEarlyCloseIgnoredTotal is the paper-trading twin of RealEarlyCloseIgnoredTotal, added
+	// 2026-09-10 after paper trading's own closeEarly was found to discard the request with NO log
+	// and NO metric while real trading recorded both.
+	//
+	// That silence is what made a real symptom unexplainable: SL/TP adjustments appeared to stop
+	// working (690/day on 09-07 down to 1/day), and the actual cause was that the model had
+	// converged to answering "close" on 2150 of 2174 update calls while "update" — the answer that
+	// adjusts SL/TP — fell to 2. The adjustment path was never broken; it was simply no longer the
+	// answer being given. Nothing recorded the 2150 discarded closes, so from the outside the
+	// engine looked idle.
+	PaperEarlyCloseIgnoredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_paper_early_close_ignored_total",
+		Help: "Model early-close requests ignored in paper trading because the action is disabled, by instrument.",
+	}, []string{"inst_id"})
+
 	// KafkaStaleMessagesTotal counts messages dropped for being older than the consumer's
 	// MaxMessageAge (internal/kafkastream). A nonzero, GROWING value means a consumer is working
 	// through a backlog of market data too old to act on — normal and self-clearing right after a

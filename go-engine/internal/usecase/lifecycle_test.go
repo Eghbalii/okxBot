@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"sync"
 	"testing"
 	"time"
@@ -434,5 +436,55 @@ func TestUpdate_CarriesSignalForward(t *testing.T) {
 	}
 	if obs.Signal.Kind != "rsi_sma" || obs.Signal.Side != "buy" {
 		t.Errorf("carried signal = %+v, want the rsi_sma buy that opened the position", obs.Signal)
+	}
+}
+
+// TestCloseEarly_IgnoredRequestIsRecorded covers the observability gap found on 2026-09-10: paper
+// trading's closeEarly returned on the disabled flag with no log and no metric, while RealTrader's
+// equivalent had recorded both since 2026-09-08.
+//
+// The silence is what made a real symptom unexplainable. SL/TP adjustments looked broken (690/day
+// down to 1/day) and the actual cause was that the model had converged to answering "close" on 2150
+// of 2174 update calls, with "update" — the answer that adjusts SL/TP — down to 2. The adjustment
+// path worked the whole time; it was just no longer the answer being given, and nothing recorded
+// the discarded closes.
+func TestCloseEarly_IgnoredRequestIsRecorded(t *testing.T) {
+	repo := newFakeRepository()
+	pt := &PaperTrader{
+		InstID:       "BTC",
+		Repo:         repo,
+		RLEarlyClose: false, // the production setting that suppresses the action
+	}
+	o := port.PaperOrder{ID: 1, InstID: "BTC", Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+	repo.orders[1] = o
+
+	before := testutil.ToFloat64(metrics.PaperEarlyCloseIgnoredTotal.WithLabelValues("BTC"))
+	pt.closeEarly(context.Background(), o, dec("101"), testLogger())
+	after := testutil.ToFloat64(metrics.PaperEarlyCloseIgnoredTotal.WithLabelValues("BTC"))
+
+	if after != before+1 {
+		t.Errorf("expected the suppressed early-close to be counted, got %v -> %v", before, after)
+	}
+	if repo.orders[1].ClosedAt != nil {
+		t.Error("the position must NOT be closed while rl_early_close is off; only the request is recorded")
+	}
+}
+
+// TestCloseEarly_EnabledStillCloses guards the other direction: recording the suppressed case must
+// not accidentally suppress the enabled one too.
+func TestCloseEarly_EnabledStillCloses(t *testing.T) {
+	repo := newFakeRepository()
+	pt := &PaperTrader{
+		InstID:       "BTC",
+		Repo:         repo,
+		RLEarlyClose: true,
+	}
+	o := port.PaperOrder{ID: 1, InstID: "BTC", Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+	repo.orders[1] = o
+
+	pt.closeEarly(context.Background(), o, dec("101"), testLogger())
+
+	if repo.orders[1].ClosedAt == nil {
+		t.Error("expected the position to be closed when rl_early_close is on")
 	}
 }
