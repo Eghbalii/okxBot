@@ -4985,3 +4985,60 @@ marked the gateway complete.
 should have a job for `okx-gateway:9105`, and a Grafana panel showing calls/sec per consumer would
 turn the next rate-limit incident into a glance instead of an investigation. Not done here; the
 counter itself was the blocking gap.
+
+## 41. realized_pnl ignored the exchange's own figures (2026-09-10)
+
+Reported as real orders closing with data that "doesn't update properly" — the reason coming out
+`manual`, and the PnL not updating. Two claims, and checking the live rows separated them.
+
+**The `manual` reason was CORRECT, not a bug.** Every row labelled `manual` also has
+`manual_close_requested = true` — those were genuinely closed from the panel by the operator, not
+mislabelled exchange closes. §37 and §38.2's fixes are working: orders 39-43 all recorded `sl` with
+real exchange close prices. Worth stating plainly because the instinct was to go looking for a
+regression in the close-reason logic, and there wasn't one.
+
+**The PnL claim was real, and worse than it looked.** `closeRealWith` computed `realized_pnl`
+**locally on every close**, even where OKX's own figures had just been fetched two lines above and
+written to adjacent columns — under a comment saying they were "preferred over a local calculation
+that cannot see fees, funding, or the true fill price."
+
+**Why the disagreement read as a puzzle: the two sides measure different things.** OKX's `pnl` on
+the flattening order is **gross** — the price move alone, with the fee reported separately in `fee`
+as a negative charge — while the local `realizedPnL` subtracts its own **estimated** fee from its
+own gross. So the stored column and the exchange column looked like a cross-check that disagreed,
+when in fact **neither held the net figure** the panel shows and the model trains on.
+
+Verified against every closed real order before changing anything: OKX's gross `pnl` equals the pure
+price math `(close-entry)/entry * size * leverage` to the last digit on **all** of them. The exchange
+and this codebase agree completely about the price move. Every discrepancy was the fee:
+
+| rows | what was stored | gap |
+|---|---|---|
+| 39-43 (backfilled by hand, §37.3/§38.3) | OKX's **gross**, no fee subtracted at all | exactly one fee |
+| 32-38 (closed by live code) | local calc with an **estimated** fee | ≈ one fee |
+
+**Fix**: `netRealizedPnL` prefers `exchange gross + exchange fee`, falling back to the local
+calculation only where OKX reported nothing (a `skipExchange` close whose algo order could not be
+read) — an estimated fee still beats no fee. The fee is **added**, not subtracted, because OKX
+reports it negative; subtracting would credit it and overstate every trade by twice its cost. That
+sign is the one thing here that would look plausible on every row while being wrong on all of them,
+so it has its own test.
+
+**This also fixes the model's reward.** `reportTerminalReal` passes the same `pnl`, so every real
+trade was training on a number off by roughly a round-trip fee — and on order 37, off by its
+**sign**: stored as a `-0.0159` loss when the truth is `+0.0017` gross and `-0.0071` net.
+
+**38 historical rows corrected** from OKX's own figures (backup `real_orders_backup_20260910c`);
+every row with an exchange figure now satisfies `realized_pnl = exchange_realized_pnl +
+exchange_fee` exactly.
+
+5 tests, mutation-checked — computing locally, flipping the fee's sign, and ignoring the fee each
+fail their own test. 604 Go tests pass (was 599).
+
+**Deployed** following §35.7: monitoring stopped first (486MB free), `trader` built alone, Kafka
+confirmed `Up 11 hours (healthy)` — no restart — new code verified in the running binary by
+`strings`, config md5 unchanged before and after transfer.
+
+**Not yet observed on a live close**: real mode is `trading_state=stopped`, so the corrected path
+has not run against a fresh close yet. The historical rows are corrected and the tests cover the
+formula, but the first real close after trading resumes is worth checking against OKX directly.
