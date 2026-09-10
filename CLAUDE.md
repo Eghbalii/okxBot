@@ -5042,3 +5042,58 @@ confirmed `Up 11 hours (healthy)` — no restart — new code verified in the ru
 **Not yet observed on a live close**: real mode is `trading_state=stopped`, so the corrected path
 has not run against a fresh close yet. The historical rows are corrected and the tests cover the
 formula, but the first real close after trading resumes is worth checking against OKX directly.
+
+## 42. "SL/TP stopped adjusting" — the model changed its answer, and nothing recorded it (2026-09-10)
+
+Reported as paper trading no longer adjusting SL/TP at all, where it "used to update constantly a
+few days ago". Real, and measurable — `paper_order_adjustments` per day:
+
+| 09-05 | 09-06 | 09-07 | 09-08 | 09-09 | 09-10 |
+|---|---|---|---|---|---|
+| 256 | 541 | **690** | 262 | 26 | **1** |
+
+**Nothing was broken.** `rl_sltp_adjust` is still `true`, `runUpdates` still runs on every throttled
+tick, and one adjustment applied during the investigation itself. What changed is the model's
+**answer**. Over 13 hours of `okxbot_model_update_decisions_total`:
+
+```
+close:  2150
+none:      22
+update:     2   <- the answer that adjusts SL/TP
+```
+
+The giveaway was that `okxbot_controller_updates_total` and the `close` decision counter were
+**identical per instrument** (BTC 89/89, PEPE 389/389): every update call was being answered
+"close".
+
+**Why the model wants out of everything**: paper PnL has been negative every day since 09-04.
+Closing is the only action that acts on that, so a policy learning from those outcomes converges on
+it. That is the model working, not failing.
+
+**But asking to close is not the same as being able to.** `rl_early_close` is off (§15.12 keeps it
+opt-in because early close destroys the counterfactual), so all 2150 requests were discarded — and
+this is the actual defect: **`PaperTrader.closeEarly` discarded them with no log and no metric**,
+while `RealTrader.closeEarly` has recorded both since 2026-09-08. From the outside the engine looked
+idle: the model was asked, answered, and its answer left no trace anywhere.
+
+That silence is what turned a straightforward behavior change into an apparently broken feature. The
+symptom pointed at the adjustment path, which was fine; the cause was one branch up, invisible.
+
+**Fix**: paper now matches real — `okxbot_paper_early_close_ignored_total` plus an info log. No
+policy change: whether to enable `rl_early_close`, or to act on the model wanting out of these
+trades, is a separate decision this does not take. 2 tests, mutation-checked (removing the metric
+and closing anyway each fail). 606 Go tests pass (was 604).
+
+**The general lesson, and it is the same one as §16.9**: a path that declines to act leaves no trace
+unless something is written to make it visible. §16.9 recorded exactly this for `sizeFromAction`'s
+silent fallbacks ("the model was consulted on all 522 signals, answered unusably every time, and the
+metric stayed empty, which read as 'the model was never called'"). This is the same failure shape in
+a different branch — worth noting that the fix there did not generalize, because each suppressed
+path has to be instrumented individually.
+
+**Open question this surfaces, not answered here**: the model asking to exit 99% of open positions
+is a strong signal about the current strategy mix, and it is currently unheard. Either it is right
+(and these trades should not be held), or it has overfit to a losing stretch. The counter now makes
+that answerable — pair `paper_early_close_ignored_total` with how those positions actually resolved
+(SL/TP/timeout) to judge whether the model was right to want out, which is exactly what
+`RealEarlyCloseIgnoredTotal`'s own comment already proposed for real trading.
