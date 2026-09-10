@@ -4927,14 +4927,61 @@ stopped first (1834MB available), `trader` built alone, Kafka confirmed still `U
 (§31's guard), unchanged. The running binary was verified to contain the new code by `strings`,
 not by trusting the build's exit code.
 
-**What deployment did NOT verify, and why**: real mode is `trading_state=stopped` with zero open
-positions and a flat balance, so the poll has nothing observable to do — and neither `cmd/trader`
-nor `cmd/okx-gateway` logs individual requests. The call reduction is proven by the mutation-checked
-test, **not** by production observation. Confirm it against live traffic when real trading next runs.
+**Initially unverifiable in production, then measured.** At first deploy there was no way to observe
+the call reduction on the server: real mode is `trading_state=stopped` with zero open positions and
+a flat balance, so the poll has nothing to log, and neither `cmd/trader` nor `cmd/okx-gateway`
+logged individual requests. §27.1 had described a per-consumer request counter since the gateway was
+designed, and it turned out never to have been implemented (§40) — so the missing measurement was
+built, and the reduction is now confirmed against live traffic:
 
-**Gap found while looking for that proof, not fixed here**: §27.7 describes `cmd/okx-gateway` as
-exposing `okxbot_gateway_requests_total{consumer,endpoint,status}`, and it does not — `:9105/metrics`
-serves only Go runtime metrics. So there is currently **no way to observe OKX call volume per
-consumer**, which is exactly the measurement this section's change is about and the one §38.2's
-rate-limit incident needed. Another instance of §16.10's own lesson: a documented property with no
-check that would fail if it were absent.
+```
+okxbot_gateway_requests_total{consumer="trader",endpoint="account",status="ok"}
+  6 calls in 60 seconds
+```
+
+Which is exactly right: 3 passes/minute at the 20s interval × 2 account calls (GetPositions +
+GetBalance) = 6. The per-engine code would have made 3 × 20 = **60**. A tenfold reduction, measured
+rather than reasoned about.
+
+## 40. The gateway's request counter existed only in this document (2026-09-10)
+
+Found while trying to verify §39's call reduction on the server and discovering there was no way to
+observe OKX call volume at all.
+
+§27.1 has described `okxbot_gateway_requests_total{consumer,endpoint,status}` since the gateway was
+designed — "visibility into exactly who is consuming how much OKX-side budget" — and §27.7 lists a
+"Prometheus metrics endpoint" as delivered. Both were true only on paper: `cmd/okx-gateway` called
+`metrics.Serve(...)`, which starts the HTTP handler, and registered **no metrics of its own**. So
+`:9105/metrics` served Go runtime stats (goroutines, GC, heap) and nothing else.
+
+**Why it mattered more than a missing dashboard.** The gateway is the single process that talks to
+OKX (§27.1), so it is the only place where call volume can be attributed to a consumer. Without the
+counter, §38.2's `50011 Too Many Requests` on `/account/positions` had to be root-caused by reading
+code and reasoning about it — the direct question ("which service is spending the budget?") could
+not be asked at all.
+
+**Fix**: the counter lives in `service.call`, the one choke point every proxied request passes
+through, so a handler added later is counted without anyone remembering to instrument it. Being held
+back by the gateway's OWN limiter is counted as `rate_limited` rather than `error` — that is a
+capacity signal, while an error is a request that actually went out and failed, and conflating the
+two would hide exactly the case this counter exists to expose. A request with no
+`X-Gateway-Consumer` header counts under `unknown` rather than being dropped: `consumerAndPriority`
+already defaults it that way rather than rejecting the request, and traffic from a service that
+forgot the header is precisely what should not be invisible here.
+
+3 tests, mutation-checked (reporting every outcome as `ok` fails the error test; hardcoding the
+consumer label fails all three). 599 Go tests total.
+
+**It paid for itself within a minute of deploying** — see §39's measurement, which was impossible an
+hour earlier and is now a single `curl`.
+
+Another instance of §16.10's lesson, which this project keeps relearning: **a documented property
+needs a check that would fail if it were absent.** Prose in this file is not that check. Both §11.2's
+`restart: unless-stopped` and §11's VPN-only network model read as settled decisions for months
+while being absent from `docker-compose.yml`; this counter read as delivered in a checklist that
+marked the gateway complete.
+
+**Still open**: the counter is registered but nothing scrapes it usefully yet — `prometheus.yml`
+should have a job for `okx-gateway:9105`, and a Grafana panel showing calls/sec per consumer would
+turn the next rate-limit incident into a glance instead of an investigation. Not done here; the
+counter itself was the blocking gap.
