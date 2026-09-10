@@ -4864,3 +4864,77 @@ Orders 41 and 43 were corrected from OKX's own records the same way §37.3 handl
 `realized_pnl` recomputed from each corrected close price **independently reproduced OKX's own
 figures to the cent** (−0.237 and −0.07692), which is what confirms the prices rather than merely
 making the columns agree. All six real orders (38-43) now carry truthful reasons, prices and fees.
+
+## 39. One account-wide reconciliation pass, not one per token (2026-09-10)
+
+Operator's own observation, following §38.2's rate-limit finding: "seems like we run it for each
+token separately, but we can do it all together, right?" — correct, and the fix §38.2 applied
+(raising the interval 5s → 20s) had only slowed the waste rather than removed it.
+
+**The shape of the problem.** `GetPositions` takes an `instType`; `GetBalance` takes a settlement
+currency. Neither takes an instrument — both are **account-scoped** and return the identical
+response to every engine. But `reconcile` ran per `RealTrader`, so a 10-token roster issued **20
+calls per cycle to learn what 2 calls carry**. That is what OKX rate-limited with `50011` on
+`/account/positions` and `/account/balance`, and it is not cosmetic: a pass that cannot read
+positions cannot detect drift, and one that cannot read the protective order records a real close
+as `manual` at the entry price (§37's bug).
+
+**Fix**: `usecase.AccountSnapshot` carries the two reads; `usecase.ReconcileDriver` owns the cadence
+and hands the same snapshot to every engine's new `ReconcileWith`. Per-instrument work is untouched
+and still per-instrument — verifying each open position's own protective order via `GetAlgoOrder`
+genuinely differs per engine and stays inside it.
+
+Every **decision** about a position stays in `ReconcileWith`. That is the same principle §35.4
+applied to the WebSocket push: one definition of how this system responds to a position change, and
+a second would be free to drift from it in a way only visible when the two disagreed about real
+money.
+
+**The WebSocket push now enters at `ReconcileDriver.ReconcileInstrument`**, which fetches a **fresh**
+snapshot rather than reusing the periodic one (explicit operator decision). A push means that
+instrument genuinely changed, so acting on data up to a full interval old would give up exactly the
+latency the socket exists to provide. It still costs 2 calls, not one per engine.
+
+**Equity recording moved to the driver too**, and this was the subtler half. `recordEquityReal`
+writes ONE shared `account_equity` row, so ten engines calling it opened **ten transactions for one
+row's work** — and when the delta was nonzero, whichever engine ran first stamped its own `instID`
+on the history row, attributing an account-wide balance change to one arbitrary token.
+
+**`ReconciledExternally`** lets a `RealTrader` keep its own loop when no driver is wired. Dropping
+the loop outright would make an engine's safety depend on a caller remembering to wire a driver —
+`cmd/trader` sets the flag, and a source-level test fails if it is ever removed, the same guard
+`buildRealTraderClamps` has for the same reason (§23: a field silently dropped from a large inline
+struct literal is what left every real position uncapped).
+
+**The call COUNT is the behavior under test.** A per-engine poll and a shared one are
+indistinguishable by their effect on positions — which is precisely why this went unnoticed for
+months — so `fakeExchangeClient` now counts `GetPositions`/`GetBalance` calls and the test asserts
+1, not 11.
+
+**A test that passed against the broken code, and what it taught.** The first equity test asserted
+on the resulting history ROWS and passed under mutation, because the fake (correctly mirroring
+Postgres) computes its delta from `AccountBalanceUSD`, which the first engine already updated — so
+the nine redundant calls each saw a zero delta and wrote nothing. The test was proving the
+repository is idempotent, not that the driver calls it once. Rewritten to count calls. Worth
+remembering: when the waste is *redundant work* rather than *wrong data*, asserting on the data
+cannot see it.
+
+9 new tests, every one mutation-checked (each fails with its own fix reverted; the per-engine-fetch
+mutation reproduces `got 11` exactly). 596 Go tests pass under `-race` (was 587).
+
+**Deployed 2026-09-10** following §35.7's procedure: 239MB free, so `grafana`/`prometheus` were
+stopped first (1834MB available), `trader` built alone, Kafka confirmed still `Up 11 hours (healthy)`
+— no restart — then monitoring resumed. Config md5 checked before and after the file transfer
+(§31's guard), unchanged. The running binary was verified to contain the new code by `strings`,
+not by trusting the build's exit code.
+
+**What deployment did NOT verify, and why**: real mode is `trading_state=stopped` with zero open
+positions and a flat balance, so the poll has nothing observable to do — and neither `cmd/trader`
+nor `cmd/okx-gateway` logs individual requests. The call reduction is proven by the mutation-checked
+test, **not** by production observation. Confirm it against live traffic when real trading next runs.
+
+**Gap found while looking for that proof, not fixed here**: §27.7 describes `cmd/okx-gateway` as
+exposing `okxbot_gateway_requests_total{consumer,endpoint,status}`, and it does not — `:9105/metrics`
+serves only Go runtime metrics. So there is currently **no way to observe OKX call volume per
+consumer**, which is exactly the measurement this section's change is about and the one §38.2's
+rate-limit incident needed. Another instance of §16.10's own lesson: a documented property with no
+check that would fail if it were absent.
