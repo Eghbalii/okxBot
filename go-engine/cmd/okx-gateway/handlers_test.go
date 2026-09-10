@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -362,4 +364,67 @@ func (f *fakeExchange) AmendAlgoOrder(req domain.AlgoOrderAmend) error { return 
 func (f *fakeExchange) CancelAlgoOrder(instID, algoID string) error    { return nil }
 func (f *fakeExchange) GetAlgoOrder(instID, algoID string) (domain.AlgoOrderStatus, error) {
 	return domain.AlgoOrderStatus{AlgoID: algoID, InstID: instID, State: "live"}, nil
+}
+
+// TestCall_CountsRequestsByConsumer covers the counter §27.1 described from the start and that was
+// found unimplemented on 2026-09-10 — the gateway served promhttp.Handler() but registered nothing
+// of its own, so :9105 carried only Go runtime stats and there was no way to see which service was
+// spending the OKX rate-limit budget. That is precisely the measurement §38.2's 50011 incident
+// needed and did not have.
+func TestCall_CountsRequestsByConsumer(t *testing.T) {
+	svc := newTestService(&fakeExchange{})
+
+	before := testutil.ToFloat64(metrics.GatewayRequestsTotal.WithLabelValues("trader", "account", "ok"))
+
+	req := httptest.NewRequest(http.MethodGet, "/positions", nil)
+	req.Header.Set("X-Gateway-Consumer", "trader")
+	if err := svc.call(req.Context(), gateway.ClassAccount, req, func() error { return nil }); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+
+	after := testutil.ToFloat64(metrics.GatewayRequestsTotal.WithLabelValues("trader", "account", "ok"))
+	if after != before+1 {
+		t.Errorf("expected the successful call to be counted once, got %v -> %v", before, after)
+	}
+}
+
+// TestCall_CountsAFailedRequestAsError keeps a failing request distinguishable from a successful
+// one: a counter that reported every attempt as "ok" would make an outage look like healthy traffic.
+func TestCall_CountsAFailedRequestAsError(t *testing.T) {
+	svc := newTestService(&fakeExchange{})
+
+	before := testutil.ToFloat64(metrics.GatewayRequestsTotal.WithLabelValues("paper-trader", "market", "error"))
+
+	req := httptest.NewRequest(http.MethodGet, "/candles", nil)
+	req.Header.Set("X-Gateway-Consumer", "paper-trader")
+	if err := svc.call(req.Context(), gateway.ClassMarket, req, func() error {
+		return errors.New("instrument not found")
+	}); err == nil {
+		t.Fatal("expected the underlying error to be returned to the caller")
+	}
+
+	after := testutil.ToFloat64(metrics.GatewayRequestsTotal.WithLabelValues("paper-trader", "market", "error"))
+	if after != before+1 {
+		t.Errorf("expected the failed call to be counted as an error, got %v -> %v", before, after)
+	}
+}
+
+// TestCall_UnattributedConsumerIsCountedAsUnknown: consumerAndPriority defaults a missing header to
+// "unknown" rather than rejecting the request, so the counter must carry that through — traffic
+// from a service that forgot the header would otherwise be invisible, which is the opposite of what
+// this metric is for.
+func TestCall_UnattributedConsumerIsCountedAsUnknown(t *testing.T) {
+	svc := newTestService(&fakeExchange{})
+
+	before := testutil.ToFloat64(metrics.GatewayRequestsTotal.WithLabelValues("unknown", "account", "ok"))
+
+	req := httptest.NewRequest(http.MethodGet, "/balance", nil) // no X-Gateway-Consumer header
+	if err := svc.call(req.Context(), gateway.ClassAccount, req, func() error { return nil }); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+
+	after := testutil.ToFloat64(metrics.GatewayRequestsTotal.WithLabelValues("unknown", "account", "ok"))
+	if after != before+1 {
+		t.Errorf("expected an unattributed call to count under \"unknown\", got %v -> %v", before, after)
+	}
 }

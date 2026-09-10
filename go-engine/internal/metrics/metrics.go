@@ -8,6 +8,21 @@ import (
 )
 
 var (
+	// GatewayRequestsTotal counts every request cmd/okx-gateway proxies to OKX, by which service
+	// asked, which endpoint class it fell under, and how it ended ("ok" / "rate_limited" / "error").
+	//
+	// This is the only way to see OKX-side call volume per consumer. The gateway is the single
+	// process that talks to OKX (CLAUDE.md §27.1), so without this counter a rate-limit incident
+	// gives no way to tell WHICH service is spending the budget — §38.2's 50011 on
+	// /account/positions had to be root-caused by reading code rather than by looking. Described in
+	// §27.1 from the start and found unimplemented on 2026-09-10: the gateway served
+	// promhttp.Handler() but registered no metrics of its own, so :9105 carried only Go runtime
+	// stats.
+	GatewayRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_gateway_requests_total",
+		Help: "Total OKX requests proxied by the gateway, by consumer, endpoint class and outcome.",
+	}, []string{"consumer", "endpoint", "status"})
+
 	// StrategySignalsTotal counts every strategy evaluation result, including holds.
 	StrategySignalsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "okxbot_strategy_signals_total",

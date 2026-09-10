@@ -11,6 +11,7 @@ import (
 
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 	"github.com/eghbalii/okxBot/go-engine/internal/gateway"
+	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 )
 
 // exchangeClient is the narrow slice of rest.Client this service calls — kept as an interface so
@@ -111,12 +112,25 @@ func isRetryableOKXError(err error) bool {
 	return strings.Contains(msg, "code=50011") || strings.Contains(msg, "code=50061")
 }
 
+// call is the one choke point every proxied OKX request passes through, which is why the request
+// counter lives here rather than in each handler — a handler added later is counted without anyone
+// remembering to instrument it.
 func (s *service) call(ctx context.Context, class gateway.EndpointClass, r *http.Request, fn func() error) error {
 	consumer, priority := consumerAndPriority(r)
 	if err := s.limiter.Acquire(ctx, class, consumer, priority); err != nil {
+		// Counted separately from a plain error: being held back by our OWN limiter is a capacity
+		// signal, while an OKX error is a request that actually went out and failed. Conflating
+		// them would hide exactly the case this counter exists to expose.
+		metrics.GatewayRequestsTotal.WithLabelValues(consumer, string(class), "rate_limited").Inc()
 		return err
 	}
-	return s.retry.Do(ctx, isRetryableOKXError, fn)
+	err := s.retry.Do(ctx, isRetryableOKXError, fn)
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+	metrics.GatewayRequestsTotal.WithLabelValues(consumer, string(class), status).Inc()
+	return err
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
