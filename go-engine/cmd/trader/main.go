@@ -362,6 +362,11 @@ func runRealTrader(
 			FillTimeout: time.Duration(cfg.FillTimeout.OrderFillTimeoutSec) * time.Second,
 
 			OrderEvents: orderEventsPub,
+
+			// The reconciliation poll is driven once for the whole roster by reconcileDriver below,
+			// not per engine (2026-09-10) — GetPositions/GetBalance are account-wide, so a
+			// per-engine poll multiplied one call by the roster size and hit OKX's rate limit.
+			ReconciledExternally: true,
 		}
 		engines[instID] = engine
 		delay := time.Duration(i) * engineStartStagger
@@ -405,6 +410,21 @@ func runRealTrader(
 		}
 	}()
 
+	// One reconciliation poll for the whole roster, replacing the per-engine loop each RealTrader
+	// used to run (2026-09-10). GetPositions and GetBalance are ACCOUNT-wide — they take no
+	// instrument and returned an identical response to all 10 engines — so the old shape issued 20
+	// calls per cycle to learn what 2 calls carry, and OKX rate-limited it (CLAUDE.md §38.2).
+	// Per-position work (verifying each protective order via GetAlgoOrder) is genuinely
+	// per-instrument and still runs inside each engine.
+	reconcileDriver := &usecase.ReconcileDriver{
+		Engines:   engines,
+		Exchange:  exchangeClient,
+		Logger:    logger,
+		InstType:  cfg.Trading.ExecInstType,
+		SettleCcy: cfg.Trading.ExecSettleCcy,
+	}
+	go func() { errCh <- reconcileDriver.Run(ctx) }()
+
 	// Account events pushed by OKX's private WebSocket, republished onto the bus by cmd/okx-gateway
 	// (2026-09-09 request: keep positions synced with the exchange, ideally by socket rather than
 	// polling). Each event names an instrument whose position/order state just changed on the
@@ -427,15 +447,11 @@ func runRealTrader(
 				logger.Warn("could not decode account event", "error", err)
 				return nil
 			}
-			engine, ok := engines[event.InstID]
-			if !ok {
-				// An event for an instrument this process does not trade — another roster, or an
-				// instrument disabled since. Nothing to reconcile, and not an error.
-				return nil
-			}
 			logger.Info("exchange pushed an account change; reconciling now",
 				"channel", event.Channel, "instId", event.InstID)
-			engine.ReconcileNow(ctx, logger)
+			// Returns false for an instrument this process does not trade — another roster, or one
+			// disabled since. Nothing to reconcile, and not an error.
+			reconcileDriver.ReconcileInstrument(ctx, event.InstID)
 			return nil
 		})
 	}()

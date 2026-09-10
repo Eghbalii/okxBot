@@ -21,16 +21,18 @@ import (
 // which can call into the repository concurrently (real Postgres handles this natively; this
 // fake must emulate that instead of assuming single-goroutine test access).
 type fakeRepository struct {
-	mu                 sync.Mutex
-	nextID             int64
-	orders             map[int64]port.PaperOrder
-	candles            []port.Candle
-	accounts           map[string]port.AccountEquity
-	equityPoints       []port.EquityPoint
-	paramChanges       []port.ParamChange
-	orderAdjustments   []port.PaperOrderAdjustment
-	paperTradingConfig map[string]*port.PaperTradingConfig
-	fundingRates       []port.FundingRate
+	mu           sync.Mutex
+	nextID       int64
+	orders       map[int64]port.PaperOrder
+	candles      []port.Candle
+	accounts     map[string]port.AccountEquity
+	equityPoints []port.EquityPoint
+	// recordExchangeBalanceCalls counts calls, not their effect — see RecordExchangeBalance below.
+	recordExchangeBalanceCalls int
+	paramChanges               []port.ParamChange
+	orderAdjustments           []port.PaperOrderAdjustment
+	paperTradingConfig         map[string]*port.PaperTradingConfig
+	fundingRates               []port.FundingRate
 
 	// realOrders uses its own counter (nextRealID), deliberately NOT sharing nextID with the
 	// paper orders map — real_orders and paper_orders are independent Postgres sequences post-
@@ -661,6 +663,11 @@ func (r *fakeRepository) ApplyRealizedPnL(ctx context.Context, mode string, pnl 
 func (r *fakeRepository) RecordExchangeBalance(ctx context.Context, mode string, rawBalanceUSD, safeMoneyUSD decimal.Decimal, instID string) (port.AccountEquity, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Counted because the real implementation opens a TRANSACTION per call against one shared
+	// account row: a redundant call is invisible in the resulting data (the second sees a zero
+	// delta and writes no history row) but is real database work, so the count is the only way to
+	// observe it.
+	r.recordExchangeBalanceCalls++
 	ae, ok := r.accounts[mode]
 	if !ok {
 		return port.AccountEquity{}, fmt.Errorf("record exchange balance: no account row for mode %s", mode)

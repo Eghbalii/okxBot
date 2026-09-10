@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -39,6 +40,13 @@ type fakeExchangeClient struct {
 	orderStatus      *domain.OrderStatus
 	getOrderErr      error
 	getOrderCalls    int
+
+	// callMu guards the account-call counters below: the reconciliation driver reconciles engines
+	// in sequence but tests may drive passes concurrently, and the race detector is the point.
+	callMu            sync.Mutex
+	getPositionsCalls int
+	getBalanceCalls   int
+	getPositionsErr   error
 
 	cancelOrderCalls []string // ordIDs passed to CancelOrder
 	cancelOrderErr   error
@@ -121,10 +129,34 @@ func (f *fakeExchangeClient) GetTicker(instID string) (domain.Ticker, error) {
 	return f.ticker, nil
 }
 func (f *fakeExchangeClient) GetPositions(instType string) ([]domain.Position, error) {
+	f.callMu.Lock()
+	f.getPositionsCalls++
+	f.callMu.Unlock()
+	if f.getPositionsErr != nil {
+		return nil, f.getPositionsErr
+	}
 	return f.positions, nil
 }
 func (f *fakeExchangeClient) GetBalance(ccy string) ([]domain.Balance, error) {
+	f.callMu.Lock()
+	f.getBalanceCalls++
+	f.callMu.Unlock()
 	return f.balances, nil
+}
+
+// PositionsCalls/BalanceCalls report how many times the ACCOUNT-wide endpoints were hit. These are
+// counted because the call COUNT is itself the behavior under test for the shared reconciliation
+// snapshot (2026-09-10) — a per-engine poll and a shared one are indistinguishable by their effect
+// on positions, and differ only in how many times they ask the exchange.
+func (f *fakeExchangeClient) PositionsCalls() int {
+	f.callMu.Lock()
+	defer f.callMu.Unlock()
+	return f.getPositionsCalls
+}
+func (f *fakeExchangeClient) BalanceCalls() int {
+	f.callMu.Lock()
+	defer f.callMu.Unlock()
+	return f.getBalanceCalls
 }
 func (f *fakeExchangeClient) GetCandles(instID, bar string, limit int) ([]domain.Candle, error) {
 	return nil, nil

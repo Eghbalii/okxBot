@@ -117,6 +117,11 @@ type RealTrader struct {
 	// comment on why this is deliberately not a tight loop. Zero falls back to the constant below.
 	ReconcileInterval time.Duration
 
+	// ReconciledExternally tells Run not to start this engine's own reconciliation loop because a
+	// ReconcileDriver is polling the account once on the whole roster's behalf. See AccountSnapshot
+	// for why per-engine polling was the wrong shape.
+	ReconciledExternally bool
+
 	// FillTimeout bounds how long a placed market order (open or the flattening close order) is
 	// given to fill before it's CANCELED and given up on (CLAUDE.md §27.5) — no automatic retry or
 	// re-pricing; the next real signal on its own normal cadence is what tries again. Futures market
@@ -625,9 +630,16 @@ func (e *RealTrader) Run(ctx context.Context) error {
 			})
 		}()
 	}
-	go func() {
-		errCh <- e.runReconcileLoop(ctx, logger)
-	}()
+	// Skipped when a ReconcileDriver owns this engine's reconciliation (2026-09-10): the driver
+	// runs ONE account-wide pass for the whole roster rather than each engine polling the same
+	// account-scoped endpoints independently. Left in place otherwise so a RealTrader run on its
+	// own is still reconciled — dropping the loop outright would make an engine's safety depend on
+	// a caller remembering to wire a driver.
+	if !e.ReconciledExternally {
+		go func() {
+			errCh <- e.runReconcileLoop(ctx, logger)
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -1710,17 +1722,19 @@ func (e *RealTrader) runReconcileLoop(ctx context.Context, logger *slog.Logger) 
 	}
 }
 
-// ReconcileNow runs one reconciliation pass immediately, outside the periodic loop's own cadence.
+// ReconcileNow runs one reconciliation pass for this instrument immediately, fetching its own
+// account snapshot.
 //
-// This is what the private WebSocket calls when OKX pushes a position/order/account event for this
-// instrument (2026-09-09): the push says "something changed", and reconcile is already the code
-// that works out what and responds to it. Routing the push through the same path rather than
-// giving the socket its own parallel handling means there is ONE definition of how this system
-// responds to a position change — a second one would be free to drift from it, and the drift would
-// only show up when the two disagreed about a real position.
+// The private WebSocket push no longer comes through here — it goes to
+// ReconcileDriver.ReconcileInstrument (2026-09-10), which fetches ONE snapshot rather than letting
+// a per-engine call re-read account-wide data. The routing principle is unchanged and still the
+// reason both paths converge on ReconcileWith: there is ONE definition of how this system responds
+// to a position change, and a second would be free to drift from it in a way only visible when the
+// two disagreed about a real position.
 //
-// Safe to call concurrently with the periodic loop: reconcile re-reads both sides before acting,
-// so a redundant pass is a no-op rather than a double-close.
+// Kept for an engine running without a driver, and used directly by tests. Safe to call
+// concurrently with the periodic loop: reconcile re-reads both sides before acting, so a redundant
+// pass is a no-op rather than a double-close.
 func (e *RealTrader) ReconcileNow(ctx context.Context, logger *slog.Logger) {
 	if logger == nil {
 		logger = e.Logger
@@ -1731,28 +1745,43 @@ func (e *RealTrader) ReconcileNow(ctx context.Context, logger *slog.Logger) {
 	e.reconcile(ctx, logger)
 }
 
-// reconcile is the one-shot comparison runReconcileLoop calls on each tick of its own ticker.
-// Exported as a method (not folded into the loop) so tests can call it directly without waiting on
-// a real ticker.
+// reconcile fetches an account snapshot of its own and runs one pass for this instrument.
+//
+// Prefer ReconcileWith when a snapshot is already in hand: GetPositions/GetBalance are ACCOUNT-wide
+// (they take no instrument and return the same response to every engine), so a per-engine fetch
+// multiplies one call by the size of the roster. See AccountSnapshot.
 func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
+	snap, err := FetchAccountSnapshot(e.Exchange, e.execInstType(), e.settleCcy())
+	if err != nil {
+		logger.Warn("reconcile: account snapshot failed", "instId", e.InstID, "error", err)
+		return
+	}
+	e.ReconcileWith(ctx, snap, logger)
+}
+
+// ReconcileWith runs one reconciliation pass for this instrument against an already-fetched
+// account snapshot (2026-09-10). Splitting the fetch out is what lets one pass serve the whole
+// roster: the per-instrument work below (the drift comparison, the protective-order verification,
+// the missed-SL/TP catch) genuinely differs per engine, but the two account-wide reads it used to
+// issue did not.
+//
+// Equity recording is deliberately NOT done here — it writes one shared account row, so the caller
+// does it once per snapshot rather than once per engine. See recordEquityReal.
+func (e *RealTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, logger *slog.Logger) {
+	if logger == nil {
+		logger = e.Logger
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	// Held for the whole pass, not just the read: the decision made here is derived from both
 	// sides' state, so releasing between reading and acting would leave exactly the window a
 	// second caller could act on the same difference.
 	e.reconcileMu.Lock()
 	defer e.reconcileMu.Unlock()
 
-	remotePositions, err := e.Exchange.GetPositions(e.execInstType())
-	if err != nil {
-		logger.Warn("reconcile: get positions failed", "instId", e.InstID, "error", err)
-		return
-	}
-	var remote *domain.Position
-	for i := range remotePositions {
-		if remotePositions[i].InstID == e.execInstID() && !remotePositions[i].Pos.IsZero() {
-			remote = &remotePositions[i]
-			break
-		}
-	}
+	remote := snap.PositionFor(e.execInstID())
 
 	local, err := e.openPositions(ctx)
 	if err != nil {
@@ -1834,11 +1863,6 @@ func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
 		}
 	}
 
-	if balances, err := e.Exchange.GetBalance(e.settleCcy()); err != nil {
-		logger.Warn("reconcile: get balance failed", "instId", e.InstID, "error", err)
-	} else if len(balances) > 0 {
-		e.recordEquityReal(ctx, balances[0].Eq, logger)
-	}
 }
 
 // recordEquityReal mirrors trade.go's Trader.recordEquity: the exchange's reported balance is

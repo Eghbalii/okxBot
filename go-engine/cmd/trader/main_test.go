@@ -154,3 +154,28 @@ func TestRestartHandlerExitCodeMatchesRestartPolicy(t *testing.T) {
 		t.Error("trader should use restart: unless-stopped so an operator-requested restart always relaunches")
 	}
 }
+
+// TestEnginesAreMarkedReconciledExternally guards a field whose absence is silent (2026-09-10):
+// dropping ReconciledExternally from main()'s engine literal makes every engine start its OWN
+// reconciliation loop again, alongside the shared driver — restoring exactly the per-token account
+// polling that hit OKX's rate limit (CLAUDE.md §38.2), with no error and no behavioral difference
+// except the call volume.
+//
+// Asserted against the source rather than a constructor because the engine literal lives inline in
+// main(); this is the same class of guard as buildRealTraderClamps' own tests, which exist because a
+// field silently dropped from a large struct literal is precisely what left every real position
+// uncapped (§23).
+func TestEnginesAreMarkedReconciledExternally(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	if !strings.Contains(string(src), "ReconciledExternally: true") {
+		t.Error("cmd/trader must set ReconciledExternally on every engine: without it each engine " +
+			"restarts its own reconciliation poll and the shared driver's whole purpose is lost")
+	}
+	if !strings.Contains(string(src), "reconcileDriver.Run(ctx)") {
+		t.Error("cmd/trader must run the shared ReconcileDriver: with ReconciledExternally set and " +
+			"no driver running, nothing reconciles real positions at all")
+	}
+}
