@@ -4789,3 +4789,78 @@ select pg_typeof(coalesce(NULL::text[], '{}'::text[])) -> text[]
 Rebuilt all three services that link the function (`api`, `paper-trader`, and `trader` via
 `AffordabilityService`). The affordability caller never failed because it always sets the field —
 which also means the bug was invisible to the one path that exercised the new column most often.
+
+## 38. Three bugs stacked behind one error message (2026-09-10)
+
+Reported as one thing — a manual SL/TP edit from the panel failing — and it was three defects in a
+row, each only visible once the one in front of it was cleared. Worth recording as a sequence,
+because the lesson is that each "fix" looked complete until the next layer answered.
+
+**1. `cmd/api` had no `OKX_GATEWAY_URL`.** §35 added a gateway client to it for the manual edit
+without adding the env var, so `config.Load`'s own `http://localhost:8094` default applied — which
+inside that container is its own loopback, not the gateway. Presented as
+`dial tcp [::1]:8094: connect: connection refused`. The Manage Tokens affordability column shares
+that client and had the same latent gap. Fixed in `docker-compose.yml`, plus a `depends_on` so
+`api` cannot start before the gateway.
+
+**2. Prices were not rounded to the instrument's tick.** With the request finally reaching OKX, it
+was rejected. A level derived from a percentage lands on arbitrary decimals — `100.41424` against
+SOL's `0.01` tick. `domain.Instrument` did not carry `tickSz` at all, so nothing could have rounded
+it. Now decoded and applied everywhere a price reaches the exchange: levels rested at open, the
+model's in-trade amends, and the operator's manual edit. The manual path stores the ROUNDED price,
+so the panel shows the level the exchange is actually enforcing rather than the one requested.
+Ticks on this account span `0.01` (SOL, ETH) to `1e-9` (PEPE), so a fixed precision would have been
+wrong for most instruments.
+
+**3. The trigger-price TYPE was missing.** Still rejected, now with `code=1` and an empty message.
+Recovered by replaying the request by hand against the account:
+
+```
+sCode=51000  sMsg="Parameter newTpTriggerPxType error"
+```
+
+OKX requires `slTriggerPxType`/`tpTriggerPxType` whenever a take-profit side is present, on both
+the place and amend paths. **This is why every real position has been opening with a stop and
+`TPTriggerPx: 0`** — OKX silently dropped the TP side rather than failing the placement, so every
+real position has run with no take-profit on the exchange since §35 shipped. `"last"` is chosen
+deliberately: the in-process backup monitor compares against the last traded price, so exchange and
+backup now agree on what counts as a touch; mark price would have them disagree exactly when it
+matters.
+
+### 38.1 The error handling is what hid it
+
+OKX's `code=1` means "an item in this batch failed" and its top-level `msg` is **empty** — the
+reason is per-item in `data[].sMsg`. `rest.Client.do` reported only the envelope, turning a
+perfectly specific rejection into `code=1 msg=`. That cost two rounds of debugging before the
+message was recovered manually. `firstItemError` now surfaces the per-item detail.
+
+**Only `cmd/okx-gateway` links `internal/okx/rest`** in production — every other service reaches
+OKX through it. I rebuilt `api` twice before checking that, which was wasted time on a box where a
+build takes ~10 minutes. Verify which binary actually contains a changed package (`grep -rln` over
+`cmd/`) before choosing what to rebuild.
+
+### 38.2 A fired stop read a beat too early, and a poll that rate-limited itself
+
+Real order 43 closed minutes after §37's fix shipped and was STILL recorded as `manual` at its
+entry price. Two further causes, both in its own logs:
+
+- OKX reports `state="effective"` the instant a protective order fires but fills in WHICH side
+  fired a beat later. The poll read it ~1s after the trigger, got an empty `actualSide`, and fell
+  back to manual; the same read moments later carried `actualSide="sl"`. Now retried briefly — this
+  is a close being recorded once, and getting its reason and real close price right is worth a
+  one-second wait on a path that only runs when a position has just disappeared.
+- The same logs showed `50011 Too Many Requests` on `/account/positions` and `/account/balance`.
+  The reconciliation poll runs **per instrument**, so §35.4's 5s cadence issued 20 account-class
+  calls every 5 seconds across a 10-token roster — for two endpoints that are account-wide and
+  return identical data to every one of them. Not harmless: a pass that cannot read positions
+  cannot detect drift, and one that cannot read the protective order falls back to manual. Raised
+  to 20s. **The right fix is one account-wide poll shared across instruments rather than N
+  identical ones**, which is a larger change than a constant.
+
+### 38.3 History corrected
+
+Orders 41 and 43 were corrected from OKX's own records the same way §37.3 handled 39/40 (backup in
+`real_orders_backup_20260910b`); 42 was closed by our own flatten and only lacked its fee.
+`realized_pnl` recomputed from each corrected close price **independently reproduced OKX's own
+figures to the cent** (−0.237 and −0.07692), which is what confirms the prices rather than merely
+making the columns agree. All six real orders (38-43) now carry truthful reasons, prices and fees.
