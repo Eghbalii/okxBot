@@ -1581,3 +1581,103 @@ func TestReconcile_LeavesAHealthyPositionOpen(t *testing.T) {
 		t.Fatal("a position inside its own levels must not be closed by reconciliation")
 	}
 }
+
+// TestNetRealizedPnL_PrefersTheExchangeAndSubtractsItsFee covers the defect found on 2026-09-10:
+// realized_pnl was ALWAYS computed locally even when OKX's own figures had just been fetched two
+// lines above and stored in adjacent columns.
+//
+// The two sides measure different things, which is what made the disagreement look like a puzzle:
+// OKX's pnl is GROSS (price move only, fee reported separately and negative), while the local
+// realizedPnL subtracts its own ESTIMATED fee from its own gross. Neither column held the net
+// number the panel shows and the model trains on.
+func TestNetRealizedPnL_PrefersTheExchangeAndSubtractsItsFee(t *testing.T) {
+	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+
+	gross := dec("0.0221")
+	fee := dec("-0.008667") // OKX reports the fee as a negative charge
+	got := netRealizedPnL(o, dec("101"), &gross, &fee)
+
+	// Real order 42's own numbers: 0.0221 gross - 0.008667 fee = 0.013433 net.
+	if want := dec("0.013433"); !got.Equal(want) {
+		t.Errorf("expected the exchange's gross minus its fee (%s), got %s", want, got)
+	}
+}
+
+// TestNetRealizedPnL_AddsTheFeeRatherThanSubtractingIt guards the sign. OKX reports the fee as a
+// negative number, so it must be ADDED; subtracting would credit the fee and overstate every single
+// trade by twice its cost — a bug that would look plausible on every row and be wrong on all of them.
+func TestNetRealizedPnL_AddsTheFeeRatherThanSubtractingIt(t *testing.T) {
+	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+
+	gross := dec("1.0")
+	fee := dec("-0.25")
+	got := netRealizedPnL(o, dec("110"), &gross, &fee)
+
+	if !got.Equal(dec("0.75")) {
+		t.Errorf("a negative fee must reduce the result to 0.75, got %s (subtracting it would give 1.25)", got)
+	}
+	if got.GreaterThan(gross) {
+		t.Errorf("net pnl (%s) must never exceed gross (%s) when a fee was charged", got, gross)
+	}
+}
+
+// TestNetRealizedPnL_FallsBackToLocalWhenTheExchangeReportedNothing: a close OKX did not report on
+// (a skipExchange close whose algo order could not be read) still needs a number, and the local
+// estimate is much closer to the truth than no fee at all.
+func TestNetRealizedPnL_FallsBackToLocalWhenTheExchangeReportedNothing(t *testing.T) {
+	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+
+	got := netRealizedPnL(o, dec("110"), nil, nil)
+	want := realizedPnL(o, dec("110"))
+	if !got.Equal(want) {
+		t.Errorf("with no exchange figures the local calculation must be used: want %s, got %s", want, got)
+	}
+	if got.IsZero() {
+		t.Error("the fallback must produce a real number, not zero")
+	}
+}
+
+// TestNetRealizedPnL_ExchangeGrossWithNoFeeReported keeps "OKX did not tell us the fee" distinct
+// from "the fee was zero": the gross figure is still better than a local estimate because it is
+// derived from the true fill price.
+func TestNetRealizedPnL_ExchangeGrossWithNoFeeReported(t *testing.T) {
+	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+
+	gross := dec("0.486")
+	got := netRealizedPnL(o, dec("104"), &gross, nil)
+	if !got.Equal(gross) {
+		t.Errorf("expected the exchange's gross to be used unchanged when no fee was reported, got %s", got)
+	}
+}
+
+// TestCloseRealWith_StoresTheExchangeNetAsRealizedPnL is the end-to-end guard: the stored
+// realized_pnl must be the exchange-derived net, not the local estimate. Real order 37 is the case
+// that made this matter — stored as a 0.0159 LOSS when the exchange's own figures make it a 0.0071
+// loss, off by roughly a full round-trip fee.
+func TestCloseRealWith_StoresTheExchangeNetAsRealizedPnL(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+
+	o := port.RealOrder{
+		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
+		EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1"),
+	}
+	repo.realOrders[1] = o
+
+	gross := dec("0.0017")
+	fee := dec("-0.008776")
+	facts := &exchangeCloseFacts{PnL: &gross, Fee: &fee}
+	if err := rt.closeRealWith(context.Background(), o, dec("101"), "sl", true, facts, testLogger()); err != nil {
+		t.Fatalf("closeRealWith: %v", err)
+	}
+
+	stored := repo.realOrders[1].RealizedPnL
+	if stored == nil {
+		t.Fatal("expected realized pnl to be stored")
+	}
+	if want := dec("-0.007076"); !stored.Equal(want) {
+		t.Errorf("expected the exchange-derived net %s to be stored, got %s", want, stored)
+	}
+}

@@ -1424,6 +1424,40 @@ func exchangeCloseNumbers(status domain.OrderStatus) (pnl, fee *decimal.Decimal)
 	return pnl, fee
 }
 
+// netRealizedPnL is what a real position actually earned or lost, preferring the exchange's own
+// figures over a local calculation whenever OKX reported them (2026-09-10).
+//
+// The two sides measure DIFFERENT things, which is the whole bug this fixes. OKX's `pnl` on the
+// flattening order is GROSS — the price move alone, with the fee reported separately in `fee` (a
+// negative number) — while the local realizedPnL subtracts its OWN ESTIMATED fee from its own gross.
+// Storing one in the column and the other alongside it made them look like a cross-check that
+// disagreed, when in fact neither was the net figure the panel and the model's reward both need.
+//
+// Verified against every closed real order on 2026-09-10: OKX's gross pnl equals the pure price
+// math (close - entry)/entry * size * leverage to the last digit on all of them, so the exchange
+// and this codebase agree completely about the price move. Every discrepancy came from the fee: the
+// live-closed rows carried a locally ESTIMATED fee instead of the real one, and the rows backfilled
+// by hand in §37.3/§38.3 carried OKX's gross with no fee subtracted at all — order 37 was stored as
+// a 0.0159 LOSS when it was really a 0.0017 gain before fees and a 0.0071 loss after them, i.e. the
+// stored number had both the wrong magnitude and, against gross, the wrong sign.
+//
+// The exchange's numbers win because they are derived from the true fill price and the fee actually
+// charged. The local calculation stays as the fallback for a close OKX did not report on — a
+// skipExchange close whose algo order could not be read, most often — where an estimated fee is
+// still much closer to the truth than no fee at all.
+func netRealizedPnL(o port.PaperOrder, closePx decimal.Decimal, exchangePnL, exchangeFee *decimal.Decimal) decimal.Decimal {
+	if exchangePnL == nil {
+		return realizedPnL(o, closePx)
+	}
+	net := *exchangePnL
+	if exchangeFee != nil {
+		// Added, not subtracted: OKX reports the fee as a negative charge, so adding it reduces the
+		// result. Subtracting would CREDIT the fee and overstate every trade by twice its cost.
+		net = net.Add(*exchangeFee)
+	}
+	return net
+}
+
 func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price decimal.Decimal, reason string, skipExchange bool, facts *exchangeCloseFacts, logger *slog.Logger) error {
 	// exchangeClosePx/exchangeFee/exchangePnL are the EXCHANGE's own numbers, left nil when it did
 	// not report them (a skipExchange close, or a status response missing the field). nil is
@@ -1532,7 +1566,7 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 		}
 	}
 
-	pnl := realizedPnL(asPaperOrderView(o), price)
+	pnl := netRealizedPnL(asPaperOrderView(o), price, exchangePnL, exchangeFee)
 	if err := e.Repo.CloseRealOrderConfirmed(ctx, o.ID, price, reason, pnl, exchangePnL, exchangeFee, exchangeClosePx); err != nil {
 		// Another path closed it first (a second reconciliation pass, the tick monitor racing
 		// reconcile, a second process after a restart). The position IS closed and this caller
