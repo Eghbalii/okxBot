@@ -818,6 +818,7 @@ th.sorted {
   pointer-events: none;
   z-index: 5;
   min-width: 196px;
+  max-width: 230px;
   padding: 8px 10px;
   background: rgba(18, 20, 24, 0.96);
   border: 1px solid #2f333c;
@@ -841,7 +842,7 @@ th.sorted {
 }
 
 .chart-tooltip-row span { color: #858b96; }
-.chart-tooltip-row b { color: #d5d8de; font-weight: 500; }
+.chart-tooltip-row b { color: #d5d8de; font-weight: 500; white-space: nowrap; }
 
 .chart-panel-head {
   display: flex;

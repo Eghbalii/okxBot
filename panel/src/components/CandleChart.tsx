@@ -12,6 +12,12 @@ import {
 import type { Candle, Position } from '../api/types'
 import { PositionZones, type ZonePosition } from './PositionZones'
 
+// Tooltip footprint, used to decide which side of the cursor it can fit on. Approximate by
+// design — it only has to be right enough to pick a side, and measuring the real box would need a
+// layout pass on every mouse move.
+const TOOLTIP_W = 230
+const TOOLTIP_H = 190
+
 const UP = '#2ebd85'
 const DOWN = '#f6465d'
 
@@ -82,7 +88,10 @@ export function CandleChart({
       },
       grid: { vertLines: { color: '#21242b' }, horzLines: { color: '#21242b' } },
       rightPriceScale: { borderColor: '#2a2e37' },
-      timeScale: { borderColor: '#2a2e37', timeVisible: true, secondsVisible: false },
+      // rightOffset keeps a few bars of empty space after the last candle: without it a position
+      // opened in the most recent bars has its marker label clipped by the pane edge (observed on
+      // a live ETH order, whose "#3044" read as "#304").
+      timeScale: { borderColor: '#2a2e37', timeVisible: true, secondsVisible: false, rightOffset: 6 },
       crosshair: { mode: 0 },
     })
     const series = chart.addSeries(CandlestickSeries, {
@@ -156,7 +165,7 @@ export function CandleChart({
           ['Size', `${fmt(p.Size)} @ ${fmt(p.Leverage)}x`],
           ['Strategy', p.StrategyName || '—'],
           ['Bar', p.Bar || '—'],
-          ['Opened', new Date(p.OpenedAt).toLocaleString()],
+          ['Opened', shortTime(p.OpenedAt)],
         ],
       })
 
@@ -185,7 +194,7 @@ export function CandleChart({
           ['PnL', p.RealizedPnL === null ? '—' : `${Number(p.RealizedPnL) >= 0 ? '+' : ''}${Number(p.RealizedPnL).toFixed(4)}`],
           ['Fees', fmt(p.FeesUSD)],
           ['Held', held(p.OpenedAt, p.ClosedAt)],
-          ['Closed', new Date(p.ClosedAt).toLocaleString()],
+          ['Closed', shortTime(p.ClosedAt)],
         ],
       })
     }
@@ -216,8 +225,14 @@ export function CandleChart({
         <div
           className="chart-tooltip"
           style={{
-            left: Math.min(hover.x + 14, (container.current?.clientWidth ?? 0) - 210),
-            top: Math.max(hover.y - 10, 4),
+            // Flip to the left of the cursor near the right edge rather than clamping: clamping
+            // still let the box overrun the pane (observed against a live order whose timestamp
+            // wrapped and pushed "AM" past the edge), and a flipped tooltip stays fully readable.
+            left:
+              hover.x + TOOLTIP_W + 18 > (container.current?.clientWidth ?? 0)
+                ? Math.max(hover.x - TOOLTIP_W - 14, 4)
+                : hover.x + 14,
+            top: Math.min(Math.max(hover.y - 10, 4), Math.max(height - TOOLTIP_H, 4)),
             borderLeftColor: hover.detail.color,
           }}
         >
@@ -234,6 +249,18 @@ export function CandleChart({
       )}
     </div>
   )
+}
+
+// Day + time, no year and no seconds: the axis underneath already says which day is in view, and
+// the full locale string wrapped onto two lines and overran the tooltip.
+function shortTime(iso: string): string {
+  const d = new Date(iso)
+  return d.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
 }
 
 function held(from: string, to: string): string {

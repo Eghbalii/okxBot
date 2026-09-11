@@ -18,8 +18,13 @@ export interface ZonePosition {
 
 // Deliberately translucent: these are bands drawn UNDER the candles (zOrder 'bottom'), and an
 // opaque fill would hide the price action the zones exist to give context to.
-const RISK_FILL = 'rgba(246, 70, 93, 0.13)'
-const REWARD_FILL = 'rgba(46, 189, 133, 0.13)'
+// A take-profit is typically several times further from entry than the stop (a real open position
+// measured 3.35% to TP against 0.60% to SL), so the reward band covers far more of the pane. At an
+// equal alpha the green stopped reading as a zone and started reading as a background wash, so the
+// reward fill is deliberately lighter than the risk fill — the two are not meant to be visually
+// equal-weighted anyway: the risk band is the one worth drawing the eye.
+const RISK_FILL = 'rgba(246, 70, 93, 0.16)'
+const REWARD_FILL = 'rgba(46, 189, 133, 0.07)'
 const RISK_EDGE = 'rgba(246, 70, 93, 0.55)'
 const REWARD_EDGE = 'rgba(46, 189, 133, 0.55)'
 const ENTRY_EDGE = 'rgba(190, 195, 205, 0.75)'
