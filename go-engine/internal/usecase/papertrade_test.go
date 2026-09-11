@@ -2915,3 +2915,69 @@ func TestSetTradingCap_ClampsToRealBalance(t *testing.T) {
 		t.Fatalf("cap above balance must clamp to the balance: want 40, got %s", ae.EquityUSD)
 	}
 }
+
+// TestMoneyPrecisionStaysBoundedAcrossGenerations reproduces the failure that stopped paper
+// trading on 2026-09-11 and proves the rounding fixes it.
+//
+// Dynamic sizing makes size = equity/activeTokens — a repeating decimal for any roster size that
+// isn't a power of ten. Closing that position computes PnL from size, and multiplication ADDS
+// digits, so the PnL is longer than the size was. That PnL accumulates into equity, which sizes
+// the next order. Nothing bounded the loop: production went 1 digit -> 18 -> 395 -> 4647 -> 11243
+// -> 16380, where PostgreSQL's NUMERIC limit rejected every close with SQLSTATE 22P03 and
+// positions simply stopped closing.
+func TestMoneyPrecisionStaysBoundedAcrossGenerations(t *testing.T) {
+	// 9 tokens is what the live roster had, and 40/9 is a repeating decimal.
+	const tokens = 9
+	equity := dec("40")
+
+	for gen := 1; gen <= 40; gen++ {
+		size := equity.Div(decimal.NewFromInt(tokens)).Round(usdScale)
+		o := port.PaperOrder{
+			Side: "buy", EntryPx: dec("2470.03"), Size: size,
+			Leverage: dec("9.6035974025726314"),
+		}
+		pnl := realizedPnL(o, dec("2455.21"))
+		equity = equity.Add(pnl)
+
+		// The bound that matters: a value that keeps growing is the bug, whatever its exact width.
+		if got := len(equity.String()); got > 40 {
+			t.Fatalf("generation %d: equity reached %d digits — precision is compounding, which is "+
+				"what exhausted NUMERIC in production", gen, got)
+		}
+	}
+}
+
+// TestRealizedPnL_IsRoundedToUsdScale pins the specific step that closed the loop: PnL is what
+// accumulates into stored equity, so an unrounded value there re-enters the next order's size.
+func TestRealizedPnL_IsRoundedToUsdScale(t *testing.T) {
+	o := port.PaperOrder{
+		Side: "buy",
+		// A size with full repeating-decimal precision, exactly as production stored it.
+		Size:     dec("1.5513978507918989841083161726078724421648771145478291340375"),
+		EntryPx:  dec("2470.03"),
+		Leverage: dec("9.6035974025726314"),
+	}
+	pnl := realizedPnL(o, dec("2455.21"))
+	if got := pnl.Exponent(); got < -usdScale {
+		t.Errorf("realized pnl carries %d decimal places, want at most %d", -got, usdScale)
+	}
+}
+
+// TestDynamicNotional_IsRoundedToUsdScale covers the other end — the division that creates the
+// repeating decimal in the first place.
+func TestDynamicNotional_IsRoundedToUsdScale(t *testing.T) {
+	repo := newFakeRepository()
+	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("40"), EquityUSD: dec("40")}
+	pt := &PaperTrader{
+		InstID: "BTC", Repo: repo, Mode: "paper",
+		AccountInitialUSD: dec("40"), ActiveTokenCount: 9,
+	}
+
+	n := pt.dynamicNotional(context.Background(), testLogger())
+	if got := n.Exponent(); got < -usdScale {
+		t.Errorf("dynamic notional carries %d decimal places, want at most %d", -got, usdScale)
+	}
+	if !n.IsPositive() {
+		t.Error("expected a positive notional")
+	}
+}

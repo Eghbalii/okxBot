@@ -286,6 +286,25 @@ func (e *PaperTrader) accountMode() string {
 // number was true the day it was configured. AccountInitialUSD/ActiveTokenCount are the fallback
 // for whichever piece is unavailable, so a transient repository error or a startup
 // misconfiguration degrades to a sane order of magnitude rather than a zero-size order.
+// usdScale bounds the precision of every money value this package computes.
+//
+// decimal.Decimal is arbitrary-precision and nothing truncates it on its own, which on 2026-09-11
+// took paper trading down completely: dynamic sizing (§32.4) makes size = equity/activeTokens, a
+// repeating decimal for any roster size that is not a power of ten. Closing that position computes
+// PnL from size, and multiplication ADDS digits rather than capping them, so the PnL carries more
+// digits than the size did. That PnL is added to equity, which sizes the next order — a feedback
+// loop with nothing bounding it.
+//
+// Measured in production, digits in paper_orders.size: 1 on 09-03 (before dynamic sizing), 18 on
+// 09-04, 395, 4647, 11243, 14366, 15491, then 16380 — where it hit PostgreSQL's NUMERIC limit and
+// every close began failing with "invalid scale in external numeric value" (SQLSTATE 22P03). The
+// engine kept running and kept trying; positions simply stopped closing.
+//
+// Same failure shape as the EMA precision bug in §16.8, and the same fix: round at each step, so
+// the value feeding the next computation is already bounded. 8dp is far finer than any real money
+// amount needs (a hundred-millionth of a dollar) while keeping the representation flat.
+const usdScale = 8
+
 func (e *PaperTrader) dynamicNotional(ctx context.Context, logger *slog.Logger) decimal.Decimal {
 	count := e.ActiveTokenCount
 	if count <= 0 {
@@ -306,7 +325,9 @@ func (e *PaperTrader) dynamicNotional(ctx context.Context, logger *slog.Logger) 
 		// would round-trip through every downstream percentage/leverage calculation as noise.
 		equity = e.AccountInitialUSD
 	}
-	return equity.Div(countDec)
+	// Rounded here, at the point the repeating decimal is created, rather than when it is stored:
+	// this value becomes o.Size, and every later computation multiplies by it.
+	return equity.Div(countDec).Round(usdScale)
 }
 
 // evenShareOfAccount is dynamicNotional expressed as a FRACTION rather than a dollar amount: the
@@ -806,7 +827,10 @@ func grossPnL(o port.PaperOrder, closePx decimal.Decimal) decimal.Decimal {
 	if o.Side == "sell" {
 		direction = decimal.NewFromInt(-1)
 	}
-	return direction.Mul(closePx.Sub(o.EntryPx)).Div(o.EntryPx).Mul(o.Size).Mul(o.Leverage)
+	// Rounded because this is what gets added to the stored account equity, which then sizes the
+	// next order: an unrounded value here is what closed the feedback loop that ran paper trading
+	// out of NUMERIC precision entirely (see usdScale).
+	return direction.Mul(closePx.Sub(o.EntryPx)).Div(o.EntryPx).Mul(o.Size).Mul(o.Leverage).Round(usdScale)
 }
 
 // tradingFee is OKX's own taker fee (CLAUDE.md 2026-09-06, live-confirmed against OKX's published
@@ -825,7 +849,7 @@ func tradingFee(o port.PaperOrder, closePx decimal.Decimal) decimal.Decimal {
 	notional := o.Size.Mul(o.Leverage)
 	entryNotional := notional
 	exitNotional := notional.Mul(closePx).Div(o.EntryPx)
-	return entryNotional.Add(exitNotional).Mul(TakerFeeRate)
+	return entryNotional.Add(exitNotional).Mul(TakerFeeRate).Round(usdScale)
 }
 
 // realizedPnLWithFunding adds the position's actual accrued funding cost/credit on top of
@@ -855,10 +879,14 @@ func realizedPnLWithFunding(ctx context.Context, repo port.Repository, o port.Pa
 		}
 		return pnl, decimal.Zero
 	}
+	// Rounded for the same reason as realizedPnL: funding is computed by SQL over a notional that
+	// itself came from a division, so it arrives with whatever precision that produced, and this
+	// result is what reaches the stored account equity.
+	cost = cost.Round(usdScale)
 	if o.Side == "sell" {
-		return pnl.Add(cost), cost.Neg()
+		return pnl.Add(cost).Round(usdScale), cost.Neg()
 	}
-	return pnl.Sub(cost), cost
+	return pnl.Sub(cost).Round(usdScale), cost
 }
 
 // TakerFeeRate is set once at process startup (cmd/paper-trader, cmd/trader) from
