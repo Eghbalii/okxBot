@@ -7,6 +7,14 @@ import { CandleChart } from './CandleChart'
 // carries almost no position history at this trade cadence, so they are not offered here.
 const BARS = ['5m', '15m', '1H'] as const
 
+// The modal is capped at 92vh; the header, legend, and the modal's own padding take roughly a
+// fixed 150px of that, so the chart gets whatever is left. Clamped at both ends: below ~300px
+// candles stop being readable, and above ~760px the chart stretches past what is useful.
+function availableChartHeight(): number {
+  const available = window.innerHeight * 0.92 - 150
+  return Math.round(Math.min(Math.max(available, 300), 760))
+}
+
 /**
  * Candles for one token with its own position history drawn on top.
  *
@@ -26,6 +34,7 @@ export default function TokenChartModal({
   onClose: () => void
 }) {
   const [bar, setBar] = useState<string>('5m')
+  const [chartHeight, setChartHeight] = useState(() => availableChartHeight())
   const [candles, setCandles] = useState<Candle[] | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -46,14 +55,29 @@ export default function TokenChartModal({
     }
   }, [instId, bar])
 
-  // Only this token's orders, and only those whose own bar matches the chart — a 1H order drawn on
-  // a 5m chart would sit at a timestamp the 5m candles never had.
+  // Closed orders are filtered to the chart's own timeframe: a 1H order's entry sits at a
+  // timestamp the 5m candles never had, so its marker would land on the wrong candle.
+  //
+  // An OPEN position is deliberately exempt (2026-09-11). Its entry, stop and target are live
+  // price levels — they are true at this instant regardless of which timeframe produced the
+  // signal, and hiding them meant switching to 1H made a position you actually hold disappear.
+  // Its entry marker may sit a little off the exact bar on a coarser chart; that is a far smaller
+  // problem than not seeing the position at all.
   const shown = useMemo(
-    () => positions.filter((p) => p.InstID === instId && (p.Bar === '' || p.Bar === bar)),
+    () =>
+      positions.filter(
+        (p) => p.InstID === instId && (!p.ClosedAt || p.Bar === '' || p.Bar === bar),
+      ),
     [positions, instId, bar],
   )
 
   const openCount = shown.filter((p) => !p.ClosedAt).length
+
+  useEffect(() => {
+    const onResize = () => setChartHeight(availableChartHeight())
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -67,7 +91,13 @@ export default function TokenChartModal({
     <div className="modal-backdrop" onClick={onClose}>
       <div
         className="modal"
-        style={{ maxWidth: '1040px', width: '94vw' }}
+        // Sized against the viewport so the whole thing — header, chart, legend — fits in one
+        // screen without the modal's own 85vh scrollbar. Previously the chart was a hardcoded
+        // 460px, which overflowed on a shorter display and hid the legend below the fold.
+        // overflow hidden because the chart is already sized to fit: the shared .modal rule scrolls
+        // at 85vh, and letting it scroll here would reintroduce exactly the "can't see it all at
+        // once" problem this sizing exists to solve.
+        style={{ maxWidth: '1280px', width: '95vw', maxHeight: '92vh', overflow: 'hidden' }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="chart-panel-head">
@@ -102,7 +132,7 @@ export default function TokenChartModal({
         )}
         {!error && candles !== null && candles.length > 0 && (
           <>
-            <CandleChart candles={candles} positions={shown} height={460} frameKey={bar} />
+            <CandleChart candles={candles} positions={shown} height={chartHeight} frameKey={bar} />
             <div className="chart-legend">
               <span>
                 <i style={{ background: '#2ebd85' }} />

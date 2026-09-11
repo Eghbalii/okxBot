@@ -140,7 +140,11 @@ export function CandleChart({
       seriesRef.current = null
       zonesRef.current = null
     }
-  }, [height])
+    // Deliberately NOT keyed on height: the modal re-sizes the chart when the window changes, and
+    // tearing the chart down to rebuild it would discard the viewport the user had zoomed to —
+    // the exact behaviour just fixed. Height is applied through applyOptions below instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     const series = seriesRef.current
@@ -244,6 +248,9 @@ export function CandleChart({
 
   return (
     <div className="candle-chart" style={{ position: 'relative' }}>
+      {/* autoSize makes the chart track THIS element and ignore the height option, so the
+          container is what carries the size — and a plain style change resizes the chart without
+          recreating it, preserving the user's zoom. */}
       <div ref={container} style={{ width: '100%', height }} />
       {hover && (
         <div
