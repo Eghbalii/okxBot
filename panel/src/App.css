@@ -802,3 +802,85 @@ th.sorted {
   max-height: 18rem;
   overflow: auto;
 }
+
+/* --- Candle chart (lightweight-charts) --------------------------------- */
+.candle-chart {
+  border: 1px solid #2a2e37;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #14161a;
+}
+
+/* Follows the cursor, so it must never intercept the mouse — the crosshair
+   handler below it is what drives its own visibility. */
+.chart-tooltip {
+  position: absolute;
+  pointer-events: none;
+  z-index: 5;
+  min-width: 196px;
+  padding: 8px 10px;
+  background: rgba(18, 20, 24, 0.96);
+  border: 1px solid #2f333c;
+  border-left-width: 3px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+
+.chart-tooltip-head {
+  font-weight: 600;
+  margin-bottom: 5px;
+  white-space: nowrap;
+}
+
+.chart-tooltip-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.chart-tooltip-row span { color: #858b96; }
+.chart-tooltip-row b { color: #d5d8de; font-weight: 500; }
+
+.chart-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.chart-bar-tabs { display: flex; gap: 4px; margin-left: auto; }
+
+.chart-bar-tab {
+  padding: 3px 10px;
+  font-size: 12px;
+  border: 1px solid #2f333c;
+  border-radius: 4px;
+  background: transparent;
+  color: #9aa0ab;
+  cursor: pointer;
+}
+
+.chart-bar-tab.active {
+  background: #2a2e37;
+  color: #e6e9ef;
+  border-color: #3a3f4a;
+}
+
+.chart-legend {
+  display: flex;
+  gap: 14px;
+  font-size: 11px;
+  color: #858b96;
+  padding: 6px 2px 0;
+}
+
+.chart-legend i {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: -1px;
+}

@@ -7,6 +7,7 @@ import { usePriceStream } from '../hooks/usePriceStream'
 import AdjustPositionForm from '../components/AdjustPositionForm'
 import OrderErrorAlert from '../components/OrderErrorAlert'
 import OrderDetailModal from '../components/OrderDetailModal'
+import TokenChartModal from '../components/TokenChartModal'
 import PaperTradingConfigBox from '../components/PaperTradingConfigBox'
 import PaperTradingStatsBox from '../components/PaperTradingStatsBox'
 import Pagination, { DEFAULT_PAGE_SIZE } from '../components/Pagination'
@@ -154,6 +155,7 @@ export default function PositionsPage() {
   const [sortDesc, setSortDesc] = useState(true)
   const [alertsEnabled, setAlertsEnabled] = useState(true)
   const [wsRefreshCount, setWsRefreshCount] = useState(0)
+  const [chartInstId, setChartInstId] = useState<string | null>(null)
   const [detailOrderId, setDetailOrderId] = useState<number | null>(null)
   const [page, setPage] = useState(0)
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
@@ -411,8 +413,10 @@ export default function PositionsPage() {
                       #{p.ID}
                     </button>
                   </td>
-                  <td title={p.InstID}>
-                    {tokenSymbol(p.InstID)}
+                  <td title={`${p.InstID} — click for the chart`}>
+                    <button className="order-id-button" onClick={() => setChartInstId(p.InstID)}>
+                      {tokenSymbol(p.InstID)}
+                    </button>
                     {isFork && (
                       <span className="badge badge-dim" style={{ marginLeft: '0.4rem' }} title="RL shadow-fork: tracking-only copy comparing an adjusted SL/TP against its baseline parent">
                         fork
@@ -559,6 +563,17 @@ export default function PositionsPage() {
 
       {detailPosition && (
         <OrderDetailModal position={detailPosition} onClose={() => setDetailOrderId(null)} />
+      )}
+
+      {/* Positions come from the rows already loaded rather than a second fetch: the chart shows
+          exactly the orders the table shows, and cannot disagree with what was just clicked. */}
+      {chartInstId && (
+        <TokenChartModal
+          instId={chartInstId}
+          mode={mode}
+          positions={rows ?? []}
+          onClose={() => setChartInstId(null)}
+        />
       )}
 
       {/* Mounted here, outside the table, rather than as an expanded row beneath the order
