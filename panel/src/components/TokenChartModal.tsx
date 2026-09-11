@@ -102,7 +102,7 @@ export default function TokenChartModal({
         )}
         {!error && candles !== null && candles.length > 0 && (
           <>
-            <CandleChart candles={candles} positions={shown} height={460} />
+            <CandleChart candles={candles} positions={shown} height={460} frameKey={bar} />
             <div className="chart-legend">
               <span>
                 <i style={{ background: '#2ebd85' }} />

@@ -61,16 +61,26 @@ export function CandleChart({
   candles,
   positions,
   height = 420,
+  // Changing this re-frames the view. The modal passes the selected timeframe, because switching
+  // 5m -> 1H is the user asking for a different chart, whereas a 5s refetch is not — and only the
+  // first must keep its own viewport.
+  frameKey,
 }: {
   candles: Candle[]
   positions: Position[]
   height?: number
+  frameKey?: string
 }) {
   const container = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick', Time> | null>(null)
   const zonesRef = useRef<PositionZones | null>(null)
   const detailsRef = useRef<Map<string, MarkerDetail>>(new Map())
+  // Guards the one-time initial framing; see the data effect below.
+  // Holds the frameKey the current viewport was framed for. The sentinel is deliberately not
+  // undefined: frameKey itself is optional, and an undefined-vs-undefined comparison would skip the
+  // very first framing.
+  const framedRef = useRef<string | undefined>('\u0000unframed')
   const [hover, setHover] = useState<{ detail: MarkerDetail; x: number; y: number } | null>(null)
 
   // Create the chart once. Data updates go through the effect below, so a new candle does not
@@ -92,7 +102,14 @@ export function CandleChart({
       // opened in the most recent bars has its marker label clipped by the pane edge (observed on
       // a live ETH order, whose "#3044" read as "#304").
       timeScale: { borderColor: '#2a2e37', timeVisible: true, secondsVisible: false, rightOffset: 6 },
-      crosshair: { mode: 0 },
+      // Normal mode plus explicit label styling: the axis labels showing the hovered time and
+      // price DO appear by default, but at the library's own grey they were easy to miss against
+      // this theme. Both axes get a readable badge instead.
+      crosshair: {
+        mode: 0,
+        vertLine: { labelVisible: true, labelBackgroundColor: '#3a4150', color: '#5d6673', width: 1 },
+        horzLine: { labelVisible: true, labelBackgroundColor: '#3a4150', color: '#5d6673', width: 1 },
+      },
     })
     const series = chart.addSeries(CandlestickSeries, {
       upColor: UP,
@@ -215,8 +232,15 @@ export function CandleChart({
       }))
     zonesRef.current?.setPositions(open)
 
-    chart.timeScale().fitContent()
-  }, [candles, positions])
+    // Only frame the view the FIRST time data arrives. The positions table refetches every 5s and
+    // re-renders this component with it, so calling fitContent on each pass threw away whatever
+    // the user had panned or zoomed to — reported as "I zoom in, move it, and it jumps back".
+    // After the initial frame the viewport belongs to the user, and new candles simply extend it.
+    if (framedRef.current !== frameKey && candles.length > 0) {
+      framedRef.current = frameKey
+      showRecent(chart, candles.length)
+    }
+  }, [candles, positions, frameKey])
 
   return (
     <div className="candle-chart" style={{ position: 'relative' }}>
@@ -261,6 +285,21 @@ function shortTime(iso: string): string {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+// How many bars to show when the chart first opens. The full history is 500 candles, which on a
+// 5m chart is nearly two days — far too wide to read individual candles, so the operator had to
+// zoom in on every open. This frames the recent window instead; the rest stays one scroll away.
+const INITIAL_BARS = 90
+
+function showRecent(chart: IChartApi, total: number): void {
+  if (total <= INITIAL_BARS) {
+    chart.timeScale().fitContent()
+    return
+  }
+  // Logical range indexes bars, not time, so this holds regardless of the timeframe. The +6 keeps
+  // rightOffset's empty bars in view so a marker on the newest candle isn't against the edge.
+  chart.timeScale().setVisibleLogicalRange({ from: total - INITIAL_BARS, to: total + 6 })
 }
 
 function held(from: string, to: string): string {
