@@ -5097,3 +5097,45 @@ is a strong signal about the current strategy mix, and it is currently unheard. 
 that answerable — pair `paper_early_close_ignored_total` with how those positions actually resolved
 (SL/TP/timeout) to judge whether the model was right to want out, which is exactly what
 `RealEarlyCloseIgnoredTotal`'s own comment already proposed for real trading.
+
+## 43. Every "exchange error" was the service racing the exchange's own stop (2026-09-11)
+
+Surfaced by §42's notification work: once the 13 errors were readable in one place, all of them
+turned out to be the same thing. The operator diagnosed it before any code was read — "it's
+probably the SL/TP, the exchange closes it itself and then the service also tries to close it" —
+and the data agreed exactly.
+
+**9 of 9 genuine failures are `sCode=51169`**: *"Order failed because you don't have any positions
+in this direction for this contract to reduce or close."* Every one has `close_reason` of `sl` or
+`tp`, and every one is on an order that had a protective order resting on the exchange. They begin
+the day exchange-side SL/TP shipped (§35). (The other 4 rows carrying `last_error` are notes
+written by hand during earlier incidents, not failures — worth checking before counting.)
+
+**Nothing was ever mis-closed.** The exchange fired its stop and closed the position correctly;
+this process's tick monitor then saw the same touch a moment later and asked OKX to close a
+position that no longer existed. What the race damaged was the alert channel — each success wrote
+an alarming `last_error` onto a trade that went exactly as intended, and an alert channel full of
+false alarms is worse than no alert channel.
+
+**Fix**: `monitorOpenPositions` asks the exchange before flattening, but **only on an SL/TP
+touch**. A manual close or a timeout is this system deciding to exit, and no resting order will
+have done that for us — deferring those to the exchange would be a real bug. When the protective
+order reads `effective`, the position is recorded closed through `closeFactsFromExchange` (OKX's
+own reason, fill price, PnL and fee, §37) instead of sending a duplicate flatten.
+
+**The case that mattered most while writing it**: an unreadable status is "don't know", never
+"already handled". `protectionAlreadyFired` returns `(fired, ok)` and any error gives `ok=false`,
+falling back to the normal close — declining to flatten on a failed API call would leave real
+exposure open on nothing more than a network blip. That has its own test, and the mutation
+inverting it fails.
+
+4 tests, all mutation-checked; removing the guard reproduces the production bug exactly ("got 1"
+duplicate flatten). 610 Go tests pass under `-race`.
+
+**Not yet exercised live**: real mode is `paused` with zero open positions, so the guard has not
+run against a real SL touch. The next real stop-out is worth checking — it should record `sl` with
+the exchange's own numbers and write no `last_error` at all.
+
+**Historical rows left as-is**: the 9 existing `51169` errors describe a real (if harmless) race
+that happened, and rewriting them would erase the evidence for this section. They stay readable in
+the bell until an operator marks them read.
