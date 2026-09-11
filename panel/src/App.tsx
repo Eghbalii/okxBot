@@ -1,4 +1,5 @@
 import { Navigate, NavLink, Route, Routes, useLocation } from 'react-router-dom'
+import NotificationBell from './components/NotificationBell'
 import './App.css'
 import ResourcesPage from './pages/ResourcesPage'
 import ModelStatusPage from './pages/ModelStatusPage'
@@ -35,6 +36,9 @@ export default function App() {
             )
           })}
         </nav>
+        {/* In the header rather than on the positions page: an exchange failure matters wherever
+            the operator happens to be, and the count has to read the same on every tab. */}
+        <NotificationBell />
       </header>
       <main className="app-main">
         <Routes>

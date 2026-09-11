@@ -5,7 +5,6 @@ import { usePositionAlerts } from '../hooks/usePositionAlerts'
 import { usePositionEvents } from '../hooks/usePositionEvents'
 import { usePriceStream } from '../hooks/usePriceStream'
 import AdjustPositionForm from '../components/AdjustPositionForm'
-import OrderErrorAlert from '../components/OrderErrorAlert'
 import OrderDetailModal from '../components/OrderDetailModal'
 import TokenChartModal from '../components/TokenChartModal'
 import PaperTradingConfigBox from '../components/PaperTradingConfigBox'
@@ -555,11 +554,6 @@ export default function PositionsPage() {
           onPageSizeChange={setPageSize}
         />
       </div>
-
-      {/* Raises any real order's latest exchange failure as a modal — a failed close in particular
-          means a position may still be live on OKX while the engine has stopped trying, which only
-          a person can resolve (2026-09-08). */}
-      <OrderErrorAlert positions={rows ?? []} />
 
       {detailPosition && (
         <OrderDetailModal position={detailPosition} onClose={() => setDetailOrderId(null)} />

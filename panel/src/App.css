@@ -885,3 +885,127 @@ th.sorted {
   margin-right: 5px;
   vertical-align: -1px;
 }
+
+/* --- Exchange-error notifications (header bell) ------------------------- */
+.notif-wrap { position: relative; margin-left: 0.75rem; }
+
+.notif-bell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.notif-bell:hover { color: var(--text); border-color: #3a3f4a; }
+.notif-bell.has-unread { color: #f6465d; border-color: rgba(246, 70, 93, 0.45); }
+
+.notif-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 9px;
+  background: #f6465d;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+}
+
+.notif-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  width: 380px;
+  z-index: 120;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+.notif-panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.6rem 0.8rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+.notif-empty { padding: 1rem 0.8rem; color: var(--text-dim); font-size: 0.85rem; }
+
+.notif-list { list-style: none; margin: 0; padding: 0; }
+.notif-list-full { max-height: 52vh; overflow-y: auto; }
+
+.notif-item {
+  padding: 0.6rem 0.8rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+
+.notif-item:last-child { border-bottom: none; }
+
+/* Unread carries a left bar rather than a different background: the row stays readable and the
+   marker survives whatever the surrounding panel colour is. */
+.notif-item.unread { border-left: 3px solid #f6465d; padding-left: calc(0.8rem - 3px); }
+
+.notif-item-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.3rem;
+  flex-wrap: wrap;
+}
+
+.notif-time { margin-left: auto; font-size: 0.72rem; white-space: nowrap; }
+
+.notif-item-msg {
+  color: var(--text-dim);
+  font-size: 0.74rem;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+/* The preview clamps to two lines; the full popup shows the whole message. */
+.notif-item-msg.clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.notif-item-hint { margin-top: 0.35rem; font-size: 0.74rem; color: #f6465d; }
+
+.notif-more {
+  width: 100%;
+  padding: 0.55rem;
+  border: none;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--accent, #4c8dff);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.notif-more:hover { background: rgba(255, 255, 255, 0.03); }
+
+.notif-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.8rem;
+  padding: 0.7rem 0;
+  font-size: 0.8rem;
+}
