@@ -346,3 +346,34 @@ type exchangeCloseFacts struct {
 	PnL *decimal.Decimal
 	Fee *decimal.Decimal
 }
+
+// protectionAlreadyFired reports whether the exchange's own resting SL/TP order has already
+// triggered for this position — i.e. whether OKX has closed it without us.
+//
+// Returns (fired, ok). ok=false means the question could not be answered: no protective order was
+// ever recorded, or the read failed. Callers must treat that as "don't know" and fall back to
+// their normal close, never as "not fired" — declining to flatten on an unreadable status would
+// leave a real position open on nothing more than a failed API call.
+//
+// Added 2026-09-11 after every genuine exchange error on this deployment turned out to be the same
+// race: the exchange's stop fires, then this process's tick monitor sees the same touch a moment
+// later and asks OKX to close a position that is already gone (sCode=51169). The close was never
+// at risk; the noise was, and it landed in the one channel that has to stay trustworthy.
+func (e *RealTrader) protectionAlreadyFired(o port.RealOrder, logger *slog.Logger) (bool, bool) {
+	if o.ExchangeAlgoOrderID == nil || *o.ExchangeAlgoOrderID == "" {
+		return false, false
+	}
+	if e.Exchange == nil {
+		return false, false
+	}
+	status, err := e.Exchange.GetAlgoOrder(e.execInstID(), *o.ExchangeAlgoOrderID)
+	if err != nil {
+		logger.Warn("could not read the protective order before closing; falling back to a normal flatten",
+			"id", o.ID, "instId", e.InstID, "algoId", *o.ExchangeAlgoOrderID, "error", err)
+		return false, false
+	}
+	// Still resting means it has NOT fired, so this system's own close is the one that has to act.
+	// Anything else — effective, canceled, failed — means it is no longer guarding the position,
+	// and only "effective" means it actually executed.
+	return status.State == "effective", true
+}

@@ -174,6 +174,16 @@ func TerminalCategory(closeReason string) string {
 // §15.12). Recorded as its own reason rather than reusing "manual" so early-closed trades stay
 // distinguishable from operator action, and so they can be compared against trades that ran to
 // SL/TP — the same evidence-gathering logic as the shadow forks.
+// CloseReasonSL/CloseReasonTP are the two reasons produced by an SL/TP touch (SLTPTouchReason).
+// Named here alongside the other reasons so call sites can compare against a constant rather than
+// a bare string — RealTrader needs to distinguish "the price reached a level" from "this system
+// decided to exit", because only the former can already have been executed by the exchange's own
+// resting order (CLAUDE.md §35).
+const CloseReasonSL = "sl"
+
+// CloseReasonTP is the take-profit twin of CloseReasonSL.
+const CloseReasonTP = "tp"
+
 const CloseReasonRLEarly = "rl_early"
 
 // CloseReasonTimeout marks a position PaperTrader itself force-closed because it stayed open

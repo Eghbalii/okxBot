@@ -3,9 +3,12 @@ package usecase
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/shopspring/decimal"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
@@ -1679,5 +1682,133 @@ func TestCloseRealWith_StoresTheExchangeNetAsRealizedPnL(t *testing.T) {
 	}
 	if want := dec("-0.007076"); !stored.Equal(want) {
 		t.Errorf("expected the exchange-derived net %s to be stored, got %s", want, stored)
+	}
+}
+
+// algoOrderID is the helper the protection tests need — a RealOrder only counts as protected when
+// it actually carries the exchange's algo id.
+func algoOrderID(id string) *string { return &id }
+
+// decPtr keeps the protection-test fixtures readable; the surrounding tests use a local variable
+// per level, which does not scale to fixtures that set several.
+func decPtr(v string) *decimal.Decimal {
+	d := dec(v)
+	return &d
+}
+
+// TestMonitorOpenPositions_SkipsTheFlattenWhenTheExchangeAlreadyClosedIt covers the race behind
+// every genuine exchange error on this deployment (2026-09-11): the exchange's own stop fires, and
+// a moment later this process's tick monitor sees the same touch and asks OKX to close a position
+// that no longer exists — rejected with sCode=51169. The position was always correctly closed; the
+// duplicate flatten just recorded an alarming last_error against a trade that went exactly right.
+func TestMonitorOpenPositions_SkipsTheFlattenWhenTheExchangeAlreadyClosedIt(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		// "effective" is OKX reporting the conditional order has triggered.
+		algoStatus: &domain.AlgoOrderStatus{State: "effective", ActualSide: "sl", OrdID: "OKX-CLOSE-1"},
+		orderStatus: &domain.OrderStatus{
+			State: "filled", AvgPx: dec("95"), AccFillSz: dec("1"), Sz: dec("1"),
+			Pnl: dec("-5"), Fee: dec("-0.02"),
+		},
+	}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.realOrders[1] = port.RealOrder{
+		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
+		EntryPx: dec("100"), SLPx: decPtr("96"), Size: dec("10"), Leverage: dec("1"),
+		ExchangeAlgoOrderID: algoOrderID("ALGO-1"),
+	}
+
+	// A price below the stop: the local touch check fires.
+	if err := rt.monitorOpenPositions(context.Background(), dec("95"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenPositions: %v", err)
+	}
+
+	if len(exchange.placedOrders) != 0 {
+		t.Errorf("expected NO flatten order when the exchange already closed the position, got %d", len(exchange.placedOrders))
+	}
+	if repo.realOrders[1].ClosedAt == nil {
+		t.Fatal("the position must still be recorded as closed — the exchange closed it, we only record it")
+	}
+	if got := repo.realOrders[1].CloseReason; got == nil || *got != "sl" {
+		t.Errorf("expected close reason sl, got %v", got)
+	}
+	// The exchange's own numbers, not a locally derived guess.
+	if got := repo.realOrders[1].ExchangeRealizedPnL; got == nil || !got.Equal(dec("-5")) {
+		t.Errorf("expected the exchange's realized pnl to be recorded, got %v", got)
+	}
+}
+
+// TestMonitorOpenPositions_StillFlattensWhenTheProtectiveOrderIsStillResting is the other half:
+// a resting ("live") order has NOT fired, so this system's close is the one that must act.
+func TestMonitorOpenPositions_StillFlattensWhenTheProtectiveOrderIsStillResting(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		algoStatus: &domain.AlgoOrderStatus{State: "live"},
+	}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.realOrders[1] = port.RealOrder{
+		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
+		EntryPx: dec("100"), SLPx: decPtr("96"), Size: dec("10"), Leverage: dec("1"),
+		ExchangeAlgoOrderID: algoOrderID("ALGO-1"),
+	}
+
+	if err := rt.monitorOpenPositions(context.Background(), dec("95"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenPositions: %v", err)
+	}
+
+	if len(exchange.placedOrders) == 0 {
+		t.Error("a still-resting protective order has not fired, so this system must send the flatten")
+	}
+}
+
+// TestMonitorOpenPositions_FlattensWhenTheProtectiveOrderCannotBeRead is the safety property. An
+// unreadable status is "don't know", never "already handled" — declining to flatten on a failed
+// API call would leave real exposure open on nothing more than a network blip.
+func TestMonitorOpenPositions_FlattensWhenTheProtectiveOrderCannotBeRead(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{getAlgoErr: errors.New("gateway timeout")}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.realOrders[1] = port.RealOrder{
+		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
+		EntryPx: dec("100"), SLPx: decPtr("96"), Size: dec("10"), Leverage: dec("1"),
+		ExchangeAlgoOrderID: algoOrderID("ALGO-1"),
+	}
+
+	if err := rt.monitorOpenPositions(context.Background(), dec("95"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenPositions: %v", err)
+	}
+
+	if len(exchange.placedOrders) == 0 {
+		t.Error("an unreadable protective order must fall back to a normal flatten, not be assumed fired")
+	}
+}
+
+// TestMonitorOpenPositions_ManualCloseIsNotDeferredToTheExchange: a manual close is this system
+// deciding to exit, and no resting SL/TP order is going to have done that for us — so the guard
+// must not intercept it even when a protective order happens to read as effective.
+func TestMonitorOpenPositions_ManualCloseIsNotDeferredToTheExchange(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		algoStatus: &domain.AlgoOrderStatus{State: "effective", ActualSide: "sl", OrdID: "X"},
+	}
+	rt := newTestRealTrader(repo, exchange, nil, nil)
+	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.realOrders[1] = port.RealOrder{
+		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
+		EntryPx: dec("100"), SLPx: decPtr("90"), Size: dec("10"), Leverage: dec("1"),
+		ExchangeAlgoOrderID:  algoOrderID("ALGO-1"),
+		ManualCloseRequested: true,
+	}
+
+	// A price nowhere near the stop, so only the manual request can trigger the close.
+	if err := rt.monitorOpenPositions(context.Background(), dec("100"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenPositions: %v", err)
+	}
+
+	if len(exchange.placedOrders) == 0 {
+		t.Error("a manual close must always send its own flatten")
 	}
 }

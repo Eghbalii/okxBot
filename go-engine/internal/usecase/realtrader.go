@@ -1368,6 +1368,39 @@ func (e *RealTrader) monitorOpenPositions(ctx context.Context, price decimal.Dec
 		if !hit {
 			continue
 		}
+		// The exchange holds the real stop (CLAUDE.md §35), and its own order fires the moment the
+		// trigger is reached — usually before this monitor sees the same tick. Flattening anyway
+		// asks OKX to close a position it already closed, which it rejects with
+		// sCode=51169 "you don't have any positions in this direction ... to reduce or close".
+		//
+		// That is what every genuine exchange error on this deployment has been: 9 of 9, all
+		// close_reason sl/tp, all on orders that had a protective order resting. The close itself
+		// was never in danger — the exchange had already done it — but each one recorded a scary
+		// last_error on a trade that completed exactly as intended, which is noise in the one
+		// channel that must stay trustworthy.
+		//
+		// So on a LOCAL SL/TP touch, ask the exchange first. Only the SL/TP reasons are checked:
+		// a manual close or a timeout is this system deciding to exit, and no resting order is
+		// going to have done that for us.
+		if reason == conductor.CloseReasonSL || reason == conductor.CloseReasonTP {
+			if fired, ok := e.protectionAlreadyFired(o, logger); ok && fired {
+				logger.Info("exchange's own protective order already closed this position; recording it rather than sending a duplicate flatten",
+					"id", o.ID, "instId", e.InstID, "reason", reason)
+				exReason, closePx, exPnL, exFee := e.closeFactsFromExchange(o, logger)
+				if exReason != "" {
+					reason = exReason
+				}
+				if !closePx.IsPositive() {
+					closePx = price
+				}
+				facts := &exchangeCloseFacts{PnL: exPnL, Fee: exFee}
+				// skipExchange: there is nothing left to flatten.
+				if err := e.closeRealWith(ctx, o, closePx, reason, true, facts, logger); err != nil {
+					logger.Error("failed to record an exchange-closed position", "id", o.ID, "instId", e.InstID, "error", err)
+				}
+				continue
+			}
+		}
 		if err := e.closeReal(ctx, o, price, reason, logger); err != nil {
 			logger.Error("failed to close real order", "id", o.ID, "instId", e.InstID, "error", err)
 		}
