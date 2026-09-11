@@ -5139,3 +5139,60 @@ the exchange's own numbers and write no `last_error` at all.
 **Historical rows left as-is**: the 9 existing `51169` errors describe a real (if harmless) race
 that happened, and rewriting them would erase the evidence for this section. They stay readable in
 the bell until an operator marks them read.
+
+## 44. Unbounded decimal precision stopped paper trading entirely (2026-09-11)
+
+Reported as "paper SL/TP isn't working", with a fair question attached: was it the edit just made?
+It was not — §43's change touched only `RealTrader` files — but the report was right, and the cause
+was mine from 2026-09-04.
+
+**Symptom**: paper trading had stopped closing positions completely. Last close 04:45, last open
+07:25, nothing for hours. The process was up, consuming ticks, evaluating strategies, and calling
+the model; it just could not finish a close. Every attempt failed with
+
+```
+ERROR: invalid scale in external "numeric" value (SQLSTATE 22P03)
+```
+
+and since a failed close is logged and retried rather than fatal, nothing looked crashed. The
+engine looked healthy from every angle except the one that mattered.
+
+**Root cause**: `paper_orders.size` had grown to **16,380 digits**. Dynamic sizing (§32.4) makes
+`size = equity / activeTokens`, a repeating decimal for any roster size that is not a power of ten.
+Closing that position computes PnL from `size`, and multiplication **adds** digits rather than
+capping them, so the PnL comes out longer than the size was. That PnL is added to stored equity,
+which sizes the next order. Nothing bounded the loop.
+
+Digits in `paper_orders.size`, by day, straight from production:
+
+| 09-03 | 09-04 | 09-05 | 09-06 | 09-07 | 09-08 | 09-09 | 09-10 |
+|---|---|---|---|---|---|---|---|
+| 1 | 18 | 395 | 4,647 | 11,243 | 14,366 | 15,491 | **16,380** |
+
+09-03 is the day before dynamic sizing shipped, when `notional_usd` was a config constant. 16,380
+is where PostgreSQL's NUMERIC limit rejected the write.
+
+**This is §16.8's EMA bug in a different place.** `decimal.Decimal` is arbitrary-precision and
+nothing truncates it on its own; any recurrence that feeds its own output back into its next input
+grows without limit. The fix is the same: round at each step, so the value entering the next
+computation is already bounded. `usdScale = 8` is applied to the sizing division, realized PnL,
+trading fees, and funding cost — every value that reaches stored equity. Eight decimal places is a
+hundred-millionth of a dollar, far finer than any real amount needs.
+
+**Why `Div` alone was not enough to catch it**: `shopspring/decimal` caps division at
+`DivisionPrecision` (16), so a single division looks bounded and testing one in isolation proves
+nothing. It is the `Mul` afterwards that grows the value, and only the round trip through the
+database makes it compound. A test that exercises one generation cannot see this — the regression
+test runs 40 and asserts the width stays flat.
+
+**Data repaired** (backup: `paper_precision_backup_20260911`): 874 orders, 1,401 equity-history
+rows, and the account row rounded to 8dp. Paper equity went from 16,364 digits to `15.87060161`.
+
+**Verified recovered**: within 30 minutes of the deploy, 8 positions closed — 2 `sl`, 1 `tp`, 5
+`timeout` — and zero `22P03` errors. New orders carry clean 8dp sizes.
+
+**Worth keeping from this one**: a failing write that is logged-and-retried rather than fatal can
+stop a subsystem completely while every health signal stays green. The bell (§42) showed nothing
+because these were paper orders, and `paper_orders` has no `last_error` column at all (§43). The
+only visible symptom was an absence — no closes — which is exactly the kind of thing nobody
+notices until they go looking.
