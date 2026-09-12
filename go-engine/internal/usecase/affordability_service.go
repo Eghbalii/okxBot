@@ -10,7 +10,6 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
-	"github.com/eghbalii/okxBot/go-engine/internal/okx"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
@@ -50,8 +49,12 @@ type AffordabilityService struct {
 	Mode string
 	// AllTokens is the full configured roster (trading.inst_ids), in short-symbol form.
 	AllTokens []string
-	// SymbolMap resolves a short symbol to the OKX instId used for instrument/ticker lookups.
-	SymbolMap okx.SymbolMap
+	// Symbols resolves a short symbol to the exchange-specific instrument id used for
+	// instrument/ticker lookups. A port rather than the concrete OKX map this field used to hold:
+	// the mapping is genuinely per-exchange — OKX needs a configured table because its X-Perp ids
+	// embed a rolling expiry, MEXC needs none because "BTC_USDT" is derivable — and a use-case must
+	// not import an adapter to find that out (CLAUDE.md §10).
+	Symbols port.SymbolResolver
 	// ExecInstType is the instType those lookups use (e.g. "FUTURES" for X-Perp).
 	ExecInstType string
 
@@ -386,7 +389,7 @@ func (s *AffordabilityService) marketData(logger *slog.Logger) (map[string]domai
 	instruments := make(map[string]domain.Instrument, len(s.AllTokens))
 	prices := make(map[string]decimal.Decimal, len(s.AllTokens))
 	for _, tok := range s.AllTokens {
-		instID, err := s.SymbolMap.Resolve(tok)
+		instID, err := s.Symbols.Resolve(tok)
 		if err != nil {
 			logger.Warn("affordability: unmapped symbol, skipping", "symbol", tok, "error", err)
 			continue

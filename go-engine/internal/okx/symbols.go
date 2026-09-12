@@ -6,7 +6,11 @@
 // short symbol says exactly as much and never needs updating when OKX rolls a contract's expiry.
 package okx
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/eghbalii/okxBot/go-engine/internal/port"
+)
 
 // SymbolMap resolves a short internal symbol ("BTC") to the real OKX instId a WS subscription or
 // REST call must use ("BTC-USD_UM_XPERP-310404"). Deliberately just a map, not a computed
@@ -43,3 +47,8 @@ func (m SymbolMap) ResolveAll(symbols []string) ([]string, error) {
 	}
 	return out, nil
 }
+
+// Compile-time proof that SymbolMap satisfies the port every use-case depends on. Without this,
+// a signature drift in port.SymbolResolver would only surface at the one cmd/ wiring site that
+// assigns it, which is exactly the kind of break that hides until deploy.
+var _ port.SymbolResolver = SymbolMap(nil)

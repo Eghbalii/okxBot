@@ -392,7 +392,7 @@ func runRealTrader(
 		Logger:         logger,
 		Mode:           "real",
 		AllTokens:      cfg.Trading.InstIDs,
-		SymbolMap:      cfg.Trading.SymbolMap,
+		Symbols:        okx.SymbolMap(cfg.Trading.SymbolMap),
 		ExecInstType:   cfg.Trading.ExecInstType,
 		MaxPositionPct: cfg.Account.MaxPositionPct,
 		MaxLeverage:    cfg.Risk.MaxLeverage,
