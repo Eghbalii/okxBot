@@ -51,6 +51,24 @@ type service struct {
 	// rather than from its own now-absent OKX_SIMULATED_TRADING — keeping the "mode can never
 	// disagree with the credentials in use" invariant intact across the process boundary.
 	simulated bool
+
+	// isRetryable decides which exchange errors are worth retrying. A FIELD rather than a
+	// hardcoded call, because this is the one genuinely exchange-specific piece of the gateway:
+	// everything else here — the limiter, the backoff, the metrics, the routes — is already
+	// expressed in terms of endpoint classes and domain types, not OKX.
+	//
+	// That is what makes this service reusable for a second exchange (MEXC, 2026-09-13) without
+	// duplicating the limiter/retry/metrics wiring into a parallel binary. nil falls back to OKX's
+	// predicate, so existing wiring keeps its exact behaviour.
+	isRetryable func(error) bool
+}
+
+// retryablePredicate returns the configured predicate, defaulting to OKX's.
+func (s *service) retryablePredicate() func(error) bool {
+	if s.isRetryable != nil {
+		return s.isRetryable
+	}
+	return isRetryableOKXError
 }
 
 func (s *service) routes() http.Handler {
@@ -124,7 +142,7 @@ func (s *service) call(ctx context.Context, class gateway.EndpointClass, r *http
 		metrics.GatewayRequestsTotal.WithLabelValues(consumer, string(class), "rate_limited").Inc()
 		return err
 	}
-	err := s.retry.Do(ctx, isRetryableOKXError, fn)
+	err := s.retry.Do(ctx, s.retryablePredicate(), fn)
 	status := "ok"
 	if err != nil {
 		status = "error"
