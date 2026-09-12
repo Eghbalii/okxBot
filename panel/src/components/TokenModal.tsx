@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import FilterToggle from './FilterToggle'
 import { api } from '../api/client'
 import SortableTh from './SortableTh'
 import { formatUsd, pnlClass, tokenSymbol } from '../utils/format'
@@ -86,6 +87,9 @@ export default function TokenModal({
   const [error, setError] = useState<string | null>(null)
   const [sortBy, setSortBy] = useState<SortField>('token')
   const [sortDesc, setSortDesc] = useState(false)
+  // Show only active tokens (2026-09-12 request). Note the inverted state here: this modal tracks
+  // DISABLED tokens, so "active" is everything NOT in that set.
+  const [activeOnly, setActiveOnly] = useState(false)
 
   useEffect(() => {
     setStatsLoading(true)
@@ -136,6 +140,11 @@ export default function TokenModal({
     () => sortRows(allInstIds, stats, sortBy, sortDesc),
     [allInstIds, stats, sortBy, sortDesc],
   )
+  // Filters the view only — a hidden row keeps its checked state and is still saved.
+  const visibleInstIds = useMemo(
+    () => (activeOnly ? sortedInstIds.filter((id) => !disabled.has(id)) : sortedInstIds),
+    [sortedInstIds, activeOnly, disabled],
+  )
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -155,6 +164,18 @@ export default function TokenModal({
         {error && <div className="error-banner">{error}</div>}
 
         {allInstIds.length === 0 && <div className="text-dim">No tokens configured.</div>}
+
+        {allInstIds.length > 0 && (
+          <div className="filter-bar">
+            <FilterToggle
+              activeOnly={activeOnly}
+              onChange={setActiveOnly}
+              activeCount={allInstIds.length - disabled.size}
+              totalCount={allInstIds.length}
+              noun="tokens"
+            />
+          </div>
+        )}
 
         {allInstIds.length > 0 && (
           <div className="table-scroll" style={{ marginBottom: '1rem' }}>
@@ -180,7 +201,7 @@ export default function TokenModal({
                 </tr>
               </thead>
               <tbody>
-                {sortedInstIds.map((instId) => {
+                {visibleInstIds.map((instId) => {
                   const s = stats[instId]
                   return (
                     <tr key={instId}>
@@ -211,6 +232,11 @@ export default function TokenModal({
                 })}
               </tbody>
             </table>
+            {visibleInstIds.length === 0 && (
+              <div className="text-dim filter-empty">
+                No active tokens. Switch to All to enable some.
+              </div>
+            )}
           </div>
         )}
 

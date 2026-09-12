@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import FilterToggle from './FilterToggle'
 import { api } from '../api/client'
 import SortableTh from './SortableTh'
 import { formatUsd, pnlClass, winRate } from '../utils/format'
@@ -102,6 +103,10 @@ export default function StrategyKindModal({
   const [error, setError] = useState<string | null>(null)
   const [sortBy, setSortBy] = useState<SortField>('name')
   const [sortDesc, setSortDesc] = useState(false)
+  // Show only the checked kinds (2026-09-12 request). Filters the VIEW, never the selection: a
+  // hidden row keeps its checked state and is still saved, so switching to "Active" and pressing
+  // Save cannot silently drop the kinds that scrolled out of sight.
+  const [activeOnly, setActiveOnly] = useState(false)
 
   useEffect(() => {
     api
@@ -158,6 +163,10 @@ export default function StrategyKindModal({
 
   const kindRows = useMemo(() => buildKindRows(strategies, stats), [strategies, stats])
   const sortedRows = useMemo(() => sortRows(kindRows, sortBy, sortDesc), [kindRows, sortBy, sortDesc])
+  const visibleRows = useMemo(
+    () => (activeOnly ? sortedRows.filter((r) => selected.has(r.kind)) : sortedRows),
+    [sortedRows, activeOnly, selected],
+  )
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -180,6 +189,15 @@ export default function StrategyKindModal({
 
         {!loading && (
           <>
+            <div className="filter-bar">
+              <FilterToggle
+                activeOnly={activeOnly}
+                onChange={setActiveOnly}
+                activeCount={selected.size}
+                totalCount={sortedRows.length}
+                noun="kinds"
+              />
+            </div>
             <div className="table-scroll" style={{ marginBottom: '1rem' }}>
               <table>
                 <thead>
@@ -200,7 +218,7 @@ export default function StrategyKindModal({
                   </tr>
                 </thead>
                 <tbody>
-                  {sortedRows.map((row) => (
+                  {visibleRows.map((row) => (
                     <tr key={row.kind}>
                       <td>
                         <span className="mono">{row.kind}</span>
@@ -226,6 +244,11 @@ export default function StrategyKindModal({
                   ))}
                 </tbody>
               </table>
+              {visibleRows.length === 0 && (
+                <div className="text-dim filter-empty">
+                  No active strategy kinds. Switch to All to enable some.
+                </div>
+              )}
             </div>
           </>
         )}

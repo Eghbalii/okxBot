@@ -1725,3 +1725,56 @@ input[type='number'] {
   color: #58a6ff;
   flex: 0 0 auto;
 }
+
+/* ---- All / Active filter in the manage modals (2026-09-12) ----------------------------------- */
+.filter-bar {
+  display: flex;
+  align-items: center;
+  margin-bottom: 0.6rem;
+}
+
+.filter-toggle {
+  display: inline-flex;
+  background: #1c1f26;
+  border: 1px solid var(--border, #272b33);
+  border-radius: 7px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.filter-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim, #858b96);
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.25rem 0.7rem;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.filter-btn:hover {
+  color: var(--text, #e6e8ec);
+}
+
+.filter-btn.active {
+  background: #2a2f39;
+  color: var(--text, #e6e8ec);
+}
+
+/* The count carries the useful part of the answer — how many are on out of how many exist — so it
+   is legible rather than a faint afterthought, but still subordinate to the label. */
+.filter-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.7rem;
+  opacity: 0.75;
+}
+
+.filter-empty {
+  padding: 0.9rem 0.2rem;
+  text-align: center;
+  font-size: 0.82rem;
+}
