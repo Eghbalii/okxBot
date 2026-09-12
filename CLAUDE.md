@@ -5346,3 +5346,132 @@ record of the same fact drifts from the first. A third generation would want a r
 than a third convention.
 
 Verified against the live panel: 12 kinds tagged, the V1 originals not.
+
+## 46. A second exchange: MEXC, and what it proved about the adapter layer (2026-09-13)
+
+Prompted by the decision to open-source this project: the operator wanted to confirm the adapter
+and port layers were real abstractions rather than OKX-shaped, and chose MEXC as the test. The
+instruction that shaped the work: OKX's peculiarities — contract-name handling, expiry dates,
+volume constraints — must be scoped to OKX and not imposed on every exchange.
+
+**The headline result is one line** (`internal/mexc/adapter.go`):
+
+```go
+var _ port.ExchangeClient = (*rest.Client)(nil)
+```
+
+It compiles. A second exchange satisfies all 14 port methods with **no change to the port at all**.
+Verified load-bearing rather than assumed — renaming one method fails the build naming it.
+
+### 46.1 The audit found one real layering violation
+
+`port.ExchangeClient` was genuinely exchange-agnostic and `usecase` depended on it correctly. But
+`usecase/affordability_service.go` imported `internal/okx` and held an `okx.SymbolMap` — a use-case
+depending on an adapter, which §10's layering exists to prevent. MEXC would have had to fabricate a
+redundant symbol map or fork the service.
+
+Fixed with `port.SymbolResolver`, because the mapping is genuinely per-exchange:
+
+- **OKX needs a configured table.** Its real-trading instruments are X-Perp futures whose id embeds
+  a rolling expiry (`BTC-USD_UM_XPERP-310404`, §33.4) — not derivable from "BTC", and it changes
+  when OKX rolls the contract.
+- **MEXC needs none.** Its perpetuals are plain `BTC_USDT` (verified live). A table there would be
+  ceremony: config lines restating a rule, each one a chance to typo an instrument into silence.
+
+`port.IdentitySymbolResolver` covers the derivable case. This is exactly the operator's instruction
+applied: OKX's contract-naming problem stays OKX's.
+
+**`TestUsecaseImportsNoExchangeAdapter`** now parses the package's imports at AST level and fails if
+a use-case imports any adapter. §10 stated this rule in prose for months while it was already
+broken — §16.10's own lesson is that a documented property needs a check that would fail if it were
+absent.
+
+### 46.2 What differs between the exchanges, and where each difference lives
+
+Every one of these is handled **inside `internal/mexc`**, never pushed into shared code:
+
+| Concern | OKX | MEXC |
+|---|---|---|
+| Symbol | `BTC-USD_UM_XPERP-310404`, rolling expiry | `BTC_USDT`, stable |
+| Symbol mapping | configured table required | identity |
+| Auth | key+secret+**passphrase** | key+secret, no passphrase |
+| Response envelope | `{code:"0"}` — code is a STRING | `{success, code:0}` — a NUMBER |
+| Klines | array of row-arrays | **parallel column arrays** |
+| Kline timestamps | ms | **seconds** (funding is ms — the two endpoints disagree) |
+| Prices | strings | JSON numbers |
+| Candle close | explicit `confirm=1` | **no flag at all** |
+| WS ack vs push | separate `event` field | channel prefix (`rs.` vs `push.`) |
+| WS ping | plain text `"ping"` | JSON `{"method":"ping"}` |
+| Sockets | public + separate business host | one socket |
+| Order side | side + posSide | **one integer** encoding both |
+| SL/TP | separate OCO algo order, has algoId | attached to a **position**, no algoId |
+
+### 46.3 The subtle one: MEXC never says a candle closed
+
+OKX marks a finalized bar with `confirm=1`. MEXC re-pushes the forming bar continuously with **no
+equivalent field**. There is nothing to read, so closure must be inferred: a push for a newer bar
+means the tracked one is complete.
+
+`ws.KlineFinalizer` does that, and deliberately does NOT hide it inside the decoder — finalization
+is per-subscription state, and a stateful decoder would make two subscriptions to one symbol
+interfere. Keyed by (symbol, interval) because one process runs several instruments across several
+timeframes on one connection (§9), and a shared key would let a 5m push finalize a 1H candle.
+
+Treating every push as closed would re-run strategies several times per second on an unfinished
+candle, which §14 is explicit is wrong.
+
+**A weak test nearly let a real bug through.** The first independence test used the same bar
+timestamp for every stream, which made a shared-key implementation behave identically to a correct
+one — it passed against the very bug it was written to catch. Found by tracing both versions rather
+than trusting the green result, then rewritten with interleaved bar times (the real case: a 1H and a
+5m bar have different open times). It now fails with "a 5m push corrupted the 1H stream".
+
+### 46.4 The gateway generalizes; it did not need forking
+
+The operator asked directly whether one generalized gateway really works for every exchange. It
+does, and the reason is that the service was already generic and only looked OKX-specific:
+
+- Its routes are `/ticker` and `/order` — **not** `/api/v5/market/tickers`.
+- Handlers call `s.client.GetTicker()` through an **interface** and return `domain.Ticker`.
+- Every OKX mention in `internal/gateway`'s limiter and retry is a **comment**, not code.
+
+So the gateway never knew it was calling OKX. It knows nine ACTIONS; translating those into a real
+URL is the adapter's job. The single exchange-specific piece was `isRetryableOKXError`, hardcoded in
+the call path — now a field, defaulting to OKX's so existing wiring is byte-identical.
+
+Proved rather than claimed, since the opposite reading is plausible (the package is *named*
+okx-gateway): `TestGateway_ServesANonOKXClient` runs the real service with a MEXC client and serves
+a `BTC_USDT` ticker end to end. `TestGateway_UsesTheConfiguredRetryPredicate` guards the piece that
+would silently regress — under OKX's predicate a MEXC rate-limit (code 510) is unrecognised and
+tried once instead of three times, so the gateway would look healthy while giving up on exactly the
+errors retrying exists for.
+
+**Keeping one gateway also keeps the property §27.1 was built for**: credentials live in exactly one
+process, no matter how many exchanges are added.
+
+### 46.5 Fail-safe defaults, all tested
+
+- An unknown margin mode maps to **isolated**, never cross — isolated bounds a liquidation to one
+  position's margin (§27.2).
+- An unmapped order state **errors** rather than defaulting to "live", which would make fill-timeout
+  wait out its full timeout on a dead order.
+- An ambiguous triggered stop reports **no** `ActualSide` rather than guessing; §37's fallback beats
+  a fabricated close reason.
+- Fees are **negated** at the boundary: MEXC reports charges positive, the domain expects negative,
+  and §41 shows a sign error there credits the fee and overstates every trade by twice its cost.
+- MEXC's retry predicate matches **structured codes**, never message text (§38.1).
+
+### 46.6 Verified live, and what is still open
+
+Public endpoints and both WebSocket channels were verified against the real MEXC API — ticker,
+klines (column-array decode, seconds timestamps, OHLC coherence), contract specs
+(`ctVal=0.0001`, `tickSz=0.1` — the values order sizing depends on, §33.3), and funding history
+(reversed to oldest-first). The live kline test asserts **0 finalizations in a 20s window**, since
+every push there belongs to one forming bar.
+
+**Still open, by design** — the authenticated half (orders, positions, balance, exchange-side SL/TP)
+is written and unit-tested but has never run against a real account, because that needs credentials.
+Per the operator's rollout: WebSocket and public data first, API keys after. The numeric-code
+mappings (order states, stop-order states) are the most likely to need correction, and are written
+to fail loudly on an unknown value rather than guess. Nothing is wired into `cmd/` yet either — no
+ingestor or trader runs against MEXC, so none of this can affect the live OKX path.
