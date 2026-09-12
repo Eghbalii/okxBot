@@ -10,6 +10,7 @@ import {
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
+import { barSeconds } from '../lib/bars'
 import type { Candle, Position } from '../api/types'
 import { PositionZones, type ZonePosition } from './PositionZones'
 
@@ -46,6 +47,20 @@ function pnlColor(pnl: string | null): string {
 }
 
 const secs = (iso: string) => (Date.parse(iso) / 1000) as UTCTimestamp
+
+// Snaps a timestamp to the start of the bar containing it.
+//
+// A marker must sit on a time the series actually HAS. Orders open a second or so after the bar
+// opens (real data: 14:35:01.735821) while candles are stamped exactly on the boundary (14:35:00),
+// so a raw timestamp matches no data point and the library falls back to the nearest one — which,
+// as the series grows, is the newest candle. That is the reported bug: the entry arrow walked
+// forward onto the last candle instead of staying on the bar the position opened on.
+function snapToBar(iso: string, bar: string): UTCTimestamp {
+  const ms = Date.parse(iso)
+  const secsPerBar = barSeconds(bar)
+  if (!secsPerBar || !Number.isFinite(ms)) return (ms / 1000) as UTCTimestamp
+  return (Math.floor(ms / (secsPerBar * 1000)) * secsPerBar) as UTCTimestamp
+}
 
 // Decimal places to render on the price axis, derived from the data rather than fixed.
 //
@@ -224,7 +239,7 @@ export function CandleChart({
       const openID = `open-${p.ID}`
       markers.push({
         id: openID,
-        time: secs(p.OpenedAt),
+        time: snapToBar(p.OpenedAt, frameKey ?? ''),
         position: long ? 'belowBar' : 'aboveBar',
         shape: long ? 'arrowUp' : 'arrowDown',
         color: long ? UP : DOWN,
@@ -252,7 +267,7 @@ export function CandleChart({
       const won = p.RealizedPnL !== null && Number(p.RealizedPnL) >= 0
       markers.push({
         id: closeID,
-        time: secs(p.ClosedAt),
+        time: snapToBar(p.ClosedAt, frameKey ?? ''),
         position: long ? 'aboveBar' : 'belowBar',
         shape: long ? 'arrowDown' : 'arrowUp',
         // Coloured by OUTCOME, not by side — §11.3's own rule that a win is positive realized PnL,
@@ -280,16 +295,21 @@ export function CandleChart({
     detailsRef.current = details
     markersRef.current?.setMarkers(markers)
 
-    const open: ZonePosition[] = positions
-      .filter((p) => !p.ClosedAt)
-      .map((p) => ({
-        id: p.ID,
-        side: p.Side,
-        entry: Number(p.EntryPx),
-        sl: p.SLPx === null ? null : Number(p.SLPx),
-        tp: p.TPPx === null ? null : Number(p.TPPx),
-      }))
-    zonesRef.current?.setPositions(open)
+    // Closed positions get a box too, now that boxes are bounded to the time the trade was open
+    // (2026-09-12). While they spanned the full chart width that was impossible — several
+    // overlapping washes with no way to tell which belonged to which trade — which is why this was
+    // previously filtered to open positions only.
+    const zones: ZonePosition[] = positions.map((p) => ({
+      id: p.ID,
+      side: p.Side,
+      entry: Number(p.EntryPx),
+      sl: p.SLPx === null ? null : Number(p.SLPx),
+      tp: p.TPPx === null ? null : Number(p.TPPx),
+      openTime: snapToBar(p.OpenedAt, frameKey ?? ''),
+      closeTime: p.ClosedAt ? snapToBar(p.ClosedAt, frameKey ?? '') : null,
+      leverage: Number(p.Leverage) || 1,
+    }))
+    zonesRef.current?.setPositions(zones)
 
     // Only frame the view the FIRST time data arrives. The positions table refetches every 5s and
     // re-renders this component with it, so calling fitContent on each pass threw away whatever
