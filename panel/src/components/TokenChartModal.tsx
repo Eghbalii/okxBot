@@ -31,8 +31,14 @@ const BARS = ['5m', '15m', '1H'] as const
 // fixed 150px of that, so the chart gets whatever is left. Clamped at both ends: below ~300px
 // candles stop being readable, and above ~760px the chart stretches past what is useful.
 function availableChartHeight(): number {
-  const available = window.innerHeight * 0.92 - 150
-  return Math.round(Math.min(Math.max(available, 300), 760))
+  // Overhead measured against the current header/legend rather than the 150 this carried from an
+  // older layout: modal padding 40 + the position strip ~44 + the row gap 12 + the legend ~46.
+  // Rounded up a little for safety — undershooting costs a few pixels of chart, overshooting costs
+  // a scrollbar, and those are not equally bad.
+  const available = window.innerHeight * 0.92 - 148
+  // Ceiling raised 760 -> 900 (2026-09-12 request): on a tall display the chart was being held
+  // well below the space actually free, which is what left the side panel looking mismatched.
+  return Math.round(Math.min(Math.max(available, 320), 900))
 }
 
 /**

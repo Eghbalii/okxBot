@@ -1037,11 +1037,11 @@ th.sorted {
 }
 
 .chart-adjust-panel {
-  flex: 0 0 250px;
+  flex: 0 0 225px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px;
+  gap: 8px;
+  padding: 10px;
   background: #16181d;
   border: 1px solid #272b33;
   border-radius: 8px;
@@ -1049,14 +1049,16 @@ th.sorted {
      which left a ragged edge beside the chart. The actions are pushed to the bottom by the spacer
      below, so a taller chart grows the gap rather than stretching the controls. */
   align-self: stretch;
-  overflow-y: auto;
+  /* hidden, not auto: the content is now sized to fit and the spacer/hint absorb any slack, so a
+     scrollbar here would mean something is wrong rather than being a usable affordance. */
+  overflow: hidden;
 }
 
-/* Pushes everything after it to the bottom of the panel, so Update/Reset sit on the chart's own
-   baseline instead of floating directly under the inputs. */
+/* Absorbs all remaining height, and is the FIRST thing to give it back when space is tight — so
+   the controls keep their size and the empty gap shrinks, rather than the panel overflowing. */
 .cap-spacer {
   flex: 1 1 auto;
-  min-height: 4px;
+  min-height: 0;
 }
 
 @media (max-width: 900px) {
@@ -1069,7 +1071,9 @@ th.sorted {
   .chart-adjust-panel {
     flex: 1 1 auto;
     width: 100%;
-    overflow-y: visible;
+    /* `overflow`, not `overflow-y`: the desktop rule is now the shorthand, and overriding only one
+       axis would leave overflow-x: hidden in force and clip the panel sideways when stacked. */
+    overflow: visible;
   }
 }
 
@@ -1077,12 +1081,12 @@ th.sorted {
    position every control below acts on, and at a glance that has to be unmistakable — the controls
    flatten real money. */
 .cap-head {
-  padding-bottom: 10px;
+  padding-bottom: 8px;
   border-bottom: 1px solid #272b33;
 }
 
 .cap-title {
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 700;
   letter-spacing: 0.2px;
   color: #f2f4f8;
@@ -1097,7 +1101,7 @@ th.sorted {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-top: 6px;
+  margin-top: 4px;
   font-size: 11px;
 }
 
@@ -1154,8 +1158,8 @@ th.sorted {
 .cap-entry {
   display: flex;
   justify-content: space-between;
-  font-size: 12px;
-  padding: 6px 8px;
+  font-size: 11.5px;
+  padding: 4px 8px;
   background: #1c1f26;
   border-radius: 6px;
 }
@@ -1174,7 +1178,7 @@ th.sorted {
   background: transparent;
   color: #858b96;
   font-size: 11px;
-  padding: 5px 0;
+  padding: 4px 0;
   border-radius: 4px;
   cursor: pointer;
 }
@@ -1231,8 +1235,8 @@ th.sorted {
   border: 1px solid #2a2f39;
   border-radius: 6px;
   color: #e6e8ec;
-  padding: 7px 8px;
-  font-size: 13px;
+  padding: 5px 8px;
+  font-size: 12.5px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1241,11 +1245,16 @@ th.sorted {
   border-color: #3d84f7;
 }
 
+/* Shrinks away entirely before the panel would ever scroll: it is guidance, and losing a line of
+   it costs nothing next to the controls becoming unreachable. */
 .cap-hint {
-  font-size: 10.5px;
-  line-height: 1.45;
+  font-size: 10px;
+  line-height: 1.4;
   color: #6f757f;
   margin: 0;
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .cap-error,
