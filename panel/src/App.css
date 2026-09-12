@@ -1316,10 +1316,17 @@ th.sorted {
   color: #ffffff;
 }
 
-/* Keeps hover distinguishable ON the selected chip, so it still feels responsive to the pointer
-   instead of going inert once selected. */
+/* The selected chip is already the chart you are looking at, so clicking it does nothing — it
+   should not advertise itself as a target (2026-09-12 request). Default cursor and no hover shift;
+   the button is also disabled in the markup, so this is appearance following behaviour rather than
+   a purely visual lie. */
+.chart-pos-chip.active {
+  cursor: default;
+}
+
 .chart-pos-chip.active:hover {
-  border-color: #6d7688;
+  background: #2a2f3b;
+  border-color: #59616f;
 }
 
 .chip-sym {
@@ -1355,7 +1362,7 @@ th.sorted {
   backdrop-filter: blur(2px);
 }
 
-/* Three buttons on one row, equal width and the same height. */
+/* Update + Reset share a row, equal width. */
 .cap-actions {
   display: flex;
   gap: 6px;
@@ -1366,5 +1373,12 @@ th.sorted {
   min-width: 0;
   padding-left: 4px;
   padding-right: 4px;
+  white-space: nowrap;
+}
+
+/* Close spans the full width beneath them — the same total width as the two above, since both rows
+   are bounded by the panel's own padding. */
+.cap-close-wide {
+  width: 100%;
   white-space: nowrap;
 }

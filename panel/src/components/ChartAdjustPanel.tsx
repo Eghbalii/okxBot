@@ -212,16 +212,13 @@ export default function ChartAdjustPanel({
       {row('tp', 'Take profit', tp, 'cap-dot-green')}
       {row('sl', 'Stop loss', sl, 'cap-dot-red')}
 
+      {/* One hint for both modes (2026-09-12 request). The % variant used to append an
+          explanation of margin-vs-price, which made the panel tall enough to scroll — the margin
+          point is already carried by the "% of margin" button label and the per-row conversion
+          shown beside each input, so it was costing layout to repeat something visible twice. */}
       <p className="cap-hint">
         Drag a level on the chart, or type here. Nothing reaches the exchange until you press
         Update.
-        {mode === 'pct' && (
-          <>
-            {' '}
-            Percentages are of <strong>margin</strong>, not of price: at {leverage}x, −15% is a{' '}
-            {(15 / leverage).toFixed(2)}% price move.
-          </>
-        )}
       </p>
 
       <div className="cap-spacer" />
@@ -229,9 +226,9 @@ export default function ChartAdjustPanel({
       {error && <p className="error cap-error">{error}</p>}
       {saved && !dirty && <p className="cap-saved">Sent to the exchange.</p>}
 
-      {/* All three on one row at the same height (2026-09-12 request). Close keeps the danger
-          styling — it is the one irreversible action here — but sits level with the others rather
-          than being pushed to the bottom, which is what an earlier reading of this got wrong. */}
+      {/* Update/Reset share a row; Close sits beneath spanning both (2026-09-12 request). The two
+          rows also separate the reversible actions from the irreversible one without needing a
+          divider. */}
       <div className="cap-actions">
         <button className="btn-primary" onClick={handleSubmit} disabled={!dirty || submitting}>
           {submitting ? 'Updating…' : 'Update'}
@@ -239,16 +236,16 @@ export default function ChartAdjustPanel({
         <button onClick={onReset} disabled={!dirty || submitting} type="button">
           Reset
         </button>
-        <button
-          className="btn-danger"
-          onClick={onClosePosition}
-          disabled={closing || submitting}
-          type="button"
-          title="Close this position now at the live price (close_reason='manual')"
-        >
-          {closing ? 'Closing…' : 'Close'}
-        </button>
       </div>
+      <button
+        className="btn-danger cap-close-wide"
+        onClick={onClosePosition}
+        disabled={closing || submitting}
+        type="button"
+        title="Close this position now at the live price (close_reason='manual')"
+      >
+        {closing ? 'Closing…' : 'Close position'}
+      </button>
     </aside>
   )
 }

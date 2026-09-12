@@ -318,8 +318,11 @@ export default function TokenChartModal({
                 <button
                   key={o.instId}
                   className={'chart-pos-chip' + (o.instId === instId ? ' active' : '')}
+                  // Genuinely disabled, not just styled that way: clicking the chart you are
+                  // already looking at does nothing, so it should not be focusable or clickable.
+                  disabled={o.instId === instId}
                   onClick={() => setInstId(o.instId)}
-                  title={`Show ${o.instId}`}
+                  title={o.instId === instId ? `${o.instId} (showing)` : `Show ${o.instId}`}
                 >
                   <span className="chip-sym">{tokenSymbol(o.instId)}</span>
                   <span className={'chip-pnl ' + pnlClass(o.pct)}>
