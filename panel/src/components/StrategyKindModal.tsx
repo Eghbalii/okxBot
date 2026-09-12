@@ -4,23 +4,21 @@ import SortableTh from './SortableTh'
 import { formatUsd, pnlClass, winRate } from '../utils/format'
 import type { PositionMode, StrategyConfig, StrategyStats } from '../api/types'
 
-// The 12 scalp/ICT/price-action kinds added CLAUDE.md §30, tagged "new" in this list so they are
-// easy to spot among the original 14 while deciding which to enable — pure display, no backend
-// concept of "new" exists (a strategy row carries no added_at/version marker for this).
-const NEW_KINDS = new Set([
-  'vwap_reversion',
-  'bb_squeeze_breakout',
-  'range_breakout',
-  'keltner_trend_scalp',
-  'ict_fvg',
-  'ict_order_block',
-  'ict_liquidity_sweep',
-  'engulfing_reversal',
-  'inside_bar_breakout',
-  'macd_momentum',
-  'volume_breakout',
-  'ema_ribbon_pullback',
-])
+// Tags the newest generation of strategies so they are easy to spot while deciding which to enable.
+// Pure display — no backend concept of "new" exists (a strategy row carries no added_at/version
+// marker for this).
+//
+// Derived from the kind's own "_v2" suffix rather than a hardcoded list. The list this replaced
+// named the twelve added in CLAUDE.md §30 and silently went stale the moment their V2 revisions
+// shipped (§45): the panel went on labelling the SUPERSEDED kinds "new" while the actual new ones
+// carried no tag at all. A suffix check cannot drift that way, since the thing it reads is the same
+// thing that makes a kind new.
+//
+// A later generation would need this revisited — at which point prefer a real column over a third
+// convention.
+function isNewKind(kind: string): boolean {
+  return kind.endsWith('_v2')
+}
 
 type SortField = 'name' | 'signals' | 'winRate' | 'pnl'
 
@@ -206,7 +204,7 @@ export default function StrategyKindModal({
                     <tr key={row.kind}>
                       <td>
                         <span className="mono">{row.kind}</span>
-                        {NEW_KINDS.has(row.kind) && (
+                        {isNewKind(row.kind) && (
                           <span className="badge badge-green" style={{ marginLeft: 6 }}>
                             new
                           </span>
