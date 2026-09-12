@@ -311,6 +311,17 @@ th:hover {
   white-space: nowrap;
 }
 
+/* Close/Update sit side by side on one line (2026-09-12 request) — in a narrow column they used
+   to stack vertically, which made the two buttons read as belonging to different rows. nowrap
+   alone isn't enough: the buttons are inline-block, so the cell has to stop them wrapping. */
+.actions-cell {
+  white-space: nowrap;
+}
+
+.actions-cell button + button {
+  margin-left: 0.4rem;
+}
+
 /* PnL/Max cells are fixed at two lines (percent + dollar, or max + min) rather than wrapping
    inline text onto a second line only when it's long enough to need it — a row's height used to
    jump depending on whether that particular row's PnL string happened to wrap (2026-09-03 request). */

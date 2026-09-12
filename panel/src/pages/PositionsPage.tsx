@@ -103,19 +103,6 @@ function slTpPct(p: Position, target: string | null): number | null {
   return (direction * (t - entry) * 100 * leverage) / entry
 }
 
-// Rounds a percent's MAGNITUDE up (2026-09-04 request: "round up so 8.82 shows as 9", clarified as
-// ceiling on the absolute value — e.g. -8.82 -> -9, not -8) rather than plain integer rounding,
-// which would round 8.82 down to 9 anyway but would round e.g. -8.2 UP toward zero to -8, the
-// opposite of "bigger magnitude" for a negative number. No decimal point, no sign, no percent
-// suffix — those are added at the call site (a "+"/"−" was explicitly dropped as unnecessary here,
-// the color already conveys direction).
-//
-// Snapped to a small epsilon before the ceiling (2026-09-06): a stop placed exactly ON the 15%
-// loss cap computes to -15.000000000000037 in float64 — the cap IS being honoured to the limit —
-// and a bare Math.ceil turned that into 16, making every capped position look like the cap had
-// been breached. Reported as "SL is at 16, the 15% limit isn't working"; the limit was working and
-// only this display was wrong. The epsilon is far below any distance that matters on a real stop,
-// so it can only absorb representation error, never a genuine excess.
 // feesDisplay renders the trading fee + funding cost/credit already subtracted into a closed
 // position's PnL (2026-09-06). Kept as one combined total for the table's compact column — the
 // order-detail modal is where a reader who wants the fee/funding split separately can see it — but
@@ -127,9 +114,14 @@ function feesDisplay(feesUSD: string | null, fundingUSD: string | null): string 
   return formatUsd(-total) // stored as a cost (positive = charged); display as its effect on PnL
 }
 
-function roundPctUp(pct: number): number {
-  const snapped = Math.abs(pct) - 1e-9
-  return Math.sign(pct) * Math.ceil(Math.max(snapped, 0))
+// SL/TP percentages are shown to one decimal place, unrounded (2026-09-12 request, replacing an
+// earlier magnitude-ceiling that displayed 8.82 as 9). Truncating rather than rounding the last
+// digit keeps a stop placed exactly on the 15% loss cap reading as 15.0 — Number.toFixed would
+// render the float64 representation -15.000000000000037 as "-15.0" anyway, but truncation makes
+// that independent of representation error rather than incidentally correct.
+function formatPct1(pct: number): string {
+  const truncated = Math.trunc(pct * 10) / 10
+  return truncated.toFixed(1)
 }
 
 export default function PositionsPage() {
@@ -434,18 +426,18 @@ export default function PositionsPage() {
                   {showLiveColumns && <td className="mono">{p.ClosedAt ? '—' : trimPrice(lastPrice)}</td>}
                   <td className="mono sl-tp-cell">
                     <div>
-                      {tpPct !== null && <span className="text-green">{roundPctUp(tpPct)}%</span>}
+                      {tpPct !== null && <span className="text-green">{formatPct1(tpPct)}%</span>}
                       {tpPct !== null && ' | '}
                       <span className="text-dim">{trimPrice(p.TPPx)}</span>
                     </div>
                     <div>
-                      {slPct !== null && <span className="text-red">{roundPctUp(slPct)}%</span>}
+                      {slPct !== null && <span className="text-red">{formatPct1(slPct)}%</span>}
                       {slPct !== null && ' | '}
                       <span className="text-dim">{trimPrice(p.SLPx)}</span>
                     </div>
                   </td>
                   <td className="mono">{Number(p.Leverage).toFixed(1)}x</td>
-                  <td className="mono">${trimPrice(p.Size)}</td>
+                  <td className="mono">${Number(p.Size).toFixed(1)}</td>
                   <DateTimeCell iso={p.OpenedAt} />
                   {showClosedColumns && <DateTimeCell iso={p.ClosedAt} />}
                   {showClosedColumns && <td>{closeReasonBadge(p.CloseReason)}</td>}
@@ -505,7 +497,7 @@ export default function PositionsPage() {
                     </td>
                   )}
                   {showLiveColumns && (
-                    <td>
+                    <td className="actions-cell">
                       {/* Close works in BOTH modes. It was gated to paper until 2026-09-08, which
                           left real positions with no way to exit from the panel at all — the
                           backend half (RequestRealManualClose, and RealTrader's own
