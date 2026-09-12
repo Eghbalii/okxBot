@@ -138,7 +138,17 @@ export default function TokenChartModal({
     return [...byToken.values()].sort((a, b) => a.instId.localeCompare(b.instId))
   }, [positions, livePrices])
 
-  const chartedPnL = otherOpen.find((o) => o.instId === instId)?.pct ?? null
+  // The charted token always appears in the strip, even with no open position on it — the strip is
+  // now the ONLY thing naming which token is displayed (the separate heading was removed), so a
+  // token opened from a closed row would otherwise leave the chart unlabelled. It carries no PnL,
+  // which is correct: there is no open position to have any.
+  const chips = useMemo(
+    () =>
+      otherOpen.some((o) => o.instId === instId)
+        ? otherOpen
+        : [...otherOpen, { instId, pct: null }].sort((a, b) => a.instId.localeCompare(b.instId)),
+    [otherOpen, instId],
+  )
 
   // --- chart-side SL/TP editing (2026-09-12 request) -----------------------------------------
   // Only a REAL, still-open position can be edited: the endpoint is real-only by construction
@@ -298,22 +308,13 @@ export default function TokenChartModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="chart-panel-head">
-          {/* The charted token, with its own live PnL beneath — everything else that used to sit
-              here (mode badge, order counts) was removed on request: it was metadata about the
-              query, not about the trade being looked at. */}
-          <div className="chart-token">
-            <div className="chart-token-name">{tokenSymbol(instId)}</div>
-            <div className={'chart-token-pnl ' + pnlClass(chartedPnL)}>
-              {chartedPnL === null ? '—' : `${chartedPnL > 0 ? '+' : ''}${chartedPnL.toFixed(1)}%`}
-            </div>
-          </div>
-
-          {/* Every other open position, each clickable to re-point this same chart. Gives one
-              screen for "how is everything doing, and let me look at that one" without going back
-              to the table. */}
-          {otherOpen.length > 0 && (
+          {/* Every open position, each clickable to re-point this same chart — one screen for "how
+              is everything doing, and let me look at that one" without going back to the table.
+              The charted token is NOT also shown separately on the left (2026-09-12 request): it is
+              already in this strip, marked as selected, and repeating it said nothing new. */}
+          {chips.length > 0 && (
             <div className="chart-pos-strip">
-              {otherOpen.map((o) => (
+              {chips.map((o) => (
                 <button
                   key={o.instId}
                   className={'chart-pos-chip' + (o.instId === instId ? ' active' : '')}

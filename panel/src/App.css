@@ -1272,35 +1272,13 @@ th.sorted {
    The header used to carry the instId, a mode badge and order counts — metadata about the query
    rather than about the trade. It now shows the charted token with its live PnL, and a strip of
    every other open position that re-points this same chart on click. */
-.chart-token {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.15;
-  margin-right: 4px;
-}
-
-.chart-token-name {
-  font-size: 17px;
-  font-weight: 700;
-  color: #f2f4f8;
-  letter-spacing: 0.2px;
-}
-
-.chart-token-pnl {
-  font-size: 13px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  margin-top: 1px;
-}
-
 /* Scrolls rather than wraps: the roster can run to ten tokens, and a wrapping strip would change
    the header's height and push the chart down as positions open and close. */
 .chart-pos-strip {
   display: flex;
   gap: 6px;
   overflow-x: auto;
-  padding: 2px 4px 4px;
-  margin-left: 4px;
+  padding: 2px 2px 4px;
   flex: 1 1 auto;
   min-width: 0;
   scrollbar-width: thin;
@@ -1315,31 +1293,43 @@ th.sorted {
   background: #1c1f26;
   border: 1px solid #272b33;
   border-radius: 6px;
-  padding: 4px 8px;
+  padding: 5px 10px;
   cursor: pointer;
-  line-height: 1.2;
+  line-height: 1.25;
 }
 
 .chart-pos-chip:hover {
   border-color: #3a414d;
+  background: #212530;
 }
 
-/* The charted token is marked by a left accent bar and a lifted background — a colour change alone
-   would collide with the PnL colouring inside the chip. */
+/* Selected is the hover treatment, carried further (2026-09-12 request) rather than a different
+   visual language — the blue accent read as a foreign element. Same lifted background and lighter
+   border, pushed brighter, plus the symbol going full white below. Deliberately no hue: the chip
+   already carries green/red for PnL, and a third colour competed with it. */
 .chart-pos-chip.active {
-  background: #232833;
-  border-color: #3d84f7;
-  box-shadow: inset 3px 0 0 0 #3d84f7;
+  background: #2a2f3b;
+  border-color: #59616f;
+}
+
+.chart-pos-chip.active .chip-sym {
+  color: #ffffff;
+}
+
+/* Keeps hover distinguishable ON the selected chip, so it still feels responsive to the pointer
+   instead of going inert once selected. */
+.chart-pos-chip.active:hover {
+  border-color: #6d7688;
 }
 
 .chip-sym {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   color: #cdd2da;
 }
 
 .chip-pnl {
-  font-size: 11px;
+  font-size: 11.5px;
   font-variant-numeric: tabular-nums;
 }
 
