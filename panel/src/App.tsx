@@ -1,5 +1,7 @@
 import { Navigate, NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import NotificationBell from './components/NotificationBell'
+import ModeSelect from './components/ModeSelect'
+import type { PositionMode } from './api/types'
 import './App.css'
 import ResourcesPage from './pages/ResourcesPage'
 import ModelStatusPage from './pages/ModelStatusPage'
@@ -17,6 +19,10 @@ const tabs = [
 
 export default function App() {
   const location = useLocation()
+  const onPositions = location.pathname.startsWith('/positions')
+  // Derived from the URL rather than held in state, so the header and the page can never disagree
+  // about which mode is showing.
+  const mode: PositionMode = location.pathname.startsWith('/positions/real') ? 'real' : 'paper'
   return (
     <div className="app">
       <header className="app-header">
@@ -36,9 +42,15 @@ export default function App() {
             )
           })}
         </nav>
-        {/* In the header rather than on the positions page: an exchange failure matters wherever
-            the operator happens to be, and the count has to read the same on every tab. */}
-        <NotificationBell />
+        {/* Right-aligned group. The bell used to sit immediately after the nav, which left it
+            floating mid-header; pushing the group to the edge gives it a fixed, findable home. */}
+        <div className="app-header-right">
+          {/* Only on the positions routes — the only page whose content is mode-scoped. */}
+          {onPositions && <ModeSelect mode={mode} />}
+          {/* In the header rather than on the positions page: an exchange failure matters wherever
+              the operator happens to be, and the count has to read the same on every tab. */}
+          <NotificationBell />
+        </div>
       </header>
       <main className="app-main">
         <Routes>

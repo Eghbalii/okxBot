@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Navigate, useNavigate, useParams } from 'react-router-dom'
+import { Navigate, useParams } from 'react-router-dom'
 import { usePolling } from '../hooks/usePolling'
 import { usePositionAlerts } from '../hooks/usePositionAlerts'
 import { usePositionEvents } from '../hooks/usePositionEvents'
@@ -105,7 +105,6 @@ function formatPct1(pct: number): string {
 
 export default function PositionsPage() {
   const { mode: rawMode } = useParams<{ mode: string }>()
-  const navigate = useNavigate()
   // Only 'paper'/'real' are valid route segments — an unrecognized value (a stale bookmark, a typo)
   // redirects to paper rather than silently misinterpreting it.
   if (rawMode !== 'paper' && rawMode !== 'real') {
@@ -264,18 +263,8 @@ export default function PositionsPage() {
 
   return (
     <div>
-      <div className="mode-tabs" style={{ marginBottom: '0.9rem' }}>
-        {(['paper', 'real'] as PositionMode[]).map((m) => (
-          <button
-            key={m}
-            className={'mode-tab' + (mode === m ? ' active' : '')}
-            onClick={() => navigate(`/positions/${m}`)}
-          >
-            {m[0].toUpperCase() + m.slice(1)}
-          </button>
-        ))}
-      </div>
-
+      {/* The Paper/Real selector moved into the header (2026-09-12 request) — it is a mode the
+          whole panel operates in, not a control belonging to this table. */}
       <PaperTradingStatsBox mode={mode} />
       <PaperTradingConfigBox mode={mode} />
 

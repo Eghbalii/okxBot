@@ -915,15 +915,15 @@ th.sorted {
 }
 
 /* --- Exchange-error notifications (header bell) ------------------------- */
-.notif-wrap { position: relative; margin-left: 0.75rem; }
+.notif-wrap { position: relative; }
 
 .notif-bell {
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
+  width: 40px;
+  height: 40px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: transparent;
@@ -1414,11 +1414,13 @@ th.sorted {
    the tiles, which made it the largest element on the page while carrying the least-consulted
    information, and the tiles wrapped unpredictably in an auto-fit grid.
 
-   2fr/3fr rather than a hard 5-column split: the stats side is three fixed rows whose width is set
-   by their content, while the chart benefits from every pixel left over. */
+   Revised 2026-09-12 to 1fr/2fr (was 2fr/3fr): the chart read as too small beside the stats. The
+   stats side only has to fit three short rows of numbers, so a third of the width is enough for it
+   and the chart gets the rest — and since the chart's height follows the stats column, a narrower
+   left side also keeps the pair from growing too tall. */
 .stats-layout {
   display: grid;
-  grid-template-columns: 2fr 3fr;
+  grid-template-columns: 1fr 2fr;
   gap: 1rem;
   align-items: stretch;
 }
@@ -1426,7 +1428,7 @@ th.sorted {
 .stats-col {
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
+  gap: 0.5rem;
   min-width: 0;
 }
 
@@ -1434,7 +1436,7 @@ th.sorted {
    the available width, which is how one over-wide tile pushed 1M PnL onto a second row. */
 .stats-row {
   display: grid;
-  gap: 0.6rem;
+  gap: 0.5rem;
   min-width: 0;
 }
 
@@ -1446,20 +1448,22 @@ th.sorted {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+/* Compact: the left column is narrower now, and three PnL tiles have to sit across it without
+   their values wrapping. */
 .stat-tile {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 0.15rem;
+  gap: 0.1rem;
   min-width: 0;
-  padding: 0.55rem 0.7rem;
+  padding: 0.45rem 0.55rem;
   background: var(--bg-elev, #16181d);
   border: 1px solid var(--border, #272b33);
   border-radius: 8px;
 }
 
 .stat-label {
-  font-size: 0.68rem;
+  font-size: 0.64rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-dim, #858b96);
@@ -1469,14 +1473,14 @@ th.sorted {
 }
 
 .stat-value {
-  font-size: 1.05rem;
+  font-size: 0.95rem;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
 }
 
 .stat-sub {
-  font-size: 0.72rem;
+  font-size: 0.68rem;
   color: var(--text-dim, #858b96);
   font-variant-numeric: tabular-nums;
 }
@@ -1571,4 +1575,60 @@ th.sorted {
   .stats-layout {
     grid-template-columns: 1fr;
   }
+}
+
+/* Number inputs carry no spinner arrows (2026-09-12 request, raised for Set Trading Cap and
+   applied everywhere for consistency). They are useless on these fields — stepping a dollar cap or
+   a price by one unit at a time is never what anyone wants — and they eat width in tiles that are
+   already tight. Both vendor forms are needed: WebKit/Blink hide a pseudo-element, Firefox takes
+   the standard property. */
+input[type='number']::-webkit-outer-spin-button,
+input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* ---- Header right-hand group (2026-09-12) ----------------------------------------------------
+   Mode selector and notification bell live together at the right edge. The bell previously
+   followed the nav directly, which left it floating in the middle of the header with no fixed
+   position as the nav's width changed. */
+.app-header-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.mode-select select {
+  background: var(--bg-elev, #16181d);
+  border: 1px solid var(--border, #272b33);
+  border-radius: 8px;
+  color: var(--text, #e6e8ec);
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 0.35rem 1.6rem 0.35rem 0.7rem;
+  cursor: pointer;
+  /* Custom chevron: the native one differs per browser and sat too far from the text. */
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath fill='%238b949e' d='M2.5 4.5 6 8l3.5-3.5z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.5rem center;
+  background-size: 11px;
+}
+
+.mode-select select:hover {
+  border-color: #3a414d;
+}
+
+/* Real money gets a standing visual marker, so "which mode am I in" is never a question that needs
+   reading — the two differ by whether orders reach the exchange. */
+.mode-select.is-real select {
+  color: #f6465d;
+  border-color: rgba(246, 70, 93, 0.45);
+  background-color: rgba(246, 70, 93, 0.08);
 }
