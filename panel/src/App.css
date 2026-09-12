@@ -1020,3 +1020,177 @@ th.sorted {
   padding: 0.7rem 0;
   font-size: 0.8rem;
 }
+
+/* ---- Chart-side SL/TP editor (2026-09-12) ----------------------------------------------------
+   The chart shrinks to make room for a fixed-width panel on the right rather than the panel
+   overlaying it: an overlay would cover the very price action the levels are being placed against.
+   Below 900px the two stack instead, since a 260px panel beside a chart leaves neither usable. */
+.chart-with-panel {
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+}
+
+.chart-main {
+  flex: 1 1 auto;
+  min-width: 0; /* lets the chart shrink instead of overflowing the modal */
+}
+
+.chart-adjust-panel {
+  flex: 0 0 250px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: #16181d;
+  border: 1px solid #272b33;
+  border-radius: 8px;
+  align-self: flex-start;
+}
+
+@media (max-width: 900px) {
+  .chart-with-panel {
+    flex-direction: column;
+  }
+  .chart-adjust-panel {
+    flex: 1 1 auto;
+    width: 100%;
+  }
+}
+
+.cap-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e6e8ec;
+}
+
+.cap-sub {
+  font-size: 11px;
+  color: #858b96;
+  margin-top: 2px;
+}
+
+.cap-entry {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  padding: 6px 8px;
+  background: #1c1f26;
+  border-radius: 6px;
+}
+
+/* Segmented price/% switch. */
+.cap-mode {
+  display: flex;
+  background: #1c1f26;
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.cap-mode-btn {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: #858b96;
+  font-size: 11px;
+  padding: 5px 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.cap-mode-btn.active {
+  background: #2a2f39;
+  color: #e6e8ec;
+}
+
+.cap-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cap-row-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.cap-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.cap-dot-red {
+  background: #f6465d;
+}
+
+.cap-dot-green {
+  background: #2ebd85;
+}
+
+.cap-label {
+  color: #9aa0ab;
+}
+
+/* The unit NOT being typed, shown beside the label so switching modes is never needed just to
+   read the other number. */
+.cap-alt {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
+.cap-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: #1c1f26;
+  border: 1px solid #2a2f39;
+  border-radius: 6px;
+  color: #e6e8ec;
+  padding: 7px 8px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cap-input:focus {
+  outline: none;
+  border-color: #3d84f7;
+}
+
+.cap-hint {
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: #6f757f;
+  margin: 0;
+}
+
+.cap-error,
+.cap-saved {
+  font-size: 11px;
+  margin: 0;
+}
+
+.cap-saved {
+  color: #2ebd85;
+}
+
+.cap-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.cap-actions button {
+  flex: 1;
+}
+
+.chart-pos-select {
+  background: #1c1f26;
+  border: 1px solid #2a2f39;
+  border-radius: 6px;
+  color: #e6e8ec;
+  font-size: 12px;
+  padding: 4px 6px;
+}

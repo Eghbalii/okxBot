@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
 import type { Candle, Position, PositionMode } from '../api/types'
 import { useLiveCandles } from '../hooks/useLiveCandles'
 import { CandleChart } from './CandleChart'
+import ChartAdjustPanel, { type LevelMode } from './ChartAdjustPanel'
+import { pctOnMargin } from './PositionZones'
 
 // How often the stored series is refetched. Live movement now arrives over the WebSocket, so this
 // is purely a consistency/backfill pass — it reconciles history and covers a dropped socket, and
@@ -99,6 +101,103 @@ export default function TokenChartModal({
 
   const openCount = shown.filter((p) => !p.ClosedAt).length
 
+  // --- chart-side SL/TP editing (2026-09-12 request) -----------------------------------------
+  // Only a REAL, still-open position can be edited: the endpoint is real-only by construction
+  // (paper ids route to a table with no manual-edit path) and a closed position has no resting
+  // order on the exchange to amend.
+  const editable = useMemo(
+    () => shown.filter((p) => !p.ClosedAt && mode === 'real'),
+    [shown, mode],
+  )
+  const [editId, setEditId] = useState<number | null>(null)
+  const target = editable.find((p) => p.ID === editId) ?? editable[0] ?? null
+
+  // Pending levels are held as PRICES — the unit the chart draws and the exchange enforces;
+  // percentage is only a display of it. null means "being cleared", undefined means "untouched".
+  const [pendingSl, setPendingSl] = useState<number | null>(null)
+  const [pendingTp, setPendingTp] = useState<number | null>(null)
+  const [levelMode, setLevelMode] = useState<LevelMode>('price')
+
+  const savedSl = target?.SLPx ? Number(target.SLPx) : null
+  const savedTp = target?.TPPx ? Number(target.TPPx) : null
+
+  // Re-seed from the saved levels when the edited position changes — the fields show what is
+  // actually in force rather than starting blank (the operator's explicit difference from the
+  // table's modal).
+  const seededFor = useRef<number | null>(null)
+  useEffect(() => {
+    if (target === null) {
+      seededFor.current = null
+      return
+    }
+    if (seededFor.current === target.ID) return
+    seededFor.current = target.ID
+    setPendingSl(target.SLPx ? Number(target.SLPx) : null)
+    setPendingTp(target.TPPx ? Number(target.TPPx) : null)
+  }, [target])
+
+  // Compared with a tolerance rather than exactly: a dragged level is a float derived from a pixel,
+  // so it is never bit-identical to the stored value even when visually unchanged.
+  const near = (a: number | null, b: number | null) => {
+    if (a === null || b === null) return a === b
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return false
+    return Math.abs(a - b) <= Math.abs(b || a) * 1e-9
+  }
+  const dirty = target !== null && (!near(pendingSl, savedSl) || !near(pendingTp, savedTp))
+
+  const onDragLevel = useCallback((which: 'sl' | 'tp', price: number) => {
+    if (which === 'sl') setPendingSl(price)
+    else setPendingTp(price)
+  }, [])
+
+  const onChangeLevel = useCallback((which: 'sl' | 'tp', price: number | null) => {
+    if (which === 'sl') setPendingSl(price)
+    else setPendingTp(price)
+  }, [])
+
+  const resetLevels = useCallback(() => {
+    setPendingSl(savedSl)
+    setPendingTp(savedTp)
+  }, [savedSl, savedTp])
+
+  // The backend takes a SIGNED MARGIN PERCENTAGE, not a price (internal/api.priceFromMarginPct), so
+  // whatever unit was typed or dragged is converted back here. pctOnMargin is that formula's exact
+  // inverse — verified to round-trip for every side/sign/leverage, including tiny-priced tokens.
+  async function submitLevels() {
+    if (target === null) return
+    const entry = Number(target.EntryPx)
+    const lev = Number(target.Leverage) || 1
+    const body: { slPct?: number; tpPct?: number } = {}
+    if (!near(pendingSl, savedSl) && pendingSl !== null) {
+      body.slPct = pctOnMargin(entry, pendingSl, target.Side, lev)
+    }
+    if (!near(pendingTp, savedTp) && pendingTp !== null) {
+      body.tpPct = pctOnMargin(entry, pendingTp, target.Side, lev)
+    }
+    if (body.slPct === undefined && body.tpPct === undefined) return
+    const res = await api.adjustPosition(target.ID, mode, body)
+    // Adopt what the exchange actually stored rather than what was requested: the backend rounds to
+    // the instrument's tick size (§38), so the panel would otherwise keep showing an unrounded
+    // value and read as dirty forever.
+    setPendingSl(res.slPx ? Number(res.slPx) : null)
+    setPendingTp(res.tpPx ? Number(res.tpPx) : null)
+    seededFor.current = null // let the next positions refetch re-seed from the stored values
+  }
+
+  // Closing with unsaved level changes asks first (explicit request) — a dragged stop that was
+  // never sent is a silent, dangerous no-op otherwise.
+  const requestClose = useCallback(() => {
+    if (
+      dirty &&
+      !window.confirm(
+        'You changed SL/TP but did not press Update, so nothing was sent to the exchange.\n\nLeave anyway and discard the changes?',
+      )
+    ) {
+      return
+    }
+    onClose()
+  }, [dirty, onClose])
+
   useEffect(() => {
     const onResize = () => setChartHeight(availableChartHeight())
     window.addEventListener('resize', onResize)
@@ -107,14 +206,14 @@ export default function TokenChartModal({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') requestClose()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  }, [requestClose])
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" onClick={requestClose}>
       <div
         className="modal"
         // Sized against the viewport so the whole thing — header, chart, legend — fits in one
@@ -133,6 +232,22 @@ export default function TokenChartModal({
             {shown.length} order{shown.length === 1 ? '' : 's'}
             {openCount > 0 ? ` · ${openCount} open` : ''}
           </span>
+          {editable.length > 1 && (
+            // Only shown when there is a real choice to make — with one open position the chart
+            // already makes it obvious which is being edited.
+            <select
+              className="chart-pos-select"
+              value={target?.ID ?? ''}
+              onChange={(e) => setEditId(Number(e.target.value))}
+              title="Which position to edit"
+            >
+              {editable.map((p) => (
+                <option key={p.ID} value={p.ID}>
+                  #{p.ID} {p.Side === 'buy' ? 'long' : 'short'}
+                </option>
+              ))}
+            </select>
+          )}
           <div className="chart-bar-tabs">
             {BARS.map((b) => (
               <button
@@ -144,7 +259,7 @@ export default function TokenChartModal({
               </button>
             ))}
           </div>
-          <button className="btn" onClick={onClose} style={{ marginLeft: 8 }}>
+          <button className="btn" onClick={requestClose} style={{ marginLeft: 8 }}>
             Close
           </button>
         </div>
@@ -158,12 +273,33 @@ export default function TokenChartModal({
         )}
         {!error && liveCandles !== null && liveCandles.length > 0 && (
           <>
-            <CandleChart
-              candles={liveCandles}
-              positions={shown}
-              height={chartHeight}
-              frameKey={bar}
-            />
+            <div className={'chart-with-panel' + (target ? ' has-panel' : '')}>
+              <div className="chart-main">
+                <CandleChart
+                  candles={liveCandles}
+                  positions={shown}
+                  height={chartHeight}
+                  frameKey={bar}
+                  editPositionId={target?.ID ?? null}
+                  editSl={pendingSl}
+                  editTp={pendingTp}
+                  onDragLevel={onDragLevel}
+                />
+              </div>
+              {target && (
+                <ChartAdjustPanel
+                  position={target}
+                  sl={pendingSl}
+                  tp={pendingTp}
+                  mode={levelMode}
+                  onModeChange={setLevelMode}
+                  onChange={onChangeLevel}
+                  onSubmit={submitLevels}
+                  onReset={resetLevels}
+                  dirty={dirty}
+                />
+              )}
+            </div>
             <div className="chart-legend">
               <span>
                 <i style={{ background: '#2ebd85' }} />

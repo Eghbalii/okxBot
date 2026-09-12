@@ -12,7 +12,7 @@ import {
 } from 'lightweight-charts'
 import { barSeconds } from '../lib/bars'
 import type { Candle, Position } from '../api/types'
-import { PositionZones, type ZonePosition } from './PositionZones'
+import { GRAB_TOLERANCE_PX, PositionZones, type ZonePosition } from './PositionZones'
 
 // Tooltip footprint, used to decide which side of the cursor it can fit on. Approximate by
 // design — it only has to be right enough to pick a side, and measuring the real box would need a
@@ -112,11 +112,23 @@ export function CandleChart({
   // 5m -> 1H is the user asking for a different chart, whereas a 5s refetch is not — and only the
   // first must keep its own viewport.
   frameKey,
+  // The position whose SL/TP can be dragged on the chart, and the levels to draw for it. Both come
+  // from the parent so the side panel and the chart are driven by ONE piece of state — a second
+  // copy here would let the two disagree about a level mid-drag, which is exactly the confusion the
+  // panel exists to remove.
+  editPositionId,
+  editSl,
+  editTp,
+  onDragLevel,
 }: {
   candles: Candle[]
   positions: Position[]
   height?: number
   frameKey?: string
+  editPositionId?: number | null
+  editSl?: number | null
+  editTp?: number | null
+  onDragLevel?: (which: 'sl' | 'tp', price: number) => void
 }) {
   const container = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -128,6 +140,22 @@ export function CandleChart({
   // attached and drawing its own copy of the arrows, so markers accumulated and rendered wrong.
   const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
   const detailsRef = useRef<Map<string, MarkerDetail>>(new Map())
+  // Drag state lives in refs, not React state: the pointer handlers are attached ONCE (below) and
+  // must see current values without being torn down and re-attached on every render — re-attaching
+  // mid-drag would drop the gesture.
+  const dragRef = useRef<{ which: 'sl' | 'tp' } | null>(null)
+  const editRef = useRef<{ id: number | null; sl: number | null; tp: number | null }>({
+    id: null,
+    sl: null,
+    tp: null,
+  })
+  const onDragRef = useRef(onDragLevel)
+  onDragRef.current = onDragLevel
+  editRef.current = {
+    id: editPositionId ?? null,
+    sl: editSl ?? null,
+    tp: editTp ?? null,
+  }
   // Guards the one-time initial framing; see the data effect below.
   // Holds the frameKey the current viewport was framed for. The sentinel is deliberately not
   // undefined: frameKey itself is optional, and an undefined-vs-undefined comparison would skip the
@@ -184,10 +212,72 @@ export function CandleChart({
       setHover({ detail, x: param.point.x, y: param.point.y })
     })
 
+    // --- SL/TP dragging (2026-09-12 request) -------------------------------------------------
+    // Attached to the chart's own element with capture-phase pointer events. Capture matters: the
+    // library installs its own pan/zoom handlers on the same element, and without capturing the
+    // pointerdown the chart would start panning the instant a level was grabbed.
+    const el = chart.chartElement()
+
+    // Which level (if any) is under the cursor, using the same tolerance the handles are drawn to.
+    const levelAt = (y: number): 'sl' | 'tp' | null => {
+      const e = editRef.current
+      if (e.id === null) return null
+      for (const which of ['sl', 'tp'] as const) {
+        const price = which === 'sl' ? e.sl : e.tp
+        if (price === null) continue
+        const ly = series.priceToCoordinate(price)
+        if (ly !== null && Math.abs(ly - y) <= GRAB_TOLERANCE_PX) return which
+      }
+      return null
+    }
+
+    const localY = (ev: PointerEvent) => ev.clientY - el.getBoundingClientRect().top
+
+    const onDown = (ev: PointerEvent) => {
+      const which = levelAt(localY(ev))
+      if (!which) return
+      dragRef.current = { which }
+      // Panning is disabled for the duration so the chart does not slide while a level is dragged;
+      // restored on pointerup regardless of how the drag ends.
+      chart.applyOptions({ handleScroll: false, handleScale: false })
+      ev.preventDefault()
+      ev.stopPropagation()
+    }
+
+    const onMove = (ev: PointerEvent) => {
+      const y = localY(ev)
+      if (!dragRef.current) {
+        // Cursor feedback: a level is only grabbable when something is being edited, so the
+        // row-resize cursor is what tells the operator the line is live.
+        el.style.cursor = levelAt(y) ? 'ns-resize' : ''
+        return
+      }
+      const price = series.coordinateToPrice(y)
+      if (price === null) return
+      onDragRef.current?.(dragRef.current.which, price as number)
+      ev.preventDefault()
+      ev.stopPropagation()
+    }
+
+    const onUp = () => {
+      if (!dragRef.current) return
+      dragRef.current = null
+      chart.applyOptions({ handleScroll: true, handleScale: true })
+    }
+
+    el.addEventListener('pointerdown', onDown, true)
+    // move/up on window, not the element: a fast drag can leave the chart's bounds, and losing the
+    // gesture there would strand the level mid-move with panning still disabled.
+    window.addEventListener('pointermove', onMove, true)
+    window.addEventListener('pointerup', onUp, true)
+
     chartRef.current = chart
     seriesRef.current = series
     zonesRef.current = zones
     return () => {
+      el.removeEventListener('pointerdown', onDown, true)
+      window.removeEventListener('pointermove', onMove, true)
+      window.removeEventListener('pointerup', onUp, true)
       chart.remove()
       chartRef.current = null
       seriesRef.current = null
@@ -308,6 +398,11 @@ export function CandleChart({
       openTime: snapToBar(p.OpenedAt, frameKey ?? ''),
       closeTime: p.ClosedAt ? snapToBar(p.ClosedAt, frameKey ?? '') : null,
       leverage: Number(p.Leverage) || 1,
+      // Only the position being edited carries pending levels/handles. `undefined` (not null) means
+      // "nothing pending" — null is a real value meaning "this level is being cleared".
+      pendingSl: p.ID === editPositionId ? (editSl ?? null) : undefined,
+      pendingTp: p.ID === editPositionId ? (editTp ?? null) : undefined,
+      editable: p.ID === editPositionId,
     }))
     zonesRef.current?.setPositions(zones)
 
@@ -322,7 +417,7 @@ export function CandleChart({
     // candles is intentionally absent: barsKey is what says the SERIES changed, and depending on
     // the array itself would put this whole rebuild back on the per-tick path.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [barsKey, positions, frameKey])
+  }, [barsKey, positions, frameKey, editPositionId, editSl, editTp])
 
   // Live tick: move only the newest bar. update() must be called with a time >= the series' last,
   // which barsKey's own effect guarantees — it has already written this bar via setData by the time

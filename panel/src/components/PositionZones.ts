@@ -22,6 +22,16 @@ export interface ZonePosition {
   closeTime: UTCTimestamp | null
   /** Leverage, so the labels can report the percentage actually realized on margin. */
   leverage: number
+  /**
+   * Unsaved levels being edited right now, drawn INSTEAD of sl/tp when set. The saved values stay
+   * in sl/tp so the renderer can show where the level currently sits on the exchange (a faint
+   * "original" line) while the operator moves the new one — without that, a drag gives no reference
+   * for how far it has moved.
+   */
+  pendingSl?: number | null
+  pendingTp?: number | null
+  /** Draws the round grab handles; only the one position being edited is draggable. */
+  editable?: boolean
 }
 
 // Translucent: these are drawn UNDER the candles (zOrder 'bottom'), and an opaque fill would hide
@@ -45,6 +55,15 @@ const MIN_BOX_W = 24
 // than running to the pane edge: the point of bounding the box was that a full-width wash tells you
 // nothing about WHEN the position is live.
 const OPEN_BOX_OVERHANG = 56
+// Radius of the round grab handle on an editable level, and the vertical slack around a level that
+// still counts as grabbing it. The hit area is deliberately larger than the dot: a 1px line is far
+// too small a target to hit reliably with a mouse.
+const HANDLE_R = 5
+export const GRAB_TOLERANCE_PX = 7
+// A level being edited is drawn solid and brighter than a saved one, so "this is the value you are
+// changing" is visible at a glance rather than inferred from the side panel.
+const PENDING_EDGE = 'rgba(255,255,255,0.9)'
+const SAVED_GHOST = 'rgba(150,155,165,0.5)'
 
 /**
  * Draws each position as a bounded box — risk above/below entry in red, reward in green — spanning
@@ -131,8 +150,31 @@ class ZoneRenderer implements IPrimitivePaneRenderer {
           ctx.setLineDash([])
         }
 
-        band(p.sl, RISK_FILL, RISK_EDGE)
-        band(p.tp, REWARD_FILL, REWARD_EDGE)
+        // The level actually drawn is the pending (being-edited) one when there is one, so the box
+        // and its label track the mouse live rather than snapping only on save.
+        const slShown = p.pendingSl !== undefined ? p.pendingSl : p.sl
+        const tpShown = p.pendingTp !== undefined ? p.pendingTp : p.tp
+
+        // Where the level currently sits on the exchange, drawn faintly behind an edit so there is
+        // a reference for how far it has been moved. Skipped when nothing is pending.
+        const ghost = (price: number | null, pending: number | null | undefined) => {
+          if (pending === undefined || price === null || price === pending) return
+          const y = this.series.priceToCoordinate(price)
+          if (y === null) return
+          ctx.strokeStyle = SAVED_GHOST
+          ctx.setLineDash([2, 4])
+          ctx.lineWidth = 1
+          ctx.beginPath()
+          ctx.moveTo(left, y)
+          ctx.lineTo(left + width, y)
+          ctx.stroke()
+          ctx.setLineDash([])
+        }
+
+        band(slShown, RISK_FILL, RISK_EDGE)
+        band(tpShown, REWARD_FILL, REWARD_EDGE)
+        ghost(p.sl, p.pendingSl)
+        ghost(p.tp, p.pendingTp)
 
         ctx.strokeStyle = ENTRY_EDGE
         ctx.lineWidth = 1
@@ -144,8 +186,27 @@ class ZoneRenderer implements IPrimitivePaneRenderer {
         // Labels carry ONLY the leverage-adjusted percentage (2026-09-12 request). The raw price is
         // already on the axis and in the table, whereas the percentage actually realized on margin
         // is the number that is not obtainable by eye — a 0.6% move at 20x is a 12% outcome.
-        this.label(ctx, p.tp, p.entry, p, left + width, LABEL_GREEN, mediaSize)
-        this.label(ctx, p.sl, p.entry, p, left + width, LABEL_RED, mediaSize)
+        this.label(ctx, tpShown, p.entry, p, left + width, LABEL_GREEN, mediaSize)
+        this.label(ctx, slShown, p.entry, p, left + width, LABEL_RED, mediaSize)
+
+        // Grab handles, drawn only for the position being edited so a chart showing many trades
+        // does not sprout dots on all of them.
+        if (p.editable) {
+          const handle = (price: number | null, color: string) => {
+            if (price === null) return
+            const y = this.series.priceToCoordinate(price)
+            if (y === null) return
+            ctx.beginPath()
+            ctx.arc(left + 10, y, HANDLE_R, 0, Math.PI * 2)
+            ctx.fillStyle = color
+            ctx.fill()
+            ctx.strokeStyle = PENDING_EDGE
+            ctx.lineWidth = 1.5
+            ctx.stroke()
+          }
+          handle(slShown, LABEL_RED)
+          handle(tpShown, LABEL_GREEN)
+        }
       }
     })
   }
