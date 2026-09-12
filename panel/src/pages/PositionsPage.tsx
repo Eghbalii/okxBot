@@ -198,11 +198,7 @@ export default function PositionsPage() {
 
   usePositionAlerts(rows, alertsEnabled)
 
-  // Also enabled while a chart is open, not just when the table shows live columns: the chart
-  // tracks the live price and builds the forming candle from it regardless of which rows the table
-  // happens to be filtered to, so a chart opened from the closed-only view would otherwise sit
-  // frozen with no tick source at all.
-  const livePrices = usePriceStream(showLiveColumns || chartInstId !== null)
+  const livePrices = usePriceStream(showLiveColumns)
 
   // Resolved from the current poll's data rather than held in state, so an open modal keeps showing
   // fresh values (live PnL, a close that just landed) instead of a snapshot frozen at click time.
@@ -562,7 +558,6 @@ export default function PositionsPage() {
           instId={chartInstId}
           mode={mode}
           positions={rows ?? []}
-          lastPrice={livePrices[chartInstId]}
           onClose={() => setChartInstId(null)}
         />
       )}

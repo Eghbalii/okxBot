@@ -43,6 +43,39 @@ type priceUpdate struct {
 	Price  string `json:"price"`
 }
 
+// candleEvent is the ingestor's own Kafka payload for one candle push (the OKX wire shape: a string
+// array, [ts, o, h, l, c, vol, ...], with confirm as the last element).
+type candleEvent struct {
+	InstID string   `json:"instId"`
+	Bar    string   `json:"bar"`
+	Candle []string `json:"candle"`
+}
+
+// candleUpdate pushes one candle to the panel as OKX reports it, forming bars included.
+//
+// Why this exists: the chart used to poll REST for candles and synthesize the forming bar from the
+// price ticks the browser happened to receive. Two consequences the operator reported — a bar's
+// real high/low were whatever the panel had seen (so wicks only appeared later, when the finalized
+// row arrived), and that correction lands a FULL BAR late because OKX marks a bar confirm=1 only
+// when the next one closes (measured: the 12:20 bar confirmed at 12:25:01). OKX's own confirm=0
+// pushes already carry the true OHLC of the forming bar, and the ingestor already publishes every
+// one to Kafka — nothing was consuming them for the panel. Forwarding them replaces the guesswork
+// with the exchange's own numbers.
+//
+// Confirmed is passed through so the panel can tell a still-forming bar from a closed one.
+type candleUpdate struct {
+	Type      string `json:"type"` // "candle"
+	InstID    string `json:"instId"`
+	Bar       string `json:"bar"`
+	Timestamp string `json:"ts"` // epoch ms, as OKX sends it
+	Open      string `json:"open"`
+	High      string `json:"high"`
+	Low       string `json:"low"`
+	Close     string `json:"close"`
+	Volume    string `json:"volume"`
+	Confirmed bool   `json:"confirmed"`
+}
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
@@ -154,6 +187,49 @@ func main() {
 			logger.Error("prices consumer exited", "error", err)
 		}
 	}()
+
+	// Live candles per configured timeframe, so the chart renders the forming bar from OKX's own
+	// OHLC instead of reconstructing it from ticks (see candleUpdate above). One consumer per bar
+	// because each timeframe is its own topic (CLAUDE.md §12), each with its own group so none of
+	// them competes for offsets with paper-trader's.
+	for _, bar := range cfg.Ingestion.Bars {
+		bar := bar
+		c := kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.candles."+bar, "api-ws-bridge-candles-"+bar)
+		go func() {
+			err := c.Run(ctx, func(_ context.Context, data []byte) error {
+				var ev candleEvent
+				if err := json.Unmarshal(data, &ev); err != nil {
+					return nil // malformed: skip rather than fail the consumer loop
+				}
+				// OKX sends [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]. Guard on length
+				// rather than assuming: a short array would panic on index, taking the goroutine
+				// (and with it this bar's whole stream) down silently.
+				if len(ev.Candle) < 6 {
+					return nil
+				}
+				out, err := json.Marshal(candleUpdate{
+					Type:      "candle",
+					InstID:    ev.InstID,
+					Bar:       ev.Bar,
+					Timestamp: ev.Candle[0],
+					Open:      ev.Candle[1],
+					High:      ev.Candle[2],
+					Low:       ev.Candle[3],
+					Close:     ev.Candle[4],
+					Volume:    ev.Candle[5],
+					Confirmed: ev.Candle[len(ev.Candle)-1] == "1",
+				})
+				if err != nil {
+					return nil
+				}
+				srv.Broadcast(out)
+				return nil
+			})
+			if err != nil && ctx.Err() == nil {
+				logger.Error("candles consumer exited", "bar", bar, "error", err)
+			}
+		}()
+	}
 
 	httpServer := &http.Server{
 		Addr:    cfg.API.Addr,

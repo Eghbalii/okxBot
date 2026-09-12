@@ -4,11 +4,11 @@ import type { Candle, Position, PositionMode } from '../api/types'
 import { useLiveCandles } from '../hooks/useLiveCandles'
 import { CandleChart } from './CandleChart'
 
-// How often the finalized-candle series is refetched. A closed bar only appears in Postgres once
-// PaperTrader persists it (CLAUDE.md §7), and the forming bar is already tracked live off the tick
-// stream, so this only has to be frequent enough to pick up a freshly-closed bar promptly — not to
-// drive the visible price movement.
-const CANDLE_REFETCH_MS = 15_000
+// How often the stored series is refetched. Live movement now arrives over the WebSocket, so this
+// is purely a consistency/backfill pass — it reconciles history and covers a dropped socket, and
+// does not drive anything the user watches. 60s rather than 15s because each call reads 500 rows
+// per open chart, and nothing waits on it any more.
+const CANDLE_REFETCH_MS = 60_000
 
 // The decision timeframes (CLAUDE.md §9). 4H/1D are collected for context but a chart of them
 // carries almost no position history at this trade cadence, so they are not offered here.
@@ -33,16 +33,11 @@ export default function TokenChartModal({
   instId,
   mode,
   positions,
-  lastPrice,
   onClose,
 }: {
   instId: string
   mode: PositionMode
   positions: Position[]
-  // Live last-traded price for this instrument, from the page's existing usePriceStream socket
-  // (CLAUDE.md §11.4). Passed down rather than opening a second subscription here: the parent
-  // already holds the stream for its own table, and two sockets would show two different prices.
-  lastPrice: string | undefined
   onClose: () => void
 }) {
   const [bar, setBar] = useState<string>('5m')
@@ -81,9 +76,10 @@ export default function TokenChartModal({
     }
   }, [instId, bar, seriesKey])
 
-  // Folds the live tick into the series: the newest bar's close tracks the price and a bar
-  // boundary starts a new candle, rather than the chart sitting still until the next refetch.
-  const liveCandles = useLiveCandles(candles, bar, lastPrice)
+  // Folds OKX's own live candle pushes into the series (over the same WebSocket the price comes
+  // from), so the forming bar carries the exchange's real OHLC instead of extremes reconstructed
+  // from whichever ticks this browser happened to receive.
+  const liveCandles = useLiveCandles(candles, instId, bar)
 
   // Closed orders are filtered to the chart's own timeframe: a 1H order's entry sits at a
   // timestamp the 5m candles never had, so its marker would land on the wrong candle.

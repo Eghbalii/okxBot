@@ -278,7 +278,23 @@ export interface PriceUpdate {
   price: string
 }
 
-export type WSEvent = PaperOrderEvent | PriceUpdate
+// CandleUpdate mirrors cmd/api's candleUpdate — one candle as OKX reports it, forming bars
+// included (confirmed=false). Carries the exchange's own OHLC, so the chart no longer has to
+// reconstruct the forming bar from the price ticks this browser happened to receive.
+export interface CandleUpdate {
+  type: 'candle'
+  instId: string
+  bar: string
+  ts: string // epoch ms, as OKX sends it
+  open: string
+  high: string
+  low: string
+  close: string
+  volume: string
+  confirmed: boolean
+}
+
+export type WSEvent = PaperOrderEvent | PriceUpdate | CandleUpdate
 
 // openEventsSocket connects to cmd/api's WebSocket bridge and calls onEvent for every message
 // received (paper order open/close, or a live price tick — discriminate on `type`), reconnecting

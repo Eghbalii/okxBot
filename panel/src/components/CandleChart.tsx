@@ -47,6 +47,37 @@ function pnlColor(pnl: string | null): string {
 
 const secs = (iso: string) => (Date.parse(iso) / 1000) as UTCTimestamp
 
+// Decimal places to render on the price axis, derived from the data rather than fixed.
+//
+// lightweight-charts defaults to precision 2 / minMove 0.01, which rendered PUMP (~0.0036) as
+// "0.00" and PEPE (~0.0000034) as "0.00" on the right-hand axis — reported as "it shows 0.0 and not
+// the real price". This roster spans BTC at 77295.7 down to PEPE at 0.000003382, nine decimal
+// places apart, so no single fixed precision can serve it: the value has to come from the prices
+// actually in view.
+//
+// Counts the digits the smallest price in the series genuinely needs, from its own decimal string
+// (not a log10 estimate, which lands a digit out on values like 0.001 and would then round a real
+// price away). Clamped: at least 2 so a normal price keeps cents, at most 10 because the library
+// hits floating-point limits past that and no instrument here needs more.
+function pricePrecision(candles: Candle[]): number {
+  let needed = 2
+  for (const c of candles) {
+    for (const v of [c.Open, c.High, c.Low, c.Close]) {
+      const n = Number(v)
+      if (!Number.isFinite(n) || n === 0) continue
+      // Only small prices need extra digits; a 5-figure price is fine at 2 even if it carries more.
+      if (Math.abs(n) >= 1) continue
+      const dec = v.includes('.') ? v.split('.')[1].replace(/0+$/, '').length : 0
+      // A leading-zero run means the significant digits start later, so more places are required:
+      // 0.0000034 needs 9 to show two significant figures, not the 7 its own string happens to have.
+      const lead = /^0\.(0*)/.exec(v)
+      const zeros = lead ? lead[1].length : 0
+      needed = Math.max(needed, Math.min(Math.max(dec, zeros + 2), 10))
+    }
+  }
+  return needed
+}
+
 /**
  * Candles for one instrument with its position history overlaid.
  *
@@ -167,6 +198,13 @@ export function CandleChart({
     const series = seriesRef.current
     const chart = chartRef.current
     if (!series || !chart) return
+
+    // Applied alongside the data: precision depends on the prices in view, so switching from BTC to
+    // PEPE has to re-derive it rather than keep the previous instrument's scale.
+    const precision = pricePrecision(candles)
+    series.applyOptions({
+      priceFormat: { type: 'price', precision, minMove: Math.pow(10, -precision) },
+    })
 
     series.setData(
       candles.map((c) => ({
