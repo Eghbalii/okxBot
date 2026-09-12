@@ -494,6 +494,7 @@ func buildRealTraderClamps(cfg *config.Config) conductor.Clamps {
 		MaxSLDistPct: cfg.PaperTrading.RLClamps.MaxSLDistPct,
 		MaxLossPct:   cfg.PaperTrading.RLClamps.MaxLossPct,
 		MinTPSLRatio: cfg.PaperTrading.RLClamps.MinTPSLRatio,
+		MaxTPSLRatio: cfg.PaperTrading.RLClamps.MaxTPSLRatio,
 	}
 }
 

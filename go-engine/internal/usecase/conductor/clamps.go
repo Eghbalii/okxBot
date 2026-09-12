@@ -34,6 +34,25 @@ type Clamps struct {
 	// multiple of the SL distance. A too-near target is widened to satisfy it rather than the trade
 	// being rejected, since the entry itself may still be sound.
 	MinTPSLRatio decimal.Decimal
+	// MaxTPSLRatio is the MAXIMUM reward:risk ratio — the counterpart bound MinTPSLRatio lacked
+	// until 2026-09-12, and the direct cause of the unreachable targets reported that day.
+	//
+	// The failure it fixes is not one bad number but the interaction of two good ones. A strategy
+	// proposing a structurally tight stop (ict_fvg's gap edge measured 0.011% from entry on a 5m
+	// bar) has that stop widened UP to the MinSLDistPct floor — a ~45x move — and MinTPSLRatio is
+	// then applied to the WIDENED stop, carrying the same multiple into the target. Nothing
+	// bounded the result, so a strategy's own intended 2:1 became an effective 40:1-80:1 and the
+	// target landed 6.5% away in price: at 10x leverage, a 65% move in margin terms, which price
+	// on a 5m scalp essentially never reaches. Measured across 1841 closed paper orders: mean
+	// realized R:R of 47:1 on ict_fvg, 80:1 on ict_order_block, and 309 positions that peaked at
+	// +10% of margin or better of which 74 still closed at a loss — round-tripping because the
+	// only target they had was one price could not touch.
+	//
+	// Capping the RATIO rather than the absolute distance is deliberate: it scales with the
+	// instrument's own volatility exactly as the stop does, so one bound is correct for BTC and
+	// PEPE alike, and a strategy that genuinely earns a wide stop still gets a proportionally wide
+	// target. Applied after MinTPSLRatio so the min/max order is well defined when both are set.
+	MaxTPSLRatio decimal.Decimal
 }
 
 // maxSLDistPctFor returns the effective SL-distance cap for a position at the given leverage: the
@@ -130,9 +149,21 @@ func (cl Clamps) Apply(side string, entryPx, leverage decimal.Decimal, in Levels
 	if in.TPPx != nil {
 		dist := signedDist(long, entryPx, *in.TPPx, false)
 		if dist.IsPositive() {
-			if cl.MinTPSLRatio.IsPositive() && slDist.IsPositive() {
-				if min := slDist.Mul(cl.MinTPSLRatio); dist.LessThan(min) {
-					dist = min
+			if slDist.IsPositive() {
+				if cl.MinTPSLRatio.IsPositive() {
+					if min := slDist.Mul(cl.MinTPSLRatio); dist.LessThan(min) {
+						dist = min
+					}
+				}
+				// Then pull an over-wide target back in. Applied after the minimum so the order is
+				// well defined when both bounds are set, and gated on slDist being positive for
+				// the same reason the minimum is: with no stop to measure against there is no
+				// ratio to bound, and inventing an absolute distance here would be a different
+				// rule than the one this clamp states.
+				if cl.MaxTPSLRatio.IsPositive() {
+					if max := slDist.Mul(cl.MaxTPSLRatio); dist.GreaterThan(max) {
+						dist = max
+					}
 				}
 			}
 			px := offsetFrom(long, entryPx, dist, false)

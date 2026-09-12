@@ -54,17 +54,17 @@ type Config struct {
 		// one place a short symbol resolves to a real OKX instId; every other line of code in this
 		// project (candles, paper_orders, strategy_assignments, Kafka topic keys, the panel) carries
 		// the short symbol and never touches OKX's wire format at all.
-		InstIDs         []string        `yaml:"inst_ids"`
+		InstIDs []string `yaml:"inst_ids"`
 		// SymbolMap resolves each InstIDs entry to the real OKX instId a WebSocket subscription or
 		// REST call actually needs (internal/okx.SymbolMap — see its own doc comment). Required:
 		// every configured symbol must have an entry, or the affected service refuses to start
 		// rather than silently subscribing to/calling nothing for it (the same "loud failure over
 		// a data gap that looks healthy" principle as CLAUDE.md §9's bar-casing validation).
 		SymbolMap       map[string]string `yaml:"symbol_map"`
-		PollIntervalSec int             `yaml:"poll_interval_sec"`
-		TdMode          string          `yaml:"td_mode"`       // "cross" or "isolated"
-		PosMode         string          `yaml:"pos_mode"`      // "net" or "long_short" (hedge mode)
-		MinOrderUSD     decimal.Decimal `yaml:"min_order_usd"` // skip rebalancing orders smaller than this
+		PollIntervalSec int               `yaml:"poll_interval_sec"`
+		TdMode          string            `yaml:"td_mode"`       // "cross" or "isolated"
+		PosMode         string            `yaml:"pos_mode"`      // "net" or "long_short" (hedge mode)
+		MinOrderUSD     decimal.Decimal   `yaml:"min_order_usd"` // skip rebalancing orders smaller than this
 		// AllowRealMoney must be explicitly true before cmd/trader will run against real (non-demo)
 		// OKX credentials — it refuses to start otherwise (CLAUDE.md §15.6's paper -> demo -> real
 		// progression). This exists because reaching real trading by simply *not setting*
@@ -198,6 +198,14 @@ type Config struct {
 			// price-distance bound to MaxLossPct/leverage whenever that is tighter. Zero disables it.
 			MaxLossPct   decimal.Decimal `yaml:"max_loss_pct"`
 			MinTPSLRatio decimal.Decimal `yaml:"min_tp_sl_ratio"`
+			// MaxTPSLRatio caps the reward:risk ratio, bounding how far a take-profit may sit from
+			// entry (2026-09-12 request: "fix the TP problem, but don't let it get too small —
+			// never below the SL's own percentage, so at least 1:1"). Without it a strategy's
+			// structurally tight stop gets widened to MinSLDistPct and MinTPSLRatio carries that
+			// widening into the target, producing targets 60-70% of margin away that price never
+			// reaches. Like MaxLossPct this defaults even when unset rather than being opt-in: an
+			// unreachable target is the failure this exists to prevent, not a mode to opt into.
+			MaxTPSLRatio decimal.Decimal `yaml:"max_tp_sl_ratio"`
 		} `yaml:"rl_clamps"`
 		// RLMaxOpenDuration force-closes any position open longer than this, close_reason='timeout'
 		// (CLAUDE.md §15.14, operator request 2026-08-30: positions were observed sitting open a
@@ -365,6 +373,7 @@ type Config struct {
 			MaxSLDistPct decimal.Decimal `yaml:"max_sl_dist_pct"`
 			MaxLossPct   decimal.Decimal `yaml:"max_loss_pct"`
 			MinTPSLRatio decimal.Decimal `yaml:"min_tp_sl_ratio"`
+			MaxTPSLRatio decimal.Decimal `yaml:"max_tp_sl_ratio"`
 		} `yaml:"rl_clamps"`
 	} `yaml:"tester"`
 
@@ -653,6 +662,16 @@ func Load(path string) (*Config, error) {
 	// failure mode it exists to prevent.
 	if cfg.PaperTrading.RLClamps.MaxLossPct.IsZero() {
 		cfg.PaperTrading.RLClamps.MaxLossPct = decimal.NewFromFloat(0.15)
+	}
+	// MaxTPSLRatio defaults to 3:1 even when unset, for the same "not opt-in" reason MaxLossPct
+	// does: an uncapped reward:risk ratio is what put targets 60-70% of margin away (CLAUDE.md
+	// §45). 3:1 is deliberately generous — it leaves every strategy's own intended 1.5:1-2:1
+	// untouched and only bites on the pathological ratios (40:1-80:1 measured in production).
+	if cfg.PaperTrading.RLClamps.MaxTPSLRatio.IsZero() {
+		cfg.PaperTrading.RLClamps.MaxTPSLRatio = decimal.NewFromFloat(3)
+	}
+	if cfg.Tester.RLClamps.MaxTPSLRatio.IsZero() {
+		cfg.Tester.RLClamps.MaxTPSLRatio = decimal.NewFromFloat(3)
 	}
 	if cfg.Tester.RLClamps.MaxLossPct.IsZero() {
 		cfg.Tester.RLClamps.MaxLossPct = decimal.NewFromFloat(0.15)

@@ -46,6 +46,29 @@ var Factories = map[string]Factory{
 	"macd_momentum":       func() Strategy { return NewMACDMomentum() },
 	"volume_breakout":     func() Strategy { return NewVolumeBreakout() },
 	"ema_ribbon_pullback": func() Strategy { return NewEMARibbonPullback() },
+
+	// V2 revisions of the twelve above (2026-09-12). Registered as SEPARATE kinds rather than as
+	// edits to their parents, per CLAUDE.md §11.3's locked-origin rule: the V1 rows keep their
+	// accumulated trade history and stay independently comparable, which is the whole point of
+	// shipping a revision rather than a replacement.
+	//
+	// What changed, uniformly (CLAUDE.md §45): levels are sized in ATR units instead of fixed
+	// percentages or raw structural distances, and the reward:risk ratio is bounded at the source
+	// so a target stays somewhere price can actually reach. Most also gained a regime filter —
+	// trend, volatility or conviction — since the V1 data showed the losses came from taking every
+	// occurrence of a pattern rather than from the pattern itself.
+	"vwap_reversion_v2":      func() Strategy { return NewVWAPReversionV2() },
+	"bb_squeeze_breakout_v2": func() Strategy { return NewBBSqueezeBreakoutV2() },
+	"range_breakout_v2":      func() Strategy { return NewRangeBreakoutV2() },
+	"keltner_trend_scalp_v2": func() Strategy { return NewKeltnerTrendScalpV2() },
+	"ict_fvg_v2":             func() Strategy { return NewICTFairValueGapV2() },
+	"ict_order_block_v2":     func() Strategy { return NewICTOrderBlockV2() },
+	"ict_liquidity_sweep_v2": func() Strategy { return NewICTLiquiditySweepV2() },
+	"engulfing_reversal_v2":  func() Strategy { return NewEngulfingReversalV2() },
+	"inside_bar_breakout_v2": func() Strategy { return NewInsideBarBreakoutV2() },
+	"macd_momentum_v2":       func() Strategy { return NewMACDMomentumV2() },
+	"volume_breakout_v2":     func() Strategy { return NewVolumeBreakoutV2() },
+	"ema_ribbon_pullback_v2": func() Strategy { return NewEMARibbonPullbackV2() },
 }
 
 // FromConfig builds a live Strategy for kind, applying config as WithParams overrides (config is
