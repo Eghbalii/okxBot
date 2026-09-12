@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { api } from '../api/client'
 import type { EquityPoint, PositionMode } from '../api/types'
 
@@ -14,8 +14,8 @@ import type { EquityPoint, PositionMode } from '../api/types'
 // operator cap change). A reset inside the window is drawn as a marker so a jump is explained
 // rather than looking like a data glitch.
 
-const HEIGHT = 340
-const PAD = { top: 14, right: 14, bottom: 28, left: 58 }
+const HEIGHT = 300
+const PAD = { top: 26, right: 14, bottom: 26, left: 54 }
 
 type Range = 'day' | 'week' | 'month' | 'year'
 
@@ -68,7 +68,7 @@ export default function BalanceChart({
   currentBalance: number
   refreshSignal: number
 }) {
-  const [range, setRange] = useState<Range>('week')
+  const [range, setRange] = useState<Range>('day')
   const [points, setPoints] = useState<EquityPoint[]>([])
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -177,13 +177,16 @@ export default function BalanceChart({
 
   return (
     <div className="balance-chart">
-      <div className="balance-chart-header">
+      {/* Overlaid on the plot rather than stacked above it (2026-09-12 request), the same move the
+          candle chart's timeframe buttons made: the controls belong to the chart they change, and
+          a header row costs height the plot needs now that it no longer spans the full width. */}
+      <div className="balance-chart-overlay">
         <div className="balance-chart-legend">
           <span>
-            <i className="legend-swatch" style={{ background: 'var(--chart-equity, #4ea1ff)' }} /> Total Equity
+            <i className="legend-swatch" style={{ background: 'var(--chart-equity, #4ea1ff)' }} /> Equity
           </span>
           <span>
-            <i className="legend-swatch" style={{ background: 'var(--chart-balance, #9d7bff)' }} /> Account Balance
+            <i className="legend-swatch" style={{ background: 'var(--chart-balance, #9d7bff)' }} /> Balance
           </span>
         </div>
         {selector}
@@ -216,6 +219,35 @@ function Plot({ series, range }: { series: Series; range: Range }) {
   const plotH = HEIGHT - PAD.top - PAD.bottom
   const { times, equities, balances, minV, maxV, minT, maxT } = series
 
+  // Index of the point under the cursor, or null when the pointer is away (2026-09-12 request:
+  // read the numbers at any point on the line rather than only the endpoints).
+  const [hover, setHover] = useState<number | null>(null)
+  const svgRef = useRef<SVGSVGElement | null>(null)
+
+  // The SVG scales to its container, so a client x must be converted back into viewBox units
+  // before it can be compared against the plotted coordinates — using the element's own width
+  // rather than assuming WIDTH, which is only true at one particular container size.
+  function onMove(e: ReactPointerEvent<SVGSVGElement>) {
+    const el = svgRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    if (rect.width === 0) return
+    const vx = ((e.clientX - rect.left) / rect.width) * WIDTH
+    const t = minT + ((vx - PAD.left) / plotW) * (maxT - minT)
+    // Nearest sample by time, not by pixel: the series is thinned unevenly, so the closest point
+    // horizontally is the one whose timestamp is closest, which is what the tooltip should report.
+    let best = 0
+    let bestD = Infinity
+    for (let i = 0; i < times.length; i++) {
+      const d = Math.abs(times[i] - t)
+      if (d < bestD) {
+        bestD = d
+        best = i
+      }
+    }
+    setHover(best)
+  }
+
   const xf = (t: number) => PAD.left + (maxT === minT ? plotW / 2 : ((t - minT) / (maxT - minT)) * plotW)
   const yf = (v: number) => PAD.top + plotH - ((v - minV) / (maxV - minV)) * plotH
 
@@ -228,13 +260,20 @@ function Plot({ series, range }: { series: Series; range: Range }) {
   // most of the vertical space unreferenced, so reading a value off the line meant eyeballing it.
   const yTicks = Array.from({ length: 5 }, (_, i) => minV + ((maxV - minV) * i) / 4)
 
-  // preserveAspectRatio is deliberately left at its default ("meet") rather than "none": with
-  // "none" the viewBox is stretched independently on each axis to fill the container, which
-  // thickens vertical strokes relative to horizontal ones and makes text lean — the main reason
-  // the first version read as blurry rather than crisp. Letting it scale uniformly keeps strokes
-  // and glyphs true at any container width.
+  // preserveAspectRatio stays at its default ("meet") — NOT "none". With "none" the viewBox is
+  // stretched independently per axis to fill the container, which thickens vertical strokes
+  // relative to horizontal ones and makes text lean; that was the reason an earlier version read
+  // as blurry. Kept deliberately now that the SVG is stretched to match the stats column's height
+  // (2026-09-12): the chart letterboxes within that box instead of distorting, and a little empty
+  // space is a far better trade than skewed glyphs on a financial readout.
   return (
-    <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className="balance-chart-svg">
+    <svg
+      ref={svgRef}
+      viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
+      className="balance-chart-svg"
+      onPointerMove={onMove}
+      onPointerLeave={() => setHover(null)}
+    >
       {yTicks.map((v) => (
         <g key={v}>
           <line
@@ -275,6 +314,70 @@ function Plot({ series, range }: { series: Series; range: Range }) {
       ))}
       <path d={pathFor(balances)} fill="none" stroke="var(--chart-balance, #9d7bff)" strokeWidth={1.5} />
       <path d={pathFor(equities)} fill="none" stroke="var(--chart-equity, #4ea1ff)" strokeWidth={1.8} />
+
+      {hover !== null && times[hover] !== undefined && (
+        <g pointerEvents="none">
+          <line
+            x1={xf(times[hover])}
+            y1={PAD.top}
+            x2={xf(times[hover])}
+            y2={HEIGHT - PAD.bottom}
+            stroke="var(--text-dim, #8b949e)"
+            strokeWidth={1}
+            strokeDasharray="3 3"
+          />
+          <circle cx={xf(times[hover])} cy={yf(balances[hover])} r={3.5} fill="var(--chart-balance, #9d7bff)" />
+          <circle cx={xf(times[hover])} cy={yf(equities[hover])} r={3.5} fill="var(--chart-equity, #4ea1ff)" />
+          <HoverReadout
+            x={xf(times[hover])}
+            width={WIDTH}
+            time={times[hover]}
+            equity={equities[hover]}
+            balance={balances[hover]}
+          />
+        </g>
+      )}
     </svg>
+  )
+}
+
+// The value readout, pinned to the top of the plot and flipping to the other side of the crosshair
+// near the right edge so it never renders half outside the chart.
+function HoverReadout({
+  x,
+  width,
+  time,
+  equity,
+  balance,
+}: {
+  x: number
+  width: number
+  time: number
+  equity: number
+  balance: number
+}) {
+  const W = 186
+  const H = 46
+  const left = x + 10 + W > width - PAD.right ? x - 10 - W : x + 10
+  const label = new Date(time).toLocaleString('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
+  return (
+    <g transform={`translate(${left}, ${PAD.top + 2})`}>
+      <rect width={W} height={H} rx={5} className="chart-readout-bg" />
+      <text x={8} y={14} className="chart-readout-time">
+        {label}
+      </text>
+      <text x={8} y={28} className="chart-readout-row" fill="var(--chart-equity, #4ea1ff)">
+        Equity ${equity.toFixed(2)}
+      </text>
+      <text x={8} y={40} className="chart-readout-row" fill="var(--chart-balance, #9d7bff)">
+        Balance ${balance.toFixed(2)}
+      </text>
+    </g>
   )
 }

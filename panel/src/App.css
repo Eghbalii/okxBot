@@ -1408,3 +1408,167 @@ th.sorted {
   width: 100%;
   white-space: nowrap;
 }
+
+/* ---- Stats box redesign (2026-09-12) ---------------------------------------------------------
+   Stats on the left, balance chart on the right. Previously the chart spanned the full width below
+   the tiles, which made it the largest element on the page while carrying the least-consulted
+   information, and the tiles wrapped unpredictably in an auto-fit grid.
+
+   2fr/3fr rather than a hard 5-column split: the stats side is three fixed rows whose width is set
+   by their content, while the chart benefits from every pixel left over. */
+.stats-layout {
+  display: grid;
+  grid-template-columns: 2fr 3fr;
+  gap: 1rem;
+  align-items: stretch;
+}
+
+.stats-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+/* Each row is an explicit column count, not auto-fit. The old grid chose its own column count from
+   the available width, which is how one over-wide tile pushed 1M PnL onto a second row. */
+.stats-row {
+  display: grid;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.stats-row-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.stats-row-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.stat-tile {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.15rem;
+  min-width: 0;
+  padding: 0.55rem 0.7rem;
+  background: var(--bg-elev, #16181d);
+  border: 1px solid var(--border, #272b33);
+  border-radius: 8px;
+}
+
+.stat-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim, #858b96);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stat-value {
+  font-size: 1.05rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.stat-sub {
+  font-size: 0.72rem;
+  color: var(--text-dim, #858b96);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The control row fills its own row, so the slider finally has room to be usable. */
+.cap-tile {
+  gap: 0.4rem;
+}
+
+.stats-chart {
+  min-width: 0;
+  display: flex;
+}
+
+/* The chart matches the stats column's height rather than deriving its own from its width.
+   preserveAspectRatio="meet" would otherwise tie height to width, so the two columns' bottom edges
+   drifted apart as the window resized — measured 163px of chart against 215px of stats on a narrow
+   card. A min-height floor keeps the plot readable if the stats column is ever shorter. */
+.stats-chart .balance-chart {
+  flex: 1 1 auto;
+  margin-top: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 210px;
+}
+
+.stats-chart .balance-chart-svg {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+/* Range tabs + legend overlaid on the plot, matching the candle chart's own treatment. */
+.balance-chart {
+  position: relative;
+}
+
+.balance-chart-overlay {
+  position: absolute;
+  top: 6px;
+  left: 10px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  pointer-events: none;
+}
+
+/* Only the buttons take the pointer, so the rest of the overlay does not block the chart's own
+   hover readout underneath it. */
+.balance-chart-overlay .chart-range-tabs {
+  pointer-events: auto;
+}
+
+.balance-chart-overlay .balance-chart-legend {
+  font-size: 0.68rem;
+  gap: 0.6rem;
+}
+
+.balance-chart-overlay .chart-range-tab {
+  font-size: 0.62rem;
+  padding: 1px 6px;
+}
+
+/* Hover readout (2026-09-12): values at the cursor's position on the line. */
+.chart-readout-bg {
+  fill: rgba(18, 20, 25, 0.92);
+  stroke: var(--border, #2a2e37);
+  stroke-width: 1;
+}
+
+.chart-readout-time {
+  font-size: 10px;
+  fill: var(--text-dim, #8b949e);
+}
+
+.chart-readout-row {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.balance-chart-svg {
+  cursor: crosshair;
+}
+
+/* Stacked below 1100px: side by side, neither the stats nor the chart has usable width. */
+@media (max-width: 1100px) {
+  .stats-layout {
+    grid-template-columns: 1fr;
+  }
+}

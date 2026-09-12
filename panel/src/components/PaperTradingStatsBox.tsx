@@ -5,18 +5,42 @@ import { formatUsd, pnlClass } from '../utils/format'
 import type { PositionMode } from '../api/types'
 import BalanceChart from './BalanceChart'
 
+// A PnL figure: the percentage leads because it is the comparable number across windows, with the
+// dollar amount beneath in a quieter weight rather than parenthesised on the same line — at three
+// tiles per row the old single line had to shrink to fit and read as one run-on value.
 function PnLTile({ label, usd, pct }: { label: string; usd: string; pct: string }) {
   const usdNum = Number(usd)
   const pctNum = Number(pct)
   return (
-    <div className="config-tile">
-      <div className="config-tile-label">{label}</div>
-      <div className={'config-tile-value mono ' + pnlClass(usdNum)}>
-        {Number.isFinite(pctNum) ? `${pctNum >= 0 ? '+' : ''}${pctNum.toFixed(2)}%` : '—'}{' '}
-        <span className="text-dim" style={{ fontWeight: 400, fontSize: '0.8rem' }}>
-          ({formatUsd(usdNum)})
-        </span>
+    <div className="stat-tile">
+      <div className="stat-label">{label}</div>
+      <div className={'stat-value mono ' + pnlClass(usdNum)}>
+        {Number.isFinite(pctNum) ? `${pctNum >= 0 ? '+' : ''}${pctNum.toFixed(2)}%` : '—'}
       </div>
+      <div className="stat-sub mono">{formatUsd(usdNum)}</div>
+    </div>
+  )
+}
+
+// A plain money figure. Same shape as PnLTile so the two rows align on a common baseline rather
+// than each tile sizing itself to its own content.
+function StatTile({
+  label,
+  value,
+  title,
+  dim,
+}: {
+  label: string
+  value: string
+  title?: string
+  dim?: boolean
+}) {
+  return (
+    <div className="stat-tile">
+      <div className="stat-label" title={title}>
+        {label}
+      </div>
+      <div className={'stat-value mono' + (dim ? ' text-dim' : '')}>{value}</div>
     </div>
   )
 }
@@ -84,8 +108,8 @@ function TradingCapTile({
   }
 
   return (
-    <div className="config-tile">
-      <div className="config-tile-label">Set Trading Cap</div>
+    <div className="stat-tile cap-tile">
+      <div className="stat-label">Set Trading Cap</div>
       <div className="cap-row">
         <input
           type="range"
@@ -128,68 +152,68 @@ export default function PaperTradingStatsBox({ mode }: { mode: PositionMode }) {
       {error && <div className="error-banner">{error}</div>}
       {!data && !error && <div className="text-dim">Loading…</div>}
       {data && (
-        <div className="config-grid">
-          <div className="config-tile">
-            <div className="config-tile-label">Open Orders</div>
-            <div className="config-tile-value mono">{data.openCount}</div>
+        <div className="stats-layout">
+          {/* Stats on the left, chart on the right (2026-09-12 redesign). The chart was previously
+              full-width beneath the tiles, which made it the largest thing on the page while
+              carrying the least-consulted information. Three rows of stats, grouped by what they
+              answer: how am I doing, what do I hold, what am I risking. */}
+          <div className="stats-col">
+            {/* Row 1 — performance. */}
+            <div className="stats-row stats-row-3">
+              <PnLTile label="24h" usd={data.pnl24hUsd} pct={data.pnl24hPct} />
+              <PnLTile label="1W" usd={data.pnl7dUsd} pct={data.pnl7dPct} />
+              <PnLTile label="1M" usd={data.pnl30dUsd} pct={data.pnl30dPct} />
+            </div>
+
+            {/* Row 2 — capital. Reserve is real-mode only (paper has no exchange balance to hold
+                back), so the row is 2-up there and 3-up on real. */}
+            <div className={'stats-row ' + (mode === 'real' ? 'stats-row-3' : 'stats-row-2')}>
+              <StatTile
+                label="Balance"
+                title="The real, continuous running total — never reset by a trading-cap change"
+                value={formatUsd(Number(data.accountBalanceUsd)).replace('+', '')}
+              />
+              <StatTile
+                label="Equity"
+                title={
+                  mode === 'real'
+                    ? 'The slice of the exchange balance this engine trades with — profit and loss accrue here'
+                    : 'The balance since the last chosen trading cap — what new positions size against'
+                }
+                value={formatUsd(Number(data.totalEquityUsd)).replace('+', '')}
+              />
+              {mode === 'real' && (
+                <StatTile
+                  label="Reserve"
+                  dim
+                  title="Account Balance minus Total Equity — capital held back from trading. Moves only when you change the cap."
+                  value={formatUsd(
+                    Number(data.accountBalanceUsd) - Number(data.totalEquityUsd),
+                  ).replace('+', '')}
+                />
+              )}
+            </div>
+
+            {/* Row 3 — the one control, given its own full-width row so its slider has room. */}
+            <div className="stats-row">
+              <TradingCapTile
+                mode={mode}
+                maxAvailable={Number(data.accountBalanceUsd)}
+                current={Number(data.totalEquityUsd)}
+                onSaved={() => setRefreshSignal((n) => n + 1)}
+              />
+            </div>
           </div>
-          <div className="config-tile">
-            <div className="config-tile-label" title="The real, continuous running total — never reset by a trading-cap change">
-              Account Balance
-            </div>
-            <div className="config-tile-value mono">
-              {formatUsd(Number(data.accountBalanceUsd)).replace('+', '')}
-            </div>
+
+          <div className="stats-chart">
+            <BalanceChart
+              mode={mode}
+              currentEquity={Number(data.totalEquityUsd)}
+              currentBalance={Number(data.accountBalanceUsd)}
+              refreshSignal={refreshSignal}
+            />
           </div>
-          <div className="config-tile">
-            <div
-              className="config-tile-label"
-              title={
-                mode === 'real'
-                  ? 'The slice of the exchange balance this engine trades with — profit and loss accrue here'
-                  : 'The balance since the last chosen trading cap — what new positions size against'
-              }
-            >
-              Total Equity
-            </div>
-            <div className="config-tile-value mono">
-              {formatUsd(Number(data.totalEquityUsd)).replace('+', '')}
-            </div>
-          </div>
-          {/* Real mode only: the untraded remainder, shown so the split between "what the exchange
-              holds" and "what I'm risking" is visible at a glance rather than mental arithmetic.
-              Paper has no exchange balance to split, so the tile would always read $0.00. */}
-          {mode === 'real' && (
-            <div className="config-tile">
-              <div
-                className="config-tile-label"
-                title="Account Balance minus Total Equity — capital held back from trading. Moves only when you change the cap."
-              >
-                Reserve
-              </div>
-              <div className="config-tile-value mono text-dim">
-                {formatUsd(Number(data.accountBalanceUsd) - Number(data.totalEquityUsd)).replace('+', '')}
-              </div>
-            </div>
-          )}
-          <PnLTile label="24h PnL" usd={data.pnl24hUsd} pct={data.pnl24hPct} />
-          <PnLTile label="1W PnL" usd={data.pnl7dUsd} pct={data.pnl7dPct} />
-          <PnLTile label="1M PnL" usd={data.pnl30dUsd} pct={data.pnl30dPct} />
-          <TradingCapTile
-            mode={mode}
-            maxAvailable={Number(data.accountBalanceUsd)}
-            current={Number(data.totalEquityUsd)}
-            onSaved={() => setRefreshSignal((n) => n + 1)}
-          />
         </div>
-      )}
-      {data && (
-        <BalanceChart
-          mode={mode}
-          currentEquity={Number(data.totalEquityUsd)}
-          currentBalance={Number(data.accountBalanceUsd)}
-          refreshSignal={refreshSignal}
-        />
       )}
     </div>
   )
