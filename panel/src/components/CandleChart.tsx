@@ -119,6 +119,7 @@ export function CandleChart({
   editPositionId,
   editSl,
   editTp,
+  editLabelMode,
   onDragLevel,
 }: {
   candles: Candle[]
@@ -128,6 +129,8 @@ export function CandleChart({
   editPositionId?: number | null
   editSl?: number | null
   editTp?: number | null
+  /** Price/% for the edited position's on-chart labels, following the side panel's own switch. */
+  editLabelMode?: 'price' | 'pct'
   onDragLevel?: (which: 'sl' | 'tp', price: number) => void
 }) {
   const container = useRef<HTMLDivElement>(null)
@@ -403,6 +406,7 @@ export function CandleChart({
       pendingSl: p.ID === editPositionId ? (editSl ?? null) : undefined,
       pendingTp: p.ID === editPositionId ? (editTp ?? null) : undefined,
       editable: p.ID === editPositionId,
+      labelMode: p.ID === editPositionId ? editLabelMode : undefined,
     }))
     zonesRef.current?.setPositions(zones)
 
@@ -417,7 +421,7 @@ export function CandleChart({
     // candles is intentionally absent: barsKey is what says the SERIES changed, and depending on
     // the array itself would put this whole rebuild back on the per-tick path.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [barsKey, positions, frameKey, editPositionId, editSl, editTp])
+  }, [barsKey, positions, frameKey, editPositionId, editSl, editTp, editLabelMode])
 
   // Live tick: move only the newest bar. update() must be called with a time >= the series' last,
   // which barsKey's own effect guarantees — it has already written this bar via setData by the time

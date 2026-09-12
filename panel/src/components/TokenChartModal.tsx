@@ -273,7 +273,12 @@ export default function TokenChartModal({
         )}
         {!error && liveCandles !== null && liveCandles.length > 0 && (
           <>
-            <div className={'chart-with-panel' + (target ? ' has-panel' : '')}>
+            <div
+              className={'chart-with-panel' + (target ? ' has-panel' : '')}
+              // The row is sized to the chart so the side panel's `align-self: stretch` has a
+              // definite height to match — without it the panel would resolve to its own content.
+              style={{ height: chartHeight }}
+            >
               <div className="chart-main">
                 <CandleChart
                   candles={liveCandles}
@@ -283,6 +288,7 @@ export default function TokenChartModal({
                   editPositionId={target?.ID ?? null}
                   editSl={pendingSl}
                   editTp={pendingTp}
+                  editLabelMode={levelMode}
                   onDragLevel={onDragLevel}
                 />
               </div>

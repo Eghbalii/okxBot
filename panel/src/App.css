@@ -1045,16 +1045,31 @@ th.sorted {
   background: #16181d;
   border: 1px solid #272b33;
   border-radius: 8px;
-  align-self: flex-start;
+  /* Matches the chart's height exactly (2026-09-12 request) rather than hugging its own content,
+     which left a ragged edge beside the chart. The actions are pushed to the bottom by the spacer
+     below, so a taller chart grows the gap rather than stretching the controls. */
+  align-self: stretch;
+  overflow-y: auto;
+}
+
+/* Pushes everything after it to the bottom of the panel, so Update/Reset sit on the chart's own
+   baseline instead of floating directly under the inputs. */
+.cap-spacer {
+  flex: 1 1 auto;
+  min-height: 4px;
 }
 
 @media (max-width: 900px) {
   .chart-with-panel {
     flex-direction: column;
+    /* Overrides the inline chart height: stacked, the row holds BOTH the chart and the panel, so
+       constraining it to the chart's height alone would clip the panel off the bottom. */
+    height: auto !important;
   }
   .chart-adjust-panel {
     flex: 1 1 auto;
     width: 100%;
+    overflow-y: visible;
   }
 }
 

@@ -25,7 +25,15 @@ function decimalsFor(entry: number): number {
 }
 
 const fmtPrice = (v: number, entry: number) => v.toFixed(decimalsFor(entry))
-const fmtPct = (v: number) => `${v > 0 ? '+' : ''}${(Math.trunc(v * 10) / 10).toFixed(1)}`
+
+// For an <input type="number">: NO leading "+". The HTML spec's valid-floating-point-number
+// production allows an optional "-" and nothing else, so a browser treats "+40.0" as invalid and
+// renders the field EMPTY. That is the reported bug — a take-profit (positive) vanished in % mode
+// while a stop (negative) displayed fine, because only the positive one carried the plus.
+const fmtPctInput = (v: number) => (Math.trunc(v * 10) / 10).toFixed(1)
+
+// For display text, where a sign makes a stop and a target distinguishable at a glance.
+export const fmtPctLabel = (v: number) => `${v > 0 ? '+' : ''}${fmtPctInput(v)}`
 
 /**
  * Chart-side SL/TP editor (2026-09-12 request).
@@ -83,7 +91,7 @@ export default function ChartAdjustPanel({
       if (price === null) return ''
       return mode === 'price'
         ? fmtPrice(price, entry)
-        : fmtPct(pctOnMargin(entry, price, side, leverage))
+        : fmtPctInput(pctOnMargin(entry, price, side, leverage))
     },
     [mode, entry, side, leverage],
   )
@@ -133,7 +141,7 @@ export default function ChartAdjustPanel({
             // typed, the one that is not is the one worth seeing, and switching modes to check a
             // number would lose your place.
             <span className={'cap-alt ' + (pct !== null && pct < 0 ? 'text-red' : 'text-green')}>
-              {mode === 'price' ? `${fmtPct(pct ?? 0)}%` : fmtPrice(price, entry)}
+              {mode === 'price' ? `${fmtPctLabel(pct ?? 0)}%` : fmtPrice(price, entry)}
             </span>
           )}
         </div>
@@ -190,7 +198,7 @@ export default function ChartAdjustPanel({
             onClick={() => onModeChange(m)}
             type="button"
           >
-            {m === 'price' ? 'Price' : '% margin'}
+            {m === 'price' ? 'Price' : '% of margin'}
           </button>
         ))}
       </div>
@@ -201,7 +209,16 @@ export default function ChartAdjustPanel({
       <p className="cap-hint">
         Drag a level on the chart, or type here. Nothing reaches the exchange until you press
         Update.
+        {mode === 'pct' && (
+          <>
+            {' '}
+            Percentages are of <strong>margin</strong>, not of price: at {leverage}x, −15% is a{' '}
+            {(15 / leverage).toFixed(2)}% price move.
+          </>
+        )}
       </p>
+
+      <div className="cap-spacer" />
 
       {error && <p className="error cap-error">{error}</p>}
       {saved && !dirty && <p className="cap-saved">Sent to the exchange.</p>}

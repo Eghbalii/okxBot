@@ -32,6 +32,12 @@ export interface ZonePosition {
   pendingTp?: number | null
   /** Draws the round grab handles; only the one position being edited is draggable. */
   editable?: boolean
+  /**
+   * How this position's labels read. Follows the side panel's own price/% switch so the two never
+   * disagree about what a number means (2026-09-12 request — the chart used to stay on percent
+   * regardless). Defaults to percent, which is what a position with no editor open shows.
+   */
+  labelMode?: 'price' | 'pct'
 }
 
 // Translucent: these are drawn UNDER the candles (zOrder 'bottom'), and an opaque fill would hide
@@ -224,7 +230,10 @@ class ZoneRenderer implements IPrimitivePaneRenderer {
     const y = this.series.priceToCoordinate(price)
     if (y === null) return
 
-    const text = formatPct(pctOnMargin(entry, price, p.side, p.leverage))
+    const text =
+      p.labelMode === 'price'
+        ? formatLevelPrice(price)
+        : formatPct(pctOnMargin(entry, price, p.side, p.leverage))
     ctx.font = '11px ui-sans-serif, system-ui, sans-serif'
     const padX = 5
     const w = ctx.measureText(text).width + padX * 2
@@ -258,6 +267,16 @@ export function pctOnMargin(
   const lev = leverage > 0 ? leverage : 1
   const direction = side === 'buy' ? 1 : -1
   return (direction * (target - entry) * 100 * lev) / entry
+}
+
+// Enough decimals for the instrument, derived from the value itself — this roster spans BTC at
+// 77295.7 to PEPE at 0.000003382, so a fixed precision would render a small token's level as 0.00.
+export function formatLevelPrice(v: number): string {
+  if (!Number.isFinite(v)) return ''
+  if (Math.abs(v) >= 1) return v.toFixed(2)
+  const s = v.toFixed(12).replace(/0+$/, '')
+  const lead = /^0\.(0*)/.exec(s)
+  return v.toFixed(Math.min((lead ? lead[1].length : 0) + 4, 10))
 }
 
 // One decimal, with an explicit sign so a target and a stop are distinguishable in isolation —
