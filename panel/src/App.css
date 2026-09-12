@@ -595,22 +595,39 @@ th.sorted {
 
 /* Set Trading Cap tile: slider + direct input + button on one line, so the tile stays the same
    height as the plain value tiles beside it in .config-grid. */
+/* The Set Trading Cap tile sits in the same auto-fit grid as the PnL tiles, whose columns are
+   minmax(11rem, 1fr) = 176px. Its slider + number + button needed ~182px and could not shrink, so
+   it forced the whole grid to fewer columns and pushed 1M PnL onto a second row (reported
+   2026-09-12). min-width:0 lets the row shrink to its column instead of widening it; the slider
+   gives up space first, since it is the one control here that stays usable at any width. */
 .cap-row {
   display: flex;
-  gap: 0.4rem;
+  gap: 0.3rem;
   align-items: center;
+  min-width: 0;
 }
 
 .cap-slider {
-  flex: 1 1 4rem;
-  min-width: 3rem;
+  flex: 1 1 2rem;
+  min-width: 1.5rem;
   accent-color: var(--accent, #4ea1ff);
   cursor: pointer;
 }
 
+/* Shrinkable rather than a fixed 4.5rem: it only ever holds a short dollar amount, and holding a
+   hard width here is what made the tile unable to fit its column. */
 .cap-input {
-  width: 4.5rem;
+  width: 3.6rem;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+/* The Set button carries a 3-letter label, so it does not need the default button padding and is
+   the cheapest place to reclaim the last few pixels. */
+.cap-row .btn-primary {
   flex: 0 0 auto;
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
 }
 
 .cap-hint {
