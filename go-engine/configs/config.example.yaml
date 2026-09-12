@@ -201,11 +201,20 @@ paper_trading:
     # which only bounds the raw price distance and knows nothing about leverage: at 20x, a stop
     # placed at max_sl_dist_pct alone would realize a 100% loss. Defaults to 0.15 even if left
     # unset here (internal/config.Load) — unlike the other rl_clamps fields, this one is not
-    # opt-in-only-if-configured. No equivalent cap exists for take-profit; profit is never limited.
+    # opt-in-only-if-configured. This caps LOSS; profit itself is never limited (max_tp_sl_ratio
+    # below bounds how far a target may sit from entry, which is a different question — it keeps a
+    # target reachable, it does not cap what a trade may earn).
     max_loss_pct: 0.15
     # Minimum reward:risk. A too-near target is widened to satisfy it rather than the trade being
     # rejected, since the entry itself may still be sound.
     min_tp_sl_ratio: 1.5
+    # Maximum reward:risk — the counterpart min_tp_sl_ratio lacked until 2026-09-12, and the direct
+    # cause of the unreachable targets reported that day. A strategy's structurally tight stop gets
+    # widened up to min_sl_dist_pct, and min_tp_sl_ratio then carries that widening into the target:
+    # measured in production, an intended 2:1 became 47:1 (ict_fvg) and 80:1 (ict_order_block), with
+    # targets 60-70% of margin away at 10x that price never reaches. Like max_loss_pct this defaults
+    # (to 3) even when left unset, since an unreachable target is the failure it exists to prevent.
+    max_tp_sl_ratio: 3
   # Force-closes any position open longer than this, close_reason='timeout' (CLAUDE.md §15.14).
   # Housekeeping, not an RL decision -- fires unconditionally, independent of the RL flags above.
   rl_max_open_duration: 6h

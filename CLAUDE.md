@@ -5196,3 +5196,135 @@ stop a subsystem completely while every health signal stays green. The bell (§4
 because these were paper orders, and `paper_orders` has no `last_error` column at all (§43). The
 only visible symptom was an absence — no closes — which is exactly the kind of thing nobody
 notices until they go looking.
+
+## 45. Unreachable take-profits: a missing ratio cap, and twelve V2 strategies (2026-09-12)
+
+Reported as two observations about paper trading: some TPs sat "60 or 70 percent" away, which is
+very hard to touch at 10x, and separately, positions that ran to +20 or +30% gave it all back
+because the target was too far and the SL/TP never adjusted. Both were real, and quantifying them
+from `paper_orders` is what found the cause.
+
+**The cause was not the strategies.** `conductor.Clamps` enforced a MINIMUM reward:risk
+(`MinTPSLRatio`) and no maximum, and the two clamps interacted:
+
+1. A strategy proposes a structurally tight stop. `ict_fvg` used the fair-value gap's own far edge,
+   which on a 5m bar measured **0.011%** from entry on real orders.
+2. `Apply` clamps that stop UP to the `min_sl_dist_pct` floor of 0.5% — a ~45x widening.
+3. `MinTPSLRatio: 1.5` is then applied to the **widened** stop, carrying the widening into the
+   target.
+4. Nothing capped the result.
+
+So a strategy's own intended 2:1 became an effective 40:1-80:1. Mean realized reward:risk measured
+across 1841 closed paper orders: **47:1** on `ict_fvg`, **69:1** on `range_breakout`, **80:1** on
+`ict_order_block`. Production orders 2514/2518/2549 all carry the signature — a stop 0.011%-0.074%
+away paired with a target 4.5%-6.5% away, which at 10x is 45-65% of margin.
+
+The give-back claim was the same bug seen from the other end: **309 closed positions reached +10%
+of margin or better, and 74 of them still closed at a loss** — they had no reachable exit.
+
+### 45.1 The fix: `MaxTPSLRatio`, for paper AND real
+
+`conductor.Clamps` gains `MaxTPSLRatio`, applied after `MinTPSLRatio` so the min/max order is
+well-defined. Config `max_tp_sl_ratio` defaults to **3** even when unset — the same "not opt-in"
+treatment `MaxLossPct` gets (§19.2), because an unreachable target is the failure this prevents
+rather than a mode to opt into. 3:1 is deliberately generous: it leaves every strategy's intended
+1.5:1-2:1 untouched and bites only on the pathological ratios.
+
+Capping the RATIO rather than an absolute distance is deliberate — it scales with the instrument's
+own volatility exactly as the stop does, so one bound is correct for BTC and PEPE alike.
+
+Applied to **both** paper and real, per explicit operator instruction ("چون اونجا هم همش خودم دارم
+دستی تغییرش میدم" — they had been correcting real TPs by hand). Both `cmd/trader` and
+`cmd/paper-trader` build their own `conductor.Clamps` struct literal, the duplication §23 records as
+having already caused one incident, so both were wired and both got a regression test.
+
+**`min_sl_dist_pct` was deliberately NOT lowered**, which was the first instinct. Checking how often
+the floor actually binds showed it pins only `weekly_dip_buy` (281 of 281 trades) and is rare
+elsewhere — average stops sit at 0.28%-0.86%, above it. The floor contributes to the mechanism but
+the missing TP cap is what makes it pathological, so only the cap was added.
+
+### 45.2 Twelve V2 strategies
+
+Registered as separate `_v2` kinds rather than edits to their parents, per §11.3's locked-origin
+rule: V1 keeps its accumulated history and stays independently comparable. Panel names were tagged
+`<kind>_V1` / `<kind>_V2` so the two are distinguishable (the `kind` column is untouched, so every
+existing assignment and historical order still resolves).
+
+What changed uniformly, driven by the V1 data rather than taste:
+
+- **Levels are sized in ATR units**, not fixed percentages. A median 5m candle is **0.081% on BTC
+  and 0.453% on ZEC** — 5.6x apart — so V1's single pair of percentages was simultaneously too
+  tight to survive noise on ZEC and too wide to be reached on BTC.
+- **Reward:risk is bounded at the source** (`v2Levels`), with a hard floor at **1:1** per the
+  operator's explicit requirement that TP% never fall below SL%.
+- **Most gained a regime filter** — trend, volatility, or conviction. The V1 record showed the
+  losses came from taking every occurrence of a pattern rather than from the pattern itself:
+  `ema_ribbon_pullback` won 12.5% of 40 trades because it entered on a bare touch of the mid EMA,
+  which on 5m is as often a trend failure as a pullback.
+
+### 45.3 Real market data corrected two things a synthetic fixture hid
+
+Worth recording because the synthetic fixture was written specifically to avoid §30.1's vacuity
+trap and still misled:
+
+1. **Six V2 strategies appeared inert** against generated candles and fire normally against real
+   ones — the generator was too smooth to produce the patterns they look for. Had that been trusted,
+   six working strategies would have been "fixed" until they fired on a fixture that was itself
+   tuned until they fired, which measures nothing. The tests now run against **1200 real OKX 5m
+   candles per instrument** (BTC/SOL/ZEC, committed as `internal/strategy/testdata/`).
+
+2. **The ratio bound alone was insufficient.** ATR scales with the instrument, so a 1.3-ATR stop at
+   2:1 is a reachable ~8% of margin on BTC and was **32% on ZEC** at the same 10x — identical ratio,
+   unreachable distance. `v2Levels` now also caps absolute distance at 2% of price, shrinking
+   **risk before reward** so the cap can never push the ratio below the 1:1 floor.
+
+Every guard is mutation-checked: removing the TP cap reproduces the production ratio exactly
+(32.5:1), disabling the distance cap fails the ZEC case, removing the 1:1 floor fails its own test.
+The floor's test calls `v2Levels` directly rather than going through `WithParams`, because
+`ClampParam` already floors `risk_reward` at its ParamSpec `Min: 1` — a test driven through the
+parameter path passes whether or not the floor exists, and was discarded once that was verified.
+
+712 Go tests pass, up from 610.
+
+### 45.4 Activation, and a config layer that silently overrides assignments
+
+V2 activated in **paper only** (explicit instruction); real mode's four assignments are untouched.
+The V1 kinds of the twelve that were still running (`vwap_reversion`, `bb_squeeze_breakout`) were
+disabled; the three pre-September originals still active (`rsi_sma_fuzzy`, `stepped_trailing`,
+`trend_confluence`) were left alone as not mine to retire.
+
+**Inserting `strategy_assignments` rows was not enough, and this is worth knowing.**
+`paper_trading_config.active_kinds` (§22) is a coarser per-KIND switch that `cmd/paper-trader`
+applies at startup via `SetAssignmentsEnabledForKinds`, which runs
+`enabled = (kind = ANY(active_kinds))` across every paper assignment — so it **overwrites** whatever
+the assignment rows say. The first restart after inserting 120 V2 assignments showed only V1
+strategies evaluating, because `active_kinds` still listed the old five. Activating a new kind means
+updating that list too. Confirmed from `okxbot_strategy_signals_total` rather than assumed.
+
+Two cleanups in the same pass: the activation cross-joined every (inst_id, bar) pair present in
+paper assignments, which produced 216 rows on 15m/1H that `active_bars` (`{5m}`) means never
+decide — disabled rather than deleted, so re-enabling a timeframe is a flag flip. And 48 rows
+landed on `ENA-USDT-SWAP`/`XAU-USDT-SWAP`, retired instruments left behind by §33.5's symbol
+migration — deleted. Final state: **120 enabled V2 assignments** = 12 strategies × 10 live tokens
+on 5m.
+
+**Verified on live orders**, not just in tests. The first two V2 orders: `ict_fvg_v2` at R:R 3.00
+with TP 14.6% of margin, `ict_order_block_v2` at R:R 1.50 with TP 22.5% — against V1's 47:1 and
+80:1. Open positions carried over from before the restart still show TPs at 79%, 84% and 98% of
+margin, which is the before/after in one query. The 15% loss cap holds on every one.
+
+### 45.5 Advice on the model, separate from the strategies
+
+Three things the data says, none of them fixed here:
+
+- **The model is being asked to close almost everything and is not being heard.** §42 measured
+  2150 `close` answers against 22 `none` and 2 `update` over 13 hours, all discarded because
+  `rl_early_close` is off. Whether it is right is now answerable: pair
+  `okxbot_paper_early_close_ignored_total` against how those positions actually resolved.
+- **`rl_sizing` should stay off until `completed_trades` clears 100 by a real margin.** §14's own
+  record of the first attempt (39 trades, converged to 100% `skip` within 20 minutes) is the
+  precedent.
+- **The reward signal was distorted for as long as the targets were.** A policy trained where TP is
+  unreachable learns that holding is pointless, which is consistent with it now wanting to close
+  everything. Retraining judgement should wait for post-fix trades rather than being drawn from the
+  existing buffer.
