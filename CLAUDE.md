@@ -5328,3 +5328,21 @@ Three things the data says, none of them fixed here:
   unreachable learns that holding is pointless, which is consistent with it now wanting to close
   everything. Retraining judgement should wait for post-fix trades rather than being drawn from the
   existing buffer.
+
+### 45.6 The panel's "new" badge was pointing at the superseded kinds (2026-09-12)
+
+Caught by the operator immediately after §45.2 shipped: the twelve were supposed to be relabelled
+V1 with the badge moving to the new generation, and only the badge half was missed.
+
+`StrategyKindModal.tsx` drove the badge from `NEW_KINDS`, a hardcoded list naming the twelve kinds
+added in §30. Shipping their V2 revisions made that list stale in the worst possible direction — the
+panel went on labelling the **superseded** kinds "new" while the actual new ones carried no tag at
+all, which is more misleading than having no badge.
+
+Now derived from the kind's own `_v2` suffix (`isNewKind`). The V2 names already carry their
+generation, so the tag reads the same thing that makes a kind new rather than a parallel list that
+has to be remembered separately — the class of bug §36.1/§36.2 keep producing, where a second
+record of the same fact drifts from the first. A third generation would want a real column rather
+than a third convention.
+
+Verified against the live panel: 12 kinds tagged, the V1 originals not.
