@@ -87,28 +87,28 @@ export function useLiveCandles(fetched: Candle[] | null, bar: string, price: str
   const newestFetchedMs =
     fetched && fetched.length > 0 ? Date.parse(fetched[fetched.length - 1].Timestamp) : null
 
-  // The bar currently forming, as its own piece of state driven by a CLOCK rather than by ticks.
-  // This is what makes rollover explicit: without it the effect below only re-runs when the price
-  // changes, so a quiet instrument that does not tick across a boundary would keep extending the
-  // previous bar. (It happened to work via the 15s refetch changing `fetched`'s identity — correct
-  // by accident, and it would break the moment anyone memoized that array.) A dedicated timer makes
-  // the boundary the thing that advances the bar, which is what it actually is.
-  const [nowBucket, setNowBucket] = useState(() => (barSecs ? bucketStart(Date.now(), barSecs) : 0))
+  // A counter that simply forces the effect below to re-run; it carries no meaning of its own.
+  //
+  // The bucket is read from the CLOCK inside that effect (`bucketStart(Date.now(), ...)`), never
+  // stored here. An earlier version kept the bucket itself in state and advanced it from a timer,
+  // which made rollover depend entirely on that timer firing — and browsers throttle timers hard in
+  // a background tab, which is exactly the "leave the chart open past a bar boundary" case this is
+  // for. A missed fire left the bucket stale indefinitely and the bar never rolled over. Reading the
+  // clock at use time cannot go stale: whenever the effect runs for any reason (a tick, a refetch,
+  // this tick) it computes the bucket that is true right then.
+  //
+  // The timer therefore only has to NUDGE, so it is a plain coarse interval rather than a
+  // boundary-aligned chain — anything that wakes the effect shortly after a boundary is enough, and
+  // a quiet instrument that does not tick is the only case relying on it at all.
+  const [nudge, setNudge] = useState(0)
   useEffect(() => {
     if (!barSecs) return
-    // Re-aligns on every fire rather than using a fixed interval: setInterval drifts, and a bar
-    // opened a few seconds late would be stamped into the previous bucket.
-    let timer: ReturnType<typeof setTimeout>
-    const schedule = () => {
-      const next = bucketStart(Date.now(), barSecs) + barSecs * 1000
-      timer = setTimeout(() => {
-        setNowBucket(bucketStart(Date.now(), barSecs))
-        schedule()
-      }, Math.max(next - Date.now(), 250))
-    }
-    setNowBucket(bucketStart(Date.now(), barSecs))
-    schedule()
-    return () => clearTimeout(timer)
+    // Capped at 5s so a boundary is noticed promptly even on a 1D bar, and floored to a second so a
+    // short timeframe does not spin. This does not need to be aligned to the boundary: it only
+    // triggers a re-read of a clock that is always correct.
+    const every = Math.min(Math.max(Math.round((barSecs * 1000) / 60), 1000), 5000)
+    const id = setInterval(() => setNudge((n) => n + 1), every)
+    return () => clearInterval(id)
   }, [barSecs])
 
   useEffect(() => {
@@ -117,7 +117,8 @@ export function useLiveCandles(fetched: Candle[] | null, bar: string, price: str
     if (!Number.isFinite(p) || p <= 0) return
 
     const instId = fetched[fetched.length - 1].InstID
-    const startMs = nowBucket
+    // Read from the clock, not from state — see the `nudge` comment above.
+    const startMs = bucketStart(Date.now(), barSecs)
     // A tick belonging to an already-finalized bar (clock skew, or a bar the server persisted
     // while this tick was in flight) is dropped rather than rewriting that candle.
     if (newestFetchedMs !== null && startMs <= newestFetchedMs) return
@@ -176,7 +177,7 @@ export function useLiveCandles(fetched: Candle[] | null, bar: string, price: str
         ],
       }
     })
-  }, [price, nowBucket, barSecs, bar, fetched, newestFetchedMs, seriesKey])
+  }, [price, nudge, barSecs, bar, fetched, newestFetchedMs, seriesKey])
 
   return useMemo(() => {
     if (fetched === null) return null

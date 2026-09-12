@@ -5,6 +5,7 @@ import {
   createSeriesMarkers,
   type IChartApi,
   type ISeriesApi,
+  type ISeriesMarkersPluginApi,
   type SeriesMarker,
   type Time,
   type UTCTimestamp,
@@ -75,6 +76,11 @@ export function CandleChart({
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick', Time> | null>(null)
   const zonesRef = useRef<PositionZones | null>(null)
+  // ONE markers plugin for the chart's lifetime. createSeriesMarkers ATTACHES a new primitive each
+  // time it is called and returns a handle to it — it is not an idempotent setter. Calling it per
+  // effect run (which now includes every 5s positions refetch) left every previous instance still
+  // attached and drawing its own copy of the arrows, so markers accumulated and rendered wrong.
+  const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
   const detailsRef = useRef<Map<string, MarkerDetail>>(new Map())
   // Guards the one-time initial framing; see the data effect below.
   // Holds the frameKey the current viewport was framed for. The sentinel is deliberately not
@@ -120,6 +126,7 @@ export function CandleChart({
     })
     const zones = new PositionZones()
     series.attachPrimitive(zones)
+    markersRef.current = createSeriesMarkers(series, [])
 
     chart.subscribeCrosshairMove((param) => {
       const id = param.hoveredInfo?.objectId
@@ -139,6 +146,7 @@ export function CandleChart({
       chartRef.current = null
       seriesRef.current = null
       zonesRef.current = null
+      markersRef.current = null
     }
     // Deliberately NOT keyed on height: the modal re-sizes the chart when the window changes, and
     // tearing the chart down to rebuild it would discard the viewport the user had zoomed to —
@@ -232,7 +240,7 @@ export function CandleChart({
     // Markers must be time-ordered or the library rejects the set.
     markers.sort((a, b) => (a.time as number) - (b.time as number))
     detailsRef.current = details
-    createSeriesMarkers(series, markers)
+    markersRef.current?.setMarkers(markers)
 
     const open: ZonePosition[] = positions
       .filter((p) => !p.ClosedAt)
