@@ -46,10 +46,16 @@ const iso = (ms: number) => new Date(ms).toISOString()
  * accommodate it, and crossing a bar boundary starts a fresh candle rather than waiting for the
  * next refetch.
  *
- * Why build the forming candle client-side at all, rather than only refetching: the `candles`
- * table holds FINALIZED bars only (CLAUDE.md §7 — PaperTrader persists a bar when it closes), so
- * there is no server-side row for the bar currently forming. Without this the newest candle on a
- * 1H chart could sit up to an hour stale while the price ticked visibly in the table beside it.
+ * Why build candles client-side at all, rather than only refetching: the `candles` table holds
+ * FINALIZED bars only (CLAUDE.md §7 — PaperTrader persists on confirm=1), and OKX marks a bar
+ * confirm=1 only when the NEXT bar closes. Measured on the live stream 2026-09-12: the 12:20 bar
+ * was confirmed at 12:25:01 — a full bar interval after it ended. So the newest server row is
+ * always ~1 bar behind, and on a 1H chart that is an hour.
+ *
+ * That lag is why this hook keeps bars it has already completed (`done` below) instead of only the
+ * one forming. Holding just the forming bar meant that at every boundary the bar the user had been
+ * watching was discarded and would not reappear until the server caught up minutes later — the
+ * chart grew no new candles, which is exactly the reported symptom.
  *
  * The locally-built candle is deliberately treated as provisional. `fetched` is the authority:
  * whenever a refetch brings back a bar this hook had been synthesizing, the real row replaces the
@@ -70,8 +76,11 @@ export function useLiveCandles(fetched: Candle[] | null, bar: string, price: str
   // a ref during render: a ref would be advanced on the render that still returns the stale candle,
   // leaving a one-frame window where the previous timeframe's bar is drawn on the new chart.
   // Bundling them makes a stale entry unusable by construction — the read below simply ignores it.
-  const [live, setLive] = useState<{ key: string; candle: Candle } | null>(null)
-  const current = live !== null && live.key === seriesKey ? live.candle : null
+  // `candles` holds the bar currently forming as its LAST entry, and any bars this hook completed
+  // locally before them — oldest first, so the array is always chronological and can be appended
+  // to the fetched series directly.
+  const [live, setLive] = useState<{ key: string; candles: Candle[] } | null>(null)
+  const localBars = live !== null && live.key === seriesKey ? live.candles : []
 
   // Newest fetched bar's start, so a tick is never folded into a bar the server has already
   // finalized — doing so would let a late tick reopen a closed candle.
@@ -114,47 +123,70 @@ export function useLiveCandles(fetched: Candle[] | null, bar: string, price: str
     if (newestFetchedMs !== null && startMs <= newestFetchedMs) return
 
     setLive((stored) => {
-      const prev = stored !== null && stored.key === seriesKey ? stored.candle : null
-      if (prev !== null && Date.parse(prev.Timestamp) === startMs) {
+      // Bars kept from a previous series are unusable; start clean rather than mixing timeframes.
+      const kept = stored !== null && stored.key === seriesKey ? stored.candles : []
+      // Anything the server has now finalized is dropped here rather than left to the read below:
+      // keeping it would grow this array without bound for as long as the chart stays open.
+      const prior = kept.filter(
+        (c) => newestFetchedMs === null || Date.parse(c.Timestamp) > newestFetchedMs,
+      )
+      const last = prior.length > 0 ? prior[prior.length - 1] : null
+
+      if (last !== null && Date.parse(last.Timestamp) === startMs) {
         // Same bar: extend it. An unchanged close is skipped so an identical tick can't churn a
         // re-render — usePriceStream already dedupes, this covers a high/low-only no-op.
-        const high = Math.max(Number(prev.High), p)
-        const low = Math.min(Number(prev.Low), p)
-        if (String(high) === prev.High && String(low) === prev.Low && String(p) === prev.Close) {
+        const high = Math.max(Number(last.High), p)
+        const low = Math.min(Number(last.Low), p)
+        if (
+          String(high) === last.High &&
+          String(low) === last.Low &&
+          String(p) === last.Close &&
+          prior.length === kept.length
+        ) {
           return stored
         }
         return {
           key: seriesKey,
-          candle: { ...prev, High: String(high), Low: String(low), Close: String(p) },
+          candles: [
+            ...prior.slice(0, -1),
+            { ...last, High: String(high), Low: String(low), Close: String(p) },
+          ],
         }
       }
-      // New bar (or the first tick since the chart opened). Opens at this tick: the true open is
-      // whatever traded at the boundary, which a client that just connected never saw. The bar is
-      // replaced by the server's own row once it finalizes, so the approximation is temporary.
+
+      // A new bucket. The bar that was forming is NOT discarded — it is kept as a completed candle,
+      // because the server will not supply its real row for another full bar interval (see the
+      // comment above this function). Its close becomes the new bar's open, so the two join up the
+      // way real candles do instead of leaving a visual gap.
+      const open = last !== null ? last.Close : String(p)
       return {
         key: seriesKey,
-        candle: {
-          InstID: instId,
-          Bar: bar,
-          Timestamp: iso(startMs),
-          Open: String(p),
-          High: String(p),
-          Low: String(p),
-          Close: String(p),
-          Volume: '0',
-        },
+        candles: [
+          ...prior,
+          {
+            InstID: instId,
+            Bar: bar,
+            Timestamp: iso(startMs),
+            Open: open,
+            High: String(Math.max(Number(open), p)),
+            Low: String(Math.min(Number(open), p)),
+            Close: String(p),
+            Volume: '0',
+          },
+        ],
       }
     })
   }, [price, nowBucket, barSecs, bar, fetched, newestFetchedMs, seriesKey])
 
   return useMemo(() => {
     if (fetched === null) return null
-    if (current === null) return fetched
-    // Guard against the server having finalized the bar this hook is synthesizing: the fetched
-    // row wins, and the synthetic one is dropped rather than appended as a duplicate timestamp
-    // (which lightweight-charts rejects as unsorted data).
-    const liveMs = Date.parse(current.Timestamp)
-    if (newestFetchedMs !== null && liveMs <= newestFetchedMs) return fetched
-    return [...fetched, current]
-  }, [fetched, current, newestFetchedMs])
+    // A locally-built bar the server has since finalized is dropped in favour of the real row: the
+    // fetched one has the true open and the real volume, and appending both would duplicate a
+    // timestamp (which lightweight-charts rejects as unsorted data).
+    const extra = localBars.filter(
+      (c) => newestFetchedMs === null || Date.parse(c.Timestamp) > newestFetchedMs,
+    )
+    if (extra.length === 0) return fetched
+    return [...fetched, ...extra]
+  }, [fetched, localBars, newestFetchedMs])
 }
