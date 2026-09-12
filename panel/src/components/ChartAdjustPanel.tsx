@@ -136,22 +136,22 @@ export default function ChartAdjustPanel({
   const row = (which: 'sl' | 'tp', label: string, price: number | null, cls: string) => {
     const pct = price === null ? null : pctOnMargin(entry, price, side, leverage)
     return (
-      <div className="cap-row">
-        <div className="cap-row-head">
-          <span className={'cap-dot ' + cls} />
-          <span className="cap-label">{label}</span>
+      <div className="cae-row">
+        <div className="cae-row-head">
+          <span className={'cae-dot ' + cls} />
+          <span className="cae-label">{label}</span>
           {price !== null && (
             // The other representation always shown beside the input: whichever unit is being
             // typed, the one that is not is the one worth seeing, and switching modes to check a
             // number would lose your place.
-            <span className={'cap-alt ' + (pct !== null && pct < 0 ? 'text-red' : 'text-green')}>
+            <span className={'cae-alt ' + (pct !== null && pct < 0 ? 'text-red' : 'text-green')}>
               {mode === 'price' ? `${fmtPctLabel(pct ?? 0)}%` : fmtPrice(price, entry)}
             </span>
           )}
         </div>
         <input
           type="number"
-          className="cap-input"
+          className="cae-input"
           step="any"
           value={which === 'sl' ? slText : tpText}
           placeholder={mode === 'price' ? 'price' : '% of margin'}
@@ -176,31 +176,31 @@ export default function ChartAdjustPanel({
 
   return (
     <aside className="chart-adjust-panel">
-      <div className="cap-head">
-        <div className="cap-title">
-          Position <span className="cap-title-id">#{position.ID}</span>
+      <div className="cae-head">
+        <div className="cae-title">
+          Position <span className="cae-title-id">#{position.ID}</span>
         </div>
-        <div className="cap-sub">
-          <span className="cap-sym">{tokenSymbol(position.InstID)}</span>
-          <span className={'cap-side ' + (side === 'buy' ? 'cap-side-long' : 'cap-side-short')}>
+        <div className="cae-sub">
+          <span className="cae-sym">{tokenSymbol(position.InstID)}</span>
+          <span className={'cae-side ' + (side === 'buy' ? 'cae-side-long' : 'cae-side-short')}>
             {side === 'buy' ? 'LONG' : 'SHORT'}
           </span>
           {/* One decimal (2026-09-12 request): leverage is a decimal column server-side and a
               bare integer hid that — 12.5x and 12x are a real difference at this account size. */}
-          <span className="cap-lev">{leverage.toFixed(1)}x</span>
+          <span className="cae-lev">{leverage.toFixed(1)}x</span>
         </div>
       </div>
 
-      <div className="cap-entry">
+      <div className="cae-entry">
         <span className="text-dim">Entry</span>
         <span className="mono">{trimPrice(position.EntryPx)}</span>
       </div>
 
-      <div className="cap-mode" role="group" aria-label="Level unit">
+      <div className="cae-mode" role="group" aria-label="Level unit">
         {(['price', 'pct'] as const).map((m) => (
           <button
             key={m}
-            className={'cap-mode-btn' + (mode === m ? ' active' : '')}
+            className={'cae-mode-btn' + (mode === m ? ' active' : '')}
             onClick={() => onModeChange(m)}
             type="button"
           >
@@ -209,27 +209,27 @@ export default function ChartAdjustPanel({
         ))}
       </div>
 
-      {row('tp', 'Take profit', tp, 'cap-dot-green')}
-      {row('sl', 'Stop loss', sl, 'cap-dot-red')}
+      {row('tp', 'Take profit', tp, 'cae-dot-green')}
+      {row('sl', 'Stop loss', sl, 'cae-dot-red')}
 
       {/* One hint for both modes (2026-09-12 request). The % variant used to append an
           explanation of margin-vs-price, which made the panel tall enough to scroll — the margin
           point is already carried by the "% of margin" button label and the per-row conversion
           shown beside each input, so it was costing layout to repeat something visible twice. */}
-      <p className="cap-hint">
+      <p className="cae-hint">
         Drag a level on the chart, or type here. Nothing reaches the exchange until you press
         Update.
       </p>
 
-      <div className="cap-spacer" />
+      <div className="cae-spacer" />
 
-      {error && <p className="error cap-error">{error}</p>}
-      {saved && !dirty && <p className="cap-saved">Sent to the exchange.</p>}
+      {error && <p className="error cae-error">{error}</p>}
+      {saved && !dirty && <p className="cae-saved">Sent to the exchange.</p>}
 
       {/* Update/Reset share a row; Close sits beneath spanning both (2026-09-12 request). The two
           rows also separate the reversible actions from the irreversible one without needing a
           divider. */}
-      <div className="cap-actions">
+      <div className="cae-actions">
         <button className="btn-primary" onClick={handleSubmit} disabled={!dirty || submitting}>
           {submitting ? 'Updating…' : 'Update'}
         </button>
@@ -238,7 +238,7 @@ export default function ChartAdjustPanel({
         </button>
       </div>
       <button
-        className="btn-danger cap-close-wide"
+        className="btn-danger cae-close-wide"
         onClick={onClosePosition}
         disabled={closing || submitting}
         type="button"

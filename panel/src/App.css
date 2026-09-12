@@ -1056,7 +1056,7 @@ th.sorted {
 
 /* Absorbs all remaining height, and is the FIRST thing to give it back when space is tight — so
    the controls keep their size and the empty gap shrinks, rather than the panel overflowing. */
-.cap-spacer {
+.cae-spacer {
   flex: 1 1 auto;
   min-height: 0;
 }
@@ -1080,24 +1080,24 @@ th.sorted {
 /* The panel's header is deliberately the heaviest thing in it (2026-09-12 request): it says which
    position every control below acts on, and at a glance that has to be unmistakable — the controls
    flatten real money. */
-.cap-head {
+.cae-head {
   padding-bottom: 8px;
   border-bottom: 1px solid #272b33;
 }
 
-.cap-title {
+.cae-title {
   font-size: 14px;
   font-weight: 700;
   letter-spacing: 0.2px;
   color: #f2f4f8;
 }
 
-.cap-title-id {
+.cae-title-id {
   color: #7d8492;
   font-weight: 600;
 }
 
-.cap-sub {
+.cae-sub {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1105,14 +1105,14 @@ th.sorted {
   font-size: 11px;
 }
 
-.cap-sym {
+.cae-sym {
   font-weight: 600;
   color: #e6e8ec;
 }
 
 /* Side reads as a filled chip rather than coloured text: it is the one field where misreading long
    for short would be expensive. */
-.cap-side {
+.cae-side {
   font-weight: 700;
   font-size: 10px;
   letter-spacing: 0.5px;
@@ -1120,17 +1120,17 @@ th.sorted {
   border-radius: 4px;
 }
 
-.cap-side-long {
+.cae-side-long {
   background: rgba(46, 189, 133, 0.16);
   color: #2ebd85;
 }
 
-.cap-side-short {
+.cae-side-short {
   background: rgba(246, 70, 93, 0.16);
   color: #f6465d;
 }
 
-.cap-lev {
+.cae-lev {
   margin-left: auto;
   color: #9aa0ab;
   font-variant-numeric: tabular-nums;
@@ -1155,7 +1155,7 @@ th.sorted {
   border-color: #f6465d;
 }
 
-.cap-entry {
+.cae-entry {
   display: flex;
   justify-content: space-between;
   font-size: 11.5px;
@@ -1165,14 +1165,14 @@ th.sorted {
 }
 
 /* Segmented price/% switch. */
-.cap-mode {
+.cae-mode {
   display: flex;
   background: #1c1f26;
   border-radius: 6px;
   padding: 2px;
 }
 
-.cap-mode-btn {
+.cae-mode-btn {
   flex: 1;
   border: 0;
   background: transparent;
@@ -1183,52 +1183,52 @@ th.sorted {
   cursor: pointer;
 }
 
-.cap-mode-btn.active {
+.cae-mode-btn.active {
   background: #2a2f39;
   color: #e6e8ec;
 }
 
-.cap-row {
+.cae-row {
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 
-.cap-row-head {
+.cae-row-head {
   display: flex;
   align-items: center;
   gap: 6px;
   font-size: 11px;
 }
 
-.cap-dot {
+.cae-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   flex: 0 0 auto;
 }
 
-.cap-dot-red {
+.cae-dot-red {
   background: #f6465d;
 }
 
-.cap-dot-green {
+.cae-dot-green {
   background: #2ebd85;
 }
 
-.cap-label {
+.cae-label {
   color: #9aa0ab;
 }
 
 /* The unit NOT being typed, shown beside the label so switching modes is never needed just to
    read the other number. */
-.cap-alt {
+.cae-alt {
   margin-left: auto;
   font-variant-numeric: tabular-nums;
   font-size: 11px;
 }
 
-.cap-input {
+.cae-input {
   width: 100%;
   box-sizing: border-box;
   background: #1c1f26;
@@ -1240,14 +1240,14 @@ th.sorted {
   font-variant-numeric: tabular-nums;
 }
 
-.cap-input:focus {
+.cae-input:focus {
   outline: none;
   border-color: #3d84f7;
 }
 
 /* Shrinks away entirely before the panel would ever scroll: it is guidance, and losing a line of
    it costs nothing next to the controls becoming unreachable. */
-.cap-hint {
+.cae-hint {
   font-size: 10px;
   line-height: 1.4;
   color: #6f757f;
@@ -1257,22 +1257,22 @@ th.sorted {
   overflow: hidden;
 }
 
-.cap-error,
-.cap-saved {
+.cae-error,
+.cae-saved {
   font-size: 11px;
   margin: 0;
 }
 
-.cap-saved {
+.cae-saved {
   color: #2ebd85;
 }
 
-.cap-actions {
+.cae-actions {
   display: flex;
   gap: 8px;
 }
 
-.cap-actions button {
+.cae-actions button {
   flex: 1;
 }
 
@@ -1372,12 +1372,12 @@ th.sorted {
 }
 
 /* Update + Reset share a row, equal width. */
-.cap-actions {
+.cae-actions {
   display: flex;
   gap: 6px;
 }
 
-.cap-actions button {
+.cae-actions button {
   flex: 1 1 0;
   min-width: 0;
   padding-left: 4px;
@@ -1387,7 +1387,7 @@ th.sorted {
 
 /* Close spans the full width beneath them — the same total width as the two above, since both rows
    are bounded by the panel's own padding. */
-.cap-close-wide {
+.cae-close-wide {
   width: 100%;
   white-space: nowrap;
 }
