@@ -4,6 +4,7 @@ import { usePolling } from '../hooks/usePolling'
 import { usePositionAlerts } from '../hooks/usePositionAlerts'
 import { usePositionEvents } from '../hooks/usePositionEvents'
 import { usePriceStream } from '../hooks/usePriceStream'
+import { unrealizedPnL } from '../lib/pnl'
 import AdjustPositionForm from '../components/AdjustPositionForm'
 import OrderDetailModal from '../components/OrderDetailModal'
 import TokenChartModal from '../components/TokenChartModal'
@@ -63,28 +64,6 @@ function DateTimeCell({ iso }: { iso: string | null | undefined }) {
       {time && <div>{time}</div>}
     </td>
   )
-}
-
-// Unrealized PnL computed client-side from entry_px/size/leverage against the live streamed price
-// (CLAUDE.md §11.4) — mirrors the same math usecase.unrealizedPnLPct uses Go-side, just so the
-// panel doesn't need a REST round-trip for something it can derive locally from data it already has.
-//
-// pct is PnL as a fraction of margin (the price move scaled by leverage), matching OKX's own
-// uplRatio convention and usd's own leverage multiplication below — before 2026-08-31 pct omitted
-// leverage entirely, so a 1% price move at 20x leverage displayed as 1% instead of the correct 20%
-// while usd (which did multiply by leverage) was already right.
-function unrealizedPnL(p: Position, lastPrice: string | undefined): { pct: number; usd: number } | null {
-  if (p.ClosedAt) return null // realized, not unrealized — RealizedPnL covers this case
-  if (!lastPrice) return null
-  const entry = Number(p.EntryPx)
-  const last = Number(lastPrice)
-  const size = Number(p.Size)
-  const leverage = Number(p.Leverage) || 1
-  if (!entry || !Number.isFinite(last)) return null
-  const direction = p.Side === 'buy' ? 1 : -1
-  const pct = (direction * (last - entry) * 100 * leverage) / entry
-  const usd = ((direction * (last - entry)) / entry) * size * leverage
-  return { pct, usd }
 }
 
 // Leverage-adjusted % move from entry to a target price (SL or TP), same formula unrealizedPnL
@@ -198,7 +177,10 @@ export default function PositionsPage() {
 
   usePositionAlerts(rows, alertsEnabled)
 
-  const livePrices = usePriceStream(showLiveColumns)
+  // Also enabled while a chart is open: the chart's header strip shows live PnL for every open
+  // position regardless of how the table itself is filtered, so a chart opened from the closed-only
+  // view would otherwise show "—" for all of them.
+  const livePrices = usePriceStream(showLiveColumns || chartInstId !== null)
 
   // Resolved from the current poll's data rather than held in state, so an open modal keeps showing
   // fresh values (live PnL, a close that just landed) instead of a snapshot frozen at click time.
@@ -558,6 +540,7 @@ export default function PositionsPage() {
           instId={chartInstId}
           mode={mode}
           positions={rows ?? []}
+          livePrices={livePrices}
           onClose={() => setChartInstId(null)}
         />
       )}

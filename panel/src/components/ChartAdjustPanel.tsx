@@ -229,6 +229,9 @@ export default function ChartAdjustPanel({
       {error && <p className="error cap-error">{error}</p>}
       {saved && !dirty && <p className="cap-saved">Sent to the exchange.</p>}
 
+      {/* All three on one row at the same height (2026-09-12 request). Close keeps the danger
+          styling — it is the one irreversible action here — but sits level with the others rather
+          than being pushed to the bottom, which is what an earlier reading of this got wrong. */}
       <div className="cap-actions">
         <button className="btn-primary" onClick={handleSubmit} disabled={!dirty || submitting}>
           {submitting ? 'Updating…' : 'Update'}
@@ -236,20 +239,14 @@ export default function ChartAdjustPanel({
         <button onClick={onReset} disabled={!dirty || submitting} type="button">
           Reset
         </button>
-      </div>
-
-      {/* Below a divider and in the danger style: flattening at market is destructive and
-          irreversible, unlike everything above it, so it should not sit flush with Update where a
-          misclick is cheap. Same call, confirm and close_reason as the positions table's button. */}
-      <div className="cap-danger">
         <button
-          className="btn-danger cap-close-btn"
+          className="btn-danger"
           onClick={onClosePosition}
           disabled={closing || submitting}
           type="button"
           title="Close this position now at the live price (close_reason='manual')"
         >
-          {closing ? 'Closing…' : 'Close position'}
+          {closing ? 'Closing…' : 'Close'}
         </button>
       </div>
     </aside>

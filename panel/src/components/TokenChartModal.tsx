@@ -6,6 +6,16 @@ import { CandleChart } from './CandleChart'
 import ChartAdjustPanel, { type LevelMode } from './ChartAdjustPanel'
 import { pctOnMargin } from './PositionZones'
 import { tokenSymbol } from '../utils/format'
+import { unrealizedPnL } from '../lib/pnl'
+
+// Colour by sign, dimmed when there is no live price yet rather than defaulting to green/red —
+// "unknown" and "flat" are different states and should not look the same.
+function pnlClass(pct: number | null): string {
+  if (pct === null) return 'text-dim'
+  if (pct > 0) return 'text-green'
+  if (pct < 0) return 'text-red'
+  return 'text-dim'
+}
 
 // How often the stored series is refetched. Live movement now arrives over the WebSocket, so this
 // is purely a consistency/backfill pass — it reconciles history and covers a dropped socket, and
@@ -33,16 +43,25 @@ function availableChartHeight(): number {
  * a different slice than the table the user just clicked.
  */
 export default function TokenChartModal({
-  instId,
+  instId: initialInstId,
   mode,
   positions,
+  livePrices,
   onClose,
 }: {
+  /** Token the chart opens on; the strip can switch to another without closing the modal. */
   instId: string
   mode: PositionMode
   positions: Position[]
+  /** instId -> last traded price, from the page's existing socket (CLAUDE.md §11.4). */
+  livePrices: Record<string, string>
   onClose: () => void
 }) {
+  // Which token is charted. Seeded from the prop and then owned here, so clicking another position
+  // in the strip re-points the SAME modal rather than closing and reopening it (2026-09-12
+  // request) — reopening would lose the selected timeframe and the chart's pan/zoom.
+  const [instId, setInstId] = useState(initialInstId)
+  useEffect(() => setInstId(initialInstId), [initialInstId])
   const [bar, setBar] = useState<string>('5m')
   const [chartHeight, setChartHeight] = useState(() => availableChartHeight())
   const [candles, setCandles] = useState<Candle[] | null>(null)
@@ -100,7 +119,26 @@ export default function TokenChartModal({
     [positions, instId, bar],
   )
 
-  const openCount = shown.filter((p) => !p.ClosedAt).length
+  // Every open position across ALL tokens, one entry per token with its live PnL. Aggregated by
+  // token rather than listed per order: the strip's job is "how is each token doing", and two
+  // positions on one token would otherwise render as two chips claiming to be the same thing.
+  const otherOpen = useMemo(() => {
+    const byToken = new Map<string, { instId: string; pct: number | null }>()
+    for (const p of positions) {
+      if (p.ClosedAt) continue
+      const live = unrealizedPnL(p, livePrices[p.InstID])
+      const prev = byToken.get(p.InstID)
+      const pct = live?.pct ?? null
+      // Summed across a token's positions, so a token showing +3% means the token is up overall.
+      byToken.set(p.InstID, {
+        instId: p.InstID,
+        pct: prev?.pct != null && pct != null ? prev.pct + pct : (prev?.pct ?? pct),
+      })
+    }
+    return [...byToken.values()].sort((a, b) => a.instId.localeCompare(b.instId))
+  }, [positions, livePrices])
+
+  const chartedPnL = otherOpen.find((o) => o.instId === instId)?.pct ?? null
 
   // --- chart-side SL/TP editing (2026-09-12 request) -----------------------------------------
   // Only a REAL, still-open position can be edited: the endpoint is real-only by construction
@@ -110,7 +148,10 @@ export default function TokenChartModal({
     () => shown.filter((p) => !p.ClosedAt && mode === 'real'),
     [shown, mode],
   )
+  // Which position the side panel edits. With the header's old dropdown gone, this is set by
+  // clicking a chip; it falls back to the first editable position on the charted token.
   const [editId, setEditId] = useState<number | null>(null)
+  useEffect(() => setEditId(null), [instId]) // re-resolve when the charted token changes
   const target = editable.find((p) => p.ID === editId) ?? editable[0] ?? null
 
   // Pending levels are held as PRICES — the unit the chart draws and the exchange enforces;
@@ -257,39 +298,37 @@ export default function TokenChartModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="chart-panel-head">
-          <h3 style={{ margin: 0 }}>{instId}</h3>
-          <span className="badge badge-dim">{mode}</span>
-          <span style={{ fontSize: 12, color: '#858b96' }}>
-            {shown.length} order{shown.length === 1 ? '' : 's'}
-            {openCount > 0 ? ` · ${openCount} open` : ''}
-          </span>
-          {editable.length > 1 && (
-            // Only shown when there is a real choice to make — with one open position the chart
-            // already makes it obvious which is being edited.
-            <select
-              className="chart-pos-select"
-              value={target?.ID ?? ''}
-              onChange={(e) => setEditId(Number(e.target.value))}
-              title="Which position to edit"
-            >
-              {editable.map((p) => (
-                <option key={p.ID} value={p.ID}>
-                  #{p.ID} {p.Side === 'buy' ? 'long' : 'short'}
-                </option>
-              ))}
-            </select>
-          )}
-          <div className="chart-bar-tabs">
-            {BARS.map((b) => (
-              <button
-                key={b}
-                className={`chart-bar-tab${b === bar ? ' active' : ''}`}
-                onClick={() => setBar(b)}
-              >
-                {b}
-              </button>
-            ))}
+          {/* The charted token, with its own live PnL beneath — everything else that used to sit
+              here (mode badge, order counts) was removed on request: it was metadata about the
+              query, not about the trade being looked at. */}
+          <div className="chart-token">
+            <div className="chart-token-name">{tokenSymbol(instId)}</div>
+            <div className={'chart-token-pnl ' + pnlClass(chartedPnL)}>
+              {chartedPnL === null ? '—' : `${chartedPnL > 0 ? '+' : ''}${chartedPnL.toFixed(1)}%`}
+            </div>
           </div>
+
+          {/* Every other open position, each clickable to re-point this same chart. Gives one
+              screen for "how is everything doing, and let me look at that one" without going back
+              to the table. */}
+          {otherOpen.length > 0 && (
+            <div className="chart-pos-strip">
+              {otherOpen.map((o) => (
+                <button
+                  key={o.instId}
+                  className={'chart-pos-chip' + (o.instId === instId ? ' active' : '')}
+                  onClick={() => setInstId(o.instId)}
+                  title={`Show ${o.instId}`}
+                >
+                  <span className="chip-sym">{tokenSymbol(o.instId)}</span>
+                  <span className={'chip-pnl ' + pnlClass(o.pct)}>
+                    {o.pct === null ? '—' : `${o.pct > 0 ? '+' : ''}${o.pct.toFixed(1)}%`}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
           <button
             className="chart-close-x"
             onClick={requestClose}
@@ -316,6 +355,20 @@ export default function TokenChartModal({
               style={{ height: chartHeight }}
             >
               <div className="chart-main">
+                {/* Overlaid on the chart rather than sitting above it (2026-09-12 request): the
+                    header is now about the position, and the timeframe belongs to the chart it
+                    changes. Absolutely positioned so it costs the chart no vertical space. */}
+                <div className="chart-bar-tabs chart-bar-tabs-overlay">
+                  {BARS.map((b) => (
+                    <button
+                      key={b}
+                      className={`chart-bar-tab${b === bar ? ' active' : ''}`}
+                      onClick={() => setBar(b)}
+                    >
+                      {b}
+                    </button>
+                  ))}
+                </div>
                 <CandleChart
                   candles={liveCandles}
                   positions={shown}

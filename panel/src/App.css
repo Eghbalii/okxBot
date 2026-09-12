@@ -1132,17 +1132,6 @@ th.sorted {
   font-variant-numeric: tabular-nums;
 }
 
-/* Separated from the level controls by a rule, so the destructive action is not adjacent to
-   Update. */
-.cap-danger {
-  border-top: 1px solid #272b33;
-  padding-top: 10px;
-}
-
-.cap-close-btn {
-  width: 100%;
-}
-
 /* Red ✕ for closing the chart (2026-09-12 request), replacing the word "Close" — which read as a
    sibling of the timeframe buttons rather than as dismissing the whole modal. */
 .chart-close-x {
@@ -1278,11 +1267,114 @@ th.sorted {
   flex: 1;
 }
 
-.chart-pos-select {
+
+/* ---- Chart header redesign (2026-09-12) ------------------------------------------------------
+   The header used to carry the instId, a mode badge and order counts — metadata about the query
+   rather than about the trade. It now shows the charted token with its live PnL, and a strip of
+   every other open position that re-points this same chart on click. */
+.chart-token {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+  margin-right: 4px;
+}
+
+.chart-token-name {
+  font-size: 17px;
+  font-weight: 700;
+  color: #f2f4f8;
+  letter-spacing: 0.2px;
+}
+
+.chart-token-pnl {
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  margin-top: 1px;
+}
+
+/* Scrolls rather than wraps: the roster can run to ten tokens, and a wrapping strip would change
+   the header's height and push the chart down as positions open and close. */
+.chart-pos-strip {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 2px 4px 4px;
+  margin-left: 4px;
+  flex: 1 1 auto;
+  min-width: 0;
+  scrollbar-width: thin;
+}
+
+.chart-pos-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  flex: 0 0 auto;
   background: #1c1f26;
-  border: 1px solid #2a2f39;
+  border: 1px solid #272b33;
   border-radius: 6px;
-  color: #e6e8ec;
-  font-size: 12px;
-  padding: 4px 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  line-height: 1.2;
+}
+
+.chart-pos-chip:hover {
+  border-color: #3a414d;
+}
+
+/* The charted token is marked by a left accent bar and a lifted background — a colour change alone
+   would collide with the PnL colouring inside the chip. */
+.chart-pos-chip.active {
+  background: #232833;
+  border-color: #3d84f7;
+  box-shadow: inset 3px 0 0 0 #3d84f7;
+}
+
+.chip-sym {
+  font-size: 11px;
+  font-weight: 600;
+  color: #cdd2da;
+}
+
+.chip-pnl {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Timeframe buttons live inside the chart now, top-left, and smaller. Absolute so they cost the
+   chart no height; pointer-events stay on the buttons themselves so the chart can still be panned
+   through the gaps between them. */
+.chart-main {
+  position: relative;
+}
+
+.chart-bar-tabs-overlay {
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  z-index: 3;
+  gap: 2px;
+}
+
+.chart-bar-tabs-overlay .chart-bar-tab {
+  font-size: 10px;
+  padding: 2px 7px;
+  background: rgba(22, 24, 29, 0.82);
+  backdrop-filter: blur(2px);
+}
+
+/* Three buttons on one row, equal width and the same height. */
+.cap-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.cap-actions button {
+  flex: 1 1 0;
+  min-width: 0;
+  padding-left: 4px;
+  padding-right: 4px;
+  white-space: nowrap;
 }
