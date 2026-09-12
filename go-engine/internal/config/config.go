@@ -24,6 +24,34 @@ type Config struct {
 		PrivateWSURL  string `yaml:"private_ws_url"`
 	} `yaml:"okx"`
 
+	// MEXC configures the MEXC futures adapter (internal/mexc), added 2026-09-13 when this project
+	// gained a second exchange.
+	//
+	// Deliberately a sibling of OKX rather than a rename of it into a generic `exchange:` block.
+	// Renaming would have rewritten the one config section a live real-money service reads, for no
+	// behavioural gain — and CLAUDE.md §31 records what a config mistake costs here. Two named
+	// sections also read more honestly than one generic block: the fields genuinely differ, and
+	// pretending otherwise is what produced the leaks this refactor is removing.
+	//
+	// The clearest difference: MEXC has NO passphrase. OKX's REST signature needs
+	// key+secret+passphrase (§4); MEXC signs with key+secret alone. A shared struct would have
+	// carried a passphrase field that is meaningless for half its users — exactly the kind of
+	// OKX-shaped abstraction the operator asked to avoid.
+	MEXC struct {
+		APIKey    string `yaml:"-"`
+		APISecret string `yaml:"-"`
+		// RESTBaseURL is MEXC's futures host. Note this is contract.mexc.com, NOT api.mexc.com —
+		// the latter is spot-only and answers futures paths with a 404 rather than an error that
+		// names the problem.
+		RESTBaseURL string `yaml:"rest_base_url"`
+		// PublicWSURL carries tickers and klines. MEXC uses ONE public socket for both, unlike
+		// OKX's split between a public and a separate "business" host (§4), so there is no
+		// BusinessWSURL here — omitting it is the point, not an oversight.
+		PublicWSURL string `yaml:"public_ws_url"`
+		// PrivateWSURL carries order/position pushes and requires a login frame.
+		PrivateWSURL string `yaml:"private_ws_url"`
+	} `yaml:"mexc"`
+
 	// Redis is still used by internal/optimizer.TrialStore for disposable trial state (CLAUDE.md
 	// §16.3) — unrelated to the event bus, which now runs on Kafka (below).
 	Redis struct {
@@ -459,6 +487,11 @@ func Load(path string) (*Config, error) {
 	cfg.OKX.APIPassphrase = os.Getenv("OKX_API_PASSPHRASE")
 	cfg.OKX.Simulated = os.Getenv("OKX_SIMULATED_TRADING") == "1"
 
+	// MEXC credentials, same env-only treatment as OKX's: secrets never live in the YAML file,
+	// which is committed-adjacent and has been accidentally overwritten before (§31).
+	cfg.MEXC.APIKey = os.Getenv("MEXC_API_KEY")
+	cfg.MEXC.APISecret = os.Getenv("MEXC_API_SECRET")
+
 	if cfg.OKX.RESTBaseURL == "" {
 		cfg.OKX.RESTBaseURL = "https://www.okx.com"
 	}
@@ -476,6 +509,23 @@ func Load(path string) (*Config, error) {
 		cfg.OKX.PublicWSURL = "wss://wspap.okx.com:8443/ws/v5/public"
 		cfg.OKX.BusinessWSURL = "wss://wspap.okx.com:8443/ws/v5/business"
 		cfg.OKX.PrivateWSURL = "wss://wspap.okx.com:8443/ws/v5/private"
+	}
+
+	// MEXC hosts. contract.mexc.com (not api.mexc.com, which is spot-only) verified live against
+	// /api/v1/contract/detail, /contract/ticker, /contract/kline and /contract/funding_rate/history
+	// on 2026-09-13. MEXC has no demo/simulated environment equivalent to OKX's, so there is no
+	// Simulated branch here — paper trading against MEXC uses live market data with virtual orders,
+	// which is what cmd/paper-trader already does.
+	if cfg.MEXC.RESTBaseURL == "" {
+		cfg.MEXC.RESTBaseURL = "https://contract.mexc.com"
+	}
+	if cfg.MEXC.PublicWSURL == "" {
+		cfg.MEXC.PublicWSURL = "wss://contract.mexc.com/edge"
+	}
+	if cfg.MEXC.PrivateWSURL == "" {
+		// Same socket as public; MEXC authenticates with a login frame on the existing connection
+		// rather than exposing a separate private host the way OKX does (§4).
+		cfg.MEXC.PrivateWSURL = "wss://contract.mexc.com/edge"
 	}
 
 	cfg.Redis.Addr = envOr("REDIS_ADDR", "localhost:6379")
