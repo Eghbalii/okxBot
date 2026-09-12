@@ -146,6 +146,15 @@ export function CandleChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Whole-series writes are keyed on the series IDENTITY, not on every candle change. A live tick
+  // mutates only the newest bar, and setData() on each one would rebuild all 500 bars and every
+  // marker several times a second — enough to make panning stutter. The tick path below calls
+  // update() instead, which is what lightweight-charts provides for exactly this.
+  //
+  // barsKey changes when a bar is ADDED or REMOVED (a new candle closed, or the timeframe
+  // switched) but not when the last bar's high/low/close move, so a tick never reaches here.
+  const barsKey = `${frameKey ?? ''}|${candles.length}|${candles.length > 0 ? candles[0].Timestamp : ''}|${candles.length > 0 ? candles[candles.length - 1].Timestamp : ''}`
+
   useEffect(() => {
     const series = seriesRef.current
     const chart = chartRef.current
@@ -244,7 +253,26 @@ export function CandleChart({
       framedRef.current = frameKey
       showRecent(chart, candles.length)
     }
-  }, [candles, positions, frameKey])
+    // candles is intentionally absent: barsKey is what says the SERIES changed, and depending on
+    // the array itself would put this whole rebuild back on the per-tick path.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [barsKey, positions, frameKey])
+
+  // Live tick: move only the newest bar. update() must be called with a time >= the series' last,
+  // which barsKey's own effect guarantees — it has already written this bar via setData by the time
+  // a tick for it can arrive, because both run off the same render.
+  const lastCandle = candles.length > 0 ? candles[candles.length - 1] : null
+  useEffect(() => {
+    const series = seriesRef.current
+    if (!series || !lastCandle) return
+    series.update({
+      time: secs(lastCandle.Timestamp),
+      open: Number(lastCandle.Open),
+      high: Number(lastCandle.High),
+      low: Number(lastCandle.Low),
+      close: Number(lastCandle.Close),
+    })
+  }, [lastCandle?.Timestamp, lastCandle?.Open, lastCandle?.High, lastCandle?.Low, lastCandle?.Close])
 
   return (
     <div className="candle-chart" style={{ position: 'relative' }}>

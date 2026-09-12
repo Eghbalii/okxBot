@@ -1,7 +1,14 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
 import type { Candle, Position, PositionMode } from '../api/types'
+import { useLiveCandles } from '../hooks/useLiveCandles'
 import { CandleChart } from './CandleChart'
+
+// How often the finalized-candle series is refetched. A closed bar only appears in Postgres once
+// PaperTrader persists it (CLAUDE.md §7), and the forming bar is already tracked live off the tick
+// stream, so this only has to be frequent enough to pick up a freshly-closed bar promptly — not to
+// drive the visible price movement.
+const CANDLE_REFETCH_MS = 15_000
 
 // The decision timeframes (CLAUDE.md §9). 4H/1D are collected for context but a chart of them
 // carries almost no position history at this trade cadence, so they are not offered here.
@@ -26,11 +33,16 @@ export default function TokenChartModal({
   instId,
   mode,
   positions,
+  lastPrice,
   onClose,
 }: {
   instId: string
   mode: PositionMode
   positions: Position[]
+  // Live last-traded price for this instrument, from the page's existing usePriceStream socket
+  // (CLAUDE.md §11.4). Passed down rather than opening a second subscription here: the parent
+  // already holds the stream for its own table, and two sockets would show two different prices.
+  lastPrice: string | undefined
   onClose: () => void
 }) {
   const [bar, setBar] = useState<string>('5m')
@@ -38,22 +50,40 @@ export default function TokenChartModal({
   const [candles, setCandles] = useState<Candle[] | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // Refetch the finalized series on an interval as well as on (instId, bar), so a bar that closes
+  // while the modal is open shows up as a real candle. The series is cleared to null ONLY when the
+  // identity changes, never on a refetch — blanking it every 15s would drop the chart back to its
+  // "Loading candles…" state and (worse) remount CandleChart, discarding the user's pan/zoom.
+  const seriesKey = `${instId}:${bar}`
+  const seriesKeyRef = useRef(seriesKey)
   useEffect(() => {
     let cancelled = false
-    setCandles(null)
+    if (seriesKeyRef.current !== seriesKey) {
+      seriesKeyRef.current = seriesKey
+      setCandles(null)
+    }
     setError(null)
-    api
-      .candles({ instId, bar, limit: 500 })
-      .then((c) => {
+
+    async function load() {
+      try {
+        const c = await api.candles({ instId, bar, limit: 500 })
         if (!cancelled) setCandles(c)
-      })
-      .catch((e: unknown) => {
+      } catch (e: unknown) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e))
-      })
+      }
+    }
+
+    load()
+    const id = setInterval(load, CANDLE_REFETCH_MS)
     return () => {
       cancelled = true
+      clearInterval(id)
     }
-  }, [instId, bar])
+  }, [instId, bar, seriesKey])
+
+  // Folds the live tick into the series: the newest bar's close tracks the price and a bar
+  // boundary starts a new candle, rather than the chart sitting still until the next refetch.
+  const liveCandles = useLiveCandles(candles, bar, lastPrice)
 
   // Closed orders are filtered to the chart's own timeframe: a 1H order's entry sits at a
   // timestamp the 5m candles never had, so its marker would land on the wrong candle.
@@ -130,9 +160,14 @@ export default function TokenChartModal({
             No candles stored for {instId} on {bar} yet.
           </p>
         )}
-        {!error && candles !== null && candles.length > 0 && (
+        {!error && liveCandles !== null && liveCandles.length > 0 && (
           <>
-            <CandleChart candles={candles} positions={shown} height={chartHeight} frameKey={bar} />
+            <CandleChart
+              candles={liveCandles}
+              positions={shown}
+              height={chartHeight}
+              frameKey={bar}
+            />
             <div className="chart-legend">
               <span>
                 <i style={{ background: '#2ebd85' }} />
