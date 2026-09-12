@@ -5,6 +5,7 @@ import { useLiveCandles } from '../hooks/useLiveCandles'
 import { CandleChart } from './CandleChart'
 import ChartAdjustPanel, { type LevelMode } from './ChartAdjustPanel'
 import { pctOnMargin } from './PositionZones'
+import { tokenSymbol } from '../utils/format'
 
 // How often the stored series is refetched. Live movement now arrives over the WebSocket, so this
 // is purely a consistency/backfill pass — it reconciles history and covers a dropped socket, and
@@ -184,6 +185,36 @@ export default function TokenChartModal({
     seededFor.current = null // let the next positions refetch re-seed from the stored values
   }
 
+  // Closes the position at the live price. Deliberately the SAME call, confirm text and
+  // close_reason as the positions table's own Close button (2026-09-12 request: "exactly like the
+  // one in the positions panel") — two buttons that flatten real money must not behave differently
+  // depending on where they were pressed.
+  const [closing, setClosing] = useState(false)
+  async function closeTargetPosition() {
+    if (target === null) return
+    if (
+      !confirm(
+        `Close ${tokenSymbol(target.InstID)} #${target.ID} now at the live price? Reason will be recorded as "manual".`,
+      )
+    ) {
+      return
+    }
+    setClosing(true)
+    try {
+      await api.closePosition(target.ID, target.Mode)
+      // Pending edits are moot once the position is gone; clearing them also stops the
+      // unsaved-changes guard from challenging the operator on the way out.
+      setPendingSl(null)
+      setPendingTp(null)
+      seededFor.current = null
+      onClose()
+    } catch (err) {
+      alert(`Failed to request close: ${(err as Error).message}`)
+    } finally {
+      setClosing(false)
+    }
+  }
+
   // Closing with unsaved level changes asks first (explicit request) — a dragged stop that was
   // never sent is a silent, dangerous no-op otherwise.
   const requestClose = useCallback(() => {
@@ -259,8 +290,13 @@ export default function TokenChartModal({
               </button>
             ))}
           </div>
-          <button className="btn" onClick={requestClose} style={{ marginLeft: 8 }}>
-            Close
+          <button
+            className="chart-close-x"
+            onClick={requestClose}
+            aria-label="Close chart"
+            title="Close chart"
+          >
+            ✕
           </button>
         </div>
 
@@ -303,6 +339,8 @@ export default function TokenChartModal({
                   onSubmit={submitLevels}
                   onReset={resetLevels}
                   dirty={dirty}
+                  onClosePosition={closeTargetPosition}
+                  closing={closing}
                 />
               )}
             </div>

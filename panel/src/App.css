@@ -1073,16 +1073,93 @@ th.sorted {
   }
 }
 
+/* The panel's header is deliberately the heaviest thing in it (2026-09-12 request): it says which
+   position every control below acts on, and at a glance that has to be unmistakable — the controls
+   flatten real money. */
+.cap-head {
+  padding-bottom: 10px;
+  border-bottom: 1px solid #272b33;
+}
+
 .cap-title {
-  font-size: 13px;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  color: #f2f4f8;
+}
+
+.cap-title-id {
+  color: #7d8492;
+  font-weight: 600;
+}
+
+.cap-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11px;
+}
+
+.cap-sym {
   font-weight: 600;
   color: #e6e8ec;
 }
 
-.cap-sub {
-  font-size: 11px;
-  color: #858b96;
-  margin-top: 2px;
+/* Side reads as a filled chip rather than coloured text: it is the one field where misreading long
+   for short would be expensive. */
+.cap-side {
+  font-weight: 700;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.cap-side-long {
+  background: rgba(46, 189, 133, 0.16);
+  color: #2ebd85;
+}
+
+.cap-side-short {
+  background: rgba(246, 70, 93, 0.16);
+  color: #f6465d;
+}
+
+.cap-lev {
+  margin-left: auto;
+  color: #9aa0ab;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Separated from the level controls by a rule, so the destructive action is not adjacent to
+   Update. */
+.cap-danger {
+  border-top: 1px solid #272b33;
+  padding-top: 10px;
+}
+
+.cap-close-btn {
+  width: 100%;
+}
+
+/* Red ✕ for closing the chart (2026-09-12 request), replacing the word "Close" — which read as a
+   sibling of the timeframe buttons rather than as dismissing the whole modal. */
+.chart-close-x {
+  margin-left: 8px;
+  background: transparent;
+  border: 1px solid rgba(246, 70, 93, 0.35);
+  color: #f6465d;
+  font-size: 13px;
+  line-height: 1;
+  padding: 5px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.chart-close-x:hover {
+  background: rgba(246, 70, 93, 0.14);
+  border-color: #f6465d;
 }
 
 .cap-entry {

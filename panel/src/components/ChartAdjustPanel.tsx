@@ -59,6 +59,8 @@ export default function ChartAdjustPanel({
   onSubmit,
   onReset,
   dirty,
+  onClosePosition,
+  closing,
 }: {
   position: Position
   sl: number | null
@@ -69,6 +71,8 @@ export default function ChartAdjustPanel({
   onSubmit: () => Promise<void>
   onReset: () => void
   dirty: boolean
+  onClosePosition: () => void
+  closing: boolean
 }) {
   const entry = Number(position.EntryPx)
   const leverage = Number(position.Leverage) || 1
@@ -173,15 +177,17 @@ export default function ChartAdjustPanel({
   return (
     <aside className="chart-adjust-panel">
       <div className="cap-head">
-        <div>
-          <div className="cap-title">Update levels</div>
-          <div className="cap-sub">
-            #{position.ID} · {tokenSymbol(position.InstID)} ·{' '}
-            <span className={side === 'buy' ? 'text-green' : 'text-red'}>
-              {side === 'buy' ? 'long' : 'short'}
-            </span>{' '}
-            · {leverage}x
-          </div>
+        <div className="cap-title">
+          Position <span className="cap-title-id">#{position.ID}</span>
+        </div>
+        <div className="cap-sub">
+          <span className="cap-sym">{tokenSymbol(position.InstID)}</span>
+          <span className={'cap-side ' + (side === 'buy' ? 'cap-side-long' : 'cap-side-short')}>
+            {side === 'buy' ? 'LONG' : 'SHORT'}
+          </span>
+          {/* One decimal (2026-09-12 request): leverage is a decimal column server-side and a
+              bare integer hid that — 12.5x and 12x are a real difference at this account size. */}
+          <span className="cap-lev">{leverage.toFixed(1)}x</span>
         </div>
       </div>
 
@@ -229,6 +235,21 @@ export default function ChartAdjustPanel({
         </button>
         <button onClick={onReset} disabled={!dirty || submitting} type="button">
           Reset
+        </button>
+      </div>
+
+      {/* Below a divider and in the danger style: flattening at market is destructive and
+          irreversible, unlike everything above it, so it should not sit flush with Update where a
+          misclick is cheap. Same call, confirm and close_reason as the positions table's button. */}
+      <div className="cap-danger">
+        <button
+          className="btn-danger cap-close-btn"
+          onClick={onClosePosition}
+          disabled={closing || submitting}
+          type="button"
+          title="Close this position now at the live price (close_reason='manual')"
+        >
+          {closing ? 'Closing…' : 'Close position'}
         </button>
       </div>
     </aside>
