@@ -356,8 +356,15 @@ function HoverReadout({
   equity: number
   balance: number
 }) {
-  const W = 186
-  const H = 46
+  // Enlarged (2026-09-12 request): the readout is the reason to hover at all, and it was the
+  // smallest text on the page while carrying the number being looked up.
+  //
+  // Sized in viewBox units, which are NOT screen pixels here: the SVG is 1200 wide and renders at
+  // roughly 790-1190px, so everything is scaled to ~0.66-0.72. A 14px font therefore lands at ~10px
+  // on screen. These values are chosen so the rendered result is legible after that shrink, which
+  // is why they look oversized in the source.
+  const W = 300
+  const H = 86
   const left = x + 10 + W > width - PAD.right ? x - 10 - W : x + 10
   const label = new Date(time).toLocaleString('en-GB', {
     day: '2-digit',
@@ -368,14 +375,14 @@ function HoverReadout({
   })
   return (
     <g transform={`translate(${left}, ${PAD.top + 2})`}>
-      <rect width={W} height={H} rx={5} className="chart-readout-bg" />
-      <text x={8} y={14} className="chart-readout-time">
+      <rect width={W} height={H} rx={8} className="chart-readout-bg" />
+      <text x={14} y={24} className="chart-readout-time">
         {label}
       </text>
-      <text x={8} y={28} className="chart-readout-row" fill="var(--chart-equity, #4ea1ff)">
+      <text x={14} y={50} className="chart-readout-row" fill="var(--chart-equity, #4ea1ff)">
         Equity ${equity.toFixed(2)}
       </text>
-      <text x={8} y={40} className="chart-readout-row" fill="var(--chart-balance, #9d7bff)">
+      <text x={14} y={74} className="chart-readout-row" fill="var(--chart-balance, #9d7bff)">
         Balance ${balance.toFixed(2)}
       </text>
     </g>
