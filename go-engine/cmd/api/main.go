@@ -129,7 +129,11 @@ func main() {
 		// touching the database (2026-09-09), so cmd/api needs its own gateway client for that one
 		// call. Same gateway, same "api" consumer identity as the affordability reporter above —
 		// the trader keeps its rate-limit priority over both.
-		Protection:    gatewayclient.New(cfg.Gateway.URL, "api"),
+		Protection: gatewayclient.New(cfg.Gateway.URL, "api"),
+		// Positions backs GET /api/health's drift check — the evidence that decides whether clearing
+		// a halt is safe (CLAUDE.md §48). Routed through the gateway like every other exchange call,
+		// so it shares the same rate limit and credential boundary (§27.1).
+		Positions:     gatewayclient.New(cfg.Gateway.URL, "api"),
 		ExecInstIDFor: okx.SymbolMap(cfg.Trading.SymbolMap).Resolve,
 		ExecInstType:  cfg.Trading.ExecInstType,
 		ProcessMgr:    cfg.API.ProcessMgr,

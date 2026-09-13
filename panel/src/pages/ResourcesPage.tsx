@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import ServiceHealthBox from '../components/ServiceHealthBox'
 import { usePolling } from '../hooks/usePolling'
 import { api } from '../api/client'
 import type { CleanupResult } from '../api/types'
@@ -69,6 +70,10 @@ export default function ResourcesPage() {
 
   return (
     <div>
+      {/* Service health first: when something is wrong this is the thing being looked for, and
+          burying it under the Grafana link would put the least urgent content on top. */}
+      <ServiceHealthBox />
+
       <div className="card">
         <h2>Server Resources</h2>
         {error && <div className="error-banner">{error}</div>}

@@ -45,6 +45,12 @@ type Server struct {
 	// ExecInstIDFor maps a market-data symbol ("BTC") to the instrument real orders actually
 	// execute against (CLAUDE.md §33.4). Nil falls back to the symbol itself.
 	ExecInstIDFor func(symbol string) (string, error)
+	// Positions reads open positions from the exchange, for GET /api/health's drift check — the
+	// evidence that decides whether clearing a halt is safe (CLAUDE.md §48). Deliberately the
+	// narrow positionLister, not a full exchange client: a health endpoint must not be able to
+	// place or cancel an order, and the type system is a better guarantee of that than care.
+	// Optional: nil makes the check report "cannot verify" rather than a misleading "safe".
+	Positions positionLister
 	// ExecInstType is the instType those instruments live under ("FUTURES"), needed to read their
 	// price tick when rounding a manually-edited SL/TP.
 	ExecInstType string
@@ -102,6 +108,10 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/resources", s.handleResources)
+	// Service health + the real-trading halt, with the drift evidence that gates its reset
+	// (CLAUDE.md §47/§48 — two outages that looked identical from the panel and were not).
+	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("POST /api/health/reset-halt", s.handleResetHalt)
 	mux.HandleFunc("GET /api/ws", s.Hub().handleWS)
 
 	mux.HandleFunc("GET /api/model/status", s.handleModelStatus)

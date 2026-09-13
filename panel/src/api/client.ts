@@ -1,4 +1,5 @@
 import type {
+  HealthResponse,
   AccountEquity,
   EquityPoint,
   Candle,
@@ -57,6 +58,16 @@ async function requestList<T>(path: string, init?: RequestInit): Promise<T[]> {
 
 export const api = {
   resources: () => request<{ grafanaUrl: string }>('/resources'),
+
+  // Service health + the real-trading halt, with the evidence that gates its reset.
+  health: async (): Promise<HealthResponse> => {
+    const h = await request<HealthResponse>('/health')
+    // Go marshals a nil slice as null, which would crash every consumer that maps over it — the
+    // same normalization every list endpoint here needs (CLAUDE.md §25, where exactly this blanked
+    // the whole panel).
+    return { ...h, services: h.services ?? [], halt: h.halt ? { ...h.halt, blockers: h.halt.blockers ?? [] } : undefined }
+  },
+  resetHalt: () => request<{ status: string; note?: string }>('/health/reset-halt', { method: 'POST' }),
 
   modelStatus: () => request<ModelStatus>('/model/status'),
   modelLogs: (unit: string, opts?: { lines?: number; errorsOnly?: boolean }) => {

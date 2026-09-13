@@ -331,3 +331,35 @@ export interface CleanupResult {
   buildCacheBytes: number
   error?: string
 }
+
+// GET /api/health — one service's container state. `state` is Docker's own vocabulary
+// (running/restarting/exited/missing) rather than a reduced up/down, because "restarting" is the
+// crash-loop signal that distinguishes CLAUDE.md §47's outage from §48's self-halt. Those look
+// identical from the panel and need opposite responses — a fix and a rebuild versus a reset.
+export interface ServiceHealth {
+  name: string
+  container: string
+  state: string
+  status: string
+  health?: string
+  critical: boolean
+}
+
+// The real-trading circuit breaker. `halted` blocks NEW positions only — existing ones keep being
+// monitored and closed, and their SL/TP rests on the exchange regardless (§35).
+export interface HaltStatus {
+  halted: boolean
+  reason?: string
+  // safeToReset is re-derived by cmd/api from the exchange and the database, not read from a flag.
+  // The reset button is gated on it so it cannot resume trading against state known to be wrong.
+  safeToReset: boolean
+  blockers?: string[]
+  exchangePositions: number
+  localOpenOrders: number
+}
+
+export interface HealthResponse {
+  services: ServiceHealth[]
+  halt?: HaltStatus
+  dockerError?: string
+}

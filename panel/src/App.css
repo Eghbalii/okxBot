@@ -1778,3 +1778,43 @@ input[type='number'] {
   text-align: center;
   font-size: 0.82rem;
 }
+
+/* Service health (CLAUDE.md §47/§48). The four states are deliberately distinct colours rather
+   than a binary up/down: "restarting" is a crash loop needing a fix, while a halt on a running
+   service needs a reset — the two outages that motivated this page looked identical without it. */
+.state-ok { background: #3fb950; }
+.state-warn { background: #d29922; }
+.state-bad { background: #f85149; }
+.state-unknown { background: #6e7681; }
+
+.health-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+}
+.health-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border, #30363d);
+  font-size: 0.86rem;
+}
+.health-table tr:last-child td { border-bottom: none; }
+
+.halt-panel {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #30363d);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.halt-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.halt-blockers {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: #f0883e;
+  font-size: 0.85rem;
+}
+.halt-blockers li { margin: 3px 0; }
