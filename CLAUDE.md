@@ -5776,11 +5776,38 @@ benefit, no error anywhere. Bucketed to the minute so it is stable between rende
 Bounded at 60 entries, oldest-first: 10 instruments × 3 bars is 30, leaving room for balance ranges
 and a second exchange (§46) without evicting anything on screen.
 
+### 50.2b Two follow-on gaps, both reported from real use (same day)
+
+The first pass left two holes, and the first is worth recording because it failed in a way that
+*looked* like success.
+
+**The balance chart was never actually cached.** Its key contained a bucketed since-timestamp, so a
+new key appeared every 60 seconds and any revisit later than that was a guaranteed miss. The cache
+worked when flipping ranges quickly and did nothing otherwise — exactly the reported symptom.
+
+Flooring to the hour, tried next, has the *same shape* of bug: a new key whenever an hour boundary
+is crossed. A test comparing keys across elapsed time caught that one before it shipped.
+
+The key now carries only the **range**. "The last day of history" is the same question whenever it
+is asked, so the key says that and `maxAgeMs` decides when to ask again. The `since` sent to the
+server is still computed live inside the fetcher, so a revalidation covers up to the present — **the
+key identifies the question, not the instant it was asked.** That is the general rule: a cache key
+containing `Date.now()` in any form is a cache that silently does nothing.
+
+**The green/red position zones waited on an uncached fetch.** Paper and Real are separate *routes*,
+so switching tabs unmounts `PositionsPage` and `rows` restarts at `null` — until it refills the
+chart has no positions and cannot draw its zones. These are the panel's largest payloads (measured:
+**210KB** paper, **133KB** real), so the cost is the re-fetch and re-parse, not the ~50ms the server
+spends. `listPositions` now uses the same cache, still revalidating every 5s so live PnL is as fresh
+as before; the difference is that a cached page renders immediately while that happens.
+
 ### 50.3 Verification
 
 `panel/` has **no test framework**, and adding one to prove a ~140-line hook would have been a
 larger change than the hook. The cache algorithm was exercised directly instead — de-duplication,
-staleness, both error paths, and the size bound, 7 checks — which beats shipping it unverified.
-Worth revisiting if the panel grows more logic of this kind.
+staleness, both error paths, and the size bound — plus a second set checking that keys stay stable
+across elapsed time, which is the specific property both §50.2b bugs violated and which neither a
+typecheck nor a visual pass would reveal. 14 checks total, and they caught a real defect before it
+shipped. Worth adding a real framework if the panel grows more logic of this kind.
 
 Bundle grew 0.7KB.
