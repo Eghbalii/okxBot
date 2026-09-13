@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { api } from '../api/client'
+import { useCachedResource } from '../hooks/useCachedResource'
 import type { PaperTradingConfig, PositionMode } from '../api/types'
 import StrategyKindModal from './StrategyKindModal'
 import TokenModal from './TokenModal'
@@ -26,6 +28,57 @@ export default function PaperTradingConfigBox({ mode }: { mode: PositionMode }) 
         <h2>Trading controls</h2>
       </div>
       <TradingControls mode={mode} />
+    </div>
+  )
+}
+
+// TradingHealthBanner surfaces, on the Positions page, anything that stops trading REGARDLESS of the
+// configured state beside it (2026-09-13 request).
+//
+// The gap it closes: the badge next to it renders `tradingState` from the database — the operator's
+// configured INTENT. It read a green "Running" throughout §47 (the trader crash-looping for eight
+// hours) and §48 (a self-halt that lasted two hours), because neither of those changes that column.
+// The one page most likely to be open while wondering "why are no positions opening" was the one
+// page that could not say.
+//
+// It reads the same GET /api/health the Resources page does, so the two can never disagree — a
+// second source of truth here would just be a new way for them to drift. Silent when everything is
+// fine: a banner shown always is a banner nobody reads.
+function TradingHealthBanner({ mode }: { mode: PositionMode }) {
+  // Cached and shared with the Resources page's own poll, so opening Positions costs no extra
+  // request and shows a known-good answer immediately.
+  const { data } = useCachedResource('health', () => api.health(), {
+    maxAgeMs: 10_000,
+    refetchMs: 15_000,
+  })
+  if (!data) return null
+
+  const downCritical = data.services.filter((s) => s.critical && s.state !== 'running')
+  // A halt applies to real trading only, so it is not reported on the Paper tab where it would be
+  // a distraction the operator cannot act on.
+  const halt = mode === 'real' ? data.halt : undefined
+  const blocked = halt && !halt.safeToReset && (halt.blockers?.length ?? 0) > 0
+
+  if (downCritical.length === 0 && !blocked) return null
+
+  // "restarting" is named explicitly rather than folded into "not running": it means a crash loop,
+  // which needs a fix and a rebuild, where a stopped container usually just needs starting.
+  const worst = downCritical[0]
+  const serviceMsg = worst
+    ? `${worst.name} is ${worst.state === 'restarting' ? 'crash-looping' : worst.state}` +
+      (downCritical.length > 1 ? ` (and ${downCritical.length - 1} more)` : '')
+    : null
+
+  return (
+    <div className="trading-health-banner">
+      <div>
+        <strong>Trading may be blocked.</strong>{' '}
+        {serviceMsg && <span>{serviceMsg}. </span>}
+        {blocked && <span>{halt?.blockers?.[0]} </span>}
+      </div>
+      <Link to="/resources" className="banner-link">
+        Open Resources →
+      </Link>
     </div>
   )
 }
@@ -138,6 +191,14 @@ function TradingControls({ mode }: { mode: PositionMode }) {
   return (
     <>
       {error && <div className="error-banner">{error}</div>}
+
+      {/* Configured intent and actual health are DIFFERENT facts and are shown as such.
+          tradingState is what the operator asked for; it says nothing about whether the service can
+          act on it. Before this, the badge read "Running" in green while the trader was
+          crash-looping (§47) or had halted itself (§48) — the state most worth noticing was the one
+          the page hid. Conflating them into one badge would lose that distinction again, so the
+          badge keeps its own meaning and the problem is reported beside it. */}
+      <TradingHealthBanner mode={mode} />
 
       <div className="state-row">
         <span className={'badge ' + meta.badge}>
