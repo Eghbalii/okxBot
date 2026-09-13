@@ -298,7 +298,7 @@ func runRealTrader(
 	// running, rather than the change only landing at the next restart.
 	engines := make(map[string]*usecase.RealTrader, len(cfg.Trading.InstIDs))
 	for i, instID := range cfg.Trading.InstIDs {
-		strategies, err := loadRealTraderStrategyAssignments(ctx, repo, instID)
+		strategies, err := loadRealTraderStrategyAssignments(ctx, repo, instID, logger)
 		if err != nil {
 			logger.Error("failed to load strategy assignments", "instId", instID, "error", err)
 			os.Exit(1)
@@ -507,22 +507,30 @@ func envOr(key, fallback string) string {
 
 // loadRealTraderStrategyAssignments mirrors cmd/paper-trader/main.go's loadStrategyAssignments —
 // resolves durable strategy_assignments rows into live usecase.StrategyAssignment values.
-func loadRealTraderStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID string) ([]usecase.StrategyAssignment, error) {
+func loadRealTraderStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID string, logger *slog.Logger) ([]usecase.StrategyAssignment, error) {
 	rows, err := repo.ListAssignments(ctx, instID, true, "real")
 	if err != nil {
 		return nil, err
 	}
 	out := make([]usecase.StrategyAssignment, 0, len(rows))
+	skipped := 0
 	for _, a := range rows {
 		sc, err := repo.GetStrategy(ctx, a.StrategyID)
 		if err != nil {
 			return nil, fmt.Errorf("resolve strategy %d for assignment %d: %w", a.StrategyID, a.ID, err)
 		}
-		s, err := strategy.FromConfig(sc.Kind, sc.Config)
-		if err != nil {
-			return nil, fmt.Errorf("build strategy %d (kind %q) for assignment %d: %w", a.StrategyID, sc.Kind, a.ID, err)
+		s, ok := buildAssignmentStrategy(sc.Kind, sc.Config, logger, instID, a.ID, a.StrategyID)
+		if !ok {
+			skipped++
+			continue
 		}
 		out = append(out, usecase.StrategyAssignment{Bar: a.Bar, Strategy: s, StrategyID: a.StrategyID, Kind: sc.Kind})
+	}
+	if skipped > 0 {
+		// Surfaced as its own line so the count is visible even when the per-row errors have
+		// scrolled away: "3 of 30 strategies are not running" is the operationally useful fact.
+		logger.Error("some strategy assignments could not be built and will not trade",
+			"instId", instID, "skipped", skipped, "loaded", len(out))
 	}
 	return out, nil
 }

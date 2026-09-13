@@ -204,7 +204,7 @@ func main() {
 		// fresh from Postgres on every start, so a crash/restart resumes with exactly the same
 		// token/timeframe->strategy bindings the panel last configured, not whatever was hardcoded
 		// here in Go.
-		strategies, err := loadStrategyAssignments(ctx, repo, instID)
+		strategies, err := loadStrategyAssignments(ctx, repo, instID, logger)
 		if err != nil {
 			logger.Error("failed to load strategy assignments", "instId", instID, "error", err)
 			os.Exit(1)
@@ -360,12 +360,13 @@ func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, ins
 // loadStrategyAssignments resolves an instrument's durable strategy_assignments rows into live
 // usecase.StrategyAssignment values the PaperTrader can run, rebuilding the strategy.Strategy from
 // its DB row's Kind+Config every time (CLAUDE.md §11.3) rather than trusting any in-memory cache.
-func loadStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID string) ([]usecase.StrategyAssignment, error) {
+func loadStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID string, logger *slog.Logger) ([]usecase.StrategyAssignment, error) {
 	rows, err := repo.ListAssignments(ctx, instID, true, "paper")
 	if err != nil {
 		return nil, err
 	}
 	out := make([]usecase.StrategyAssignment, 0, len(rows))
+	skipped := 0
 	for _, a := range rows {
 		cfg, err := repo.GetStrategy(ctx, a.StrategyID)
 		if err != nil {
@@ -373,9 +374,22 @@ func loadStrategyAssignments(ctx context.Context, repo *postgres.Repository, ins
 		}
 		s, err := strategy.FromConfig(cfg.Kind, cfg.Config)
 		if err != nil {
-			return nil, fmt.Errorf("build strategy %d (kind %q) for assignment %d: %w", a.StrategyID, cfg.Kind, a.ID, err)
+			// SKIP rather than failing the whole load — see cmd/trader's identical guard for the
+			// incident that motivated it (2026-09-13): one strategy kind enabled in the database
+			// but absent from the binary took the service down on every restart, forever.
+			logger.Error("skipping unusable strategy assignment — this strategy will not trade",
+				"instId", instID, "assignmentId", a.ID, "strategyId", a.StrategyID,
+				"kind", cfg.Kind, "error", err)
+			skipped++
+			continue
 		}
 		out = append(out, usecase.StrategyAssignment{Bar: a.Bar, Strategy: s, StrategyID: a.StrategyID, Kind: cfg.Kind})
+	}
+	if skipped > 0 {
+		// Surfaced as its own line so the count is visible even when the per-row errors have
+		// scrolled away: "3 of 30 strategies are not running" is the operationally useful fact.
+		logger.Error("some strategy assignments could not be built and will not trade",
+			"instId", instID, "skipped", skipped, "loaded", len(out))
 	}
 	return out, nil
 }
