@@ -74,6 +74,15 @@ type Server struct {
 	// called) — renamed since it now has nothing to do with backfill.
 	AllInstIDs []string
 
+	// ExchangeBalances backs the Home page's per-exchange balance row (2026-09-13). One entry per
+	// supported exchange; a nil Client means this deployment holds no credentials for it, which the
+	// panel renders as "not configured" rather than as a zero balance — a missing key and an empty
+	// account mean very different things.
+	ExchangeBalances []ExchangeBalanceSource
+	// Scanner runs token discovery. Optional: nil disables POST /api/market/scan with a clear error
+	// rather than a panic, so cmd/api still runs anywhere the exchange clients are not wired.
+	Scanner marketScanner
+
 	// hub fans out real-time paper-order open/close events to connected panel WebSocket clients
 	// (CLAUDE.md §11.4). Lazily initialized by Routes/Hub so callers never need to construct it
 	// themselves.
@@ -108,6 +117,16 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/resources", s.handleResources)
+
+	// Home page (2026-09-13): per-exchange balances, the ranked token market, and the instrument
+	// roster that decides which of those tokens the bot actually trades.
+	mux.HandleFunc("GET /api/exchange-balances", s.handleExchangeBalances)
+	mux.HandleFunc("GET /api/market/tokens", s.handleListMarketTokens)
+	mux.HandleFunc("POST /api/market/scan", s.handleRunScan)
+	mux.HandleFunc("GET /api/instruments", s.handleListInstruments)
+	mux.HandleFunc("POST /api/instruments", s.handleCreateInstrument)
+	mux.HandleFunc("PATCH /api/instruments/{id}", s.handleSetInstrumentFlags)
+	mux.HandleFunc("DELETE /api/instruments/{id}", s.handleDeleteInstrument)
 	// Service health + the real-trading halt, with the drift evidence that gates its reset
 	// (CLAUDE.md §47/§48 — two outages that looked identical from the panel and were not).
 	mux.HandleFunc("GET /api/health", s.handleHealth)

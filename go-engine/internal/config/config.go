@@ -446,6 +446,47 @@ type Config struct {
 		// without hammering the endpoint.
 		PollInterval time.Duration `yaml:"poll_interval"`
 	} `yaml:"funding_rate"`
+
+	// Scan configures token discovery (internal/usecase.MarketScanner, 2026-09-13): find the top /
+	// highest-volume / most-active tokens on every supported exchange and admit the best of them to
+	// the roster. Hosted as a scheduled job inside cmd/api rather than its own service — it serves
+	// nothing to anyone and runs a few times a day, so a container would add a deployment unit and
+	// a memory footprint on a 3.9GB box (§35.7) and nothing else.
+	Scan struct {
+		// Interval between scans. A few times a day is enough (operator's own figure): the roster
+		// changes on the order of days, and each scan is one whole-market REST call per exchange
+		// against a budget shared with the live trading path (§27.1/§39).
+		Interval time.Duration `yaml:"interval"`
+		// TopN is how many of each exchange's ranked candidates are admitted to the roster per
+		// scan. Bounded on purpose: every admitted token costs a WebSocket subscription, a candle
+		// window per timeframe, and a share of the shared account through dynamic sizing (§32.4).
+		TopN int `yaml:"top_n"`
+		// MinVolumeUSD is the 24h notional floor below which a token is not a candidate at any
+		// score — a market this thin cannot absorb even this project's small positions.
+		MinVolumeUSD decimal.Decimal `yaml:"min_volume_usd"`
+		// Exchanges is the list the scan covers. Config today, deliberately shaped to move to a
+		// database table later (operator's instruction): everything downstream reads
+		// usecase.ExchangeSource, never this struct, so that move touches one wiring function.
+		Exchanges []ScanExchange `yaml:"exchanges"`
+	} `yaml:"scan"`
+}
+
+// ScanExchange is one exchange the token-discovery scan covers.
+type ScanExchange struct {
+	// Name is the exchange identity stored on every instruments/market_tokens row: "okx" or "mexc".
+	// An unknown name is refused at startup rather than skipped — a typo would otherwise silently
+	// drop a whole exchange from discovery while every log looked healthy (§9's bar-casing
+	// precedent).
+	Name string `yaml:"name"`
+	// InstType is the product family to scan. "FUTURES" on OKX, where the X-Perp perpetuals real
+	// trading executes against live (§33.2); ignored by MEXC, which has one futures family.
+	InstType string `yaml:"inst_type"`
+	// QuoteSuffixes are the wire-format id patterns that identify a USD-quoted PERPETUAL on this
+	// exchange, and the text stripped to recover the short internal symbol. These are the actual
+	// defence against admitting a DATED future to a perpetual-futures bot: live-verified
+	// 2026-09-13, OKX's three patterns accept exactly its 179 X-Perp instruments and reject all 28
+	// dated ones. Widen them only with that check re-run.
+	QuoteSuffixes []string `yaml:"quote_suffixes"`
 }
 
 // GatewayClassLimit is one endpoint class's config-overridable rate limit (CLAUDE.md §27.1). A
@@ -730,7 +771,58 @@ func Load(path string) (*Config, error) {
 		cfg.Optimizer.MaxLossPct = decimal.NewFromFloat(0.15)
 	}
 
+	// Token discovery (2026-09-13). Interval 8h is "a few times a day", the operator's own figure —
+	// the roster changes on the order of days, so scanning more often spends the shared OKX
+	// rate-limit budget (§27.1) to re-read data that has not meaningfully moved.
+	if cfg.Scan.Interval == 0 {
+		cfg.Scan.Interval = 8 * time.Hour
+	}
+	if cfg.Scan.TopN == 0 {
+		cfg.Scan.TopN = 20
+	}
+	if cfg.Scan.MinVolumeUSD.IsZero() {
+		cfg.Scan.MinVolumeUSD = decimal.NewFromInt(1_000_000)
+	}
+	// The default roster covers both supported exchanges with the patterns verified live against
+	// each one's real response on 2026-09-13. OKX scans FUTURES, not SWAP: FUTURES is where the
+	// X-Perp perpetuals this account can actually trade live (§33.2 — every classic SWAP instrument
+	// returned maxBuy=maxSell=0 for this account).
+	if len(cfg.Scan.Exchanges) == 0 {
+		cfg.Scan.Exchanges = []ScanExchange{
+			{Name: "okx", InstType: "FUTURES", QuoteSuffixes: []string{"-USD_UM_XPERP-"}},
+			{Name: "mexc", InstType: "", QuoteSuffixes: []string{"_USDT"}},
+		}
+	}
+	if err := validateScanExchanges(cfg.Scan.Exchanges); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// knownExchanges is the set of exchange names this build has an adapter for. A name outside it is a
+// configuration error, not something to skip: a typo would otherwise drop a whole exchange from
+// discovery while every log looked perfectly healthy — the same silent-data-gap failure mode §9's
+// bar-name casing validation exists to prevent.
+var knownExchanges = map[string]bool{"okx": true, "mexc": true}
+
+func validateScanExchanges(exs []ScanExchange) error {
+	seen := map[string]bool{}
+	for _, ex := range exs {
+		if !knownExchanges[ex.Name] {
+			return fmt.Errorf("scan.exchanges: unknown exchange %q (known: okx, mexc)", ex.Name)
+		}
+		if seen[ex.Name] {
+			return fmt.Errorf("scan.exchanges: %q listed twice", ex.Name)
+		}
+		seen[ex.Name] = true
+		// An exchange with no patterns would scan its whole market and admit nothing, which reads
+		// as "this exchange has no good tokens" rather than as a missing config line.
+		if len(ex.QuoteSuffixes) == 0 {
+			return fmt.Errorf("scan.exchanges: %q has no quote_suffixes — it would admit nothing", ex.Name)
+		}
+	}
+	return nil
 }
 
 // ValidatePaperTradingBars confirms every bar in PaperTrading.Bars is also present in

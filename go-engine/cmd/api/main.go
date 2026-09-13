@@ -105,6 +105,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	scanner := newMarketScanner(cfg, repo, logger)
+
 	srv := &api.Server{
 		Repo:               repo,
 		RLBaseURL:          cfg.RLService.URL,
@@ -150,8 +152,20 @@ func main() {
 		// removed entirely (2026-09-01, explicit operator instruction: that OKX endpoint must
 		// never be called).
 		AllInstIDs: cfg.Trading.InstIDs,
+
+		// Home page (2026-09-13): per-exchange balances, and the token-discovery scan. The scan is
+		// hosted here rather than in its own service on the operator's own reasoning — it serves
+		// nothing to anyone and runs a few times a day, so a container would add a deployment unit
+		// and a memory footprint on a 3.9GB box (§35.7) and nothing else.
+		ExchangeBalances: buildBalanceSources(cfg),
+		Scanner:          scannerAdapter{inner: scanner},
 	}
 	routes := srv.Routes() // must be called before Hub() usage below so the same *wsHub backs both
+
+	// The scheduled discovery scan. Runs one scan immediately so a freshly deployed cmd/api has a
+	// market snapshot without waiting out the first interval — a Home page showing an empty market
+	// for hours after a deploy reads as a broken feature rather than as a pending job.
+	go scanner.RunEvery(ctx, cfg.Scan.Interval)
 
 	// CLAUDE.md §11.4/§12: paper-order open/close events published by cmd/paper-trader onto Kafka
 	// are relayed to every connected panel WebSocket client, replacing 5s position polling for the

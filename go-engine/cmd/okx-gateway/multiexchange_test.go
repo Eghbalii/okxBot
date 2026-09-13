@@ -32,6 +32,11 @@ type mexcShapedClient struct {
 	calls          int
 }
 
+func (m *mexcShapedClient) GetAllTickers(string) ([]domain.MarketTicker, error) {
+	m.calls++
+	return nil, m.err
+}
+
 func (m *mexcShapedClient) GetTicker(instID string) (domain.Ticker, error) {
 	m.calls++
 	if m.err != nil {

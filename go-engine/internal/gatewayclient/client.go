@@ -114,6 +114,14 @@ func (c *Client) GetTicker(instID string) (domain.Ticker, error) {
 	return out, err
 }
 
+// GetAllTickers fetches one instType's whole market in a single call, for token discovery.
+func (c *Client) GetAllTickers(instType string) ([]domain.MarketTicker, error) {
+	var out []domain.MarketTicker
+	path := "/tickers?" + url.Values{"instType": {instType}}.Encode()
+	err := c.do(context.Background(), http.MethodGet, path, nil, &out)
+	return out, err
+}
+
 func (c *Client) GetPositions(instType string) ([]domain.Position, error) {
 	var out []domain.Position
 	path := "/positions"

@@ -18,6 +18,11 @@ import (
 // handler tests can substitute a fake without a real OKX connection.
 type exchangeClient interface {
 	GetTicker(instID string) (domain.Ticker, error)
+	// GetAllTickers is one instType's whole market in a single call — the input to token discovery
+	// (2026-09-13). Routed through the gateway like every other exchange call so the scan's usage
+	// shares the same rate-limit budget and shows up in the per-consumer request counter (§40),
+	// rather than spending OKX's budget from outside where nothing can see it.
+	GetAllTickers(instType string) ([]domain.MarketTicker, error)
 	GetPositions(instType string) ([]domain.Position, error)
 	GetBalance(ccy string) ([]domain.Balance, error)
 	GetCandles(instID, bar string, limit int) ([]domain.Candle, error)
@@ -74,6 +79,7 @@ func (s *service) retryablePredicate() func(error) bool {
 func (s *service) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ticker", s.handleGetTicker)
+	mux.HandleFunc("GET /tickers", s.handleGetAllTickers)
 	mux.HandleFunc("GET /positions", s.handleGetPositions)
 	mux.HandleFunc("GET /balance", s.handleGetBalance)
 	mux.HandleFunc("GET /candles", s.handleGetCandles)
@@ -171,6 +177,28 @@ func (s *service) handleGetTicker(w http.ResponseWriter, r *http.Request) {
 	err := s.call(r.Context(), gateway.ClassMarket, r, func() error {
 		var innerErr error
 		result, innerErr = s.client.GetTicker(instID)
+		return innerErr
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleGetAllTickers serves one instType's whole market. ClassMarket, not ClassAccount: it is
+// public market data, and it must not draw on the account-endpoint budget the reconciliation poll
+// depends on (§38.2 — a poll that cannot read positions cannot detect drift).
+func (s *service) handleGetAllTickers(w http.ResponseWriter, r *http.Request) {
+	instType := r.URL.Query().Get("instType")
+	if instType == "" {
+		writeError(w, http.StatusBadRequest, errors.New("instType is required"))
+		return
+	}
+	var result []domain.MarketTicker
+	err := s.call(r.Context(), gateway.ClassMarket, r, func() error {
+		var innerErr error
+		result, innerErr = s.client.GetAllTickers(instType)
 		return innerErr
 	})
 	if err != nil {

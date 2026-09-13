@@ -358,3 +358,46 @@ gateway:
     capacity: 20
     refill: 20
     interval_ms: 2000
+
+# ---------------------------------------------------------------------------------------------
+# Token discovery (CLAUDE.md §51, 2026-09-13): find the top / highest-volume / most-active tokens
+# on every supported exchange and admit the best of them to the roster.
+#
+# Hosted as a scheduled job inside cmd/api, NOT its own service — it serves nothing to any other
+# service and runs a few times a day, so a container would add a deployment unit and a memory
+# footprint on a 3.9GB box (§35.7) and nothing else.
+scan:
+  # A few times a day is enough: the roster changes on the order of days, and each scan is one
+  # whole-market REST call per exchange against a budget shared with the live trading path
+  # (§27.1/§39's finding that redundant polling is what rate-limited the account).
+  interval: 8h
+  # How many of each exchange's ranked candidates are ADMITTED to the roster per scan. Bounded
+  # deliberately: every admitted token costs a WebSocket subscription, a candle window per
+  # timeframe, and a share of the shared account through dynamic sizing (§32.4), so admitting
+  # everything good would dilute every position's size toward nothing.
+  top_n: 20
+  # 24h notional floor below which a token is not a candidate at any score — a market this thin
+  # cannot absorb even this project's small positions without moving the price, so ranking it
+  # highly on a big percentage move would be actively misleading.
+  min_volume_usd: 1000000
+  # The exchange list. Config today, shaped to move to a database table later (operator's
+  # instruction): everything downstream reads usecase.ExchangeSource, never this block, so that
+  # move touches one wiring function. An unknown name is REFUSED at startup rather than skipped —
+  # a typo would otherwise drop a whole exchange from discovery while every log looked healthy.
+  exchanges:
+    - name: "okx"
+      # FUTURES, not SWAP: FUTURES is where the X-Perp perpetuals this account can actually trade
+      # live (§33.2 — every classic SWAP instrument returned maxBuy=maxSell=0 for this account).
+      inst_type: "FUTURES"
+      # These patterns are the ACTUAL defence against admitting a DATED future to a
+      # perpetual-futures bot. Live-verified 2026-09-13 against the real response: this one pattern
+      # accepts exactly OKX's 179 X-Perp instruments and rejects all 28 dated contracts
+      # ("BTC-USD-270924", "BTC-USD_UM-260925" — the latter is one underscore-delimited token short
+      # of the perpetual's own shape). Widen them only with that check re-run.
+      quote_suffixes:
+        - "-USD_UM_XPERP-"
+    - name: "mexc"
+      # MEXC's futures API has exactly one contract family, so there is nothing to select between.
+      inst_type: ""
+      quote_suffixes:
+        - "_USDT"

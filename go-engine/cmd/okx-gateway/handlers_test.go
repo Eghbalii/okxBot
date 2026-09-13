@@ -30,6 +30,7 @@ type fakeExchange struct {
 	orderStatus  domain.OrderStatus
 	instrument   domain.Instrument
 	fundingRates []domain.FundingRate
+	allTickers   []domain.MarketTicker
 
 	placeOrderCalls    int
 	cancelOrderCalls   int
@@ -55,6 +56,12 @@ func (f *fakeExchange) GetTicker(instID string) (domain.Ticker, error) {
 		return domain.Ticker{}, err
 	}
 	return f.ticker, nil
+}
+func (f *fakeExchange) GetAllTickers(instType string) ([]domain.MarketTicker, error) {
+	if err := f.maybeFail(); err != nil {
+		return nil, err
+	}
+	return f.allTickers, nil
 }
 func (f *fakeExchange) GetPositions(instType string) ([]domain.Position, error) {
 	if err := f.maybeFail(); err != nil {
