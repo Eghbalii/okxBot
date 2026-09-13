@@ -117,6 +117,12 @@ services:
       CONFIG_PATH: /app/configs/config.yaml
       KAFKA_BROKERS: kafka:9092
       METRICS_ADDR: ":9101"
+      # Required since 2026-09-13: the instrument roster moved from config.yaml into Postgres
+      # (migration 000031, §53), so this service now reads which instruments to subscribe to from the
+      # database. It had no Postgres dependency before that and therefore no DSN — the same gap that
+      # left cmd/trader silently failing to write its equity timeline for months (§27.7), caught here
+      # within a minute because the ingestor cannot start at all without it.
+      POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
     ports:
       - "9101:9101"
     volumes:
@@ -124,6 +130,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      timescaledb:
+        condition: service_started
 
   # okx-gateway is the single process that holds real OKX credentials and rate-limits/prioritizes
   # REST calls across every other service (CLAUDE.md §27.1). Deployed here but NOT YET the

@@ -391,12 +391,20 @@ export default function HomePage() {
                           <span className="flag flag-on" title="collecting data / paper trading">
                             paper
                           </span>
-                          <span
-                            className={'flag ' + (r.enabledReal ? 'flag-on' : 'flag-off')}
-                            title={r.enabledReal ? 'enabled for real money' : 'not enabled for real money'}
-                          >
-                            real
-                          </span>
+                          {/* The real-money flag is distinguished by its TEXT, not only its color.
+                              A headless pass over this page read both states as the same word
+                              "real" and only the class differed — which is precisely how a glance
+                              misreads the highest-stakes distinction on the page. Color alone is
+                              not a label for whether real capital is at risk. */}
+                          {r.enabledReal ? (
+                            <span className="flag flag-on" title="enabled for real money">
+                              real ✓
+                            </span>
+                          ) : (
+                            <span className="flag flag-off" title="not enabled for real money">
+                              real off
+                            </span>
+                          )}
                         </>
                       ) : (
                         <span className="flag flag-off" title="not in the trading roster">

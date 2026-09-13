@@ -6069,3 +6069,41 @@ credentials, and `$0.00` for it would be a plausible-looking lie); a live stream
 scan's own last price (the ingestor only subscribes to the roster, so untracked tokens have no
 stream); and paper-enabled vs. real-enabled per token, which is exactly what a freshly-discovered
 token looks like.
+
+### 53.7 Deployed and verified live (2026-09-13)
+
+Not only built — driven end to end against the real server, and that found two genuine bugs plus
+three artifacts of my own test.
+
+**Deploy order caused a real bug.** `cmd/api` hosts the scan and restarted first, so the scan
+populated `instruments` before the ingestor ever looked at it. The seed rule was "fill the table if it
+is EMPTY", which was then unreachable — and the scan's finds are not the configured roster: TRUMP and
+PEPE were both below the $1M floor that day, so the next ingestor restart would have silently stopped
+collecting two tokens actively being traded. Fixed to seed per MISSING SYMBOL, which is
+order-independent. Verified live: the ingestor came up subscribed to 21 tokens — the 10 configured
+(TRUMP and PEPE present) plus 11 discovered — across all five timeframes, with ticks and candles
+flowing for the new ones within seconds.
+
+**`cmd/ingestor` had no `POSTGRES_DSN`.** It had no database dependency until the roster moved there,
+so `docker-compose.yml` never set one and it fell back to `localhost` and crash-looped. The same gap
+that left `cmd/trader` silently failing to write its equity timeline for months (§27.7) — caught in
+under a minute here only because this service cannot start at all without it, where the trader's
+version failed quietly every poll.
+
+**Colour alone is not a label.** The roster's most consequential distinction — is this token enabled
+for REAL MONEY — rendered the same word "real" in both states, differing only by CSS class. A headless
+pass read both as identical, which is exactly how a glance misreads it. Now "real ✓" vs "real off".
+
+Three things that looked like bugs and were not, worth recording so the next pass does not re-chase
+them: `networkidle` never settles on this page (it holds a live-price WebSocket), reading the DOM
+immediately after load shows empty stats and zero icon fallbacks (both arrive asynchronously — the
+real fallback rate is **49 of 142**, matching the CDN check), and the 502 on `/api/*` was §18.2's
+nginx-caches-the-upstream-IP rule, which applies to rebuilding `api` too, not just the panel.
+
+Final state: 16/16 services up, no errors in any log, `market_tokens` ranking sensibly (BTC and ETH
+top on volume; FIL at +23.9% and ZCAT with a 61% range surfacing on the change/range terms), and
+**40 scanned tokens admitted with `enabled_real = 0` across the board** — the gate that matters.
+
+One consequence to be aware of rather than a defect: paper equity is $11.10 and dynamic sizing is
+equity ÷ active tokens (§32.4), so going from 10 to 21 tokens halves each new paper position to
+~$0.53. `scan.top_n` (20) is the dial for that.
