@@ -363,3 +363,68 @@ export interface HealthResponse {
   halt?: HaltStatus
   dockerError?: string
 }
+
+// --- Home page (2026-09-13) ---
+
+// ExchangeBalance is one exchange's account balance for the Home page's top row.
+//
+// `configured` is false when the deployment holds no credentials for that exchange. The distinction
+// matters and is shown explicitly: a missing key and an empty account mean very different things, and
+// rendering the former as a zero balance would be a plausible-looking lie. MEXC's authenticated half
+// has never run against a real account, so this is the live case rather than a hypothetical.
+export interface ExchangeBalance {
+  exchange: string
+  configured: boolean
+  ccy: string
+  equityUsd: string
+  availUsd: string
+  err?: string
+}
+
+// MarketToken is one scanned instrument's 24h snapshot — one row per (exchange, symbol), NOT merged
+// across exchanges, because the same token's volume and liquidity genuinely differ per venue and
+// merging would average away the property that decides whether the bot can trade it.
+export interface MarketToken {
+  exchange: string
+  symbol: string
+  execInstId: string
+  lastPx: string
+  high24h: string
+  low24h: string
+  vol24hUsd: string
+  change24hPct: string
+  range24hPct: string
+  score: string
+  scannedAt: string
+  inRoster: boolean
+  enabledPaper: boolean
+  enabledReal: boolean
+}
+
+// Instrument is one row of the tradeable roster — the tokens actually being collected and traded, as
+// opposed to the whole scanned market above. The three flags are independent by design: a discovered
+// token collects data and paper-trades immediately while staying off for real money until a person
+// enables it.
+export interface Instrument {
+  id: number
+  symbol: string
+  exchange: string
+  execInstId: string
+  instType: string
+  enabledIngest: boolean
+  enabledPaper: boolean
+  enabledReal: boolean
+  source: 'manual' | 'scan' | 'seed'
+  vol24hUsd: string
+  change24hPct: string
+  scanScore: string
+  updatedAt: string
+}
+
+export interface ScanResult {
+  exchange: string
+  scanned: number
+  candidates: number
+  admitted: number
+  err?: string
+}

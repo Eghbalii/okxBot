@@ -1846,3 +1846,135 @@ input[type='number'] {
   font-weight: 500;
 }
 .banner-link:hover { text-decoration: underline; }
+
+/* ============================================================================
+   Home page (2026-09-13): balances, service status, token market.
+   Built on the existing dark-theme variables rather than a second palette.
+   ============================================================================ */
+
+/* Shared utilities the Home page needs and this stylesheet did not yet have. Defined once here
+   rather than inline per element, since the market table uses them on every row. */
+.muted { color: var(--text-dim); }
+.error { color: var(--red); }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.pos { color: var(--green); }
+.neg { color: var(--red); }
+
+.home-page { display: flex; flex-direction: column; gap: 16px; }
+
+/* --- balances row --- */
+.home-balances { display: flex; flex-wrap: wrap; gap: 12px; }
+.balance-card {
+  flex: 1 1 180px;
+  min-width: 170px;
+  padding: 12px 14px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+/* An unconfigured exchange is visibly dimmed rather than hidden: the operator should be able to see
+   that a supported exchange exists and has no credentials, which is different from it not existing. */
+.balance-card.unconfigured { opacity: 0.6; }
+.balance-exchange {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--text-dim); margin-bottom: 6px;
+}
+.balance-amount { font-size: 20px; font-weight: 600; }
+.balance-amount.muted, .balance-amount.error { font-size: 14px; font-weight: 400; }
+.balance-ccy { font-size: 12px; color: var(--text-dim); font-weight: 400; }
+.balance-avail { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+
+/* --- paper / real service cards --- */
+.home-services { display: flex; flex-wrap: wrap; gap: 12px; }
+.service-card {
+  flex: 1 1 340px;
+  padding: 12px 14px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+/* A left edge in each mode's own color, so paper and real are never mistaken for each other at a
+   glance — the one distinction on this page where a misread has real consequences. */
+.service-card-paper { border-left: 3px solid var(--accent); }
+.service-card-real { border-left: 3px solid var(--yellow); }
+.service-card-head {
+  display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;
+}
+.service-card-title { font-weight: 600; }
+.service-card-link { font-size: 12px; color: var(--accent); text-decoration: none; }
+.service-card-link:hover { text-decoration: underline; }
+.service-card-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 10px 14px;
+}
+.service-card-grid > div { display: flex; flex-direction: column; }
+.stat-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.03em; }
+.stat-value { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* --- market table --- */
+.home-market {
+  background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px;
+}
+.home-market-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.home-market-head h2 { margin: 0; font-size: 15px; }
+.home-search {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  border-radius: 4px; padding: 5px 8px; font-size: 13px; width: 150px;
+}
+.home-toggle { display: flex; align-items: center; gap: 5px; font-size: 13px; color: var(--text-dim); }
+.home-market-count { margin-left: auto; font-size: 12px; color: var(--text-dim); }
+.scan-results { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; font-size: 12px; }
+.scan-result { color: var(--text-dim); }
+.scan-result.error { color: var(--red); }
+
+.home-market-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.home-market-table th, .home-market-table td {
+  padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: left;
+}
+.home-market-table th { font-size: 11px; color: var(--text-dim); text-transform: uppercase; }
+/* Rows are clickable (they open the chart), so they say so on hover. */
+.home-market-row { cursor: pointer; }
+.home-market-row:hover { background: rgba(88, 166, 255, 0.07); }
+
+.token-cell { display: flex; align-items: center; gap: 8px; }
+.token-symbol { font-weight: 600; }
+.token-icon { border-radius: 50%; display: inline-block; }
+.token-icon-fallback {
+  display: inline-flex; align-items: center; justify-content: center;
+  color: #fff; font-weight: 700; letter-spacing: -0.02em; line-height: 1;
+}
+
+/* The live-price marker: a small dot rather than a word, so it costs no column width on a table
+   where every other cell is a number. */
+.live-dot {
+  display: inline-block; width: 5px; height: 5px; margin-left: 5px;
+  border-radius: 50%; background: var(--green); vertical-align: middle;
+}
+
+/* --- exchange badges, with the full list on hover --- */
+.exchange-badges { position: relative; display: inline-flex; gap: 3px; }
+.exchange-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 22px; height: 16px; padding: 0 3px;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.02em;
+  border-radius: 3px; background: var(--border); color: var(--text-dim);
+}
+/* Per-exchange color so a venue is recognizable without reading the letters. */
+.exchange-badge-okx { background: #1f4d7a; color: #cfe6ff; }
+.exchange-badge-mexc { background: #1b5c4a; color: #cdf3e6; }
+.exchange-badges-popover {
+  display: none; position: absolute; top: 100%; left: 0; z-index: 20;
+  margin-top: 4px; padding: 5px 8px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  font-size: 11px; white-space: nowrap;
+}
+.exchange-badges:hover .exchange-badges-popover { display: block; }
+.exchange-badges-popover-row { display: block; }
+
+/* --- per-mode status flags --- */
+.status-cell { display: flex; gap: 4px; }
+.flag {
+  font-size: 10px; padding: 1px 5px; border-radius: 3px; text-transform: uppercase;
+  font-weight: 600; letter-spacing: 0.02em;
+}
+.flag-on { background: rgba(63, 185, 80, 0.16); color: var(--green); }
+.flag-off { background: var(--border); color: var(--text-dim); }

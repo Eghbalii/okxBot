@@ -7,9 +7,11 @@ import ResourcesPage from './pages/ResourcesPage'
 import ModelStatusPage from './pages/ModelStatusPage'
 import StrategiesPage from './pages/StrategiesPage'
 import PositionsPage from './pages/PositionsPage'
+import HomePage from './pages/HomePage'
 import StrategyTesterPage from './pages/StrategyTesterPage'
 
 const tabs = [
+  { to: '/home', label: 'Home' },
   { to: '/positions/paper', label: 'Positions' },
   { to: '/strategies', label: 'Strategies' },
   { to: '/strategy-tester', label: 'Strategy Tester' },
@@ -54,7 +56,10 @@ export default function App() {
       </header>
       <main className="app-main">
         <Routes>
-          <Route path="/" element={<Navigate to="/positions/paper" replace />} />
+          {/* Home is the landing route (2026-09-13 request). Positions keeps its own URLs, so
+              existing bookmarks still work. */}
+          <Route path="/" element={<Navigate to="/home" replace />} />
+          <Route path="/home" element={<HomePage />} />
           <Route path="/positions" element={<Navigate to="/positions/paper" replace />} />
           <Route path="/positions/:mode" element={<PositionsPage />} />
           <Route path="/strategies" element={<StrategiesPage />} />

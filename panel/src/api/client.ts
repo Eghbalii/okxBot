@@ -20,6 +20,10 @@ import type {
   TesterConfig,
   TesterVersion,
   TesterVersionDetail,
+  ExchangeBalance,
+  MarketToken,
+  Instrument,
+  ScanResult,
 } from './types'
 
 // Same-origin in production (the panel is served from behind the OpenVPN-only cmd/api host, per
@@ -58,6 +62,44 @@ async function requestList<T>(path: string, init?: RequestInit): Promise<T[]> {
 
 export const api = {
   resources: () => request<{ grafanaUrl: string }>('/resources'),
+
+  // --- Home page (2026-09-13) ---
+  // Every one of these goes through requestList: Go marshals a nil slice as null, which crashes any
+  // consumer that maps over it. That is not hypothetical here — it blanked the whole panel once
+  // (CLAUDE.md §25), on the one endpoint that used plain request() instead.
+  exchangeBalances: () => requestList<ExchangeBalance>('/exchange-balances'),
+  marketTokens: (opts: { exchange?: string; limit?: number } = {}) => {
+    const params = new URLSearchParams()
+    if (opts.exchange) params.set('exchange', opts.exchange)
+    if (opts.limit) params.set('limit', String(opts.limit))
+    return requestList<MarketToken>(`/market/tokens?${params}`)
+  },
+  instruments: (opts: { exchange?: string; enabled?: string } = {}) => {
+    const params = new URLSearchParams()
+    if (opts.exchange) params.set('exchange', opts.exchange)
+    if (opts.enabled) params.set('enabled', opts.enabled)
+    return requestList<Instrument>(`/instruments?${params}`)
+  },
+  createInstrument: (body: {
+    symbol: string
+    exchange: string
+    execInstId: string
+    instType?: string
+    enabledIngest?: boolean
+    enabledPaper?: boolean
+    enabledReal?: boolean
+  }) => request<Instrument>('/instruments', { method: 'POST', body: JSON.stringify(body) }),
+  setInstrumentFlags: (
+    id: number,
+    patch: { enabledIngest?: boolean; enabledPaper?: boolean; enabledReal?: boolean },
+  ) =>
+    request<{ ok: boolean }>(`/instruments/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  deleteInstrument: (id: number) =>
+    request<{ ok: boolean }>(`/instruments/${id}`, { method: 'DELETE' }),
+  runScan: () => requestList<ScanResult>('/market/scan', { method: 'POST' }),
 
   // Service health + the real-trading halt, with the evidence that gates its reset.
   health: async (): Promise<HealthResponse> => {
