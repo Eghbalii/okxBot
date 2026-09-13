@@ -5734,3 +5734,53 @@ Both are now pinned by tests using **verbatim bytes from the live Docker socket*
 fixtures written from my own assumptions, and the halt stub implements only `ListRealPositions`, so
 reading the paper table panics loudly instead of quietly returning an empty slice that looks like
 real drift.
+
+## 50. Chart and balance caching in the panel (2026-09-13)
+
+Requested because switching between open positions in the chart, and between the balance chart's
+day/week/month ranges, felt slow — data was reloaded from scratch every time.
+
+**Measured before building anything, and the measurement changed the design.** The backend is not
+the bottleneck: `/api/candles` answers in **10ms** and `/api/account/history` in **19ms**. A
+server-side cache would have solved nothing. The cost was entirely client-side — discarding a result
+the browser already had, paying the round trip again, and remounting `CandleChart`, which also threw
+away the user's pan/zoom on every switch.
+
+`TokenChartModal` made this explicit: it called `setCandles(null)` whenever `(instId, bar)` changed,
+so switching positions blanked the chart to "Loading candles…" by design.
+
+### 50.1 `useCachedResource`
+
+A stale-while-revalidate cache in a module-level `Map` — deliberately module-level, since a cache in
+component state would be discarded exactly when the modal closes, which is right before it is
+reopened.
+
+- A cached value is returned **synchronously on first render**, so switching back to a recently
+  viewed position draws in the same frame with no loading state. Reading in an effect instead would
+  paint one empty frame first, which is the flicker this removes.
+- Stale data stays on screen **while** revalidating. A chart 30 seconds old beats an empty box.
+- `loading` is true only when there is genuinely nothing to show, so a background refresh can never
+  blank a view.
+- Concurrent callers for one key share a single request rather than racing.
+
+**Two error paths, deliberately different:** a failed *refresh* keeps the stale value (a transient
+error must not blank a chart someone is reading), while a failed *first* fetch leaves no entry, so
+nothing poisons the cache with an empty value.
+
+### 50.2 The subtle bug avoided
+
+The balance chart's cache key contains a since-timestamp. A raw `Date.now()` there changes on every
+render, which would make every lookup miss and the cache silently do nothing — working code, zero
+benefit, no error anywhere. Bucketed to the minute so it is stable between renders.
+
+Bounded at 60 entries, oldest-first: 10 instruments × 3 bars is 30, leaving room for balance ranges
+and a second exchange (§46) without evicting anything on screen.
+
+### 50.3 Verification
+
+`panel/` has **no test framework**, and adding one to prove a ~140-line hook would have been a
+larger change than the hook. The cache algorithm was exercised directly instead — de-duplication,
+staleness, both error paths, and the size bound, 7 checks — which beats shipping it unverified.
+Worth revisiting if the panel grows more logic of this kind.
+
+Bundle grew 0.7KB.
