@@ -93,6 +93,76 @@ func TestRosterFor_DoesNotFallBackWhenEveryRowIsDisabled(t *testing.T) {
 	}
 }
 
+// The scenario that broke on the real deploy, minutes after it shipped (2026-09-13).
+//
+// The discovery scan runs before the ingestor and paper-trader restart, so it populates the roster
+// first. The original rule ("seed only when the table is empty") then became unreachable, and two
+// CONFIGURED tokens that happened to be below the scan's volume floor that day — TRUMP and PEPE —
+// would have silently stopped being collected on the next ingestor restart. A silent data gap on a
+// pipeline that looks healthy, which is the exact failure mode §9 exists to prevent.
+func TestRosterFor_SeedsConfiguredSymbolsMissedByAScan(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+
+	// The scan got there first, and found tokens the operator never configured while missing two the
+	// operator did.
+	for _, sym := range []string{"BTC", "FIL", "TAO"} {
+		if _, err := repo.UpsertInstrument(ctx, port.Instrument{
+			Symbol: sym, Exchange: "okx", ExecInstID: sym + "-X", InstType: "FUTURES",
+			EnabledIngest: true, EnabledPaper: true, Source: "scan",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	configured := []string{"BTC", "TRUMP", "PEPE"}
+	execIDs := map[string]string{"BTC": "BTC-X", "TRUMP": "TRUMP-X", "PEPE": "PEPE-X"}
+
+	got, err := RosterFor(ctx, repo, "okx", "ingest", configured, execIDs, "FUTURES", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	have := map[string]bool{}
+	for _, s := range got.Symbols {
+		have[s] = true
+	}
+	for _, sym := range configured {
+		if !have[sym] {
+			t.Errorf("configured symbol %q is missing from the roster — it would silently stop being collected", sym)
+		}
+	}
+	// The scan's own finds must survive too: seeding is additive, not a reset to the config list.
+	for _, sym := range []string{"FIL", "TAO"} {
+		if !have[sym] {
+			t.Errorf("scan-discovered symbol %q was dropped by the seed", sym)
+		}
+	}
+}
+
+// A configured symbol whose row EXISTS but is disabled must stay disabled — seeding fills gaps, it
+// does not overrule a person. Without this, the order-independence fix above would have reintroduced
+// migration 000030's bug in the process of fixing a different one.
+func TestRosterFor_DoesNotReseedADisabledConfiguredSymbol(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.UpsertInstrument(ctx, port.Instrument{
+		Symbol: "BTC", Exchange: "okx", ExecInstID: "BTC-X",
+		EnabledIngest: false, EnabledPaper: false, Source: "seed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := RosterFor(ctx, repo, "okx", "ingest",
+		[]string{"BTC"}, map[string]string{"BTC": "BTC-X"}, "FUTURES", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Symbols) != 0 {
+		t.Errorf("symbols = %v — a deliberately disabled token was re-enabled by the config seed", got.Symbols)
+	}
+}
+
 // The three flags are independent (migration 000031's whole design), so a token can be collecting
 // data and paper-trading while real trading does not see it at all.
 func TestRosterFor_RespectsEachConsumerIndependently(t *testing.T) {

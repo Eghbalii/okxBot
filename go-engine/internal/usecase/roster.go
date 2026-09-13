@@ -39,12 +39,13 @@ type Roster struct {
 // three independent flags migration 000031 keeps separate precisely so a discovered token can
 // collect data and paper-trade while staying off for real money.
 //
-// FALLING BACK TO CONFIG IS DELIBERATE AND BOUNDED: an EMPTY roster (no rows at all for this
-// exchange) means the table has never been seeded, which is the state of every deployment the moment
-// this migration lands — so config.yaml's own list is used and seeded, and nothing breaks on the
-// deploy. A roster that exists but has every row DISABLED is NOT the same thing and is honored
-// as-is: falling back there would resurrect tokens an operator deliberately turned off, which is
-// migration 000030's exact bug.
+// SEEDING FROM CONFIG IS DELIBERATE AND BOUNDED: any configured symbol with NO ROW AT ALL is seeded,
+// so an existing deployment keeps collecting and trading exactly what it did before this migration
+// landed, regardless of which service starts first (the first version seeded only a wholly empty
+// table and lost that property the moment the discovery scan populated it — see the comment below).
+//
+// A symbol whose row EXISTS but is disabled is honored as-is and never re-seeded: that would resurrect
+// tokens an operator deliberately turned off, which is migration 000030's exact bug.
 func RosterFor(
 	ctx context.Context,
 	repo port.Repository,
@@ -58,17 +59,41 @@ func RosterFor(
 	if err != nil {
 		return Roster{}, fmt.Errorf("load roster: %w", err)
 	}
-	if len(all) == 0 && len(fallbackSymbols) > 0 {
-		if logger != nil {
-			logger.Info("instrument roster is empty, seeding it from config",
-				"exchange", exchange, "symbols", len(fallbackSymbols))
+	// Seed the CONFIGURED symbols that have no row yet — not merely "seed when the table is empty".
+	//
+	// That weaker condition shipped first and was wrong, caught within minutes of the real deploy: the
+	// scan happens to run before the ingestor and paper-trader restart, so it populated the table
+	// first, the seed path became unreachable, and TRUMP and PEPE — configured for trading, but below
+	// the scan's volume floor that day — would have silently stopped being collected on the next
+	// ingestor restart. Seeding per-missing-symbol instead makes the outcome independent of which
+	// service happens to start first, which is the property that was actually wanted.
+	//
+	// Note this seeds only symbols with NO ROW AT ALL. A symbol whose row exists and is disabled is
+	// left alone: re-seeding it would resurrect a token an operator deliberately turned off, which is
+	// migration 000030's exact bug.
+	if len(fallbackSymbols) > 0 {
+		have := make(map[string]bool, len(all))
+		for _, in := range all {
+			have[in.Symbol] = true
 		}
-		if err := SeedRoster(ctx, repo, exchange, fallbackSymbols, fallbackExecIDs, fallbackInstType); err != nil {
-			return Roster{}, err
+		var missing []string
+		for _, sym := range fallbackSymbols {
+			if !have[sym] {
+				missing = append(missing, sym)
+			}
 		}
-		all, err = repo.ListInstruments(ctx, port.InstrumentFilter{Exchange: exchange})
-		if err != nil {
-			return Roster{}, fmt.Errorf("load roster after seeding: %w", err)
+		if len(missing) > 0 {
+			if logger != nil {
+				logger.Info("seeding configured symbols that have no roster row",
+					"exchange", exchange, "symbols", missing)
+			}
+			if err := SeedRoster(ctx, repo, exchange, missing, fallbackExecIDs, fallbackInstType); err != nil {
+				return Roster{}, err
+			}
+			all, err = repo.ListInstruments(ctx, port.InstrumentFilter{Exchange: exchange})
+			if err != nil {
+				return Roster{}, fmt.Errorf("load roster after seeding: %w", err)
+			}
 		}
 	}
 

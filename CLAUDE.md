@@ -5925,3 +5925,147 @@ fix and a rebuild where a stopped container usually just needs starting.
 Not only in logic: `rl-service` was stopped on the server, the endpoint correctly reported it as a
 down critical service, and it was restarted immediately (8/8 back). Plus 7 checks on the show/hide
 decision covering both incidents and all four cases it must stay quiet for.
+
+## 53. Token discovery, the database-backed roster, and a Home page (2026-09-13)
+
+Requested as one feature — "I want more token options for trading: find the top tokens from every
+exchange by volume, change, trend; then a Home page showing balances per exchange, paper/real
+service status, and a sortable token table with icons and exchange marks, clickable to a chart."
+
+Building it surfaced a blocker that reshaped the work, and it is the part worth remembering.
+
+### 53.1 The roster had to move to the database first
+
+The scan can find a promising token in seconds. Putting it to work was the problem: the tradeable
+roster lived in `config.yaml` as `trading.inst_ids` plus a **hand-maintained** `trading.symbol_map`,
+resolved ONCE at each service's startup. A discovered token has neither an entry nor an exec instId,
+so nothing could subscribe to it. Reporting candidates a human then copies into YAML was offered and
+rejected — correctly, since that is not "more token options", it is a list.
+
+So migration `000031` adds `instruments` (the working set) and `market_tokens` (the ranked whole
+market), and `usecase.RosterFor` is what every service now loads instead of config. `exec_inst_id`
+replaces `symbol_map` entirely, which is a real improvement independent of discovery: OKX's X-Perp
+ids embed a rolling expiry (§33.4) that a YAML map goes stale on silently, while the roster refreshes
+it on every scan.
+
+**Three independent enable flags, not one.** `enabled_ingest` / `enabled_paper` / `enabled_real`
+encode the operator's own instruction: a discovered token joins the WebSocket subscriptions and paper
+trading immediately — that is how it earns a track record — and is added to the real-mode list
+**disabled**, for a person to turn on. One combined flag would make discovery and real-capital
+exposure the same decision.
+
+**The fallback boundary is deliberate in both directions**, and it is where this could have gone
+wrong:
+
+| roster state | behavior | why |
+|---|---|---|
+| table EMPTY | seed from `config.yaml` | the state of every existing deployment the moment this lands; the deploy must change nothing |
+| exists, all rows DISABLED | honored as-is | falling back would resurrect tokens an operator turned off — migration 000030's exact bug |
+| `cmd/trader` (real), empty | REFUSE to start | seeding real-money instruments from a config file on a service's own initiative is a different kind of act |
+
+**Restart, don't reload.** `usecase.RosterWatcher` polls for a change and exits the process, letting
+the restart policy relaunch it — the same mechanism §18/§22 use. A WS subscription is fixed for the
+life of its socket, and a restart re-derives every piece of state from the database, where a partial
+in-place reload is exactly how a service ends up half-subscribed with nothing reporting it. It treats
+an unreadable **or empty** read as "don't act": a database blip must not restart a healthy trading
+service, and restarting into an empty roster would crash-loop.
+
+### 53.2 It is a job, not a service
+
+Per the operator's own reasoning, and worth recording because the instinct here is wrong: this is not
+a service. It serves nothing to any other service, runs a few times a day, and only searches for
+tokens and hands them to the main services. It lives as a scheduled job inside `cmd/api` (which
+already holds the exchange clients and the database). A container would add a deployment unit and a
+memory footprint on a 3.9GB box (§35.7) and nothing else. Interval 8h.
+
+The exchange list is `config.Scan.Exchanges`, shaped to move to a table later: everything downstream
+reads `usecase.ExchangeSource`, never the config struct, so that move touches one wiring function. An
+unknown exchange name is **refused at startup** rather than skipped — a typo would otherwise drop a
+whole exchange from discovery while every log looked healthy (§9's precedent).
+
+### 53.3 Scoring, and what it deliberately does not do
+
+`0.55` volume / `0.25` change / `0.20` range, each normalized against the scan's own maximum rather
+than an absolute constant ("high volume" only means anything relative to the rest of that day's
+market).
+
+Volume dominates because liquidity is the one property that gates whether this bot can trade a token
+at all — §33.2's own finding was that the execution venue's thinness, not the signal, was the binding
+constraint. Change is taken as an **absolute value**: a token down 30% is as tradeable as one up 30%
+for a bot that trades both sides (§9), and signing it would rank the market by direction, which is a
+prediction the scan has no business making. Range is the component that survives a token moving hard
+both ways and coming back — the day a mean-reversion strategy has the most to work with, and one a
+change-only ranking is blind to. A `$1M` 24h floor excludes markets too thin to absorb even this
+project's small positions at any score.
+
+`TopN` (20) bounds admission, not ranking: every admitted token costs a WS subscription, a candle
+window per timeframe, and a share of the shared account through dynamic sizing (§32.4).
+
+### 53.4 A bug that would have failed silently in production
+
+Verifying `GetAllTickers` against the real API rather than a fixture is what caught it. **OKX returns
+`""` — not `"0"`, not a missing field — for every price field of an instrument that has never
+traded.** Because `/market/tickers` decodes as one array, that single row
+(`TEST002-USD_UM_XPERP-310822`) failed the decode for **all 207 FUTURES instruments** — the instType
+real trading executes against. The whole scan returned nothing, from one dead instrument.
+
+Fixed with `okx.LooseDecimal` on a **separate wire type**. The trading-path `Ticker` stays strict on
+purpose: there an empty price is a fault, and reading it as zero is how a close gets recorded at the
+wrong number (§37). Tolerance is correct only where the alternative is discarding a whole exchange's
+market data.
+
+Each adapter also normalizes at its **own** boundary, per the instruction that OKX's peculiarities
+must not be imposed on every exchange:
+
+- OKX's `volCcy24h` is **base-currency** volume, multiplied by price here. `vol24h` is a contract
+  count — live-verified 8,559,200 vs 855,920 on EDGE-USDT-SWAP, so ranking by it would order the
+  market by contract size. Change is derived from `open24h`.
+- MEXC reports `amount24` in dollars already ($1.97B for BTC) and `riseFallRate` directly, so its
+  lack of an open price costs nothing.
+
+### 53.5 Two tests that passed against the bug they were written for
+
+Both found by mutation, not review, and both worth recording because the failure mode is the same:
+asserting a *consequence* that another correct mechanism also produces.
+
+1. **The dated-futures test.** OKX's FUTURES instType carries 179 X-Perp perpetuals alongside 28
+   **dated** contracts, and admitting a dated one to a perpetual-futures bot would place real orders
+   on an instrument that expires. My test claimed a `ContainsAny("-_")` guard was the defence. It is
+   not — the **suffix patterns** reject those ids, and the test passed with the guard removed. Both
+   the comment and the test were rewritten to say what is true, and the guard kept with its own test
+   for the case it does cover (a too-loose pattern yielding a symbol with a separator in it).
+2. **The roster fallback test.** Asserting that the disabled flags *survived* proved nothing, because
+   `UpsertInstrument` never overwrites flags anyway — a roster wrongly re-seeded on every read looks
+   identical from outside. It now counts writes, and fails with "wrote 2 instrument rows" when the
+   `len(all) == 0` guard is removed.
+
+The general rule: when the thing being tested is *redundant work* rather than *wrong data*, asserting
+on the data cannot see it (§39 hit this exact shape with the equity-recording test).
+
+### 53.6 Home page
+
+`/` now lands on `/home`; Positions keeps its own URLs so existing bookmarks work.
+
+Balances per exchange, paper and real service cards (equity, balance, open orders, 24h/7d/30d PnL),
+and the market table — sortable by symbol, price, change, range, volume or score, with a symbol
+filter and a traded-only toggle. Rows open the existing `TokenChartModal`, which already carries its
+own token switcher, so the "menu to choose different tokens" is the component already built for it.
+
+Icons load from a public CDN with a deterministic **letter-avatar fallback**, and the fallback is not
+decoration: checked against the live roster, **5 of 11 tokens 404** (PEPE, TRUMP, HYPE, PUMP, WIF),
+and discovery will surface more no icon set has heard of. A broken-image placeholder on a third of the
+table would make the page unreadable. Avatar colors derive from the symbol's own characters, so a
+token keeps its color across reloads and sort orders. Exchange marks are letter marks, not brand
+logos — a logo is a trademark and two letters carry the same information.
+
+One row per **token** with venues rolled up, since "which tokens look interesting" is a question about
+tokens. Volume is **summed** (total tradeable liquidity is what decides whether a token is worth
+trading) while price comes from the **deepest** venue — averaging a thin venue against a deep one
+produces a number that exists nowhere.
+
+Three pairs of states are kept distinct rather than collapsed, each one somewhere this project has
+already been bitten: unconfigured vs. failed vs. a real zero balance (§46.6 — MEXC holds no working
+credentials, and `$0.00` for it would be a plausible-looking lie); a live streamed price vs. the
+scan's own last price (the ingestor only subscribes to the roster, so untracked tokens have no
+stream); and paper-enabled vs. real-enabled per token, which is exactly what a freshly-discovered
+token looks like.
