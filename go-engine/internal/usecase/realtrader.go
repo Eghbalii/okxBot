@@ -1896,6 +1896,28 @@ func (e *RealTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, lo
 		logger.Warn("reconcile: exchange reports flat but local state shows an open position; closing locally",
 			"instId", e.InstID, "localOrders", len(local))
 		for _, o := range local {
+			// A position the exchange has only just filled must not be closed on a "flat" reading.
+			//
+			// This cost real money on 2026-09-13 (CLAUDE.md §51). Order 148 opened at 15:35:02;
+			// three seconds later OKX's positions endpoint still reported flat, so this branch
+			// marked it closed AND cancelled its protective order. Eighteen seconds after that the
+			// exchange reported the position — which by then had no local record and no stop, and
+			// ran unprotected until it was flattened by hand.
+			//
+			// It is the exact mirror of §48: there, a lagging endpoint made an open look untracked;
+			// here, it makes an open look already-closed. Both are the same underlying fact — the
+			// exchange's position view trails its own fills — so both need the same answer, which
+			// is to distrust it briefly rather than act on the first reading.
+			//
+			// Skipping is safe: the position stays open locally and the very next pass (5s later,
+			// or immediately on a pushed event) re-evaluates. A position genuinely closed outside
+			// this system is still caught, one pass later.
+			if age := time.Since(o.OpenedAt); age < staleCloseGrace {
+				logger.Info("reconcile: exchange reports flat for a just-opened position; "+
+					"deferring rather than closing it",
+					"instId", e.InstID, "id", o.ID, "age", age)
+				continue
+			}
 			// Ask the exchange why this position closed and at what price, instead of assuming a
 			// manual close at the entry price (2026-09-09) — see closeFactsFromExchange.
 			reason, closePx, exPnL, exFee := e.closeFactsFromExchange(o, logger)
@@ -2031,3 +2053,17 @@ func (e *RealTrader) shouldDeferUntrackedHalt(logger *slog.Logger, remote *domai
 		"deferring to the next pass", "instId", e.InstID, "remoteSize", remote.Pos)
 	return true
 }
+
+// staleCloseGrace is how long after opening a position reconcile refuses to believe the exchange
+// reporting flat for it.
+//
+// OKX's positions endpoint trails its own fills — measured at 18+ seconds on 2026-09-13 (§51),
+// where a position filled at 15:35:02 was still absent from that endpoint at 15:35:05 and only
+// appeared at 15:35:24. 60s is comfortably beyond the observed lag without being so long that a
+// genuine external close (a liquidation, a manual close in OKX's app) goes unnoticed for a
+// meaningful time — that is detected on the first pass after the grace expires.
+//
+// Deliberately a grace period rather than a retry count: the quantity that actually varies is
+// elapsed TIME since the fill, and a count would mean something different at the 5s poll than on a
+// burst of WebSocket-pushed passes.
+const staleCloseGrace = 60 * time.Second
