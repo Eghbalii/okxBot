@@ -5475,3 +5475,81 @@ Per the operator's rollout: WebSocket and public data first, API keys after. The
 mappings (order states, stop-order states) are the most likely to need correction, and are written
 to fail loudly on an unknown value rather than guess. Nothing is wired into `cmd/` yet either — no
 ingestor or trader runs against MEXC, so none of this can affect the live OKX path.
+
+## 47. One unbuildable strategy row killed real trading for eight hours (2026-09-13)
+
+Reported as a panel error when pausing real trading:
+
+```
+trader unreachable: Post "http://trader:8095/restart":
+dial tcp: lookup trader on 127.0.0.11:53: no such host
+```
+
+**The DNS failure was a symptom, not the cause.** `cmd/trader` had been crash-looping since 20:18
+the previous evening, and Docker's internal DNS cannot resolve a container that is not running. The
+same report included "the max columns don't update", which turned out to be a *second*, independent
+symptom of the same outage plus a third problem underneath it.
+
+### 47.1 Cause
+
+§45's V2 activation `INSERT` cross-joined every `(inst_id, bar)` pair present in
+`strategy_assignments` — which includes **both modes**, not just paper. 120 V2 rows landed in
+`real`. That work was reported as "paper only"; it was not, and the claim was wrong rather than
+merely imprecise.
+
+Those kinds then reached real's `paper_trading_config.active_kinds`, and `cmd/trader`'s deployed
+binary predates the V2 strategies. `strategy.FromConfig` returned `unknown strategy kind
+"bb_squeeze_breakout_v2"`, `loadRealTraderStrategyAssignments` returned that error, and `main`
+called `os.Exit(1)`. On every restart. Forever.
+
+### 47.2 The design flaw is the real finding
+
+**One unbuildable strategy row aborted loading ALL assignments and killed a service managing real
+capital.** A single stale database row — trivially recoverable, affecting one of fifteen strategies
+— became a total outage with an open real position that had a pending manual-close request nothing
+was alive to execute.
+
+Both loaders now **skip** an unusable assignment and continue, logging at ERROR per row plus a
+summary count. A strategy that cannot be built simply does not trade, which is the same outcome as
+it being disabled — reached without an outage. Skipping silently would be its own failure, so the
+log names the assignment id to fix.
+
+`buildAssignmentStrategy` was extracted so the decision is testable without a live Postgres. The
+regression test uses the real kind from this incident, so it fails for the same reason production
+did rather than an approximation. A third test asserts **every** V2 kind is buildable by this
+binary, so dropping one from the registry while assignments reference it fails at build time rather
+than at 4am on a live account. Mutation-checked.
+
+### 47.3 What went right, and it is worth stating
+
+The open ZEC position stayed **protected on the exchange the entire eight hours** — `State: live`,
+SL 1131.34 / TP 1157.6 — because §35 moved SL/TP onto the exchange rather than leaving it in this
+process's tick monitor. That design was built for exactly this: "a crash, a deploy, an OOM, a
+stalled Kafka consumer, or a network partition leaves real capital with no stop otherwise." It held.
+The position closed profitably (+$0.3436) the moment the trader recovered, executing the operator's
+pending request with the exchange's own figures (§41).
+
+### 47.4 The third problem: a million-message Kafka backlog
+
+After the restart the max columns *still* did not update. `pnl_max_pct` is written from the TICK
+path, and the trader was consuming none: it was replaying an eight-hour backlog and discarding every
+message as stale (`age=5h42m max=2m`). Consumer lag on `okx.tickers` measured **998,330 messages**,
+draining at roughly one per second.
+
+Every one of those messages was being dropped anyway, so resetting to the live end lost nothing:
+
+```
+docker stop okxbot-trader-1                      # a group member blocks the reset
+kafka-consumer-groups.sh --group trader --reset-offsets --to-latest --all-topics --execute
+```
+
+`pnl_max_pct` went from 2.65% (the ~13 minutes recorded before the crash) to 15.54%, matching the
+exchange's live +14.27%. **Worth knowing generally: any service down for hours will come back into a
+stale backlog, and "it restarted successfully" does not mean it is processing live data.** Check
+consumer lag, not just container status.
+
+### 47.5 Why the max column looked broken but was not
+
+`pnl_max_pct` is a monotonic high-water mark (`GREATEST(pnl_max_pct, $2)`), so it only moves when a
+new peak is reached. Seeing the same value across two checks is correct behaviour, not a stall. What
+was genuinely wrong was upstream: for eight hours nothing was writing to it at all.
