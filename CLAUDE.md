@@ -5683,6 +5683,37 @@ this and left it). Every one of those calls has silently failed since it was wri
 Engine API over the already-mounted socket instead — read-only by construction, since that socket is
 effectively root on the host.
 
+### 49.4b `docker compose restart` does NOT pick up a newly built image
+
+The panel showed none of this after a hard refresh, and the code was fine — the deploy was wrong.
+
+`docker compose restart panel` restarts the EXISTING container with the image it already has. It
+never adopts a newly built one. The image had the new bundle (`index-CStebppL.js`, containing
+`safeToReset`), while the running container still served the old `index-1UAqHCKd.js` from image
+`009617c5…` — a different image id from the freshly built `cbc65404…`.
+
+This is a trap specific to this project because §18.2 established `docker compose restart panel` as
+the fix for nginx caching a redeployed upstream's IP. That rule is still right, and it is NOT a
+substitute for recreating the container when the panel's own image changed.
+
+**The rule:**
+
+| What changed | Command |
+|---|---|
+| Only an upstream (`api`, `rl-service`) redeployed | `docker compose restart panel` (§18.2, re-resolves DNS) |
+| The panel's own source | `docker compose up -d panel` (recreates on the new image) |
+
+Verify by comparing image ids, not by whether the container restarted:
+
+```
+docker inspect okxbot-panel-1 --format '{{.Image}}'   # what is running
+docker images okxbot-panel --format '{{.ID}}'          # what was just built
+```
+
+A restarted container with an unchanged uptime-since-restart looks identical either way, which is
+exactly why "it restarted successfully" is not evidence the new code is live (§47.4's lesson, in a
+different disguise).
+
 ### 49.5 Two bugs that only the live deploy could find
 
 Worth recording because both would have passed any test written from the same assumptions as the
