@@ -46,7 +46,12 @@ type fakeRepository struct {
 
 	nextInstrumentID int64
 	instruments      map[int64]port.Instrument
-	marketTokens     map[string][]port.MarketToken
+	// upsertInstrumentCalls counts WRITES, not their effect. RosterFor's config fallback must fire
+	// only when the table is genuinely empty, and because UpsertInstrument never overwrites an
+	// existing row's flags, a wrongly re-seeded roster looks identical to a correctly-read one from
+	// the outside — only the call count separates them.
+	upsertInstrumentCalls int
+	marketTokens          map[string][]port.MarketToken
 }
 
 func newFakeRepository() *fakeRepository {
@@ -3030,6 +3035,7 @@ func (f *fakeRepository) ListInstruments(_ context.Context, filter port.Instrume
 func (f *fakeRepository) UpsertInstrument(_ context.Context, in port.Instrument) (port.Instrument, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.upsertInstrumentCalls++
 	for id, existing := range f.instruments {
 		if existing.Exchange == in.Exchange && existing.Symbol == in.Symbol {
 			// Refresh the market snapshot and exec id only. The enable flags stay as they are —

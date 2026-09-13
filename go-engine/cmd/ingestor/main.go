@@ -11,12 +11,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
-	"github.com/eghbalii/okxBot/go-engine/internal/okx"
 	"github.com/eghbalii/okxBot/go-engine/internal/okx/ws"
+	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )
 
 func main() {
@@ -28,29 +30,79 @@ func main() {
 		os.Exit(1)
 	}
 
-	// CLAUDE.md §27, 2026-09-04 design: trading.inst_ids are short internal symbols ("BTC"), never
-	// OKX's own wire-format instId — this is the ONE place in the whole pipeline that talks OKX's
-	// wire format at all, so it resolves each symbol to a real instId for the WS subscription, then
-	// translates every inbound message's instId back to the short symbol before anything is
-	// published to Kafka. Resolved once at startup, failing loudly (not subscribing to nothing) if
-	// any configured symbol has no map entry.
-	symbolMap := okx.SymbolMap(cfg.Trading.SymbolMap)
-	wsInstIDs, err := symbolMap.ResolveAll(cfg.Trading.InstIDs)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// The instrument roster now comes from the DATABASE, not config.yaml (2026-09-13, migration
+	// 000031). That is what lets the token-discovery scan put a newly-found token to work: while the
+	// roster was trading.inst_ids plus a hand-maintained trading.symbol_map, a scanned token had
+	// neither an entry nor an exec instId and could never be subscribed to.
+	//
+	// config.yaml's own list is still the seed for a database that has never held a roster — the
+	// state of every deployment the moment this lands — so this deploy changes nothing about what is
+	// collected until a scan or an operator says otherwise. See usecase.RosterFor.
+	repo, err := postgres.New(ctx, cfg.Postgres.DSN)
+	if err != nil {
+		logger.Error("failed to connect to postgres", "error", err)
+		os.Exit(1)
+	}
+	defer repo.Close()
+	if err := repo.Migrate(ctx); err != nil {
+		logger.Error("failed to run migrations", "error", err)
+		os.Exit(1)
+	}
+
+	// CLAUDE.md §27, 2026-09-04 design: symbols are short internal identities ("BTC"), never OKX's
+	// own wire-format instId — this is the ONE place in the whole pipeline that talks OKX's wire
+	// format at all, so it resolves each symbol to a real instId for the WS subscription, then
+	// translates every inbound message's instId back to the short symbol before anything is published
+	// to Kafka.
+	seedExecIDs, err := usecase.SeedExecIDs(cfg.Trading.SymbolMap, cfg.Trading.InstIDs)
 	if err != nil {
 		logger.Error("failed to resolve trading.inst_ids against trading.symbol_map", "error", err)
 		os.Exit(1)
 	}
-	symbolFor := reverseSymbolMap(cfg.Trading.InstIDs, wsInstIDs)
+	roster, err := usecase.RosterFor(ctx, repo, "okx", "ingest",
+		cfg.Trading.InstIDs, seedExecIDs, cfg.Trading.ExecInstType, logger)
+	if err != nil {
+		logger.Error("failed to load instrument roster", "error", err)
+		os.Exit(1)
+	}
+	if len(roster.Symbols) == 0 {
+		// Starting with nothing to subscribe to would leave a process that looks healthy and
+		// collects no data at all — the silent-data-gap failure §9 exists to prevent.
+		logger.Error("instrument roster is empty for the ingest consumer — nothing to subscribe to")
+		os.Exit(1)
+	}
+
+	wsInstIDs := make([]string, 0, len(roster.Symbols))
+	symbolFor := make(map[string]string, len(roster.Symbols))
+	for _, sym := range roster.Symbols {
+		wireID := roster.ExecInstID[sym]
+		wsInstIDs = append(wsInstIDs, wireID)
+		symbolFor[wireID] = sym
+	}
 	resolveSymbol := func(wireInstID string) (string, error) {
 		sym, ok := symbolFor[wireInstID]
 		if !ok {
-			return "", fmt.Errorf("received data for OKX instId %q with no configured symbol_map entry", wireInstID)
+			return "", fmt.Errorf("received data for OKX instId %q with no roster entry", wireInstID)
 		}
 		return sym, nil
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// Watch for the roster changing underneath us and restart when it does. A WS subscription is
+	// fixed for the life of its socket, so adding an instrument means re-subscribing; exiting and
+	// letting the restart policy relaunch re-derives every piece of state from the database, where a
+	// partial in-place reload is how a service ends up half-subscribed with nothing reporting it
+	// (the same mechanism cmd/strategy-tester §18 and cmd/paper-trader §22 use for config changes).
+	go (&usecase.RosterWatcher{
+		Repo: repo, Exchange: "okx", Consumer: "ingest",
+		Interval: time.Minute, Logger: logger, Baseline: roster.Symbols,
+		OnChange: func(reason string) {
+			logger.Info("restarting to pick up the new instrument roster", "reason", reason)
+			stop()
+		},
+	}).Run(ctx)
 
 	metrics.Serve(envOr("METRICS_ADDR", ":9101"), logger)
 
@@ -132,7 +184,7 @@ func main() {
 		})
 	}
 
-	logger.Info("starting okx ingestor", "instIds", cfg.Trading.InstIDs, "bars", cfg.Ingestion.Bars)
+	logger.Info("starting okx ingestor", "instIds", roster.Symbols, "bars", cfg.Ingestion.Bars)
 
 	errCh := make(chan error, 1+len(candleClients))
 	go func() { errCh <- tickerClient.Run(ctx) }()
@@ -159,17 +211,6 @@ type candleEvent struct {
 	InstID string   `json:"instId"`
 	Bar    string   `json:"bar"`
 	Candle []string `json:"candle"`
-}
-
-// reverseSymbolMap builds the real-OKX-instId -> short-symbol lookup used to translate every
-// inbound WS message back to the internal identity. symbols and resolvedInstIDs must be the same
-// length and in the same order (as SymbolMap.ResolveAll guarantees).
-func reverseSymbolMap(symbols, resolvedInstIDs []string) map[string]string {
-	out := make(map[string]string, len(symbols))
-	for i, sym := range symbols {
-		out[resolvedInstIDs[i]] = sym
-	}
-	return out
 }
 
 func envOr(key, fallback string) string {

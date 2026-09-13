@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 	"testing"
 )
 
@@ -34,19 +35,30 @@ func TestRewriteInstID_InvalidJSONErrors(t *testing.T) {
 	}
 }
 
-func TestReverseSymbolMap_BuildsCorrectLookup(t *testing.T) {
-	symbols := []string{"BTC", "ETH"}
-	resolved := []string{"BTC-USD_UM_XPERP-310404", "ETH-USD_UM_XPERP-310404"}
-
-	got := reverseSymbolMap(symbols, resolved)
-
-	if got["BTC-USD_UM_XPERP-310404"] != "BTC" {
-		t.Errorf("got[BTC-USD_UM_XPERP-310404] = %q, want BTC", got["BTC-USD_UM_XPERP-310404"])
+// seedExecIDsFrom is the one-time bridge from config.yaml's symbol_map into the database-backed
+// roster (2026-09-13). It replaced reverseSymbolMap, which became dead once the roster's own
+// exec_inst_id column took over the lookup — removed rather than left behind with a passing test,
+// since a tested function nothing calls reads as load-bearing when it is not.
+func TestSeedExecIDsFrom_BuildsTheSeedMap(t *testing.T) {
+	m := map[string]string{
+		"BTC": "BTC-USD_UM_XPERP-310404",
+		"ETH": "ETH-USD_UM_XPERP-310404",
 	}
-	if got["ETH-USD_UM_XPERP-310404"] != "ETH" {
-		t.Errorf("got[ETH-USD_UM_XPERP-310404] = %q, want ETH", got["ETH-USD_UM_XPERP-310404"])
+	got, err := usecase.SeedExecIDs(m, []string{"BTC", "ETH"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(got) != 2 {
-		t.Errorf("len(got) = %d, want 2", len(got))
+	if got["BTC"] != "BTC-USD_UM_XPERP-310404" || got["ETH"] != "ETH-USD_UM_XPERP-310404" {
+		t.Errorf("got %v", got)
+	}
+}
+
+// A symbol with no map entry must fail the seed rather than write a row with an empty exec id: OKX
+// accepts an empty instId as a subscription and then pushes nothing, which is a silent data gap on a
+// pipeline that looks perfectly healthy (§9's own reasoning for validating bar-name casing).
+func TestSeedExecIDsFrom_FailsOnAMissingEntry(t *testing.T) {
+	m := map[string]string{"BTC": "BTC-USD_UM_XPERP-310404"}
+	if _, err := usecase.SeedExecIDs(m, []string{"BTC", "MYSTERY"}); err == nil {
+		t.Error("a symbol with no symbol_map entry must fail loudly")
 	}
 }

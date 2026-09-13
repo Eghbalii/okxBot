@@ -235,7 +235,45 @@ func runRealTrader(
 		logger.Error("paper_trading.bars is empty; RealTrader needs at least one decision bar")
 		os.Exit(1)
 	}
-	if err := repo.SetAssignmentsEnabledForKinds(ctx, "real", ptCfg.ActiveKinds, cfg.Trading.InstIDs, decisionBars); err != nil {
+	// The instrument roster comes from the DATABASE, filtered to rows a person has explicitly enabled
+	// for REAL money (2026-09-13, migration 000031). This is where the discovery scan's own posture
+	// takes effect: a scanned token is admitted with enabled_real=FALSE, so it collects data and
+	// paper-trades without ever reaching this loop until somebody turns it on from the panel.
+	//
+	// No config fallback here, deliberately, unlike the ingestor and paper-trader: those seed an
+	// empty table from config.yaml so an existing deployment keeps collecting and paper-trading
+	// exactly what it did before. Seeding real-money instruments from a config file on a service's
+	// own initiative is a different kind of act, and this process refuses rather than assumes.
+	realRoster, err := usecase.RosterFor(ctx, repo, "okx", "real", nil, nil, "", logger)
+	if err != nil {
+		logger.Error("failed to load real-mode instrument roster", "error", err)
+		os.Exit(1)
+	}
+	instIDs := realRoster.Symbols
+	if len(instIDs) == 0 {
+		logger.Error("no instrument is enabled for real trading — enable one from the panel's roster")
+		os.Exit(1)
+	}
+	// Prefer the roster's own exec id over config's symbol_map: the roster is what a scan writes, and
+	// OKX's X-Perp ids carry a rolling expiry (§33.4) that the roster refreshes on every scan while a
+	// YAML map goes stale silently.
+	for _, sym := range instIDs {
+		if id := realRoster.ExecInstID[sym]; id != "" {
+			execInstIDFor[sym] = id
+		}
+	}
+	// Restart when the real roster changes, so enabling a token from the panel takes effect without a
+	// manual redeploy — the same mechanism the other two services use.
+	go (&usecase.RosterWatcher{
+		Repo: repo, Exchange: "okx", Consumer: "real",
+		Interval: time.Minute, Logger: logger, Baseline: instIDs,
+		OnChange: func(reason string) {
+			logger.Info("restarting to pick up the new real-mode instrument roster", "reason", reason)
+			os.Exit(0)
+		},
+	}).Run(ctx)
+
+	if err := repo.SetAssignmentsEnabledForKinds(ctx, "real", ptCfg.ActiveKinds, instIDs, decisionBars); err != nil {
 		logger.Error("failed to apply real-mode active-strategy-kinds restriction", "error", err)
 		os.Exit(1)
 	}
@@ -244,7 +282,7 @@ func runRealTrader(
 	// PaperTrader's own equivalent sweep.
 	if ptCfg.TradingState == "stopped" {
 		openOnly := true
-		for _, instID := range cfg.Trading.InstIDs {
+		for _, instID := range instIDs {
 			open, err := repo.ListRealPositions(ctx, port.PositionFilter{InstID: instID, Open: &openOnly})
 			if err != nil {
 				logger.Error("failed to list open real positions for stopped sweep", "instId", instID, "error", err)
@@ -292,12 +330,12 @@ func runRealTrader(
 
 	clamps := buildRealTraderClamps(cfg)
 
-	errCh := make(chan error, len(cfg.Trading.InstIDs)+1+len(candleDispatchers))
+	errCh := make(chan error, len(instIDs)+1+len(candleDispatchers))
 	const engineStartStagger = 300 * time.Millisecond
 	// Kept so the affordability service can push roster changes into engines that are already
 	// running, rather than the change only landing at the next restart.
-	engines := make(map[string]*usecase.RealTrader, len(cfg.Trading.InstIDs))
-	for i, instID := range cfg.Trading.InstIDs {
+	engines := make(map[string]*usecase.RealTrader, len(instIDs))
+	for i, instID := range instIDs {
 		strategies, err := loadRealTraderStrategyAssignments(ctx, repo, instID, logger)
 		if err != nil {
 			logger.Error("failed to load strategy assignments", "instId", instID, "error", err)
@@ -324,7 +362,7 @@ func runRealTrader(
 			Mode:            mode,
 			TdMode:          cfg.Trading.TdMode,
 			PosMode:         cfg.Trading.PosMode,
-			ActiveTokens:    cfg.Trading.InstIDs,
+			ActiveTokens:    instIDs,
 
 			// Panel control-box gates for real mode (CLAUDE.md real-trading readiness plan,
 			// 2026-09-04) — mirrors cmd/paper-trader's own PaperTrader construction exactly.
@@ -387,10 +425,13 @@ func runRealTrader(
 	// trading loop down because an affordability check could not read a price would be far worse
 	// than leaving the roster as it is.
 	affordability := &usecase.AffordabilityService{
-		Repo:           repo,
-		Exchange:       exchangeClient,
-		Logger:         logger,
-		Mode:           "real",
+		Repo:     repo,
+		Exchange: exchangeClient,
+		Logger:   logger,
+		Mode:     "real",
+		// The full CONFIGURED set, not the real-enabled roster: this service decides which tokens
+		// are affordable and re-enables one that has become affordable again, so handing it only the
+		// already-enabled subset would leave it unable to ever restore a token it disabled itself.
 		AllTokens:      cfg.Trading.InstIDs,
 		Symbols:        okx.SymbolMap(cfg.Trading.SymbolMap),
 		ExecInstType:   cfg.Trading.ExecInstType,

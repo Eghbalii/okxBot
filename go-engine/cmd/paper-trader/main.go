@@ -56,7 +56,42 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("starting paper trader", "instIds", cfg.Trading.InstIDs)
+	// The instrument roster comes from the DATABASE, not config.yaml (2026-09-13, migration 000031) —
+	// the same source the ingestor reads, so a token the discovery scan admitted starts paper-trading
+	// on the next restart rather than needing a config edit. config.yaml's list seeds a database that
+	// has never held a roster, so this deploy changes nothing about what is traded until a scan or an
+	// operator says otherwise (usecase.RosterFor).
+	seedExecIDs, err := usecase.SeedExecIDs(cfg.Trading.SymbolMap, cfg.Trading.InstIDs)
+	if err != nil {
+		logger.Error("failed to resolve trading.inst_ids against trading.symbol_map", "error", err)
+		os.Exit(1)
+	}
+	roster, err := usecase.RosterFor(ctx, repo, "okx", "paper",
+		cfg.Trading.InstIDs, seedExecIDs, cfg.Trading.ExecInstType, logger)
+	if err != nil {
+		logger.Error("failed to load instrument roster", "error", err)
+		os.Exit(1)
+	}
+	if len(roster.Symbols) == 0 {
+		logger.Error("instrument roster is empty for the paper consumer — nothing to trade")
+		os.Exit(1)
+	}
+	instIDs := roster.Symbols
+
+	// Restart when the roster changes, so a scan-admitted token is picked up without a manual
+	// redeploy. Same mechanism and reasoning as the ingestor's: each PaperTrader owns one
+	// instrument's candle windows and consumer registrations, built once at startup, and a restart
+	// re-derives all of it from the database rather than mutating it in place half-way.
+	go (&usecase.RosterWatcher{
+		Repo: repo, Exchange: "okx", Consumer: "paper",
+		Interval: time.Minute, Logger: logger, Baseline: instIDs,
+		OnChange: func(reason string) {
+			logger.Info("restarting to pick up the new instrument roster", "reason", reason)
+			stop()
+		},
+	}).Run(ctx)
+
+	logger.Info("starting paper trader", "instIds", instIDs)
 
 	// Funding-rate poller (CLAUDE.md, 2026-09-06): keeps funding_rates current so realizedPnL's
 	// funding-cost lookup has real, per-instrument, per-period data rather than a fixed config
@@ -67,7 +102,7 @@ func main() {
 		gatewayclient.New(cfg.Gateway.URL, "paper-trader"),
 		repo,
 		cfg.Trading.SymbolMap,
-		cfg.Trading.InstIDs,
+		instIDs,
 		cfg.FundingRate.PollInterval,
 		logger,
 	)
@@ -100,14 +135,14 @@ func main() {
 		logger.Error("failed to seed origin strategies", "error", err)
 		os.Exit(1)
 	}
-	if err := ensureDefaultAssignment(ctx, repo, cfg.Trading.InstIDs, paperTradingBars); err != nil {
+	if err := ensureDefaultAssignment(ctx, repo, instIDs, paperTradingBars); err != nil {
 		logger.Error("failed to ensure default strategy assignment", "error", err)
 		os.Exit(1)
 	}
 	// Global per-kind "active strategies" toggle (CLAUDE.md): bulk-applied to strategy_assignments
 	// BEFORE loadStrategyAssignments reads them below, so ListAssignments(enabledOnly=true) picks
 	// up the result with no change needed to that function. A no-op when ActiveKinds is empty.
-	if err := repo.SetAssignmentsEnabledForKinds(ctx, "paper", ptCfg.ActiveKinds, cfg.Trading.InstIDs, paperTradingBars); err != nil {
+	if err := repo.SetAssignmentsEnabledForKinds(ctx, "paper", ptCfg.ActiveKinds, instIDs, paperTradingBars); err != nil {
 		logger.Error("failed to apply active-strategy-kinds restriction", "error", err)
 		os.Exit(1)
 	}
@@ -128,7 +163,7 @@ func main() {
 	// Panel control-box HTTP surface (CLAUDE.md) — GET/PUT /config + POST /restart, mirroring
 	// cmd/strategy-tester's own pattern. GET /config reflects ptCfg as loaded at THIS startup, not
 	// a live DB round-trip, same asymmetry as the tester (a save is only "live" after a restart).
-	ptSvc := &paperTraderService{repo: repo, logger: logger, current: ptCfg, allInstIDs: cfg.Trading.InstIDs}
+	ptSvc := &paperTraderService{repo: repo, logger: logger, current: ptCfg, allInstIDs: instIDs}
 	ptAddr := envOr("PAPER_TRADER_ADDR", "0.0.0.0:8093")
 	ptHTTPServer := &http.Server{Addr: ptAddr, Handler: ptSvc.routes()}
 	go func() {
@@ -185,13 +220,13 @@ func main() {
 	// service's existing "config changes need a restart" posture (§22) — enabling/disabling a token
 	// mid-run doesn't retroactively resize an order already open, only the next one to open.
 	activeTokenCount := 0
-	for _, instID := range cfg.Trading.InstIDs {
+	for _, instID := range instIDs {
 		if !slices.Contains(ptCfg.DisabledInstIDs, instID) {
 			activeTokenCount++
 		}
 	}
 
-	errCh := make(chan error, len(cfg.Trading.InstIDs)+1+len(candleDispatchers))
+	errCh := make(chan error, len(instIDs)+1+len(candleDispatchers))
 	// Staggering each instrument's engine start (rather than launching every goroutine in the same
 	// instant) spreads out seedCandles()'s REST calls — with 10 instruments x 3 bars, an
 	// unstaggered start fires 30 requests within milliseconds and was observed tripping an OKX
@@ -199,7 +234,7 @@ func main() {
 	// instrument each run. 300ms keeps total startup delay well under a second even at Phase B's
 	// 10-token scale.
 	const engineStartStagger = 300 * time.Millisecond
-	for i, instID := range cfg.Trading.InstIDs {
+	for i, instID := range instIDs {
 		// Strategy assignments are durable (strategy_assignments table, CLAUDE.md §11.3): loaded
 		// fresh from Postgres on every start, so a crash/restart resumes with exactly the same
 		// token/timeframe->strategy bindings the panel last configured, not whatever was hardcoded
@@ -242,7 +277,7 @@ func main() {
 			// Force-closes a stale position regardless of RL flags (CLAUDE.md §15.14) — unlike
 			// everything else in this block, this is unconditional housekeeping, not RL behavior.
 			MaxOpenDuration: cfg.PaperTrading.RLMaxOpenDuration,
-			ActiveTokens:    cfg.Trading.InstIDs,
+			ActiveTokens:    instIDs,
 			// One shared account across every token (CLAUDE.md §15.6): each per-instrument engine
 			// trades against the same "paper" balance row, not a slice of it.
 			Mode:                "paper",

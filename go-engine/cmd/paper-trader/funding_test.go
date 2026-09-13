@@ -49,7 +49,10 @@ func TestRunFundingRatePoller_ResolvesSymbolBeforeFetching(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
-	go func() { runFundingRatePoller(ctx, fetcher, saver, symbolMap, []string{"BTC"}, time.Hour, testLogger()); close(done) }()
+	go func() {
+		runFundingRatePoller(ctx, fetcher, saver, symbolMap, []string{"BTC"}, time.Hour, testLogger())
+		close(done)
+	}()
 	cancel()
 	<-done
 
@@ -74,7 +77,10 @@ func TestRunFundingRatePoller_StoresUnderShortSymbol(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { runFundingRatePoller(ctx, fetcher, saver, symbolMap, []string{"BTC"}, time.Hour, testLogger()); close(done) }()
+	go func() {
+		runFundingRatePoller(ctx, fetcher, saver, symbolMap, []string{"BTC"}, time.Hour, testLogger())
+		close(done)
+	}()
 	cancel()
 	<-done
 
