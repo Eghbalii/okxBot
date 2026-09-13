@@ -64,25 +64,75 @@ export default function TokenIcon({ symbol, size = 24 }: { symbol: string; size?
   )
 }
 
-// ExchangeBadges shows which exchanges carry a token: compact marks by default, with the full list on
-// hover, per the Home page's own spec. The marks are letter-based rather than brand logos — an
-// exchange's logo is its trademark, and a two-letter mark carries the same information here.
+// Exchange logo sources, verified against the live CDN (2026-09-13): 294 is OKX (the black
+// checkerboard), 544 is MEXC (the blue M). Checked by actually downloading and looking at both —
+// an id map is exactly the kind of thing that is silently wrong otherwise.
+//
+// Unlike token icons, this is a SMALL FIXED SET: an exchange only appears here once an adapter has
+// been written for it, so a missing id is a wiring gap to fix rather than the routine case. The
+// letter fallback still exists for when the CDN itself is unreachable.
+const EXCHANGE_LOGOS: Record<string, string> = {
+  okx: 'https://s2.coinmarketcap.com/static/img/exchanges/64x64/294.png',
+  mexc: 'https://s2.coinmarketcap.com/static/img/exchanges/64x64/544.png',
+}
+
+/**
+ * One exchange's round logo, falling back to a colored letter mark.
+ *
+ * Round rather than square because these are identity marks in a dense table, and a circle reads as
+ * "who" where a square reads as "what" — the token icons beside them are already round for the same
+ * reason.
+ */
+export function ExchangeIcon({ exchange, size = 20 }: { exchange: string; size?: number }) {
+  const [failed, setFailed] = useState(false)
+  const src = EXCHANGE_LOGOS[exchange]
+  const style = { width: size, height: size, minWidth: size }
+
+  if (!src || failed) {
+    return (
+      <span
+        className={`exchange-icon exchange-icon-fallback exchange-icon-${exchange}`}
+        style={{ ...style, fontSize: size * 0.42 }}
+        title={exchange}
+        aria-label={exchange}
+      >
+        {exchange.slice(0, 2).toUpperCase()}
+      </span>
+    )
+  }
+  return (
+    <img
+      className="exchange-icon"
+      style={style}
+      src={src}
+      alt={exchange}
+      title={exchange}
+      loading="lazy"
+      onError={() => setFailed(true)}
+    />
+  )
+}
+
+/**
+ * The exchanges a token trades on: round logos, with their names revealed on hover.
+ *
+ * The name is shown on hover rather than always, because at ten-plus rows the names cost more width
+ * than the whole price column and say the same thing twice — but a logo alone is unreadable until
+ * you have learned it, so the hover has to be real rather than only a native title tooltip (which is
+ * slow to appear and cannot be styled).
+ */
 export function ExchangeBadges({ exchanges }: { exchanges: string[] }) {
   const sorted = [...exchanges].sort()
   return (
     <span className="exchange-badges" title={sorted.join(', ')}>
       {sorted.map((ex) => (
-        <span key={ex} className={`exchange-badge exchange-badge-${ex}`} aria-label={ex}>
-          {ex.slice(0, 2).toUpperCase()}
-        </span>
+        <ExchangeIcon key={ex} exchange={ex} />
       ))}
-      {/* The hover list is a real element rather than only the title attribute: a native tooltip is
-          slow to appear and cannot be styled, and this is the page's primary way of answering "where
-          can I trade this". */}
       <span className="exchange-badges-popover" role="tooltip">
         {sorted.map((ex) => (
           <span key={ex} className="exchange-badges-popover-row">
-            {ex}
+            <ExchangeIcon exchange={ex} size={14} />
+            {ex.toUpperCase()}
           </span>
         ))}
       </span>

@@ -1931,9 +1931,19 @@ input[type='number'] {
   padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: left;
 }
 .home-market-table th { font-size: 11px; color: var(--text-dim); text-transform: uppercase; }
-/* Rows are clickable (they open the chart), so they say so on hover. */
-.home-market-row { cursor: pointer; }
+/* The row highlights on hover to keep it readable across, but only the token name navigates — a
+   table where every click opens something is hard to read from. */
 .home-market-row:hover { background: rgba(88, 166, 255, 0.07); }
+
+/* A button, not a span, so it is keyboard-reachable — but styled as the text it sits in rather than
+   as a control, since a button chrome on every row would dominate the table. */
+.token-symbol-link {
+  background: none; border: none; padding: 0; margin: 0;
+  font: inherit; font-weight: 600; color: var(--text);
+  cursor: pointer; text-align: left;
+}
+.token-symbol-link:hover { color: var(--accent); text-decoration: underline; }
+.token-symbol-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
 
 .token-cell { display: flex; align-items: center; gap: 8px; }
 .token-symbol { font-weight: 600; }
@@ -1950,17 +1960,21 @@ input[type='number'] {
   border-radius: 50%; background: var(--green); vertical-align: middle;
 }
 
-/* --- exchange badges, with the full list on hover --- */
-.exchange-badges { position: relative; display: inline-flex; gap: 3px; }
-.exchange-badge {
-  display: inline-flex; align-items: center; justify-content: center;
-  min-width: 22px; height: 16px; padding: 0 3px;
-  font-size: 9px; font-weight: 700; letter-spacing: 0.02em;
-  border-radius: 3px; background: var(--border); color: var(--text-dim);
+/* --- exchange icons, with names revealed on hover --- */
+.exchange-badges { position: relative; display: inline-flex; gap: 4px; align-items: center; }
+/* Round, like the token icons beside them: a circle reads as "who", a square as "what". The white
+   ground matters — both logos are drawn for light backgrounds and vanish into this theme without it. */
+.exchange-icon {
+  border-radius: 50%; display: inline-block; background: #fff;
+  object-fit: contain; padding: 1px; box-sizing: border-box;
 }
-/* Per-exchange color so a venue is recognizable without reading the letters. */
-.exchange-badge-okx { background: #1f4d7a; color: #cfe6ff; }
-.exchange-badge-mexc { background: #1b5c4a; color: #cdf3e6; }
+.exchange-icon-fallback {
+  display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 700; letter-spacing: -0.02em; line-height: 1;
+  background: var(--border); color: var(--text-dim); padding: 0;
+}
+.exchange-icon-okx { background: #1f4d7a; color: #cfe6ff; }
+.exchange-icon-mexc { background: #1b5c4a; color: #cdf3e6; }
 .exchange-badges-popover {
   display: none; position: absolute; top: 100%; left: 0; z-index: 20;
   margin-top: 4px; padding: 5px 8px;
@@ -1968,7 +1982,7 @@ input[type='number'] {
   font-size: 11px; white-space: nowrap;
 }
 .exchange-badges:hover .exchange-badges-popover { display: block; }
-.exchange-badges-popover-row { display: block; }
+.exchange-badges-popover-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
 
 /* --- per-mode status flags --- */
 .status-cell { display: flex; gap: 4px; }

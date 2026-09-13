@@ -1,4 +1,8 @@
-export const PAGE_SIZE_OPTIONS = [20, 50, 100, 200]
+// 10 was added for the Home page's market table (2026-09-13 request, which asked for ten tokens per
+// page). It matters that the list contains every size a caller actually uses: a <select> given a
+// value absent from its options renders the first option instead, so the control silently displayed
+// "20" while the table was showing 10 — a control reporting a setting that is not in effect.
+export const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200]
 export const DEFAULT_PAGE_SIZE = 20
 
 // Renders the page controls; the fetch itself is server-side paginated (CLAUDE.md §11.4,

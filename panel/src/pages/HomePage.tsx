@@ -11,6 +11,7 @@ import type {
 import { useCachedResource } from '../hooks/useCachedResource'
 import { usePriceStream } from '../hooks/usePriceStream'
 import SortableTh from '../components/SortableTh'
+import Pagination from '../components/Pagination'
 import TokenIcon, { ExchangeBadges } from '../components/TokenIcon'
 import TokenChartModal from '../components/TokenChartModal'
 
@@ -221,6 +222,11 @@ export default function HomePage() {
   const [search, setSearch] = useState('')
   const [rosterOnly, setRosterOnly] = useState(false)
   const [chartToken, setChartToken] = useState<string | null>(null)
+  const [page, setPage] = useState(0)
+  // 10 per page by explicit request. Client-side: the whole snapshot is ~142 rows and already
+  // arrives in one request, so paging in the browser is instant where a request per page would add a
+  // VPN round trip to every click for no benefit at this size.
+  const [pageSize, setPageSize] = useState(10)
   const [scanning, setScanning] = useState(false)
   const [scanResults, setScanResults] = useState<ScanResult[] | null>(null)
 
@@ -249,6 +255,15 @@ export default function HomePage() {
       return (a[sortBy] - b[sortBy]) * dir
     })
   }, [tokens, rosterOnly, search, sortBy, sortDesc])
+
+  // Clamp rather than reset to 0: re-sorting should keep you where you were reading, but filtering
+  // down to fewer rows than the current offset would otherwise show a blank table that looks broken.
+  const pageCount = Math.max(1, Math.ceil(rows.length / pageSize))
+  const safePage = Math.min(page, pageCount - 1)
+  const pageRows = useMemo(
+    () => rows.slice(safePage * pageSize, safePage * pageSize + pageSize),
+    [rows, safePage, pageSize],
+  )
 
   function onSort(field: SortField) {
     if (field === sortBy) {
@@ -292,13 +307,19 @@ export default function HomePage() {
             className="home-search"
             placeholder="Filter symbol…"
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => {
+              setSearch(e.target.value)
+              setPage(0)
+            }}
           />
           <label className="home-toggle">
             <input
               type="checkbox"
               checked={rosterOnly}
-              onChange={(e) => setRosterOnly(e.target.checked)}
+              onChange={(e) => {
+                setRosterOnly(e.target.checked)
+                setPage(0)
+              }}
             />
             Traded only
           </label>
@@ -333,48 +354,71 @@ export default function HomePage() {
                   Token
                 </SortableTh>
                 <th>Exchanges</th>
-                <SortableTh field="lastPx" sortBy={sortBy} sortDesc={sortDesc} onSort={onSort}>
+                <SortableTh
+                  field="lastPx"
+                  sortBy={sortBy}
+                  sortDesc={sortDesc}
+                  onSort={onSort}
+                  title="A green dot means the price is streaming live. Without one it is the last scan's price — only tokens in the trading roster have a live feed."
+                >
                   Price
                 </SortableTh>
                 <SortableTh field="change24hPct" sortBy={sortBy} sortDesc={sortDesc} onSort={onSort}>
                   24h
                 </SortableTh>
-                <SortableTh field="range24hPct" sortBy={sortBy} sortDesc={sortDesc} onSort={onSort}>
+                <SortableTh
+                  field="range24hPct"
+                  sortBy={sortBy}
+                  sortDesc={sortDesc}
+                  onSort={onSort}
+                  title="24h high minus low, as a % of price. Unlike 24h change it does not cancel out on a token that moved hard both ways and came back."
+                >
                   Range
                 </SortableTh>
                 <SortableTh field="vol24hUsd" sortBy={sortBy} sortDesc={sortDesc} onSort={onSort}>
                   Volume 24h
                 </SortableTh>
-                <SortableTh field="score" sortBy={sortBy} sortDesc={sortDesc} onSort={onSort}>
+                <SortableTh
+                  field="score"
+                  sortBy={sortBy}
+                  sortDesc={sortDesc}
+                  onSort={onSort}
+                  title="The scan's ranking composite: 55% volume, 25% absolute 24h change, 20% range — each relative to the day's largest. Volume dominates because liquidity decides whether this bot can trade a token at all."
+                >
                   Score
                 </SortableTh>
                 <th>Status</th>
               </tr>
             </thead>
             <tbody>
-              {rows.map((r) => {
+              {pageRows.map((r) => {
                 // A live price when the bot is streaming this token, the scan's own last price
                 // otherwise. Never blank: an untracked token still has a real, if slightly older,
                 // price, and showing nothing would read as missing data.
                 const live = livePrices[r.symbol]
                 const price = live ? Number(live) : r.lastPx
                 return (
-                  <tr
-                    key={r.symbol}
-                    className="home-market-row"
-                    onClick={() => setChartToken(r.symbol)}
-                    title={`Open ${r.symbol} chart`}
-                  >
+                  <tr key={r.symbol} className="home-market-row">
+                    {/* Only the token name opens the chart (explicit request). A whole-row click
+                        fires on any stray click in the table — selecting a price, missing a header —
+                        and a table where every click navigates is hard to read from. */}
                     <td className="token-cell">
                       <TokenIcon symbol={r.symbol} />
-                      <span className="token-symbol">{r.symbol}</span>
+                      <button
+                        type="button"
+                        className="token-symbol token-symbol-link"
+                        onClick={() => setChartToken(r.symbol)}
+                        title={`Open ${r.symbol} chart`}
+                      >
+                        {r.symbol}
+                      </button>
                     </td>
                     <td>
                       <ExchangeBadges exchanges={r.exchanges} />
                     </td>
-                    <td className="num" title={live ? 'live' : `from ${r.priceFrom} scan`}>
+                    <td className="num" title={live ? 'live price (streaming)' : `last scan price, from ${r.priceFrom}`}>
                       {fmtPrice(price)}
-                      {live && <span className="live-dot" />}
+                      {live && <span className="live-dot" title="streaming live" />}
                     </td>
                     <td className={'num ' + (r.change24hPct >= 0 ? 'pos' : 'neg')}>
                       {fmtPct(r.change24hPct)}
@@ -417,6 +461,18 @@ export default function HomePage() {
               })}
             </tbody>
           </table>
+        )}
+        {rows.length > 0 && (
+          <Pagination
+            page={safePage}
+            pageSize={pageSize}
+            total={rows.length}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size)
+              setPage(0)
+            }}
+          />
         )}
       </div>
 
