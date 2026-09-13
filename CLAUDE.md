@@ -6107,3 +6107,37 @@ top on volume; FIL at +23.9% and ZCAT with a 61% range surfacing on the change/r
 One consequence to be aware of rather than a defect: paper equity is $11.10 and dynamic sizing is
 equity ÷ active tokens (§32.4), so going from 10 to 21 tokens halves each new paper position to
 ~$0.53. `scan.top_n` (20) is the dial for that.
+
+### 53.8 Paper trading cap raised to $200 (2026-09-13)
+
+Operator decision, after the roster grew from 10 to 21 tokens and made the sizing problem obvious:
+paper equity was $11.32 and dynamic sizing is equity ÷ active tokens (§32.4), so each new position was
+opening at ~$0.54 — too small to produce a reward signal worth learning from.
+
+**Checked before acting, and two of the alarming numbers were not what they looked like:**
+
+- **The −$51.40 over 30 days spans TWO resets**, not one continuous drawdown (`reset_count` was 2,
+  last on 2026-09-04). The §15.7 give-it-another-chance mechanic had already fired twice, so that
+  figure is the sum across reloads rather than the depth of a single hole.
+- **`completed_trades: 7` against a 5,117-entry replay buffer** looked like the reward path was
+  broken — §15.12's exact failure mode, where the model is asked questions and never told how any
+  answer turned out. It is not: `rl-service` had restarted 2 hours earlier, and that counter is
+  per-process while the buffer is restored from snapshot (§15.11's design working as intended). Worth
+  recording because the two numbers will look contradictory again after every restart.
+
+**$200 rather than $500**, deliberately. It gives ~$9.52 per position across 21 tokens (~$95 notional
+at 10x), which is close to the $5.67 average the model already has 1,920 trades of experience at — so
+the observation's size-ratio feature stays in a distribution it has seen, rather than jumping into one
+it has not. §19.1's own lesson applies here: a step change in a feature the model reads is a real cost,
+not a free parameter.
+
+**A correction to the reasoning I initially offered the operator**: a bigger cap does NOT buy
+proportionally more runway. Losses scale with position size, so at $200 the per-trade loss roughly
+doubles too and the account lasts a similar number of days. What the cap buys is *meaningful position
+sizes*, not more time — and saying otherwise would have made the change look safer than it is.
+
+**The underlying loss rate is untouched by this**, and is the real open question: 35% win rate
+(674/1920) with a −$0.027 average per trade, and every one of the last eight days negative. More
+capital per trade will lose it faster, not slower. The two candidate next steps stay open and
+independent of this change: cutting `scan.top_n` so fewer tokens share the account, and reviewing the
+strategy mix that is producing a 35% win rate.
