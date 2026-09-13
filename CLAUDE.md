@@ -5811,3 +5811,70 @@ typecheck nor a visual pass would reveal. 14 checks total, and they caught a rea
 shipped. Worth adding a real framework if the panel grows more logic of this kind.
 
 Bundle grew 0.7KB.
+
+## 51. A lagging "flat" reading closed a just-opened position and cancelled its stop (2026-09-13)
+
+Reported as the panel's new halt-reset button refusing to work:
+
+```
+exchange reports 1 open position(s) but only 0 are tracked locally
+— resolve the untracked position before resetting
+```
+
+**The gate was right.** It was refusing because a genuinely untracked position existed — which is
+exactly what §49.2 built it for. Checked before acting: the exchange held a real PUMP position
+(8 contracts long, $29 notional at 9x) with no local row and, worse, **no stop-loss**.
+
+### 51.1 How it happened — the mirror of §48
+
+From the trader's own logs:
+
+```
+15:35:02  opened real order id=148 instId=PUMP   (SL rested on the exchange)
+15:35:05  reconcile: "exchange reports flat but local state shows an open position; closing locally"
+15:35:06  cancelled the resting protective order; closed real order id=148
+15:35:24  reconcile: "exchange reports an open position this system has no record of"
+```
+
+OKX's positions endpoint trailed its own fill by roughly **20 seconds**. Reconcile believed the
+first flat reading, marked the order closed, **and cancelled its protective order** — leaving real
+capital running with no stop and no record until it was flattened by hand.
+
+This is the **exact mirror of §48**: there a lagging endpoint made an open position look
+*untracked*; here it makes one look *already-closed*. Both are the same underlying fact — the
+exchange's position view trails its own fills — and both needed the same answer: distrust it
+briefly rather than act on the first reading.
+
+### 51.2 The fix
+
+A position younger than `staleCloseGrace` (60s, against the ~20s lag measured) is **deferred**
+rather than closed. Safe because the next pass re-evaluates 5 seconds later, or immediately on a
+pushed event; a position genuinely closed outside this system — a liquidation, a manual close in
+OKX's app — is still caught, one pass later.
+
+A grace **period** rather than a retry count on purpose: the quantity that actually varies is
+elapsed time since the fill, and a count would mean something different on the 5s poll than during
+a burst of WebSocket-pushed passes.
+
+Mutation-checked both ways, which matters for a guard that can fail in either direction: removing it
+reproduces the incident, making it unconditional leaves the database permanently drifted from the
+exchange.
+
+### 51.3 Resolution
+
+Flattened by hand per the operator's decision (chosen over re-protecting it, since closing removes
+the risk entirely): filled at 0.003624, realized **-$0.2205** net of a $0.0145 fee. Order 148's row
+was updated in place with the exchange's own figures (§41) rather than a new row being invented —
+there was only ever one position, and a second row would misrepresent the trade history. Its
+`last_error` records what happened, so the anomaly stays legible in the data.
+
+After that the reset button unlocked on its own (`exchange 0 / local 0`), which is the gate behaving
+exactly as designed end to end: refuse while a real problem exists, unlock once it is resolved.
+
+### 51.4 What this says about the halt design
+
+Three incidents in two days (§47 crash loop, §48 false-positive halt, §51 real drift) all surfaced
+as "real trading isn't working". The §49 health panel now distinguishes them, and this one proved
+the gate's value in the direction that matters most: it **refused to clear a halt that was
+protecting against a genuine, unprotected real position**. A confirmation dialog would have let it
+through.
