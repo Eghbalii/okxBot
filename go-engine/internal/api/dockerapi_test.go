@@ -62,7 +62,8 @@ func TestListContainers_DecodesRealDockerShape(t *testing.T) {
 		t.Error("status dropped — it carries the restart count and uptime")
 	}
 
-	// A container with no healthcheck must decode cleanly with an empty health, not fail.
+	// Docker says "none" for a container with no healthcheck; it must normalize to empty so the
+	// panel does not render a badge that reads like a failed check.
 	if got := states["okxbot-panel-1"]; got.State != "exited" || got.Health != "" {
 		t.Errorf("panel = %+v, want exited with empty health", got)
 	}

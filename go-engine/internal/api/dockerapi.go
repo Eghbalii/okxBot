@@ -103,7 +103,14 @@ func listContainersFrom(ctx context.Context, client *http.Client, url string) (m
 			continue
 		}
 		name := strings.TrimPrefix(c.Names[0], "/")
-		out[name] = ContainerState{Name: name, State: c.State, Status: c.Status, Health: c.Health.Status}
+		// Docker reports "none" for a container that declares no healthcheck. Normalized to empty
+		// so the panel shows nothing rather than a badge reading "none", which looks like a
+		// failed check rather than an absent one.
+		health := c.Health.Status
+		if health == "none" {
+			health = ""
+		}
+		out[name] = ContainerState{Name: name, State: c.State, Status: c.Status, Health: health}
 	}
 	return out, nil
 }
