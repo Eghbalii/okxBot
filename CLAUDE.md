@@ -5553,3 +5553,72 @@ consumer lag, not just container status.
 `pnl_max_pct` is a monotonic high-water mark (`GREATEST(pnl_max_pct, $2)`), so it only moves when a
 new peak is reached. Seeing the same value across two checks is correct behaviour, not a stall. What
 was genuinely wrong was upstream: for eight hours nothing was writing to it at all.
+
+## 48. Opening a position halted all real trading (2026-09-13)
+
+Reported as real trading being down again, shortly after enabling all twelve V2 strategies for real
+mode. Unlike §47 the service was **UP** — it had halted itself, and stayed halted for two hours
+across every instrument.
+
+```
+WARN real trading halted, skipping new opens instId=BTC
+     reason="reconcile: untracked open position on DOGE (exchange reports 45 short)"
+```
+
+### 48.1 It was not drift — it was a race with this system's own open
+
+```
+05:25:05.661  ERROR reconcile: exchange reports an open position this system has no record of
+05:25:06.675  INFO  opened real order id=129 instId=DOGE
+```
+
+The order was **mid-flight**. `Exchange.PlaceOrder` is a blocking network call and the exchange
+fills the position *during* it, so there is an unavoidable window — measured at ~1s here — where the
+position exists remotely with no local row. The insert already happens as early as it possibly can
+(immediately after `PlaceOrder` returns, a deliberate 2026-09-04 change so the panel shows the order
+as `pending` for the in-flight window), and that is still too late, because the fill precedes the
+return.
+
+**The private WebSocket (§35.4) is what turned a rare race into a reliable one.** The fill itself
+pushes an account-change event, which triggers a reconcile pass *immediately* — landing inside the
+very window the fill opened. Before that socket existed, a 5s poll would usually miss a 1s gap.
+
+### 48.2 The fix
+
+`RealTrader.openInFlight` is set across the open sequence, under the `openMu` the open path already
+holds, and reconcile defers the untracked-position halt while it is set.
+
+Deferring is safe rather than a hole in the check: the open path always writes its row (or logs
+loudly if it cannot), and the next pass — 5s later, or immediately on the next pushed event —
+re-evaluates with the row present. A genuinely untracked position still halts, one pass later.
+
+`shouldDeferUntrackedHalt` is extracted so the decision is testable without a repository or a live
+exchange, and the regression test exercises the real predicate rather than a seam invented for the
+test. Mutation-checked in **both** directions, which matters for a guard like this: removing it
+reproduces the outage, making it unconditional lets genuine drift through unnoticed. Plus a `-race`
+test for the flag, since the open path writes it on one goroutine while reconcile reads it on
+another.
+
+### 48.3 Two things that made a one-second race cost two hours
+
+Worth recording separately, because neither is fixed by the above:
+
+1. **`risk.Manager.Reset()` has no production caller.** Once halted, the only recovery is a process
+   restart. A transient condition therefore latches permanently — the DOGE position that triggered
+   this closed at 07:10, and trading was still halted at 07:25 with the exchange reporting flat and
+   zero open rows. Nothing re-evaluates a halt.
+2. **The halt is global across instruments.** A race on DOGE stopped BTC, ETH and eight others from
+   trading. That is the right default for a margin-mode mismatch or a drawdown breach, but it makes
+   a per-instrument false positive expensive.
+
+Both deserve their own change: a halt that re-evaluates its own condition, or at minimum a panel
+control to clear one after review.
+
+### 48.4 What to check when real trading looks "down"
+
+The last two incidents had the same symptom and completely different causes, so the order matters:
+
+1. `docker ps` — is the container actually **restarting** (§47's crash loop) or **up** (this)?
+2. If up, grep for `halted` — a self-halt looks identical to being down from the panel's side.
+3. Check the exchange against the database. Both flat while halted means the halt is stale.
+4. Check Kafka consumer lag — "restarted successfully" does not mean "processing live data" (§47.4).
