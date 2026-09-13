@@ -5622,3 +5622,84 @@ The last two incidents had the same symptom and completely different causes, so 
 2. If up, grep for `halted` — a self-halt looks identical to being down from the panel's side.
 3. Check the exchange against the database. Both flat while halted means the halt is stale.
 4. Check Kafka consumer lag — "restarted successfully" does not mean "processing live data" (§47.4).
+
+## 49. Service health in the panel, and a halt reset gated on evidence (2026-09-13)
+
+Prompted by §47 and §48 happening two days apart: two outages that looked **identical** from the
+panel and needed **opposite** responses.
+
+| | §47 | §48 |
+|---|---|---|
+| Container | **restarting** (crash loop) | **running** |
+| Cause | unbuildable strategy row → `os.Exit(1)` | self-halted on a false drift signal |
+| Panel showed | `dial tcp: lookup trader … no such host` | nothing — positions just stopped opening |
+| Fix needed | code fix + rebuild | reset |
+
+Telling them apart meant SSHing to the server both times.
+
+### 49.1 What was built
+
+`GET /api/health` reports every tracked service's Docker state **verbatim** — `restarting` is
+deliberately not flattened into a generic "down", because that is precisely the crash-loop signal
+separating the two cases. Plus the real-trading halt with the evidence behind it.
+
+Shown on the Resources tab, above the Grafana link: when something is wrong this is what is being
+looked for, and burying it under the least urgent content would be backwards.
+
+### 49.2 The reset is gated on evidence, not a dialog
+
+The operator's own sequencing: *know a problem occurred → understand why → reset only if safe.* A
+confirmation dialog does not achieve that — it asks the operator to guess exactly when they have the
+least information.
+
+So `cmd/api` **re-derives the halt condition** from the same two sources the trader's own reconcile
+compares — the exchange's open positions and this system's open rows — rather than reading a flag.
+That answers the stronger question ("is the situation actually resolved") rather than ("does the
+trader still have a flag set"), which is what §48 needed: the DOGE position that caused that halt
+closed at 07:10 while trading stayed halted until 07:25 with both sides flat.
+
+**Fails closed throughout.** An unreachable exchange, an unreadable database, or no exchange wired
+all report "cannot verify" and keep the button locked. Unknown is not safe, and an unreachable
+exchange is exactly when a stale reset would be most dangerous. Both fail-open mutations are checked.
+
+The reset itself restarts `cmd/trader`: `risk.Manager`'s flag is in that process's memory with no
+cross-process API, and its startup re-derives state from the exchange and database anyway — so a
+restart both clears the flag and rebuilds the state it should have.
+
+### 49.3 Why not Grafana
+
+Considered, and it does not fit. Prometheus has 13 `okxbot` metrics and **none of them cover the
+halt** — there is no metric to chart. More fundamentally, a halt is a *state with a reason*, not a
+number, and "why did trading stop and is it safe to resume" is not a time series.
+
+Embedding remains possible for historical CPU/RAM charts: Grafana currently sends
+`X-Frame-Options: deny`, which `GF_SECURITY_ALLOW_EMBEDDING=true` plus anonymous auth would lift —
+safe behind the VPN (§11), and the same no-auth posture the panel already has.
+
+### 49.4 A latent gap this closed
+
+`procstatus.go` shells out to a `docker` binary that `Dockerfile.api` never installed (§18 recorded
+this and left it). Every one of those calls has silently failed since it was written. This dials the
+Engine API over the already-mounted socket instead — read-only by construction, since that socket is
+effectively root on the host.
+
+### 49.5 Two bugs that only the live deploy could find
+
+Worth recording because both would have passed any test written from the same assumptions as the
+code:
+
+1. **`haltStatus` read the wrong table.** It called `Repo.ListPositions`, which reads `paper_orders`;
+   real orders have had their own table since §34. Against production it reported "2 exchange
+   positions, 0 tracked locally" while the database held both — permanent false drift and a
+   permanently locked reset button. The gate, inverted.
+2. **Docker's `Health` is an OBJECT**, `{"Status":"healthy","FailingStreak":0}`, not the string its
+   name suggests. Typing it as a string failed the *whole* response, so every service's state came
+   back empty at once. I typed it from a field **list** — and a field list is not a schema.
+
+The second fix then landed in the wrong file (`health.go` instead of `dockerapi.go`, where the
+decoding type actually lives), so the redeploy failed identically and had to be traced again.
+
+Both are now pinned by tests using **verbatim bytes from the live Docker socket** rather than
+fixtures written from my own assumptions, and the halt stub implements only `ListRealPositions`, so
+reading the paper table panics loudly instead of quietly returning an empty slice that looks like
+real drift.
