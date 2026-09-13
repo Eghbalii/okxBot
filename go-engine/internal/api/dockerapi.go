@@ -57,7 +57,13 @@ type dockerContainer struct {
 	Names  []string `json:"Names"`
 	State  string   `json:"State"`
 	Status string   `json:"Status"`
-	Health string   `json:"Health"`
+	// Health is an OBJECT here — {"Status":"healthy","FailingStreak":0} — not the string its name
+	// suggests (verified against the live socket, 2026-09-13). Decoding it as a string fails the
+	// WHOLE response, which on first deploy blanked every service's state at once rather than just
+	// this one field. A field list is not a schema.
+	Health struct {
+		Status string `json:"Status"`
+	} `json:"Health"`
 }
 
 // listContainers returns every container's state, keyed by its name with Docker's leading slash
@@ -67,7 +73,13 @@ type dockerContainer struct {
 // this is for, and omitting it would make a dead service look identical to one that was never
 // configured.
 func listContainers(ctx context.Context, client *http.Client) (map[string]ContainerState, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/containers/json?all=1", nil)
+	return listContainersFrom(ctx, client, "http://docker/containers/json?all=1")
+}
+
+// listContainersFrom is listContainers with the URL injected, so the decode path can be exercised
+// against Docker's real response shape without a unix socket.
+func listContainersFrom(ctx context.Context, client *http.Client, url string) (map[string]ContainerState, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build docker request: %w", err)
 	}
@@ -91,7 +103,7 @@ func listContainers(ctx context.Context, client *http.Client) (map[string]Contai
 			continue
 		}
 		name := strings.TrimPrefix(c.Names[0], "/")
-		out[name] = ContainerState{Name: name, State: c.State, Status: c.Status, Health: c.Health}
+		out[name] = ContainerState{Name: name, State: c.State, Status: c.Status, Health: c.Health.Status}
 	}
 	return out, nil
 }
