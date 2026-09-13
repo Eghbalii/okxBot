@@ -400,6 +400,81 @@ type PaperTradingConfigPatch struct {
 	ActiveBars          *[]string
 }
 
+// Instrument is one row of the tradeable-instrument roster (migration 000031) — the database-backed
+// replacement for config.yaml's trading.inst_ids plus trading.symbol_map (2026-09-13).
+//
+// The roster moved into the database so the token-discovery scan can admit a newly-found token to
+// data collection and paper trading on its own. While it lived in YAML, resolved once per service
+// at startup, a scanned token had no entry and no exec instId and therefore could not reach the
+// ingestor's WebSocket subscriptions at all.
+type Instrument struct {
+	ID       int64
+	Symbol   string // the short internal symbol ("BTC") every other table and Kafka key carries
+	Exchange string // "okx", "mexc"
+	// ExecInstID is the exchange's own wire-format instrument id — OKX's
+	// "BTC-USD_UM_XPERP-310404", MEXC's "BTC_USDT". Replaces trading.symbol_map.
+	ExecInstID string
+	InstType   string // "FUTURES", "SWAP", or "" where the exchange has no such concept
+
+	// The three flags are independent on purpose: a scanned token collects data and paper-trades
+	// immediately (that is how it earns a track record) while staying off for real money until a
+	// person enables it. One combined flag would make discovery and real-capital exposure the same
+	// decision.
+	EnabledIngest bool
+	EnabledPaper  bool
+	EnabledReal   bool
+
+	Source string // "manual", "scan", or "seed"
+
+	// Ranking snapshot from the scan that admitted or last refreshed this row; zero for a row that
+	// has never been scored (seeded or hand-added).
+	Vol24hUSD    decimal.Decimal
+	Change24hPct decimal.Decimal
+	ScanScore    decimal.Decimal
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// InstrumentFilter narrows ListInstruments. A zero filter returns the whole roster.
+type InstrumentFilter struct {
+	Exchange string // "" = every exchange
+	// Enabled restricts to rows enabled for one consumer: "ingest", "paper", or "real". "" returns
+	// rows regardless of their flags — which is what the panel's roster view wants, and what no
+	// trading service should ever ask for.
+	Enabled string
+}
+
+// InstrumentPatch updates one roster row's flags. Nil fields are left unchanged, so enabling a
+// token for real money cannot accidentally clear its ingest flag.
+type InstrumentPatch struct {
+	EnabledIngest *bool
+	EnabledPaper  *bool
+	EnabledReal   *bool
+	ExecInstID    *string
+	InstType      *string
+}
+
+// MarketToken is one scanned instrument's market snapshot (migration 000031's market_tokens) — the
+// ranked view of an exchange's whole tradeable market that the Home page sorts, distinct from the
+// Instrument roster, which is the small subset actually being traded.
+type MarketToken struct {
+	Exchange     string
+	Symbol       string
+	ExecInstID   string
+	LastPx       decimal.Decimal
+	Open24h      decimal.Decimal
+	High24h      decimal.Decimal
+	Low24h       decimal.Decimal
+	Vol24hUSD    decimal.Decimal
+	Change24hPct decimal.Decimal
+	// Range24hPct is (high-low)/price: a volatility proxy that, unlike Change24hPct, does not
+	// cancel out on a token that moved hard in both directions and came back.
+	Range24hPct decimal.Decimal
+	Score       decimal.Decimal
+	ScannedAt   time.Time
+}
+
 // ParamChange is one recorded strategy parameter-change event (CLAUDE.md §16): either
 // cmd/strategy-optimizer persisting a winning tuned candidate (Source="optimizer") or an operator
 // editing a sub-strategy's params by hand via the panel (Source="manual"). Backs the panel's
@@ -664,6 +739,32 @@ type Repository interface {
 	// ListParamChanges returns instID's parameter-change history at or after since (zero time =
 	// no lower bound), oldest first — the shape the panel's marker-overlay chart consumes.
 	ListParamChanges(ctx context.Context, instID string, since time.Time) ([]ParamChange, error)
+
+	// ListInstruments reads the tradeable-instrument roster (migration 000031) — the database-backed
+	// replacement for config.yaml's trading.inst_ids + trading.symbol_map. Every trading service
+	// loads its own working set through this at startup, so a token the discovery scan admitted is
+	// picked up on the next restart without a config edit.
+	ListInstruments(ctx context.Context, f InstrumentFilter) ([]Instrument, error)
+	// UpsertInstrument adds a roster row or refreshes an existing one, keyed by (exchange, symbol).
+	// The enable flags of an EXISTING row are never overwritten — a scan re-finding a token it
+	// already admitted must not resurrect a token an operator has since disabled, which is the same
+	// provenance mistake migration 000030 was written to fix.
+	UpsertInstrument(ctx context.Context, in Instrument) (Instrument, error)
+	// SetInstrumentFlags applies patch's non-nil fields to one roster row.
+	SetInstrumentFlags(ctx context.Context, id int64, patch InstrumentPatch) error
+	// DeleteInstrument removes a roster row outright — an operator action, for a token that should
+	// stop being collected entirely rather than merely being disabled.
+	DeleteInstrument(ctx context.Context, id int64) error
+
+	// ReplaceMarketTokens overwrites the scanned market snapshot for one exchange in a single
+	// transaction. Overwrite rather than append: a scan runs a few times a day and the panel only
+	// asks what the market looks like NOW, so retaining history would grow without bound to answer
+	// a question nobody is asking. Scoped per exchange so one exchange's failed scan cannot wipe
+	// another's good data.
+	ReplaceMarketTokens(ctx context.Context, exchange string, toks []MarketToken) error
+	// ListMarketTokens returns the scanned market snapshot, highest score first. exchange "" reads
+	// every exchange; limit 0 means no limit.
+	ListMarketTokens(ctx context.Context, exchange string, limit int) ([]MarketToken, error)
 
 	// GetPaperTradingConfig returns mode's ("paper" or "real") panel-editable control-box config
 	// (CLAUDE.md real-trading readiness plan, 2026-09-04 — paper_trading_config is now one row per

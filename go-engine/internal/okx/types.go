@@ -237,3 +237,46 @@ func (s AlgoOrderStatus) ToDomain() domain.AlgoOrderStatus {
 		OrdID:       s.OrdID,
 	}
 }
+
+// MarketTicker is GET /api/v5/market/tickers' wire shape — the all-instruments discovery endpoint
+// (2026-09-13), deliberately a SEPARATE type from Ticker above rather than extra fields on it.
+//
+// Two reasons it has to be separate, both learned from the live response:
+//
+//   - Its decimals are LooseDecimal, because OKX returns "" for every price field of an instrument
+//     that has never traded, and one such row fails the decode for the entire array (see
+//     LooseDecimal's own comment). Ticker must stay strict: on the trading path an empty price is a
+//     fault, and reading it as zero is how a close gets recorded at the wrong number (§37).
+//   - It reads volCcy24h, the BASE-CURRENCY volume, which is what a cross-instrument comparison
+//     needs once multiplied by price. Ticker.Vol24h is bound to vol24h, a CONTRACT count — the two
+//     differ by the contract multiplier (live-verified on EDGE-USDT-SWAP: 8,559,200 vs 855,920), and
+//     ranking a market by contract count orders it by contract size rather than by activity.
+type MarketTicker struct {
+	InstID    string       `json:"instId"`
+	Last      LooseDecimal `json:"last"`
+	Open24h   LooseDecimal `json:"open24h"`
+	High24h   LooseDecimal `json:"high24h"`
+	Low24h    LooseDecimal `json:"low24h"`
+	VolCcy24h LooseDecimal `json:"volCcy24h"`
+}
+
+// ToDomain normalizes an OKX market ticker into the exchange-agnostic discovery shape. Both
+// conversions happen here, at OKX's own boundary, so the scanner never learns that OKX reports
+// volume in base currency or that it reports an open price where MEXC reports a rate (CLAUDE.md
+// §46's instruction that one exchange's peculiarities must not be imposed on every exchange).
+func (t MarketTicker) ToDomain() domain.MarketTicker {
+	m := domain.MarketTicker{
+		InstID:    t.InstID,
+		Last:      t.Last.Decimal,
+		Open24h:   t.Open24h.Decimal,
+		High24h:   t.High24h.Decimal,
+		Low24h:    t.Low24h.Decimal,
+		Vol24hUSD: t.VolCcy24h.Mul(t.Last.Decimal),
+	}
+	// Guarded against a zero open so a newly-listed or never-traded instrument yields 0 rather than
+	// a divide-by-zero panic.
+	if !t.Open24h.IsZero() {
+		m.Change24hPct = t.Last.Sub(t.Open24h.Decimal).Div(t.Open24h.Decimal).Mul(decimal.NewFromInt(100))
+	}
+	return m
+}

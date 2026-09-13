@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -42,13 +43,19 @@ type fakeRepository struct {
 	nextRealID           int64
 	realOrders           map[int64]port.RealOrder
 	realOrderAdjustments []port.PaperOrderAdjustment
+
+	nextInstrumentID int64
+	instruments      map[int64]port.Instrument
+	marketTokens     map[string][]port.MarketToken
 }
 
 func newFakeRepository() *fakeRepository {
 	return &fakeRepository{
-		orders:     make(map[int64]port.PaperOrder),
-		accounts:   make(map[string]port.AccountEquity),
-		realOrders: make(map[int64]port.RealOrder),
+		orders:       make(map[int64]port.PaperOrder),
+		accounts:     make(map[string]port.AccountEquity),
+		realOrders:   make(map[int64]port.RealOrder),
+		instruments:  make(map[int64]port.Instrument),
+		marketTokens: make(map[string][]port.MarketToken),
 	}
 }
 
@@ -2980,4 +2987,138 @@ func TestDynamicNotional_IsRoundedToUsdScale(t *testing.T) {
 	if !n.IsPositive() {
 		t.Error("expected a positive notional")
 	}
+}
+
+// --- instrument roster (migration 000031) ---
+//
+// These mirror internal/postgres's real behavior rather than being stubs, including the two
+// properties production code actually depends on: UpsertInstrument must NOT overwrite an existing
+// row's enable flags, and ReplaceMarketTokens must scope its clear to one exchange. A fake that
+// diverged from its counterpart would quietly weaken every test built on it (CLAUDE.md §17).
+
+func (f *fakeRepository) ListInstruments(_ context.Context, filter port.InstrumentFilter) ([]port.Instrument, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []port.Instrument
+	for _, in := range f.instruments {
+		if filter.Exchange != "" && in.Exchange != filter.Exchange {
+			continue
+		}
+		switch filter.Enabled {
+		case "":
+		case "ingest":
+			if !in.EnabledIngest {
+				continue
+			}
+		case "paper":
+			if !in.EnabledPaper {
+				continue
+			}
+		case "real":
+			if !in.EnabledReal {
+				continue
+			}
+		default:
+			return nil, fmt.Errorf("unknown enabled filter %q", filter.Enabled)
+		}
+		out = append(out, in)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Symbol < out[j].Symbol })
+	return out, nil
+}
+
+func (f *fakeRepository) UpsertInstrument(_ context.Context, in port.Instrument) (port.Instrument, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, existing := range f.instruments {
+		if existing.Exchange == in.Exchange && existing.Symbol == in.Symbol {
+			// Refresh the market snapshot and exec id only. The enable flags stay as they are —
+			// the whole point of the real implementation's ON CONFLICT clause.
+			existing.ExecInstID = in.ExecInstID
+			existing.InstType = in.InstType
+			existing.Vol24hUSD = in.Vol24hUSD
+			existing.Change24hPct = in.Change24hPct
+			existing.ScanScore = in.ScanScore
+			existing.UpdatedAt = time.Now()
+			f.instruments[id] = existing
+			return existing, nil
+		}
+	}
+	f.nextInstrumentID++
+	in.ID = f.nextInstrumentID
+	in.CreatedAt = time.Now()
+	in.UpdatedAt = in.CreatedAt
+	f.instruments[in.ID] = in
+	return in, nil
+}
+
+func (f *fakeRepository) SetInstrumentFlags(_ context.Context, id int64, patch port.InstrumentPatch) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	in, ok := f.instruments[id]
+	if !ok {
+		return fmt.Errorf("no instrument with id %d", id)
+	}
+	if patch.EnabledIngest != nil {
+		in.EnabledIngest = *patch.EnabledIngest
+	}
+	if patch.EnabledPaper != nil {
+		in.EnabledPaper = *patch.EnabledPaper
+	}
+	if patch.EnabledReal != nil {
+		in.EnabledReal = *patch.EnabledReal
+	}
+	if patch.ExecInstID != nil {
+		in.ExecInstID = *patch.ExecInstID
+	}
+	if patch.InstType != nil {
+		in.InstType = *patch.InstType
+	}
+	in.UpdatedAt = time.Now()
+	f.instruments[id] = in
+	return nil
+}
+
+func (f *fakeRepository) DeleteInstrument(_ context.Context, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.instruments[id]; !ok {
+		return fmt.Errorf("no instrument with id %d", id)
+	}
+	delete(f.instruments, id)
+	return nil
+}
+
+func (f *fakeRepository) ReplaceMarketTokens(_ context.Context, exchange string, toks []port.MarketToken) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Empty means "nothing to report", leaving the last known-good snapshot in place — matching the
+	// real implementation, which must not clear a view because one scan failed.
+	if len(toks) == 0 {
+		return nil
+	}
+	f.marketTokens[exchange] = append([]port.MarketToken(nil), toks...)
+	return nil
+}
+
+func (f *fakeRepository) ListMarketTokens(_ context.Context, exchange string, limit int) ([]port.MarketToken, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []port.MarketToken
+	for ex, toks := range f.marketTokens {
+		if exchange != "" && ex != exchange {
+			continue
+		}
+		out = append(out, toks...)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Score.Equal(out[j].Score) {
+			return out[i].Score.GreaterThan(out[j].Score)
+		}
+		return out[i].Symbol < out[j].Symbol
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
