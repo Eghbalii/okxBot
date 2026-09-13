@@ -5878,3 +5878,50 @@ as "real trading isn't working". The §49 health panel now distinguishes them, a
 the gate's value in the direction that matters most: it **refused to clear a halt that was
 protecting against a genuine, unprotected real position**. A confirmation dialog would have let it
 through.
+
+## 52. The Positions page said "Running" while trading was blocked (2026-09-13)
+
+Reported from real use: the Positions page's status badge showed a green **Running** while the
+Resources page had known something was wrong for a long time.
+
+**Both were telling the truth about different things**, which is why neither looked broken:
+
+| | Source | Answers |
+|---|---|---|
+| Positions badge | `paper_trading_config.trading_state` (Postgres) | "what did the operator ASK for" |
+| Resources panel | `GET /api/health` (Docker + exchange) | "what is actually HAPPENING" |
+
+`tradingState` is configured intent. It read "Running" throughout §47 (the trader crash-looping for
+eight hours) and §48 (a self-halt lasting two hours), because neither of those touches that column.
+The page most likely to be open while wondering *"why are no positions opening"* was the one page
+that could not say.
+
+### 52.1 Kept as two facts, not merged into one
+
+Conflating them into a single badge would lose the distinction between "I asked it to run" and "it
+is able to run" — both of which matter, and which need different responses. So the badge keeps its
+meaning and `TradingHealthBanner` sits beside it, reporting anything that blocks trading with a link
+through to Resources where the detail and the reset live.
+
+It reads the **same** `GET /api/health` the Resources page does, so the two can never disagree; a
+second source of truth here would only be a new way to drift. Shared through the §50 cache, so
+opening Positions costs no extra request.
+
+### 52.2 Silent unless it matters
+
+A banner shown always is a banner nobody reads. It fires for a down **critical** service or a
+genuinely blocked halt, and deliberately **not** for:
+
+- a non-critical service — Grafana being down does not stop trading;
+- a halt on the **Paper** tab — halts are real-only, and it would be a distraction nobody can act on;
+- `safeToReset=false` with **no blockers**, which means "could not verify" (§49.2's fail-closed
+  path). Raising the banner on an unreachable exchange would cry wolf on every transient blip.
+
+"restarting" is named as **crash-looping** rather than folded into "not running", since that needs a
+fix and a rebuild where a stopped container usually just needs starting.
+
+### 52.3 Verified against a real failure
+
+Not only in logic: `rl-service` was stopped on the server, the endpoint correctly reported it as a
+down critical service, and it was restarted immediately (8/8 back). Plus 7 checks on the show/hide
+decision covering both incidents and all four cases it must stay quiet for.
