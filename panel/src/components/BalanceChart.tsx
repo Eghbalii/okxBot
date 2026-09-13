@@ -79,18 +79,28 @@ export default function BalanceChart({
   // refreshSignal is part of the key rather than a dependency that forces a refetch: bumping it
   // (after a trade closes) moves every range onto fresh entries at once, and the old ones age out
   // of the bounded cache on their own.
-  const sinceMs = Date.now() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000
-  // Bucket the since-timestamp so it is stable between renders — a raw Date.now() would change the
-  // cache key on every render and defeat caching entirely.
-  const sinceBucket = Math.floor(sinceMs / 60_000)
+  // The cache key carries the RANGE, never a timestamp. Two earlier attempts both failed here in
+  // the same way and are worth recording, because each looked correct:
+  //
+  //   1. A raw Date.now() changed the key on every render — the cache never hit at all.
+  //   2. Bucketing to the minute still produced a new key every 60s, and flooring to the hour still
+  //      produces one whenever an hour boundary is crossed. Both made the cache appear to work
+  //      while switching quickly and do nothing otherwise, which is exactly what was reported.
+  //
+  // "The last day of history" is the same request whenever it is asked, so the key says that and
+  // the freshness window (maxAgeMs) is what decides when to go and get it again. The `since` sent
+  // to the server is still computed live inside the fetcher, so a revalidation genuinely covers up
+  // to the present — the key identifies the QUESTION, not the instant it was asked.
   const {
     data: cachedPoints,
     error,
     loading,
   } = useCachedResource(
-    `equity:${mode}:${range}:${refreshSignal ?? 0}:${sinceBucket}`,
-    () => api.accountHistory(mode, new Date(sinceMs)),
-    { maxAgeMs: 60_000 },
+    `equity:${mode}:${range}:${refreshSignal ?? 0}`,
+    () => api.accountHistory(mode, new Date(Date.now() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000)),
+    // Longer than the 15s stats poll around it: the equity timeline only changes when a trade
+    // closes, so revalidating every few seconds costs a 173KB re-parse for nothing.
+    { maxAgeMs: 120_000 },
   )
   const points = cachedPoints ?? []
 

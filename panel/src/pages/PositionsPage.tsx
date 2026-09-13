@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Navigate, useParams } from 'react-router-dom'
-import { usePolling } from '../hooks/usePolling'
+import { useCachedResource } from '../hooks/useCachedResource'
 import { usePositionAlerts } from '../hooks/usePositionAlerts'
 import { usePositionEvents } from '../hooks/usePositionEvents'
 import { usePriceStream } from '../hooks/usePriceStream'
@@ -149,7 +149,19 @@ export default function PositionsPage() {
   // Server-side sort/page (2026-09-02): closed positions grew into the hundreds, and fetching
   // every row on every 5s poll to sort/paginate client-side had become a genuinely slow query and
   // a multi-MB payload. Any change to filter/sort/page now triggers a fresh, bounded query instead.
-  const { data, error } = usePolling(
+  //
+  // Cached per query (2026-09-13): switching between the Paper and Real tabs is a ROUTE change, so
+  // this whole page unmounts and `rows` restarts at null — and until it refills, the chart has no
+  // positions and cannot draw its green/red zones. That is the reported "the highlight takes a
+  // while to appear". These are the panel's largest payloads (measured: 210KB paper, 133KB real),
+  // so re-fetching and re-parsing them on every tab switch is the expensive part, not the ~50ms the
+  // server spends.
+  //
+  // wsRefreshCount is part of the KEY rather than a dependency that forces a refetch, so an
+  // order opening or closing moves to a fresh entry while the previous one stays available.
+  const queryKey = `positions:${mode}:${instId}:${openFilter}:${sortBy}:${sortDesc}:${page}:${pageSize}:${wsRefreshCount}`
+  const { data, error } = useCachedResource(
+    queryKey,
     () =>
       api.listPositions({
         mode,
@@ -160,9 +172,9 @@ export default function PositionsPage() {
         page,
         pageSize,
       }),
-    5_000,
-    [mode, instId, openFilter, sortBy, sortDesc, page, pageSize],
-    wsRefreshCount,
+    // Revalidates on the same 5s cadence as before, so live PnL stays as fresh as it was; the
+    // difference is that a cached page is shown immediately while that happens instead of a blank.
+    { maxAgeMs: 4_000, refetchMs: 5_000 },
   )
   const rows = data?.items ?? null
   const total = data?.total ?? 0
