@@ -153,6 +153,23 @@ type RealTrader struct {
 	candles   map[string][]domain.Candle
 
 	openMu sync.Mutex
+	// openInFlight is set while an order is being placed on the exchange but is not yet visible in
+	// the database, and reconcile treats an "untracked" remote position as untracked ONLY when it
+	// is clear.
+	//
+	// Without it, opening a position halts all real trading (2026-09-13, CLAUDE.md §48). The window
+	// is inherent rather than avoidable: Exchange.PlaceOrder is a blocking network call, the
+	// exchange fills the position DURING it, and the local row cannot be written until the call
+	// returns with an order id. Measured in production, that gap was ~1s — reconcile flagged DOGE
+	// as untracked at 05:25:05.661 and the row was written at 05:25:06.675.
+	//
+	// The private WebSocket (§35.4) is what makes this reliably reproducible rather than rare: the
+	// fill itself pushes an account-change event, which triggers a reconcile pass immediately, so
+	// the poll lands inside the very window the fill opened.
+	//
+	// Guarded by openMu, which the open path already holds across the whole read-then-open sequence
+	// (§16.9), so setting and clearing it needs no second lock.
+	openInFlight bool
 	// reconcileMu serializes reconciliation passes. Before the private WebSocket, reconcile had a
 	// single caller on a fixed ticker and could not overlap with itself; now a pushed position
 	// event can trigger a pass while the periodic one is mid-flight. Both read the local and remote
@@ -725,6 +742,13 @@ func (e *RealTrader) evaluateStrategies(ctx context.Context, bar string, price d
 	// goroutines — same race PaperTrader.openMu guards against (CLAUDE.md §16.9).
 	e.openMu.Lock()
 	defer e.openMu.Unlock()
+
+	// Suppress reconcile's untracked-position halt for the duration, since an order placed here is
+	// live on the exchange before its local row exists (§48). Cleared on every return path,
+	// including an early return or a panic, so a bug in the open path can never leave the check
+	// permanently disabled — which would be strictly worse than the halt it prevents.
+	e.setOpenInFlight(true)
+	defer e.setOpenInFlight(false)
 
 	open, err := e.openPositions(ctx)
 	if err != nil {
@@ -1881,6 +1905,17 @@ func (e *RealTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, lo
 			}
 		}
 	case remote != nil && len(local) == 0:
+		// An open in flight explains this completely: the exchange has filled the position but the
+		// local row is not written yet. Halting here stops ALL real trading across every instrument
+		// because of a position this system is in the middle of opening deliberately (§48).
+		//
+		// Skipping is safe rather than a hole in the check: the open path always writes its row (or
+		// logs loudly if it cannot), and the very next reconcile pass — one second later on the
+		// 5s poll, or immediately on the next pushed event — re-evaluates with the row present. A
+		// genuinely untracked position therefore still halts, just one pass later.
+		if e.shouldDeferUntrackedHalt(logger, remote) {
+			break
+		}
 		logger.Error("reconcile: exchange reports an open position this system has no record of",
 			"instId", e.InstID, "remoteSize", remote.Pos, "remoteSide", remote.PosSide)
 		e.RiskManager.Halt(fmt.Sprintf("reconcile: untracked open position on %s (exchange reports %s %s)",
@@ -1957,4 +1992,42 @@ func (e *RealTrader) recordEquityReal(ctx context.Context, rawBalance decimal.De
 	if _, err := e.Repo.RecordExchangeBalance(ctx, e.accountMode(), rawBalance, e.SafeMoneyUSD, e.InstID); err != nil {
 		logger.Warn("reconcile: equity timeline write failed", "mode", e.accountMode(), "error", err)
 	}
+}
+
+// setOpenInFlight marks whether this engine is mid-open, suppressing reconcile's untracked-position
+// halt for its own instrument (CLAUDE.md §48).
+//
+// Guarded by openMu, which evaluateStrategies already holds across the whole open sequence. Taking
+// it here too would deadlock; reconcile reads the flag under the same lock via isOpenInFlight.
+func (e *RealTrader) setOpenInFlight(v bool) {
+	e.openInFlight = v
+}
+
+// isOpenInFlight reports whether an open is in progress on this engine.
+//
+// Takes openMu because reconcile runs on a different goroutine from the open path — reading a bool
+// without synchronisation is a data race the Go race detector correctly flags, and the value read
+// could be arbitrarily stale. A blocked read here is also exactly the desired behaviour: if an open
+// currently holds openMu, reconcile waits for it to finish and then sees the committed row rather
+// than the in-flight gap.
+func (e *RealTrader) isOpenInFlight() bool {
+	e.openMu.Lock()
+	defer e.openMu.Unlock()
+	return e.openInFlight
+}
+
+// shouldDeferUntrackedHalt reports whether an "untracked" remote position should be tolerated
+// because this engine is in the middle of opening it.
+//
+// Extracted as its own predicate so the decision is unit-testable without a repository or a live
+// exchange — the surrounding ReconcileWith needs both. That matters here because this exact
+// decision, made wrongly, halted all real trading for two hours (CLAUDE.md §48), and a regression
+// test should be able to reproduce it directly rather than approximate it.
+func (e *RealTrader) shouldDeferUntrackedHalt(logger *slog.Logger, remote *domain.Position) bool {
+	if !e.isOpenInFlight() {
+		return false
+	}
+	logger.Info("reconcile: remote position with no local row while an open is in flight; "+
+		"deferring to the next pass", "instId", e.InstID, "remoteSize", remote.Pos)
+	return true
 }
