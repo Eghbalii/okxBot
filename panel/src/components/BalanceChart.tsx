@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { api } from '../api/client'
-import type { EquityPoint, PositionMode } from '../api/types'
+import { useCachedResource } from '../hooks/useCachedResource'
+import type { PositionMode } from '../api/types'
 
 // Plain inline SVG, no charting library — the same "hand-rolled CSS/minimal deps" convention
 // ParamChangeChart already follows (CLAUDE.md §14 Phase 3). Two lines over one timeline: Total
@@ -69,31 +70,29 @@ export default function BalanceChart({
   refreshSignal: number
 }) {
   const [range, setRange] = useState<Range>('day')
-  const [points, setPoints] = useState<EquityPoint[]>([])
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(true)
 
-  useEffect(() => {
-    let cancelled = false
-    setLoading(true)
-    const since = new Date(Date.now() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000)
-    api
-      .accountHistory(mode, since)
-      .then((p) => {
-        if (cancelled) return
-        setPoints(p)
-        setError(null)
-      })
-      .catch((err) => {
-        if (!cancelled) setError((err as Error).message)
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [mode, range, refreshSignal])
+  // Cached per (mode, range), so flipping between day/week/month re-shows an already-loaded range
+  // instantly instead of blanking to a loading state each time (2026-09-13 request). This response
+  // is the largest the panel fetches — measured at 173KB for real mode — so re-parsing it on every
+  // toggle is the expensive part, not the 19ms the server takes to produce it.
+  //
+  // refreshSignal is part of the key rather than a dependency that forces a refetch: bumping it
+  // (after a trade closes) moves every range onto fresh entries at once, and the old ones age out
+  // of the bounded cache on their own.
+  const sinceMs = Date.now() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000
+  // Bucket the since-timestamp so it is stable between renders — a raw Date.now() would change the
+  // cache key on every render and defeat caching entirely.
+  const sinceBucket = Math.floor(sinceMs / 60_000)
+  const {
+    data: cachedPoints,
+    error,
+    loading,
+  } = useCachedResource(
+    `equity:${mode}:${range}:${refreshSignal ?? 0}:${sinceBucket}`,
+    () => api.accountHistory(mode, new Date(sinceMs)),
+    { maxAgeMs: 60_000 },
+  )
+  const points = cachedPoints ?? []
 
   const series = useMemo<Series | null>(() => {
     if (points.length === 0) return null

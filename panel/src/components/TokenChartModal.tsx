@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
-import type { Candle, Position, PositionMode } from '../api/types'
+import { useCachedResource } from '../hooks/useCachedResource'
+import type { Position, PositionMode } from '../api/types'
 import { useLiveCandles } from '../hooks/useLiveCandles'
 import { CandleChart } from './CandleChart'
 import ChartAdjustPanel, { type LevelMode } from './ChartAdjustPanel'
@@ -70,39 +71,27 @@ export default function TokenChartModal({
   useEffect(() => setInstId(initialInstId), [initialInstId])
   const [bar, setBar] = useState<string>('5m')
   const [chartHeight, setChartHeight] = useState(() => availableChartHeight())
-  const [candles, setCandles] = useState<Candle[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
 
-  // Refetch the finalized series on an interval as well as on (instId, bar), so a bar that closes
-  // while the modal is open shows up as a real candle. The series is cleared to null ONLY when the
-  // identity changes, never on a refetch — blanking it every 15s would drop the chart back to its
-  // "Loading candles…" state and (worse) remount CandleChart, discarding the user's pan/zoom.
-  const seriesKey = `${instId}:${bar}`
-  const seriesKeyRef = useRef(seriesKey)
-  useEffect(() => {
-    let cancelled = false
-    if (seriesKeyRef.current !== seriesKey) {
-      seriesKeyRef.current = seriesKey
-      setCandles(null)
-    }
-    setError(null)
-
-    async function load() {
-      try {
-        const c = await api.candles({ instId, bar, limit: 500 })
-        if (!cancelled) setCandles(c)
-      } catch (e: unknown) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
-      }
-    }
-
-    load()
-    const id = setInterval(load, CANDLE_REFETCH_MS)
-    return () => {
-      cancelled = true
-      clearInterval(id)
-    }
-  }, [instId, bar, seriesKey])
+  // Candles come from a stale-while-revalidate cache keyed by (instId, bar), so switching between
+  // open positions shows an already-loaded series in the SAME frame instead of blanking to
+  // "Loading candles…" and re-fetching (2026-09-13 request).
+  //
+  // The previous version cleared the series to null on every identity change, which is what made
+  // switching feel slow: the backend answers in ~10ms, but the round trip plus a full remount of
+  // CandleChart discarded the rendered chart and the user's pan/zoom every time.
+  //
+  // refetchMs keeps the original behaviour of picking up a bar that closes while the modal is open.
+  // maxAgeMs is deliberately shorter than that interval so a revisit after a while still
+  // revalidates promptly, while a rapid back-and-forth between two positions serves from cache.
+  const seriesKey = `candles:${instId}:${bar}`
+  const {
+    data: candles,
+    error,
+    loading: candlesLoading,
+  } = useCachedResource(seriesKey, () => api.candles({ instId, bar, limit: 500 }), {
+    maxAgeMs: 30_000,
+    refetchMs: CANDLE_REFETCH_MS,
+  })
 
   // Folds OKX's own live candle pushes into the series (over the same WebSocket the price comes
   // from), so the forming bar carries the exchange's real OHLC instead of extremes reconstructed
@@ -350,7 +339,7 @@ export default function TokenChartModal({
         </div>
 
         {error && <p className="error">Could not load candles: {error}</p>}
-        {!error && candles === null && <p style={{ color: '#858b96' }}>Loading candles…</p>}
+        {!error && candlesLoading && <p style={{ color: '#858b96' }}>Loading candles…</p>}
         {!error && candles !== null && candles.length === 0 && (
           <p style={{ color: '#858b96' }}>
             No candles stored for {instId} on {bar} yet.
