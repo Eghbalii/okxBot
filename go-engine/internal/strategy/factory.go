@@ -35,6 +35,14 @@ var Factories = map[string]Factory{
 	"coin_flip":      func() Strategy { return NewCoinFlip() },
 	"weekly_dip_buy": func() Strategy { return NewWeeklyDipBuy() },
 
+	// The four kinds added 2026-09-14 to fill gaps the whole existing roster shares: none of the 36
+	// asks whether the market is a place its pattern can work, none combines opinions, none looks
+	// outside its own instrument, and none knows what time it is (docs/RL_V8_PLAN.md).
+	"confluence":          func() Strategy { return NewConfluence() },
+	"btc_divergence":      func() Strategy { return NewBTCDivergence() },
+	"btc_divergence_fade": func() Strategy { d := NewBTCDivergence(); d.Mode = "fade"; return d },
+	"session_momentum":    func() Strategy { return NewSessionMomentum() },
+
 	// Scalp/price-action/ICT additions (CLAUDE.md §9, added 2026-09) — aimed at low timeframes
 	// (5m) per an explicit operator request for well-known scalping-style strategies, since the
 	// original 14 skew toward slower swing-style setups.

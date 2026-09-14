@@ -93,9 +93,6 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		r.result.WinRate = float64(r.result.Wins) / float64(r.result.Samples)
 		r.result.MeanReward = r.result.MeanReward / float64(r.result.Samples)
 	}
-	if base, ok := r.result.ByStrategy[BaselineKind]; ok && base.Trades > 0 {
-		r.result.Significance = SignificanceVsBaseline(r.result.ByStrategy, BaselineKind, PnLSpread(r.pnls))
-	}
 	for _, k := range r.result.ByStrategy {
 		if k.Trades == 0 {
 			continue
@@ -105,6 +102,13 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		k.MeanReward = k.rewardSum / n
 		k.AvgHoldBars = float64(k.holdSum) / n
 		k.PnLPerTrade = k.PnLUSD / n
+	}
+
+	// AFTER the loop above, not before it. Significance reads PnLPerTrade, which is derived there —
+	// computing it first silently compared zeros and reported every gap as 0.00 with t=0.00, a
+	// table that looks like a finished measurement and contains none.
+	if base, ok := r.result.ByStrategy[BaselineKind]; ok && base.Trades > 0 {
+		r.result.Significance = SignificanceVsBaseline(r.result.ByStrategy, BaselineKind, PnLSpread(r.pnls))
 	}
 	return r.result, nil
 }

@@ -454,3 +454,36 @@ func TestOpenPosition_CapsOnePositionAsAFractionOfEquity(t *testing.T) {
 		t.Errorf("one slot must still be capped at 25%% of a $40 account ($10), got %s", p.size)
 	}
 }
+
+// Significance must be computed AFTER the per-kind derived fields it reads.
+//
+// It was not: SignificanceVsBaseline ran before the loop that fills PnLPerTrade, so every gap was
+// computed from zeros and the whole table reported gap=0.0000, t=0.00. That is worse than a missing
+// feature — it looks like a finished measurement saying "no strategy differs from random", which
+// was also the conclusion being investigated, so it would have confirmed itself.
+func TestRun_SignificanceIsComputedFromFilledStats(t *testing.T) {
+	src := &fakeSource{series: map[string][]domain.Candle{
+		"SOL/5m": trendingSeries(600, 150),
+		"BTC/5m": trendingSeries(600, 64000),
+	}}
+	r := testRunner(src, &MemorySink{}, []string{"coin_flip", "macd_momentum", "vwap_reversion"})
+
+	res, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.Significance) == 0 {
+		t.Fatal("no significance reported despite the baseline being in the run")
+	}
+
+	nonZero := 0
+	for _, s := range res.Significance {
+		if s.Gap != 0 {
+			nonZero++
+		}
+	}
+	if nonZero == 0 {
+		t.Error("every gap is exactly 0.0000 — significance is reading PnLPerTrade before it is " +
+			"filled, which reports a finished-looking table containing no measurement")
+	}
+}
