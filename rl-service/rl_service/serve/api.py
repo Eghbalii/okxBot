@@ -31,18 +31,23 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.utils import update_learning_rate
 
 from rl_service.config import load_config
-from rl_service.learner import Learner, reward_from_outcome
+from rl_service.learner import Learner
 from rl_service.obs import (
     ACTION_DIM,
     ACTION_SCHEMA_VERSION,
+    OBSERVATION_DIM,
     OBSERVATION_SCHEMA_VERSION,
     TERMINAL_CATEGORIES,
+    ZERO_REWARD_CATEGORIES,
     Action,
     Observation,
+    SchemaError,
     decode_action,
     flat_action,
+    mask_action_for_learning,
     to_vector,
 )
+from rl_service.reward import trade_reward
 
 logger = logging.getLogger("rl_service.serve")
 
@@ -91,6 +96,8 @@ def _load_model() -> None:
         _cfg.serve.model_path, _cfg.serve.learning_rate,
     )
 
+    _repair_entropy(_model)
+
     if not _cfg.serve.learning_enabled:
         logger.info("Continuous learning disabled; serving frozen weights.")
         return
@@ -120,6 +127,42 @@ def _load_model() -> None:
     logger.info("Continuous learning ENABLED (CLAUDE.md §15.11) — freeze this for real money.")
 
 
+def _repair_entropy(model: SAC) -> None:
+    """Restores the entropy target and coefficient a loaded checkpoint would otherwise carry.
+
+    THE ROOT CAUSE OF §54.8's COLLAPSE, and why this runs on every load rather than once.
+
+    SAC defaults target_entropy to -dim(action_space) and trains alpha to satisfy it. Over eight
+    tanh-squashed dimensions that target demands a near-deterministic policy, so alpha was driven
+    from 1.0 to 0.000919 — a thousandfold drop. With alpha at zero the entropy term vanishes from
+    the actor loss, and nothing then penalises the policy for drifting to the tanh bounds. It did:
+    every output pinned at ±1, returning an identical answer to every input, while /predict
+    succeeded, /health stayed green, and the learner reported real gradient steps throughout.
+
+    BOTH halves are required and neither works alone. A corrected target with the collapsed alpha
+    restored from the checkpoint re-diverged within 31 gradient steps (measured during the
+    rollback); resetting alpha under the old target is simply undone by the same signal that
+    collapsed it the first time. A rollback to a healthy snapshot fixes neither, because the
+    snapshot carries the same alpha.
+    """
+    try:
+        import torch
+
+        model.target_entropy = float(_cfg.serve.target_entropy)
+
+        if _cfg.serve.reset_entropy_coef and getattr(model, "log_ent_coef", None) is not None:
+            with torch.no_grad():
+                model.log_ent_coef.fill_(0.0)  # log(1.0) — alpha back to SAC's own starting point
+            logger.info("Entropy coefficient reset to 1.0 (docs/RL_V8_PLAN.md)")
+
+        logger.info("Entropy target set to %s", model.target_entropy)
+    except Exception:
+        # A failure here must not stop the service from serving. It does mean the next collapse
+        # would be unguarded, which is why /health reports entropy_coef: the number is visible even
+        # when this repair could not run.
+        logger.exception("entropy repair failed; serving anyway, watch /health's entropy_coef")
+
+
 @app.on_event("shutdown")
 def _snapshot_on_shutdown() -> None:
     """A clean shutdown must not throw away experience collected since the last snapshot."""
@@ -136,14 +179,41 @@ def health():
     # current action schema" — CLAUDE.md §11.2 makes the same point about model_loaded, and the
     # panel needs to tell these apart for the same reason: they mean very different things.
     action_compatible = _model is not None and _model.action_space.shape[0] == ACTION_DIM
+    # observation_compatible is the v8 addition, and the reason it matters is that its absence is
+    # what let ten inputs vanish for weeks: to_vector used to reshape the observation to whatever
+    # the loaded model wanted, so a mis-shaped model looked exactly like a working one
+    # (docs/RL_V8_PLAN.md). model_loaded:true is NOT evidence the model is usable — §16.9 records a
+    # wrongly-shaped model serving happily while the policy saw no market data at all.
+    observation_compatible = (
+        _model is not None and _model.observation_space.shape[0] == OBSERVATION_DIM
+    )
     body = {
         "status": "ok",
         "model_loaded": _model is not None,
         "action_schema_version": ACTION_SCHEMA_VERSION,
         "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
         "action_compatible": action_compatible,
+        "observation_compatible": observation_compatible,
+        "observation_dim": OBSERVATION_DIM,
+        "model_observation_dim": (
+            int(_model.observation_space.shape[0]) if _model is not None else None
+        ),
         "learning_enabled": _learner is not None,
     }
+    # The entropy coefficient, exposed so the next collapse is VISIBLE. SAC trains alpha to hit its
+    # target entropy, and on this project's 9-dim action space the default target (-dim = -9)
+    # demanded a near-deterministic policy: alpha fell 1.0 -> 0.000919, the entropy term vanished
+    # from the actor loss, and nothing then penalised the policy for drifting to the tanh bounds —
+    # all nine outputs pinned at ±1, returning an identical answer to every input (§54.8). Every
+    # health signal stayed green throughout. A falling alpha here is the early warning that was
+    # missing.
+    if _model is not None:
+        try:
+            body["entropy_coef"] = float(_model.ent_coef_tensor.detach().cpu().item())
+        except Exception:
+            ent = getattr(_model, "ent_coef", None)
+            body["entropy_coef"] = float(ent) if isinstance(ent, (int, float)) else None
+        body["target_entropy"] = float(getattr(_model, "target_entropy", 0.0))
     if _learner is not None:
         body["learning"] = _learner.stats()
     return body
@@ -163,10 +233,30 @@ def predict(obs: Observation) -> Action:
     if _model is None:
         return flat_action()
 
-    expected_dim = _model.observation_space.shape[0]
+    # A model whose INPUT width differs cannot be served, and this check is new in v8.
+    #
+    # Before it, to_vector took the loaded model's own width and padded or truncated the observation
+    # to fit — so the model dictated what the code sent, and a mis-shaped model was indistinguishable
+    # from a working one. §16.9 records an 83-dim model against an 89-dim caller collapsing every
+    # observation into the fixed tail (the policy saw no market data at all) while /health reported
+    # model_loaded: true throughout. Refusing is the only honest answer.
+    obs_dim = _model.observation_space.shape[0]
+    if obs_dim != OBSERVATION_DIM:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"loaded model expects a {obs_dim}-dim observation; this service builds "
+                f"{OBSERVATION_DIM} (observation_schema_version {OBSERVATION_SCHEMA_VERSION}). "
+                "Train a model against the current schema — the width is never padded to fit."
+            ),
+        )
+
     try:
-        obs_vec = to_vector(obs, expected_dim)
-    except ValueError as e:
+        obs_vec = to_vector(obs)
+    except SchemaError as e:
+        # 422 rather than 503: the observation is at fault, not the model. The caller should skip
+        # the call rather than retry — Go validates before sending for exactly this reason, so a
+        # 422 here means the two sides disagree about the schema.
         raise HTTPException(status_code=422, detail=str(e)) from e
 
     # A model trained against an older, narrower action space cannot answer the current one —
@@ -202,16 +292,28 @@ def _learn(obs: Observation, obs_vec: np.ndarray, raw: np.ndarray) -> None:
     assert _learner is not None
 
     if obs.category in TERMINAL_CATEGORIES:
-        reward = reward_from_outcome(
-            obs.position_state.realized_pnl_usd,
-            obs.account_initial_usd or obs.account_equity_usd,
-            obs.position_state.size_usd,
+        ps = obs.position_state
+        breakdown = trade_reward(
+            realized_pnl_usd=ps.realized_pnl_usd,
+            risk_pct=ps.risk_pct,
+            position_size_usd=ps.size_usd,
+            leverage=ps.leverage,
+            equity_usd=obs.account_equity_usd,
+            peak_equity_usd=obs.account_peak_usd or obs.account_initial_usd,
+            # An operator's manual close trains nothing: attributing a person's decision to the
+            # policy would score it on something it never did (§15.12). The call still happens so
+            # the pending decision resolves rather than leaking.
+            zero_reward=obs.category in ZERO_REWARD_CATEGORIES,
         )
-        matched = _learner.complete(obs.order_id, reward, obs_vec.reshape(-1))
+        matched = _learner.complete(obs.order_id, breakdown.total, obs_vec.reshape(-1))
         if not matched:
             # Expected after a restart, or for trades opened before learning was enabled — the
             # decision that produced them was never recorded, so there is nothing to score.
             logger.debug("terminal call for unknown order %s; nothing to score", obs.order_id)
         return
 
-    _learner.record(obs.order_id, obs_vec.reshape(-1), raw)
+    # Zero the head that decided nothing before it reaches the replay buffer (docs/RL_V8_PLAN.md).
+    # decode_action reads only the head matching this category, so training on the other one teaches
+    # the network to move an output nothing reads — and an output rewarded without having caused
+    # anything drifts to the tanh bound unopposed, which is the state §54.8 measured.
+    _learner.record(obs.order_id, obs_vec.reshape(-1), mask_action_for_learning(raw, obs.category))

@@ -26,6 +26,16 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
+// btcReferenceSymbol is the symbol BTC's candles are stored under. Explicit rather than assumed:
+// the symbol changed once already (§33.4's short-symbol migration), and a hardcoded literal buried
+// in a struct literal would have gone quietly wrong rather than failing.
+const btcReferenceSymbol = "BTC"
+
+// tokenStatsRefresh is how often the roster-wide token figures are reloaded. These change on the
+// discovery scan's own cadence (hours, §53), so anything faster is a query for a number that has
+// not moved.
+const tokenStatsRefresh = time.Hour
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
@@ -209,6 +219,36 @@ func main() {
 		defer d.Close()
 	}
 
+	// The market-wide reference block (docs/RL_V8_PLAN.md). Every other observation input is
+	// intra-token, so without this the model cannot see that an altcoin reverses the moment BTC's
+	// candle turns red — the operator's own observation and the reason the block exists.
+	//
+	// Its own consumer group, and its own dispatcher registration per bar, so it works whether or
+	// not BTC is in the traded roster: disabling BTC for trading must not silently blind the model
+	// about the whole market.
+	btcRef := &usecase.BTCReference{
+		InstID:       btcReferenceSymbol,
+		Bars:         paperTradingBars,
+		CandleWindow: cfg.PaperTrading.CandleLimit,
+		Repo:         repo,
+		Consumers:    make(map[string]port.MarketDataConsumer, len(paperTradingBars)),
+	}
+	for _, bar := range paperTradingBars {
+		d, ok := candleDispatchers[bar]
+		if !ok {
+			// A decision bar with no ingestion is already a startup error elsewhere
+			// (ValidatePaperTradingBars); guard anyway so a future reordering cannot produce a
+			// reference that silently never updates.
+			logger.Error("btc reference: no candle dispatcher for decision bar", "bar", bar)
+			os.Exit(1)
+		}
+		btcRef.Consumers[bar] = d.ForInstrument(btcReferenceSymbol)
+	}
+
+	// The roster-wide half of the token profile (volume, rank, 24h figures), refreshed on the
+	// discovery scan's own cadence rather than queried per decision.
+	tokenStats := &usecase.TokenStatsCache{Repo: repo, Refresh: tokenStatsRefresh}
+
 	// Paper-order open/close events, for the panel's real-time WebSocket bridge (cmd/api).
 	orderEventsPub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "okx.paper-order-events")
 	defer orderEventsPub.Close()
@@ -307,6 +347,12 @@ func main() {
 			// everything else in this block, this is unconditional housekeeping, not RL behavior.
 			MaxOpenDuration: cfg.PaperTrading.RLMaxOpenDuration,
 			ActiveTokens:    instIDs,
+			// v8 observation inputs (docs/RL_V8_PLAN.md). BTCCandles is NOT optional: nil makes
+			// buildObservation fail, which skips every model call — deliberately, since a zeroed
+			// BTC block would read as "BTC is perfectly flat and uncorrelated" rather than as
+			// missing information.
+			BTCCandles: btcRef.Window,
+			TokenStats: tokenStats.For,
 			// One shared account across every token (CLAUDE.md §15.6): each per-instrument engine
 			// trades against the same "paper" balance row, not a slice of it.
 			Mode:                "paper",
@@ -329,6 +375,8 @@ func main() {
 		}()
 	}
 
+	go func() { errCh <- btcRef.Run(ctx, logger) }()
+	go func() { errCh <- tokenStats.Run(ctx, logger) }()
 	go func() { errCh <- tickDispatcher.Run(ctx) }()
 	for _, d := range candleDispatchers {
 		d := d

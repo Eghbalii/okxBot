@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -69,5 +71,31 @@ func TestBuildRLClamps_ProductionScenarioIsNowCaught(t *testing.T) {
 		t.Logf("stop correctly tightened from %s (5%% naive) to %s (0.75%% capped)", naiveSL, out.SLPx)
 	} else {
 		t.Errorf("stop was NOT tightened — still at the naive 5%% distance, MaxLossPct had no effect")
+	}
+}
+
+// The v8 observation inputs must actually be wired into the engine (docs/RL_V8_PLAN.md).
+//
+// This is the §23 incident class, and the reason it gets a source-level test rather than a
+// behavioural one: BTCCandles and TokenStats are two fields in a ~40-field struct literal, and a
+// field dropped from a large literal is invisible — §23 records exactly that costing every real
+// position its 15% loss cap. Here the failure is quieter still: a nil BTCCandles makes
+// buildObservation fail, which SKIPS every model call, so the service would run indefinitely
+// looking healthy while never consulting the model at all.
+func TestPaperTraderWiresTheV8ObservationInputs(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	for _, want := range []string{
+		"BTCCandles: btcRef.Window",
+		"TokenStats: tokenStats.For",
+		"errCh <- btcRef.Run(ctx, logger)",
+		"errCh <- tokenStats.Run(ctx, logger)",
+	} {
+		if !strings.Contains(string(src), want) {
+			t.Errorf("cmd/paper-trader no longer wires %q — without it the engine builds no valid "+
+				"observation and silently never calls the model", want)
+		}
 	}
 }

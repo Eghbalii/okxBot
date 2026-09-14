@@ -179,3 +179,26 @@ func TestEnginesAreMarkedReconciledExternally(t *testing.T) {
 			"no driver running, nothing reconciles real positions at all")
 	}
 }
+
+// The v8 observation inputs must be wired here too (docs/RL_V8_PLAN.md).
+//
+// A deliberate copy of cmd/paper-trader's equivalent rather than a shared helper: the two mains
+// build their own struct literals, and §23's lesson is that a field dropped from one must not hide
+// behind the other already being correct. Both get their own test for that reason.
+func TestRealTraderWiresTheV8ObservationInputs(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	for _, want := range []string{
+		"BTCCandles: btcRef.Window",
+		"TokenStats: tokenStats.For",
+		"errCh <- btcRef.Run(ctx, logger)",
+		"errCh <- tokenStats.Run(ctx, logger)",
+	} {
+		if !strings.Contains(string(src), want) {
+			t.Errorf("cmd/trader no longer wires %q — without it RealTrader builds no valid "+
+				"observation and silently never calls the model", want)
+		}
+	}
+}

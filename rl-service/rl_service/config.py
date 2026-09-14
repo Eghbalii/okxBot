@@ -83,10 +83,37 @@ class ServeConfig:
     learning_starts: int = 100
     # Gradient steps per closed trade. Off-policy means each experience is reused many times, so
     # this can be >1 even though experiences arrive slowly.
-    gradient_steps: int = 4
+    #
+    # ONE, not four, as of v8. Four steps at batch 256 per closed trade replayed each experience
+    # ~6 times in two hours, out of a buffer that is all one market regime and mostly losses —
+    # aggressive enough to overfit a trickle, which is the opposite of what off-policy reuse is for
+    # at this data volume (docs/RL_V8_PLAN.md).
+    gradient_steps: int = 1
     # Snapshot cadence, in closed trades. A snapshot writes BOTH weights and the replay buffer:
     # weights alone would silently discard every collected experience on restart.
-    snapshot_every: int = 25
+    #
+    # Raised 25 -> 100 with v8. At 25 the snapshot hook OVERWROTE a deliberately restored backup
+    # after 31 gradient steps, before anyone could see what had happened (§54.8's rollback) — a
+    # cadence that destroys the evidence of the failure it is supposed to help diagnose.
+    snapshot_every: int = 100
+
+    # --- entropy (docs/RL_V8_PLAN.md) ---
+    #
+    # SAC defaults target_entropy to -dim(action_space), which is -8 here. Spread over eight
+    # tanh-squashed dimensions that demands about -1.0 per dimension — a near-deterministic policy.
+    # SAC then trains alpha to satisfy it, and alpha fell from 1.0 to 0.000919: with alpha at zero
+    # the entropy term vanishes from the actor loss, so nothing penalises the policy for drifting
+    # to the tanh bounds, and it did — all outputs pinned at ±1, returning an identical answer to
+    # every input (§54.8).
+    #
+    # -4.5 asks for roughly half that much determinism, leaving real exploration in a policy that
+    # has to keep learning from a trickle of live outcomes.
+    target_entropy: float = -4.5
+    # Reset alpha to 1.0 when loading a checkpoint. BOTH halves are needed and neither works alone:
+    # a corrected target with the collapsed alpha restored from the checkpoint re-diverges (measured:
+    # within 31 gradient steps), and resetting alpha under the old target is simply undone by the
+    # same training signal that collapsed it the first time.
+    reset_entropy_coef: bool = True
     # Where the replay buffer is snapshotted. Sits beside model_path by default.
     buffer_path: str = "models/sac_global_buffer.pkl"
     # Overrides the learning_rate baked into the loaded checkpoint at startup (SAC.load's own

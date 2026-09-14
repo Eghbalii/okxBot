@@ -33,6 +33,12 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
+// btcReferenceSymbol is the symbol BTC's candles are stored under (see cmd/paper-trader).
+const btcReferenceSymbol = "BTC"
+
+// tokenStatsRefresh is how often the roster-wide token figures are reloaded.
+const tokenStatsRefresh = time.Hour
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
@@ -312,6 +318,28 @@ func runRealTrader(
 		defer d.Close()
 	}
 
+	// The market-wide reference block (docs/RL_V8_PLAN.md) — see cmd/paper-trader for why it is
+	// separate from the per-instrument engines and independent of the traded roster. Its own
+	// consumer registration per decision bar.
+	btcRef := &usecase.BTCReference{
+		InstID:       btcReferenceSymbol,
+		Bars:         decisionBars,
+		CandleWindow: cfg.PaperTrading.CandleLimit,
+		Repo:         repo,
+		Consumers:    make(map[string]port.MarketDataConsumer, len(decisionBars)),
+	}
+	for _, bar := range decisionBars {
+		d, ok := candleDispatchers[bar]
+		if !ok {
+			logger.Error("btc reference: no candle dispatcher for decision bar", "bar", bar)
+			os.Exit(1)
+		}
+		btcRef.Consumers[bar] = d.ForInstrument(btcReferenceSymbol)
+	}
+
+	// The roster-wide half of the token profile, refreshed on the discovery scan's own cadence.
+	tokenStats := &usecase.TokenStatsCache{Repo: repo, Refresh: tokenStatsRefresh}
+
 	orderEventsPub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "okx.paper-order-events")
 	defer orderEventsPub.Close()
 
@@ -363,6 +391,11 @@ func runRealTrader(
 			TdMode:          cfg.Trading.TdMode,
 			PosMode:         cfg.Trading.PosMode,
 			ActiveTokens:    instIDs,
+			// v8 observation inputs (docs/RL_V8_PLAN.md). BTCCandles is NOT optional: nil makes
+			// buildObservation fail, which skips every model call — deliberately, since a zeroed
+			// BTC block would read as "BTC is flat and uncorrelated" rather than as missing data.
+			BTCCandles: btcRef.Window,
+			TokenStats: tokenStats.For,
 
 			// Panel control-box gates for real mode (CLAUDE.md real-trading readiness plan,
 			// 2026-09-04) — mirrors cmd/paper-trader's own PaperTrader construction exactly.
@@ -497,6 +530,8 @@ func runRealTrader(
 		})
 	}()
 
+	go func() { errCh <- btcRef.Run(ctx, logger) }()
+	go func() { errCh <- tokenStats.Run(ctx, logger) }()
 	go func() { errCh <- tickDispatcher.Run(ctx) }()
 	for _, d := range candleDispatchers {
 		d := d
