@@ -138,6 +138,18 @@ type MarketView struct {
 	// ok=false rather than a partial window, and a strategy must degrade gracefully when it does
 	// (the engine keeps running through a warm-up period where longer timeframes are still filling).
 	Bars map[string][]Candle
+
+	// Reference is the wider market's window on the same bar — BTC, in practice.
+	//
+	// Added for the strategies that compare an instrument against the market rather than reading it
+	// in isolation (see btc_divergence.go). Every one of the 36 kinds that predate it reads only
+	// its own price, which is why none of them can express "this token is rising while BTC falls" —
+	// the operator's own observation, and a real event this registry had no vocabulary for.
+	//
+	// Nil when no reference feed is wired, or when the instrument IS the reference. A strategy that
+	// needs it must return Hold rather than falling back to a single-instrument rule, which would
+	// be a different strategy wearing the same name and results.
+	Reference []Candle
 }
 
 // Higher returns another timeframe's window, reporting ok=false when that bar isn't being

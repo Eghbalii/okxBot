@@ -30,6 +30,11 @@ type Runner struct {
 	records map[string]*stratRecord
 	result  Result
 
+	// pnls collects every trade's realized PnL, so the significance test measures the spread from
+	// the run itself rather than assuming a constant — the same strategy on a $40 account and a
+	// $2,600 one has the same edge and very different absolute PnL.
+	pnls []float64
+
 	// nextOrderID numbers simulated trades. Not cosmetic: the learner pairs a decision with the
 	// outcome that lands hours later BY ORDER ID (§15.11), so a dataset whose samples share an id —
 	// or carry none — would let one trade's reward train another trade's decision. The live
@@ -87,6 +92,9 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	if r.result.Samples > 0 {
 		r.result.WinRate = float64(r.result.Wins) / float64(r.result.Samples)
 		r.result.MeanReward = r.result.MeanReward / float64(r.result.Samples)
+	}
+	if base, ok := r.result.ByStrategy[BaselineKind]; ok && base.Trades > 0 {
+		r.result.Significance = SignificanceVsBaseline(r.result.ByStrategy, BaselineKind, PnLSpread(r.pnls))
 	}
 	for _, k := range r.result.ByStrategy {
 		if k.Trades == 0 {
@@ -182,7 +190,16 @@ func (r *Runner) runOne(ctx context.Context, instID, bar string, kinds []string,
 		if len(window) > minLen {
 			window = window[len(window)-minLen:]
 		}
-		view := strategy.MarketView{Bars: map[string][]strategy.Candle{bar: window}, Bar: bar, Candles: window}
+		// Reference carries BTC's window so a cross-market strategy can actually see it
+		// (strategy.MarketView.Reference). Without this, btc_divergence would hold on every bar and
+		// silently score as a strategy that never trades rather than one that was never given its
+		// input — the failure mode §30.1 records a whole suite passing vacuously through.
+		view := strategy.MarketView{
+			Bars:      map[string][]strategy.Candle{bar: window},
+			Bar:       bar,
+			Candles:   window,
+			Reference: btcWindow,
+		}
 
 		for kind, s := range strats {
 			if _, busy := open[kind]; busy {

@@ -205,6 +205,7 @@ func (r *Runner) closePosition(
 	ks.rewardSum += reward
 	ks.holdSum += idx - p.openedIdx
 
+	r.pnls = append(r.pnls, pnlF)
 	r.result.Samples++
 	r.result.ByReason[reason]++
 	r.result.TotalPnL += pnlF

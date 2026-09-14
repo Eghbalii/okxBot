@@ -117,6 +117,11 @@ type Result struct {
 	// on average, bad for one" is invisible in a total.
 	ByStrategy map[string]*KindStats `json:"by_strategy"`
 
+	// Significance compares every strategy against the null baseline, when one was included in the
+	// run. Reported because a raw ranking is misleading: the first full screening's entire table of
+	// 37 strategies had every gap at t < 1, so the ordering carried no information at all.
+	Significance []Significance `json:"significance,omitempty"`
+
 	// Resets counts how many times the simulated account was drained and topped back up (§15.7).
 	// Surfaced because a dataset built across many resets describes a strategy mix that loses
 	// money, and that is the first thing worth knowing before training on it.
