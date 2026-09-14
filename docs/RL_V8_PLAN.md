@@ -243,3 +243,45 @@ a restored backup after 31 steps before anyone could inspect it.
 - Rebuild/restart services ONE AT A TIME, cleaning docker cache between each (§35.7: building two
   at once, or even one while monitoring runs, has killed Kafka on this 3.9GB box).
 - Real trading stays stopped throughout.
+
+---
+
+## Progress log
+
+### Done: schema + reward (commit c07a1e8)
+- `rl_service/obs.py` rewritten for v8. OBSERVATION_DIM = **84**, ACTION_DIM = **8**, computed from
+  constants and pinned by a test that builds a full observation and counts it.
+- `to_vector` no longer takes an `expected_dim` and no longer pads or truncates — it raises.
+- `rl_service/reward.py`: one risk-adjusted reward function replacing two that disagreed. Weights
+  calibrated against the measured distribution of 2084 closed trades (median |return| 5.1%, mean
+  risk 6.6%). Verified: a typical win scores 0.73, the same gain with a 15% stop 0.32, the same
+  trade at 50x 0.25, with a 20% drawdown 0.67.
+- 58 Python tests (40 schema, 18 reward), pinning properties rather than numbers.
+
+### Done: Go observation building (commit d50c2a7)
+- `internal/usecase/features.go`: `BuildIndicators`, `BuildMarketBlock`, `BuildReturns`,
+  `BuildBTCContext`, `correlation`, `returnVolatility`.
+- `internal/domain/rl.go` + `rl_validate.go`: v8 types, `Validate()`, `ValidationField()` for the
+  metric label.
+- `buildObservation` on both PaperTrader and RealTrader returns `(Observation, error)`; all six call
+  sites skip the model on error and count `okxbot_model_calls_skipped_total{stage,reason}`.
+- Legacy `Trader.step` no longer calls the model at all.
+- 833 Go tests pass, go vet clean.
+
+### Next, in order
+1. **Wire BTCCandles and TokenStats in `cmd/paper-trader` and `cmd/trader`.** Both fields are
+   declared and nil today, and nil disables model calls — so the engine is inert until this lands.
+   BTC's candle window comes from the same store every instrument already reads; TokenStats from the
+   discovery scan's `market_tokens` snapshot.
+2. **`rl_service/serve/api.py`**: refuse a model whose `observation_space` ≠ OBSERVATION_DIM (503,
+   mirroring the existing ACTION_DIM check), report `observation_compatible` on `/health`, and wire
+   `mask_action_for_learning` into the learner so a head that decided nothing takes no gradient.
+3. **`rl_service/learner.py`**: use `reward.trade_reward`, carry `risk_pct`/fees/leverage through,
+   honour the zero-reward rule for manual closes.
+4. **Entropy fixes** (from the previous session): `target_entropy = -4.5`, reset alpha at load,
+   expose `entropy.coef` on `/health`, `gradient_steps` 1, reconsider `snapshot_every`.
+5. **Backtest component** — its own top-level section, as the operator asked, for open-source value.
+6. **Roster**: 16 slots (DOGE/ZEC/PUMP/SOL x macd_momentum/inside_bar_breakout_v2/
+   range_breakout_v2/stepped_trailing), paper cap $40, max leverage 10. And stop the discovery scan
+   from auto-enabling `enabled_paper`, or the budget input keeps shifting for no economic reason.
+7. Train, **show the operator the results**, deploy only on their approval.
