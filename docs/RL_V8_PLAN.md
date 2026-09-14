@@ -285,3 +285,24 @@ a restored backup after 31 steps before anyone could inspect it.
    range_breakout_v2/stepped_trailing), paper cap $40, max leverage 10. And stop the discovery scan
    from auto-enabling `enabled_paper`, or the budget input keeps shifting for no economic reason.
 7. Train, **show the operator the results**, deploy only on their approval.
+
+### Operator instruction (2026-09-14): all three RL gates ON
+
+`rl_sizing`, `rl_sltp_adjust` and `rl_early_close` are ALL enabled — in the backtest and in live
+paper trading alike. The model makes the open decision, manages the levels, and may exit early.
+
+This reverses two long-standing defaults and the reasons they existed are worth stating, because
+both are now answered rather than ignored:
+
+- **`rl_sizing` was off** because §14's first attempt converged to 100% `skip` within 20 minutes on
+  a policy with 39 completed trades. That policy had six market inputs (docs/RL_V8_PLAN.md's audit)
+  and a reward of ~1e-4. Both are fixed, and the backtest warm start means the policy is no longer
+  random when live trading begins — which is what §16.9's deadlock was actually about.
+- **`rl_early_close` was off** because it destroys the counterfactual: an early-closed trade can
+  never show what it would have done. That cost is real and accepted. It is also the only way the
+  model's own exit judgement ever gets a reward attached to it, and §42 measured the model asking to
+  close on 84 of 89 update calls with every one discarded — the question has been asked thousands of
+  times and never answered.
+
+The backtest must exercise the same three, or the warm start would train a policy on a lifecycle
+different from the one it is then served — the train/serve skew this whole plan exists to remove.
