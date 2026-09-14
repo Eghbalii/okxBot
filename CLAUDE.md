@@ -6273,3 +6273,51 @@ Both are worth recording because the tests looked correct:
 
 The general lesson, and this project has now hit it twice in two days (§53.5): a test that asserts a
 *consequence* another correct mechanism also produces proves nothing about the code it names.
+
+### 54.8 The model saturated, and was rolled back (2026-09-14)
+
+The overnight early-close trial produced **zero** early closes, which the operator reported as the
+flag not being active. It was: `rl_early_close: true` was verified inside the running container, the
+container had started after the config edit, and the `early_close_ignored` counter had disappeared
+entirely. The flag worked. **The model simply never asked to close.**
+
+Probing the live service across the full PnL range — from 50% down to 50% up — returned `none` every
+single time. Reading the raw action vector explained why:
+
+```
+[1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0]
+```
+
+**Every one of the nine outputs saturated at ±1.** Not a policy making decisions — a policy pinned to
+its bounds. It explains all three behaviours observed that day at once: `size_pct` always the full
+budget, `leverage_frac` always 10x, and an action head where `close` sat at a constant −1 so the
+argmax could never select it.
+
+Dangerous property worth naming: **a saturated policy still returns well-formed answers.** Every
+`/predict` call succeeded, `/health` was green, the learner reported real gradient steps, and orders
+opened normally. Nothing in any metric said "this model stopped deciding" — the only way to see it
+was to read the action vector directly.
+
+The day before, the same model answered `close` on 84 of 89 update calls. Between the two states lay
+**66 gradient steps**, and the weights' checksum had changed. A policy flipping from one saturated
+extreme to the opposite one in 66 steps is diverging, not learning.
+
+**Rolled back** to the pre-trial snapshot at the operator's instruction, with `rl-service` STOPPED
+for the copy (§16.9). The current diverged state was backed up first as
+`model-backups/20260914-diverged-saturated/` — without it there would have been no way back from the
+rollback itself, and it is the only evidence of the failure.
+
+The restored model is measurably different, not merely a different file: 6/9 outputs saturated rather
+than 9/9, `leverage_frac` at 0.548 rather than pinned, and — the property that matters — `close`
+rising monotonically as losses deepen (−0.96 at +30% PnL to −0.69 at −40%). It still prefers `update`
+over `close`, but it is responding to PnL again, which the diverged version had stopped doing
+entirely.
+
+**Backups now live at `models/backup/` in the repo** (gitignored: 78MB per snapshot would bloat a
+public repo permanently, and git keeps every version forever) as well as on the server. An earlier
+copy went to a directory outside the project that the operator had not asked for — recorded because
+the fix is to put artefacts where the person asked, not where seemed reasonable.
+
+**Still open**: learning is enabled again, so the same divergence can recur — the 66 steps that
+produced it took under two hours. Worth watching the action vector, not just `/health`, and
+considering whether `learning_enabled` should be off until the divergence itself is understood.

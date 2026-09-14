@@ -19,6 +19,11 @@ rl-service/**/*.egg-info/
 /data/
 /rl-service/data/
 rl-service/models/
+# Model backups kept locally for rollback (2026-09-14). Deliberately NOT committed: the weights are
+# 4MB and the replay buffer 74MB per snapshot, which would bloat a public repo (§46) permanently,
+# since git keeps every version forever. They live on disk here and on the server under
+# model-backups/ — the point is having them recoverable, not versioned.
+models/backup/
 *.log
 
 # OS / editor
