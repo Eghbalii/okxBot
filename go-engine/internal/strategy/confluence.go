@@ -127,8 +127,8 @@ type memberOpinion struct {
 
 func (c *Confluence) Params() []ParamSpec {
 	return []ParamSpec{
-		{Name: "min_agree", Min: decimal.NewFromInt(2), Max: decimal.NewFromInt(6), Default: decimal.NewFromInt(2)},
-		{Name: "agree_window", Min: decimal.NewFromInt(1), Max: decimal.NewFromInt(20), Default: decimal.NewFromInt(5)},
+		{Name: "min_agree", Min: decimal.NewFromInt(2), Max: decimal.NewFromInt(6), Default: decimal.NewFromInt(3)},
+		{Name: "agree_window", Min: decimal.NewFromInt(1), Max: decimal.NewFromInt(30), Default: decimal.NewFromInt(12)},
 		{Name: "sl_pct", Min: decimal.NewFromFloat(0.002), Max: decimal.NewFromFloat(0.03), Default: decimal.NewFromFloat(0.006)},
 		{Name: "tp_pct", Min: decimal.NewFromFloat(0.002), Max: decimal.NewFromFloat(0.08), Default: decimal.NewFromFloat(0.015)},
 	}
@@ -187,8 +187,21 @@ func NewConfluence() *Confluence {
 			NewICTOrderBlock(),     // structure
 			NewKeltnerTrendScalp(), // volatility/trend
 		},
-		MinAgree:    2,
-		AgreeWindow: 5,
+		// 3 of 4 rather than 2, tightened 2026-09-15. The first screening gave t=+1.15 on 2,366
+		// trades and reported it would need ~7,115 to settle — which is the signature of a gap too
+		// SMALL to confirm rather than a sample too thin. More volume cannot fix that; only a
+		// stronger signal can, and the only lever this strategy has is how much agreement it
+		// demands. Two of four is a coincidence often enough to be worth little.
+		MinAgree: 3,
+		// 12, not 5, and the two are COUPLED — measured, not chosen. At a 5-bar window, 3-of-4
+		// agreement occurs ZERO times in 800 bars; at 8 it occurs twice; at 12 it occurs 32 times.
+		// Demanding stronger agreement without widening the window does not make the strategy
+		// pickier, it makes it silent, which is a different thing that looks the same from outside.
+		//
+		// The cost is real and worth stating: a 12-bar window on 5m is an hour, so "three strategies
+		// agree" means "three spoke within the hour" rather than "three see the same setup now".
+		// Whether that is still a meaningful confluence is exactly what the backtest measures.
+		AgreeWindow: 12,
 		SLPct:       decimal.NewFromFloat(0.006),
 		TPPct:       decimal.NewFromFloat(0.015),
 	}

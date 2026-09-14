@@ -248,3 +248,138 @@ func AvgVolume(candles []Candle, period int) (decimal.Decimal, error) {
 	}
 	return sum.Div(decimal.NewFromInt(int64(period))), nil
 }
+
+// ADX measures TREND STRENGTH without regard to direction, over `period` bars.
+//
+// Added 2026-09-14 for the regime-adaptive strategies. It answers a question no indicator in this
+// package could: not "which way is price going" but "is it going anywhere at all". Screening 41
+// strategies found none of them asking that — they all trade their pattern whenever it appears, and
+// a breakout pattern in a chopping market is noise no matter how cleanly it forms.
+//
+// Wilder's formulation: directional movement is the portion of a bar's range that extends beyond
+// the previous bar's, smoothed; ADX is the smoothed absolute difference between the two directional
+// indicators as a fraction of their sum. Conventionally above ~25 reads as trending and below ~20
+// as ranging, but those thresholds are instrument- and timeframe-dependent and belong in a
+// strategy's parameters rather than here.
+//
+// Uses Wilder's smoothing (an EMA with alpha = 1/period), matching every published ADX; a simple
+// moving average would produce a different, more reactive number under the same name.
+func ADX(candles []Candle, period int) (decimal.Decimal, error) {
+	// Two smoothing passes are needed — one for DI, one for ADX itself — so the series must be long
+	// enough for both to warm up, not just for one.
+	if period < 1 {
+		period = 14
+	}
+	if len(candles) < 2*period+1 {
+		return decimal.Zero, errNeedMore(2*period+1, len(candles))
+	}
+
+	dxs, err := dxSeries(candles, period)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	if len(dxs) < period {
+		return decimal.Zero, errNeedMore(period, len(dxs))
+	}
+
+	// Seed the ADX with the mean of the first `period` DX values, then smooth the rest — Wilder's
+	// own initialization, and what makes this comparable to the number a charting package shows.
+	sum := decimal.Zero
+	for _, d := range dxs[:period] {
+		sum = sum.Add(d)
+	}
+	adx := sum.Div(decimal.NewFromInt(int64(period)))
+	n := decimal.NewFromInt(int64(period))
+	for _, d := range dxs[period:] {
+		adx = adx.Mul(n.Sub(decimal.NewFromInt(1))).Add(d).Div(n)
+	}
+	return adx.Round(emaScale), nil
+}
+
+// DirectionalIndex returns (+DI, -DI) — the directional halves ADX summarizes.
+//
+// Exposed separately because a strategy that knows the market is trending usually also wants to
+// know which way, and recomputing the smoothing to get it would double the work for a number
+// already calculated here.
+func DirectionalIndex(candles []Candle, period int) (plusDI, minusDI decimal.Decimal, err error) {
+	if period < 1 {
+		period = 14
+	}
+	if len(candles) < period+1 {
+		return decimal.Zero, decimal.Zero, errNeedMore(period+1, len(candles))
+	}
+	p, m, _, err := smoothedDM(candles, period, len(candles)-1)
+	return p, m, err
+}
+
+// dxSeries computes the DX value at every bar where it is defined.
+func dxSeries(candles []Candle, period int) ([]decimal.Decimal, error) {
+	var out []decimal.Decimal
+	for i := period; i < len(candles); i++ {
+		plusDI, minusDI, ok, err := smoothedDM(candles, period, i)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		sum := plusDI.Add(minusDI)
+		if !sum.IsPositive() {
+			// Both directional indicators zero: no movement at all in the window. DX is undefined,
+			// and zero is the honest reading — nothing is trending.
+			out = append(out, decimal.Zero)
+			continue
+		}
+		out = append(out, plusDI.Sub(minusDI).Abs().Div(sum).Mul(decimal.NewFromInt(100)))
+	}
+	return out, nil
+}
+
+// smoothedDM returns Wilder-smoothed +DI and -DI as of bar `at`.
+func smoothedDM(candles []Candle, period, at int) (plusDI, minusDI decimal.Decimal, ok bool, err error) {
+	if at < period || at >= len(candles) {
+		return decimal.Zero, decimal.Zero, false, nil
+	}
+
+	var trSum, plusSum, minusSum decimal.Decimal
+	for i := at - period + 1; i <= at; i++ {
+		tr, up, down := directionalMove(candles[i-1], candles[i])
+		trSum = trSum.Add(tr)
+		plusSum = plusSum.Add(up)
+		minusSum = minusSum.Add(down)
+	}
+	if !trSum.IsPositive() {
+		return decimal.Zero, decimal.Zero, true, nil
+	}
+	hundred := decimal.NewFromInt(100)
+	return plusSum.Div(trSum).Mul(hundred).Round(emaScale),
+		minusSum.Div(trSum).Mul(hundred).Round(emaScale), true, nil
+}
+
+// directionalMove returns one bar's true range and its directional movement.
+//
+// Only the LARGER of the two moves counts, and only when it is positive: a bar that extends beyond
+// the previous one in both directions is an expansion, not a directional move, and counting both
+// would read an inside-out bar as simultaneously bullish and bearish.
+func directionalMove(prev, cur Candle) (tr, up, down decimal.Decimal) {
+	hl := cur.High.Sub(cur.Low)
+	hc := cur.High.Sub(prev.Close).Abs()
+	lc := cur.Low.Sub(prev.Close).Abs()
+	tr = hl
+	if hc.GreaterThan(tr) {
+		tr = hc
+	}
+	if lc.GreaterThan(tr) {
+		tr = lc
+	}
+
+	upMove := cur.High.Sub(prev.High)
+	downMove := prev.Low.Sub(cur.Low)
+	if upMove.IsPositive() && upMove.GreaterThan(downMove) {
+		up = upMove
+	}
+	if downMove.IsPositive() && downMove.GreaterThan(upMove) {
+		down = downMove
+	}
+	return tr, up, down
+}

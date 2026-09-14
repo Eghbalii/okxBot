@@ -37,16 +37,37 @@ type BTCDivergence struct {
 	// divergence measured against noise is noise.
 	MinBTCMove decimal.Decimal
 
+	// MinEfficiency gates on the token's own regime (added 2026-09-15).
+	//
+	// The fade mode needed this most: 1,983 trades at t=+0.82, needing ~11,930 to settle — it
+	// already had the volume and still could not confirm, which no amount of further sampling
+	// fixes. A spread snapping back is a mean-reversion premise, and mean reversion is exactly what
+	// fails in a market that is trending: there, a token running ahead of BTC is not stretched, it
+	// is leading. Capping efficiency keeps fade out of the regime that breaks it.
+	MaxEfficiency decimal.Decimal
+	// MinEfficiency is the mirror for follow mode, which wants a market that is actually going
+	// somewhere for the laggard to catch up to.
+	MinEfficiency decimal.Decimal
+	// RegimeWindow is how many bars the efficiency ratio spans.
+	RegimeWindow int
+
 	SLPct decimal.Decimal
 	TPPct decimal.Decimal
 }
 
 func NewBTCDivergence() *BTCDivergence {
 	return &BTCDivergence{
-		Mode:          "follow",
-		Window:        12,
-		MinDivergence: decimal.NewFromFloat(0.008),
-		MinBTCMove:    decimal.NewFromFloat(0.003),
+		Mode:   "follow",
+		Window: 12,
+		// Loosened 2026-09-15 after the first real screening: 374 trades gave t=+0.86 — positive
+		// but indistinguishable from chance, and the significance report said it needs ~2,010 to
+		// settle. A 0.8% divergence on a 5m bar is a large dislocation, so the threshold was
+		// bounding the SAMPLE rather than the quality; these are the gates to relax, not the idea.
+		MinDivergence: decimal.NewFromFloat(0.003),
+		MinBTCMove:    decimal.NewFromFloat(0.0012),
+		RegimeWindow:  20,
+		// Set per mode in the factory: follow wants a trending market, fade wants a ranging one.
+		MinEfficiency: decimal.NewFromFloat(0.25),
 		SLPct:         decimal.NewFromFloat(0.006),
 		TPPct:         decimal.NewFromFloat(0.015),
 	}
@@ -89,6 +110,27 @@ func (b *BTCDivergence) EvaluateView(v MarketView) (Signal, error) {
 	spread := ownMove.Sub(btcMove)
 	if spread.Abs().LessThan(b.MinDivergence) {
 		return Signal{Side: Hold}, nil
+	}
+
+	// The regime gate. Checked against the TOKEN's own behaviour rather than BTC's, because the
+	// premise being protected is about how this instrument responds — whether a stretched spread
+	// snaps back (it does in a range) or keeps stretching (it does in a trend).
+	if b.MinEfficiency.IsPositive() || b.MaxEfficiency.IsPositive() {
+		win := b.RegimeWindow
+		if win <= 0 {
+			win = 20
+		}
+		reg, err := ClassifyRegime(own, win)
+		if err != nil {
+			// Cannot classify: "I do not know" is not "yes", the same call RegimeFilter makes.
+			return Signal{Side: Hold}, nil
+		}
+		if b.MinEfficiency.IsPositive() && reg.Efficiency.LessThan(b.MinEfficiency) {
+			return Signal{Side: Hold}, nil
+		}
+		if b.MaxEfficiency.IsPositive() && reg.Efficiency.GreaterThan(b.MaxEfficiency) {
+			return Signal{Side: Hold}, nil
+		}
 	}
 
 	side := Hold
@@ -153,6 +195,7 @@ func (b *BTCDivergence) Params() []ParamSpec {
 func (b *BTCDivergence) WithParams(p map[string]decimal.Decimal) Strategy {
 	out := NewBTCDivergence()
 	out.Mode = b.Mode
+	out.MinEfficiency, out.MaxEfficiency, out.RegimeWindow = b.MinEfficiency, b.MaxEfficiency, b.RegimeWindow
 	if v, ok := p["window"]; ok {
 		out.Window = int(v.IntPart())
 	}

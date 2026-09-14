@@ -38,10 +38,25 @@ var Factories = map[string]Factory{
 	// The four kinds added 2026-09-14 to fill gaps the whole existing roster shares: none of the 36
 	// asks whether the market is a place its pattern can work, none combines opinions, none looks
 	// outside its own instrument, and none knows what time it is (docs/RL_V8_PLAN.md).
-	"confluence":          func() Strategy { return NewConfluence() },
-	"btc_divergence":      func() Strategy { return NewBTCDivergence() },
-	"btc_divergence_fade": func() Strategy { d := NewBTCDivergence(); d.Mode = "fade"; return d },
-	"session_momentum":    func() Strategy { return NewSessionMomentum() },
+	"confluence":     func() Strategy { return NewConfluence() },
+	"btc_divergence": func() Strategy { return NewBTCDivergence() },
+	"btc_divergence_fade": func() Strategy {
+		d := NewBTCDivergence()
+		d.Mode = "fade"
+		// Fade is a mean-reversion premise, so it wants a RANGING market — the mirror of follow's
+		// requirement. Trading it in a trend is what a spread that keeps stretching looks like.
+		d.MinEfficiency = decimal.Zero
+		d.MaxEfficiency = decimal.NewFromFloat(0.35)
+		return d
+	},
+	"session_momentum": func() Strategy { return NewSessionMomentum() },
+
+	// Ported from TradingView at the operator's request (2026-09-14), chosen from seven candidates
+	// for carrying ideas the roster lacks rather than another entry pattern: a regime gate that
+	// declines to trade, filters on an existing pattern, and slope ACCELERATION rather than order.
+	"trendshift":      func() Strategy { return NewTrendShift() },
+	"sweep_reverse":   func() Strategy { return NewSweepReverse() },
+	"gradient_ribbon": func() Strategy { return NewGradientRibbon() },
 
 	// Scalp/price-action/ICT additions (CLAUDE.md §9, added 2026-09) — aimed at low timeframes
 	// (5m) per an explicit operator request for well-known scalping-style strategies, since the

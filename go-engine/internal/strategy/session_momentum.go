@@ -38,9 +38,13 @@ type SessionMomentum struct {
 
 func NewSessionMomentum() *SessionMomentum {
 	return &SessionMomentum{
-		OpenHoursUTC: []int{0, 7, 13},
+		// Six handovers rather than three, and a lower move threshold: the first screening gave
+		// t=+1.22 on 790 trades and needs ~2,109 to settle. Crypto has no single open, so the
+		// conventional three were leaving most of the day unobserved — these add the session CLOSES,
+		// which are handovers in exactly the same sense and were arbitrarily excluded.
+		OpenHoursUTC: []int{0, 4, 7, 12, 13, 20},
 		WindowBars:   6,
-		MinMove:      decimal.NewFromFloat(0.004),
+		MinMove:      decimal.NewFromFloat(0.002),
 		SLPct:        decimal.NewFromFloat(0.006),
 		TPPct:        decimal.NewFromFloat(0.015),
 	}
