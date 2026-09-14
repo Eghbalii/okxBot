@@ -511,6 +511,17 @@ type Repository interface {
 	// the same durable `candles` hypertable PaperTrader writes to (CLAUDE.md §7); no separate
 	// candle store.
 	ListCandles(ctx context.Context, instID, bar string, limit int) ([]Candle, error)
+	// ListCandlesRange returns every finalized candle for instID/bar within [from, to), oldest
+	// first. A zero `from` or `to` means unbounded on that side.
+	//
+	// Distinct from ListCandles, which returns the most recent N: the backtest replays history
+	// FORWARD from the beginning and needs all of it in order, which a most-recent-N read cannot
+	// express. Paged by the caller via `from` so a multi-month replay does not materialize the
+	// whole table at once.
+	ListCandlesRange(ctx context.Context, instID, bar string, from, to time.Time, limit int) ([]Candle, error)
+	// CandleRange reports the oldest and newest candle timestamps held for instID/bar, so a
+	// backtest can size its own run without scanning the data first. Zero times when there are none.
+	CandleRange(ctx context.Context, instID, bar string) (oldest, newest time.Time, err error)
 
 	CreateStrategy(ctx context.Context, s StrategyConfig) (int64, error)
 	GetStrategy(ctx context.Context, id int64) (StrategyConfig, error)

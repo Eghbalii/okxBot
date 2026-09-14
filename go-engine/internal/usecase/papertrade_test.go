@@ -94,6 +94,51 @@ func (r *fakeRepository) ListCandles(ctx context.Context, instID, bar string, li
 	}
 	return out, nil
 }
+
+// ListCandlesRange and CandleRange filter the way the real query does, rather than being stubs.
+// §17's lesson: a fake that diverges from its real counterpart quietly weakens every test that uses
+// it — there, SaveCandle appended where Postgres upserts, and an idempotency test failed against a
+// fake that could not model the behaviour being asserted.
+func (r *fakeRepository) ListCandlesRange(ctx context.Context, instID, bar string, from, to time.Time, limit int) ([]port.Candle, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []port.Candle
+	for _, c := range r.candles {
+		if c.InstID != instID || c.Bar != bar {
+			continue
+		}
+		if !from.IsZero() && c.Timestamp.Before(from) {
+			continue
+		}
+		if !to.IsZero() && !c.Timestamp.Before(to) {
+			continue
+		}
+		out = append(out, c)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (r *fakeRepository) CandleRange(ctx context.Context, instID, bar string) (time.Time, time.Time, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var oldest, newest time.Time
+	for _, c := range r.candles {
+		if c.InstID != instID || c.Bar != bar {
+			continue
+		}
+		if oldest.IsZero() || c.Timestamp.Before(oldest) {
+			oldest = c.Timestamp
+		}
+		if c.Timestamp.After(newest) {
+			newest = c.Timestamp
+		}
+	}
+	return oldest, newest, nil
+}
+
 func (r *fakeRepository) CreateStrategy(ctx context.Context, s port.StrategyConfig) (int64, error) {
 	return 0, nil
 }
