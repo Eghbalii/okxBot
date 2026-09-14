@@ -208,14 +208,34 @@ class Learner:
             }
 
 
-def reward_from_outcome(realized_pnl_usd: float, account_initial_usd: float) -> float:
+def reward_from_outcome(
+    realized_pnl_usd: float,
+    account_initial_usd: float,
+    position_size_usd: float = 0.0,
+) -> float:
     """Turns a closed trade's realized PnL into the reward the policy learns from.
 
-    Normalized by the account's starting balance rather than used raw, for the same reason the
-    observation feeds ratios (CLAUDE.md §15.11): a $5 win means something different on a $100
-    account than on a $10,000 one, and a policy trained on raw dollars would not transfer when the
-    balance is reconfigured.
+    Normalized by the POSITION's own capital rather than the account's, when the size is known
+    (changed 2026-09-14). Both are scale-free, which was the original requirement (CLAUDE.md
+    §15.11: a $5 win means something different on a $100 account than on a $10,000 one), but
+    dividing by the account makes the reward depend on a number the trade had nothing to do with.
+
+    Measured consequence: with a $2,600 account and typical PnL near $0.10, rewards landed at 1e-4
+    to 1e-3 — indistinguishable from zero to SAC. Worse, raising the account cap from $200 to
+    $2,600 that same day shrank every reward thirteenfold without a single trade changing, so the
+    policy was told its results had collapsed when nothing about them had.
+
+    Dividing by position size instead gives return-on-capital: a trade that makes 5% of what it
+    risked scores 0.05 whether the account is $200 or $2,600, and the figure means the same thing
+    across every instrument and position size.
+
+    Falls back to the account denominator when size is unknown (0), so historical rows and the
+    pretrain path keep working rather than silently scoring zero.
     """
+    pnl = float(realized_pnl_usd)
+    size = float(position_size_usd or 0.0)
+    if size > 0:
+        return pnl / size
     if not account_initial_usd:
         return 0.0
-    return float(realized_pnl_usd) / float(account_initial_usd)
+    return pnl / float(account_initial_usd)

@@ -203,7 +203,9 @@ def _learn(obs: Observation, obs_vec: np.ndarray, raw: np.ndarray) -> None:
 
     if obs.category in TERMINAL_CATEGORIES:
         reward = reward_from_outcome(
-            obs.position_state.realized_pnl_usd, obs.account_initial_usd or obs.account_equity_usd
+            obs.position_state.realized_pnl_usd,
+            obs.account_initial_usd or obs.account_equity_usd,
+            obs.position_state.size_usd,
         )
         matched = _learner.complete(obs.order_id, reward, obs_vec.reshape(-1))
         if not matched:
