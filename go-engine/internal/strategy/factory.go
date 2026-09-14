@@ -29,7 +29,11 @@ var Factories = map[string]Factory{
 	"stepped_trailing":     func() Strategy { return NewSteppedTrailing() },
 	"stoch_cross":          func() Strategy { return NewStochCross() },
 	"trend_confluence":     func() Strategy { return NewTrendConfluence() },
-	"weekly_dip_buy":       func() Strategy { return NewWeeklyDipBuy() },
+	// The null baseline (see coinflip.go). Registered so it runs through the identical path as
+	// every real kind — it measures what an entry signal is worth by measuring what no signal is
+	// worth. Never assign it to live trading.
+	"coin_flip":      func() Strategy { return NewCoinFlip() },
+	"weekly_dip_buy": func() Strategy { return NewWeeklyDipBuy() },
 
 	// Scalp/price-action/ICT additions (CLAUDE.md §9, added 2026-09) — aimed at low timeframes
 	// (5m) per an explicit operator request for well-known scalping-style strategies, since the
