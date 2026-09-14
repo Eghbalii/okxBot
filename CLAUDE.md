@@ -6321,3 +6321,57 @@ the fix is to put artefacts where the person asked, not where seemed reasonable.
 **Still open**: learning is enabled again, so the same divergence can recur — the 66 steps that
 produced it took under two hours. Worth watching the action vector, not just `/health`, and
 considering whether `learning_enabled` should be off until the divergence itself is understood.
+
+### 54.9 Stops walked to entry, and the account emptied (2026-09-14)
+
+Reported as "the model strangely pushed the stops toward zero, and now we have no open positions at
+all". Both halves were literally true, and they were the same fact.
+
+Measured over one 45-minute window:
+
+| | |
+|---|---|
+| stop closes | 31 |
+| **under 0.3% from entry** | **27** |
+| average stop distance | **0.168%** |
+| average realized PnL | **−$0.16** |
+| average time held | 15 minutes |
+| stop adjustments in one hour | **81 across 66 orders** |
+| open positions at the end | **0** |
+
+A 0.168% stop on a 5m bar is inside ordinary noise: the position is closed by the next tick that
+happens to wiggle, for approximately nothing.
+
+**Cause, and it is the same shape for the third time.** `ratchetSL` bounded the stop against the
+LIVE PRICE (`SLPriceGapPct`, 0.1%) — which is what prevents the instant-close failure of 2026-09-05
+— and nothing bounded it against ENTRY. `conductor.Clamps.MinSLDistPct` (0.5%) already forbids
+exactly this, on the open path only. So, exactly as with §54.7's reward:risk cap a few hours earlier,
+**the bound governed where a trade STARTS and not where the model subsequently moved it.**
+
+That is now three instances of one pattern (§45 → §54.7 → this). Worth stating as a rule: **any
+clamp that exists only in `conductor.Clamps.Apply` protects the opening decision alone.** The
+in-trade adjustment path is a separate code path with its own guards, and a level the open path
+would refuse can be reached one adjustment later.
+
+**The fix is deliberately asymmetric.** Splitting the same 31 closes by which side of entry the stop
+sat on:
+
+- **20 still on the losing side**, averaging 0.187% from entry — the broken case.
+- **8 trailed past entry into profit**, averaging 0.105% — §15.4's trailing mechanic working as
+  designed. A profit-locking stop is SUPPOSED to sit near price.
+
+So the floor applies only while the stop has not yet crossed entry. Applying it universally would
+forbid trailing altogether, which is the capability §15.4 exists to provide — and the mutation test
+for that direction fails with "the floor blocked a profit-lock".
+
+**Clamped, never rejected**, per the lesson already recorded above `ratchetSL`: the first version of
+the price guard rejected over-reaching proposals, and the measured cost was 5 stop adjustments
+against 306 target ones — the model had lost control of the stop entirely.
+
+The bound is passed in from `conductor.Clamps.MinSLDistPct` rather than duplicated as a package
+constant, so the two paths cannot drift on what "too tight" means.
+
+**This is not the same failure as §54.8's saturation.** That model answered identically regardless of
+input; this one was responding to price and doing something specific and wrong. The rollback restored
+a policy that decides — it did not, on its own, stop that policy walking stops somewhere unprofitable,
+because nothing in the engine said it could not.
