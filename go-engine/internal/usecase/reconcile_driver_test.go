@@ -202,7 +202,8 @@ func TestPositionFor_TreatsAZeroSizeRowAsFlat(t *testing.T) {
 func TestFetchAccountSnapshot_BalanceFailureIsNotFatal(t *testing.T) {
 	exchange := &fakeExchangeClient{
 		positions: []domain.Position{{InstID: "BTC", Pos: dec("1"), PosSide: "long"}},
-		balances:  nil, // no balance row reported
+		// no balance row reported at all — the case under test
+		noDefaultBalance: true,
 	}
 
 	snap, err := FetchAccountSnapshot(exchange, "SWAP", "USDT")

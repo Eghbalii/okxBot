@@ -21,7 +21,7 @@ func openOneRealPosition(t *testing.T, repo *fakeRepository, exchange *fakeExcha
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
@@ -291,7 +291,7 @@ func TestRunUpdates_SkipsPositionsThatAreNotHoldingExposure(t *testing.T) {
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionUpdate, SLPx: dec("98")}}
 	rt := newTestRealTrader(repo, exchange, model, nil)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	sl := dec("95")
 	repo.realOrders[1] = port.RealOrder{

@@ -2,7 +2,9 @@ package usecase
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -192,74 +194,137 @@ func clampUnit(d decimal.Decimal) decimal.Decimal {
 	}
 }
 
-// buildObservation assembles the CLAUDE.md §15.3 observation for this token, shared across all
-// of this token's open orders for one evaluation pass (position/PnL/dist-to-SL-TP fields are then
-// overwritten per-order by the caller, since those are order-specific). The candle window/strategy
-// signals/price-context (bar-scoped) reflect the most recent finalized candle as before; LastPrice
-// and the per-order PnL/distance fields reflect whatever price the caller passes in — the live tick
-// price when called from handleTick (CLAUDE.md §15.9), a candle close when called from
-// evaluateStrategies' new-order path (still candle-driven by design, §9).
-func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) domain.Observation {
+// buildObservation assembles the v8 observation for this token (docs/RL_V8_PLAN.md).
+//
+// Returns an ERROR rather than a partly-filled observation, which is the central discipline of v8.
+// Before this it returned a struct unconditionally: a failed GetAccountEquity left the balance at
+// zero (which makes three separate ratios read zero, telling the model the account is empty) and a
+// short candle window yielded fewer returns than the vector expects, absorbed downstream by
+// padding. Both looked healthy from every log. A caller that gets an error here must SKIP the model
+// call — not send it and let rl_service reject it, because a rejected call leaves a pending
+// decision in the learner that never receives its reward (§15.12's gap, reopened).
+//
+// The candle window/market block reflect the most recent bar; LastPrice and the per-order PnL
+// fields reflect whatever price the caller passes — the live tick from handleTick (§15.9), a candle
+// close from evaluateStrategies' open path (still candle-driven by design, §9).
+func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) (domain.Observation, error) {
 	view := e.marketView(bar)
 	window := view.Candles
 
-	tb := domain.TimeframeBlock{Bar: bar, PriceContext: buildPriceContext(window)}
-	for _, a := range e.Strategies {
-		if a.Bar != bar {
-			continue
-		}
-		sig, err := strategy.EvaluateWith(a.Strategy, view)
-		if err != nil {
-			continue // best-effort: a failing strategy just doesn't contribute a signal this round
-		}
-		// Strategies may express SL/TP as levels or as percentages; resolve to levels here so the
-		// observation always carries prices (CLAUDE.md §15.11).
-		resolved := sig.ResolveLevels(price)
-		tb.StrategySignals = append(tb.StrategySignals, domain.StrategySignal{
-			StrategyID: a.StrategyID,
-			Side:       string(sig.Side),
-			Confidence: sig.Confidence,
-			EntryPx:    resolved.EntryPx,
-			SLPx:       resolved.SLPx,
-			TPPx:       resolved.TPPx,
-			Kind:       a.Kind,
-			Bar:        a.Bar,
-		})
+	mb, err := BuildMarketBlock(bar, window)
+	if err != nil {
+		return domain.Observation{}, fmt.Errorf("market block: %w", err)
+	}
+
+	btc, err := e.btcContext(bar, mb.ClosePctChanges)
+	if err != nil {
+		return domain.Observation{}, err
+	}
+
+	acct, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), e.AccountInitialUSD)
+	if err != nil {
+		// No longer a Warn-and-continue. Equity feeds three ratios plus the position-size budget,
+		// so a zero here is not one missing number but a coherent-looking lie about the account.
+		return domain.Observation{}, fmt.Errorf("account equity: %w", err)
+	}
+
+	exposure, levExposure, openCount, err := e.exposureSnapshot(ctx)
+	if err != nil {
+		return domain.Observation{}, fmt.Errorf("open exposure: %w", err)
 	}
 
 	obs := domain.Observation{
-		SchemaVersion:     domain.ObservationSchemaVersion,
-		InstID:            e.InstID,
-		ActiveTokens:      e.ActiveTokens,
-		LastPrice:         price,
-		Timeframes:        []domain.TimeframeBlock{tb},
-		AccountInitialUSD: e.AccountInitialUSD,
-		// The risk budget the model must size within (schema v7). MaxPositionPct is the per-token
-		// EVEN SHARE of the account (1/ActiveTokenCount), NOT account.max_position_pct: the fixed
-		// sizing path (dynamicNotional) already divides equity evenly across the active tokens, so
-		// that share is what one position is actually expected to take. Deriving it from the live
-		// token count rather than a config constant means adding or disabling a token reshapes the
-		// budget automatically — which is the whole reason the caps are an input rather than being
-		// baked into the output scaling. account.max_position_pct still applies afterwards in
-		// sizeFromModelAction as the hard ceiling it has always been.
+		SchemaVersion:            domain.ObservationSchemaVersion,
+		InstID:                   e.InstID,
+		LastPrice:                price,
+		TokenProfile:             e.tokenProfile(window),
+		Timeframes:               []domain.MarketBlock{mb},
+		BTC:                      btc,
+		AccountEquityUSD:         acct.EquityUSD,
+		AccountInitialUSD:        e.AccountInitialUSD,
+		AccountPeakUSD:           e.peakEquity(acct.EquityUSD),
+		OpenExposureUSD:          exposure,
+		OpenLeveragedExposureUSD: levExposure,
+		OpenPositionCount:        openCount,
+		// MaxPositionPct is the per-token EVEN SHARE of the account (1/PositionSlots), not
+		// account.max_position_pct: the fixed sizing path (dynamicNotional) divides equity evenly
+		// across slots, so that share is what one position is actually expected to take. Deriving
+		// it from the live slot count means adding or disabling a token reshapes the budget
+		// automatically — the whole reason the caps are an input rather than baked into output
+		// scaling. account.max_position_pct still applies afterwards as the hard ceiling.
 		MaxPositionPct: e.evenShareOfAccount(),
 		MaxLeverage:    e.MaxLeverage,
-		// The lifecycle category and per-call Signal are always set by the caller, which is the
-		// only place that knows which decision is being asked (CLAUDE.md §15.12). CategoryUpdate
-		// stands as the fallback because it is the one category that claims nothing — no strategy
-		// spoke, no outcome is being reported — so a caller that somehow forgot to set one cannot
-		// accidentally train the model on a reward or an entry decision that never happened.
+		// Category and Signal are always set by the caller, the only place that knows which decision
+		// is being asked (§15.12). CategoryUpdate stands as a fallback because it is the one
+		// category that claims nothing — no strategy spoke, no outcome is being reported — so a
+		// caller that forgot to set one cannot accidentally train the model on a reward or an entry
+		// decision that never happened.
 		Category: domain.CategoryUpdate,
 	}
+	return obs, nil
+}
 
-	if acct, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), e.AccountInitialUSD); err == nil {
-		obs.AccountEquityUSD = acct.EquityUSD
-	} else {
-		logger.Warn("rl observation: get account equity failed", "mode", e.accountMode(), "error", err)
+// btcContext builds the market-wide reference block from BTC's own candle window on the same bar.
+//
+// A token with no BTC window available is an error rather than a zeroed block: zeros would read as
+// "BTC is perfectly flat and uncorrelated", which is a specific and false claim about the market,
+// not an absence of information.
+func (e *PaperTrader) btcContext(bar string, tokenReturns []decimal.Decimal) (domain.BTCContext, error) {
+	if e.BTCCandles == nil {
+		return domain.BTCContext{}, fmt.Errorf("btc context: no reference feed wired")
 	}
-	obs.OpenExposureUSD = e.openExposure(ctx, logger)
+	window, ok := e.BTCCandles(bar)
+	if !ok || len(window) == 0 {
+		return domain.BTCContext{}, fmt.Errorf("btc context: no %s window yet", bar)
+	}
+	return BuildBTCContext(window, tokenReturns)
+}
 
-	return obs
+// tokenProfile describes what this instrument IS, replacing v7's identity one-hot.
+//
+// Volatility and price come from the candle window this call already holds; volume, rank and the
+// 24h figures come from the discovery scan's own market snapshot (§53) when one is wired, since
+// those are roster-wide facts a single instrument's engine has no other way to know.
+func (e *PaperTrader) tokenProfile(window []domain.Candle) domain.TokenProfile {
+	p := domain.TokenProfile{}
+	if len(window) == 0 {
+		return p
+	}
+	last := window[len(window)-1]
+	if last.Close.IsPositive() {
+		f, _ := last.Close.Float64()
+		if f > 0 {
+			p.LogPrice = decimal.NewFromFloat(math.Log10(f))
+		}
+		if atr, err := strategy.ATR(window, atrPeriod); err == nil {
+			p.TypicalVolatility = atr.Div(last.Close)
+		}
+	}
+	if e.TokenStats != nil {
+		s := e.TokenStats(e.InstID)
+		p.LogVolume24h = s.LogVolume24h
+		p.VolumeRank = s.VolumeRank
+		p.Range24h = s.Range24h
+		p.Change24h = s.Change24h
+		p.LogTradeCount = s.LogTradeCount
+	}
+	return p
+}
+
+// peakEquity is the high-water mark this process has observed, so drawdown is measured from the
+// peak rather than from the configured starting balance. v7 fed equity/initial, and SetAccountCap
+// rewrites initial (§32.2) — so every cap change wiped the model's view of drawdown back to ~1.0.
+//
+// Process-local: losing it on restart means the mark resets to the current balance, which
+// understates drawdown until a new peak is set. That is the conservative direction (it cannot
+// invent a drawdown that did not happen) and it costs nothing to correct itself.
+func (e *PaperTrader) peakEquity(equity decimal.Decimal) decimal.Decimal {
+	e.peakMu.Lock()
+	defer e.peakMu.Unlock()
+	if equity.GreaterThan(e.peak) {
+		e.peak = equity
+	}
+	return e.peak
 }
 
 // levelAdjustPct expresses "move this level from current to proposed" as a fraction of the live
@@ -309,7 +374,6 @@ func positionStateOf(o port.PaperOrder, price decimal.Decimal) domain.PositionSt
 		Side:             side,
 		SizeUSD:          o.Size,
 		Leverage:         o.Leverage,
-		IsFork:           o.Variant == "rl_adjusted",
 		UnrealizedPnLPct: unrealizedPnLPct(o, price),
 		PnLMaxPct:        o.PnLMaxPct,
 		PnLMinPct:        o.PnLMinPct,
@@ -322,65 +386,32 @@ func positionStateOf(o port.PaperOrder, price decimal.Decimal) domain.PositionSt
 	return ps
 }
 
-// openExposure sums the notional of every open baseline position across ALL tokens (CLAUDE.md
-// §15.6): with one shared account, the agent has to see how much of it is already committed
-// elsewhere before asking for more. Forks are excluded — they shadow their baseline parent rather
-// than putting separate capital at risk (§15.4). Best-effort: a read failure reports zero exposure
-// rather than blocking the decision, and the Go-side caps in rlSizing still bound the result.
-func (e *PaperTrader) openExposure(ctx context.Context, logger *slog.Logger) decimal.Decimal {
+// exposureSnapshot reports how much of the shared account is already committed across ALL tokens
+// (CLAUDE.md §15.6): with one pool, the agent has to see what is spent elsewhere before asking for
+// more.
+//
+// Returns BOTH margin committed and leveraged exposure. v7 sent only the first, which is notional
+// before leverage — a $10 position at 10x counted as $10 of committed risk when it is really $100,
+// understating real market exposure by exactly the leverage factor.
+//
+// No longer best-effort: a read failure used to report zero exposure, telling the model the account
+// is entirely free when it may be fully committed.
+func (e *PaperTrader) exposureSnapshot(ctx context.Context) (margin, leveraged decimal.Decimal, count int, err error) {
 	openOnly := true
 	positions, err := e.Repo.ListPositions(ctx, port.PositionFilter{Mode: e.accountMode(), Open: &openOnly})
 	if err != nil {
-		logger.Warn("rl observation: list open positions failed", "mode", e.accountMode(), "error", err)
-		return decimal.Zero
+		return decimal.Zero, decimal.Zero, 0, err
 	}
-
-	var total decimal.Decimal
 	for _, p := range positions {
-		if p.Variant == "baseline" || p.Variant == "" {
-			total = total.Add(p.Size)
+		margin = margin.Add(p.Size)
+		lev := p.Leverage
+		if !lev.IsPositive() {
+			lev = decimal.NewFromInt(1)
 		}
+		leveraged = leveraged.Add(p.Size.Mul(lev))
+		count++
 	}
-	return total
-}
-
-func buildPriceContext(window []domain.Candle) domain.PriceContext {
-	pc := domain.PriceContext{}
-	if len(window) == 0 {
-		return pc
-	}
-
-	// The last entry is the LIVE FORMING candle (handleCandle replaces rather than appends while a
-	// bar is open), so its OHLC is current rather than up to a full bar stale — CLAUDE.md §15.11.
-	live := window[len(window)-1]
-	pc.Open, pc.High, pc.Low, pc.Close = live.Open, live.High, live.Low, live.Close
-
-	if len(window) < 2 {
-		return pc
-	}
-
-	start := 0
-	if len(window) > priceContextWindow+1 {
-		start = len(window) - priceContextWindow - 1
-	}
-	for i := start + 1; i < len(window); i++ {
-		prev := window[i-1].Close
-		if prev.IsZero() {
-			continue
-		}
-		pc.ClosePctChanges = append(pc.ClosePctChanges, window[i].Close.Sub(prev).Div(prev))
-	}
-
-	swingHigh, errH := strategy.Highest(window, minInt(swingWindow, len(window)))
-	swingLow, errL := strategy.Lowest(window, minInt(swingWindow, len(window)))
-	last := window[len(window)-1].Close
-	if errH == nil && last.IsPositive() {
-		pc.DistToSwingHighPct = swingHigh.Sub(last).Div(last)
-	}
-	if errL == nil && last.IsPositive() {
-		pc.DistToSwingLowPct = swingLow.Sub(last).Div(last)
-	}
-	return pc
+	return margin, leveraged, count, nil
 }
 
 // unrealizedPnLPct is the position's unrealized PnL as a fraction of margin (entry-to-price move

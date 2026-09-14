@@ -49,6 +49,10 @@ func newTestRealTrader(repo port.Repository, exchange *fakeExchangeClient, model
 			MaxSLDistPct: dec("0.5"),
 			MaxLossPct:   dec("0.5"),
 		},
+		// v8 requires a BTC reference block on every observation (docs/RL_V8_PLAN.md). Wired here
+		// rather than per-test because a missing feed makes buildObservation fail outright —
+		// correct in production, but it would turn every unrelated test into a BTC-window test.
+		BTCCandles: func(string) ([]domain.Candle, bool) { return testCandleWindow(64000), true },
 	}
 }
 
@@ -58,6 +62,19 @@ func buySignal() strategy.Signal {
 
 func realTraderCandle(price string) domain.Candle {
 	return domain.Candle{Open: dec(price), High: dec(price), Low: dec(price), Close: dec(price), Volume: dec("1")}
+}
+
+// realTraderWindow is a candle window long enough to build a v8 observation, ENDING at `price`.
+//
+// A single candle no longer suffices: v8 needs MinCandlesForIndicators candles and exactly
+// domain.ReturnsWindow returns, and it refuses rather than padding (docs/RL_V8_PLAN.md). The window
+// ends at the requested price so every existing assertion about entry, stop and target prices is
+// unaffected — only the history behind that price is new.
+func realTraderWindow(price string) []domain.Candle {
+	f, _ := dec(price).Float64()
+	w := testCandleWindow(f)
+	w[len(w)-1] = realTraderCandle(price)
+	return w
 }
 
 // TestOpenReal_ModelOpenPlacesRealOrderAndPersists confirms a model "open" answer results in
@@ -72,7 +89,7 @@ func TestOpenReal_ModelOpenPlacesRealOrderAndPersists(t *testing.T) {
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	// GetBalance backs buildObservation's AccountEquityUSD (ground truth from the exchange).
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
@@ -111,7 +128,7 @@ func TestOpenReal_ModelSkipPlacesNoOrder(t *testing.T) {
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionSkip}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -133,7 +150,7 @@ func TestOpenReal_NoModelDeclinesEntirely(t *testing.T) {
 	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, nil, strategies)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -152,7 +169,7 @@ func TestEvaluateStrategies_OnePositionPerTokenBlocksASecondOpen(t *testing.T) {
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.3"), LeverageFrac: dec("0.2")}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	// Pre-seed an already-open real position for this instrument directly in the fake.
 	repo.realOrders[999] = port.RealOrder{ID: 999, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("99"), Size: dec("10"), Leverage: dec("1")}
@@ -175,7 +192,7 @@ func TestEvaluateStrategies_PendingOrderDoesNotBlockASecondOpen(t *testing.T) {
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.3"), LeverageFrac: dec("0.2")}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	repo.realOrders[999] = port.RealOrder{ID: 999, InstID: rt.InstID, Status: "pending", Side: "buy", EntryPx: dec("99"), Size: dec("10"), Leverage: dec("1")}
 	repo.nextRealID = 999
@@ -291,6 +308,10 @@ func TestCloseReal_SucceedsAndReportsTerminal(t *testing.T) {
 	model := &fakeModelClient{}
 	rt := newTestRealTrader(repo, exchange, model, nil)
 	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	// The terminal call needs a buildable observation like any other: v8 refuses to send a short
+	// one, so a trade closed with no candle window trains nothing (docs/RL_V8_PLAN.md).
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("110")}
+	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
 	order := port.RealOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
 	repo.realOrders[1] = order
@@ -426,9 +447,12 @@ func TestBuildObservation_UsesExchangeBalanceNotRepoBookkeeping(t *testing.T) {
 
 	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("777")}}}
 	rt := newTestRealTrader(repo, exchange, nil, nil)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": testCandleWindow(100)}
 
-	obs := rt.buildObservation(context.Background(), "1m", dec("100"), testLogger())
+	obs, err := rt.buildObservation(context.Background(), "1m", dec("100"), testLogger())
+	if err != nil {
+		t.Fatalf("buildObservation: %v", err)
+	}
 
 	if !obs.AccountEquityUSD.Equal(dec("777")) {
 		t.Errorf("expected AccountEquityUSD=777 (from Exchange.GetBalance), got %s — "+
@@ -476,9 +500,12 @@ func TestBuildObservation_SubtractsSafeMoneyFromExchangeBalance(t *testing.T) {
 	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("40")}}}
 	rt := newTestRealTrader(repo, exchange, nil, nil)
 	rt.SafeMoneyUSD = dec("20")
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": testCandleWindow(100)}
 
-	obs := rt.buildObservation(context.Background(), "1m", dec("100"), testLogger())
+	obs, err := rt.buildObservation(context.Background(), "1m", dec("100"), testLogger())
+	if err != nil {
+		t.Fatalf("buildObservation: %v", err)
+	}
 
 	if !obs.AccountEquityUSD.Equal(dec("20")) {
 		t.Errorf("expected AccountEquityUSD=20 (40 exchange balance - 20 safe money), got %s", obs.AccountEquityUSD)
@@ -499,7 +526,7 @@ func TestOpenReal_FillConfirmedImmediatelyRecordsEntryPx(t *testing.T) {
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
 	rt.FillTimeout = 50 * time.Millisecond
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -535,7 +562,7 @@ func TestOpenReal_NeverFilledCancelsAndOpensNothing(t *testing.T) {
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
 	rt.FillTimeout = 50 * time.Millisecond
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -572,7 +599,7 @@ func TestOpenReal_PendingRowVisibleBeforeFillResolves(t *testing.T) {
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
 	rt.FillTimeout = 50 * time.Millisecond
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -606,7 +633,7 @@ func TestOpenReal_PartialFillRecordsActualSize(t *testing.T) {
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
 	rt.FillTimeout = 50 * time.Millisecond
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -675,7 +702,7 @@ func TestHandleTick_RunUpdatesThrottled(t *testing.T) {
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClientRL{action: domain.Action{}}
 	rt := newTestRealTrader(repo, exchange, model, nil)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
 	sl := dec("95")
@@ -716,7 +743,7 @@ func TestRunUpdates_SkipsManualOverrideEntirely(t *testing.T) {
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionClose}}
 	rt := newTestRealTrader(repo, exchange, model, nil)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
 	sl := dec("95")
@@ -748,7 +775,7 @@ func TestHandleTick_RunUpdatesFiresOnFirstTick(t *testing.T) {
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClientRL{action: domain.Action{}}
 	rt := newTestRealTrader(repo, exchange, model, nil)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
 	sl := dec("95")
@@ -824,7 +851,7 @@ func TestOpenReal_ModelStopWithoutTargetStillGetsATarget(t *testing.T) {
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
@@ -869,7 +896,7 @@ func TestOpenReal_NoTargetAnywhereStillGetsOneFromStopDistance(t *testing.T) {
 	// The derivation is a RATIO of the stop distance, so it only applies where one is configured —
 	// production sets this (paper_trading.rl_clamps.min_tp_sl_ratio); the shared harness does not.
 	rt.RLClamps.MinTPSLRatio = dec("1.5")
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
@@ -1185,7 +1212,7 @@ func TestOpenReal_StaleWrongSideStopIsReplacedNotRefused(t *testing.T) {
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
 	// An ABSOLUTE stop, as the structural strategies emit (CLAUDE.md §16.8) — vwap_reversion and
@@ -1241,7 +1268,7 @@ func TestSetOpensDisabled_TakesEffectOnARunningEngine(t *testing.T) {
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
 	rt.SetOpensDisabled(true)
@@ -1357,7 +1384,7 @@ func TestCloseReal_CapturesExchangeRecordsForBothLegs(t *testing.T) {
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("100")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
 	if err := rt.evaluateStrategies(ctx, "1m", dec("100"), testLogger()); err != nil {

@@ -119,7 +119,7 @@ func TestOpenReal_UsesExecInstIDNotMarketDataInstID(t *testing.T) {
 	rt.ExecInstID = "BTC-USD_UM_XPERP-310404"
 	rt.ExecInstType = "FUTURES"
 	rt.SettleCcy = "USDC"
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("80000")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("80000")}
 	exchange.balances = []domain.Balance{{Ccy: "USDC", Eq: dec("1000")}}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("80000"), testLogger()); err != nil {
@@ -150,7 +150,7 @@ func TestOpenReal_ConvertsSizeThroughInstrumentMetadata(t *testing.T) {
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
 	rt := newTestRealTrader(repo, exchange, model, strategies)
 	rt.ExecInstID = "BTC-USD_UM_XPERP-310404"
-	rt.candles = map[string][]domain.Candle{"1m": {realTraderCandle("80000")}}
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("80000")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("80000"), testLogger()); err != nil {

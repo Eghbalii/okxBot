@@ -162,6 +162,25 @@ var (
 		Help: "Total number of RL model open/skip decisions on strategy signals, by instrument and decision (open/skip).",
 	}, []string{"inst_id", "decision"})
 
+	// ModelCallsSkippedTotal counts decisions where the model was NOT consulted because the
+	// observation could not be built (docs/RL_V8_PLAN.md).
+	//
+	// This is the metric v7 had no equivalent of, and its absence is why an observation missing ten
+	// inputs went unnoticed for weeks: rl_service padded whatever it was given, so an incomplete
+	// observation still produced a confident-looking action and nothing anywhere counted it. v8
+	// refuses instead of padding, and this makes the refusals visible — `stage` says which decision
+	// was skipped (open/update/terminal), `reason` names the exact field
+	// (timeframe.returns, account_equity_usd, btc.returns, ...), so "why is the model quiet" is
+	// answerable from Prometheus rather than by grepping logs.
+	//
+	// A burst right after a restart is EXPECTED and correct: candle windows start empty, and no
+	// decision should be made on data that does not exist yet. A sustained nonzero rate afterwards
+	// is not, and means a feed or a dependency is not delivering.
+	ModelCallsSkippedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_model_calls_skipped_total",
+		Help: "Total RL model calls skipped because the observation was incomplete, by instrument, lifecycle stage and the field at fault.",
+	}, []string{"inst_id", "stage", "reason"})
+
 	// ControllerUpdatesTotal counts every update the SignalConductor decides is due (CLAUDE.md
 	// §15.12's ShouldUpdate) — i.e. how many times the lifecycle actually asks the model about an
 	// open position, regardless of what the model then answers.

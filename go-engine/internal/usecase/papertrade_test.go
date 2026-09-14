@@ -821,9 +821,18 @@ func newTestPaperTrader(repo port.Repository, strategies []StrategyAssignment) *
 		PositionSlots:       10,
 		MaxPositionPct:      dec("0.25"),
 		MaxTotalExposurePct: dec("0.60"),
-		MaxOpenOrders:       3,
-		Logger:              testLogger(),
-		candles:             map[string][]domain.Candle{"1m": nil, "15m": nil},
+		// v8's Validate rejects a non-positive MaxLeverage: it is part of the risk budget the model
+		// sizes within, and zero would mean "no leverage is permitted", which is a claim rather
+		// than an absent setting.
+		MaxLeverage:   dec("10"),
+		MaxOpenOrders: 3,
+		Logger:        testLogger(),
+		candles:       map[string][]domain.Candle{"1m": nil, "15m": nil},
+		// v8 requires a BTC reference block on every observation (docs/RL_V8_PLAN.md), so every test
+		// engine gets one. Wired here rather than per-test because a missing feed makes
+		// buildObservation fail outright — correct behaviour in production, but it would turn every
+		// unrelated test into a BTC-window test.
+		BTCCandles: func(string) ([]domain.Candle, bool) { return testCandleWindow(64000), true },
 	}
 }
 
@@ -1026,7 +1035,7 @@ func TestMaxOpenOrders_GatesNewSignals(t *testing.T) {
 
 	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "1m", Strategy: alwaysBuy}})
-	pt.candles["1m"] = []domain.Candle{{Open: dec("100"), High: dec("101"), Low: dec("99"), Close: dec("100"), Volume: dec("1")}}
+	pt.candles["1m"] = paperWindow("100")
 
 	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -1047,7 +1056,7 @@ func TestEvaluateStrategies_OnlyRunsStrategyAssignedToThatBar(t *testing.T) {
 		{Bar: "1m", Strategy: alwaysBuy1m},
 		{Bar: "15m", Strategy: alwaysBuy15m},
 	})
-	pt.candles["1m"] = []domain.Candle{{Close: dec("100")}}
+	pt.candles["1m"] = paperWindow("100")
 
 	// A 1m candle close should only trigger the 1m-assigned strategy, not the 15m one.
 	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
@@ -1131,7 +1140,7 @@ func TestEvaluateStrategies_DistinctStrategiesMayBothOpen(t *testing.T) {
 		{Bar: "5m", StrategyID: 1, Strategy: alwaysBuy},
 		{Bar: "5m", StrategyID: 2, Strategy: alwaysSell},
 	})
-	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.candles["5m"] = paperWindow("100")
 
 	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -1150,7 +1159,7 @@ func TestEvaluateStrategies_TradingPausedOpensNothing(t *testing.T) {
 	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 
 	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", Strategy: alwaysBuy}})
-	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.candles["5m"] = paperWindow("100")
 	pt.TradingPaused = true
 
 	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
@@ -1171,7 +1180,7 @@ func TestEvaluateStrategies_OpensDisabledStopsNewOpensOnly(t *testing.T) {
 	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 
 	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", Strategy: alwaysBuy}})
-	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.candles["5m"] = paperWindow("100")
 	pt.OpensDisabled = true
 
 	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
@@ -1191,7 +1200,7 @@ func TestEvaluateStrategies_DisableLongSkipsBuySignalsOnly(t *testing.T) {
 	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 
 	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", Strategy: alwaysBuy}})
-	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.candles["5m"] = paperWindow("100")
 	pt.DisableLong = true
 
 	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
@@ -1209,7 +1218,7 @@ func TestEvaluateStrategies_DisableShortSkipsSellSignalsOnly(t *testing.T) {
 	alwaysSell := &stubStrategy{signal: strategy.Signal{Side: strategy.Sell, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 
 	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", Strategy: alwaysSell}})
-	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.candles["5m"] = paperWindow("100")
 	pt.DisableShort = true
 
 	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
@@ -1239,7 +1248,7 @@ func TestEvaluateStrategies_NeverOpensWithoutStopLoss(t *testing.T) {
 	pt.RLClamps = conductor.Clamps{
 		MinSLDistPct: dec("0.005"), MaxSLDistPct: dec("0.05"), MinTPSLRatio: dec("1.5"),
 	}
-	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.candles["5m"] = paperWindow("100")
 
 	if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -1290,8 +1299,8 @@ func TestEvaluateStrategies_ConcurrentBarsDoNotBothOpen(t *testing.T) {
 		{Bar: "5m", StrategyID: 9, Strategy: buy5m},
 		{Bar: "15m", StrategyID: 9, Strategy: buy15m},
 	})
-	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
-	pt.candles["15m"] = []domain.Candle{{Close: dec("100")}}
+	pt.candles["5m"] = paperWindow("100")
+	pt.candles["15m"] = paperWindow("100")
 
 	var wg sync.WaitGroup
 	start := make(chan struct{})
@@ -1323,7 +1332,7 @@ func TestEvaluateStrategies_SkipsOpenWhenBaselineAlreadyOpen(t *testing.T) {
 	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 
 	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", StrategyID: 7, Strategy: alwaysBuy}})
-	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
+	pt.candles["5m"] = paperWindow("100")
 
 	for i := 0; i < 3; i++ {
 		if err := pt.evaluateStrategies(context.Background(), "5m", dec("100"), testLogger()); err != nil {
@@ -1722,9 +1731,7 @@ func (f *fakeModelClientRL) Predict(ctx context.Context, obs domain.Observation)
 func TestRunUpdates_AppliesAdjustmentInPlace(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
-	pt.candles = map[string][]domain.Candle{"1m": {
-		{Close: dec("100")}, {Close: dec("101")}, {Close: dec("102")}, {Close: dec("105")},
-	}, "15m": nil}
+	pt.candles = map[string][]domain.Candle{"1m": paperWindow("105"), "15m": nil}
 	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionUpdate, SLPx: dec("97"), TPPx: dec("108")}}
 	pt.Model = model
 
@@ -1778,9 +1785,7 @@ func TestRunUpdates_AppliesAdjustmentInPlace(t *testing.T) {
 func TestRunUpdates_RepeatedAdjustmentsAllApplyToSameOrder(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
-	pt.candles = map[string][]domain.Candle{"1m": {
-		{Close: dec("100")}, {Close: dec("101")}, {Close: dec("102")}, {Close: dec("105")},
-	}, "15m": nil}
+	pt.candles = map[string][]domain.Candle{"1m": paperWindow("105"), "15m": nil}
 	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionUpdate, SLPx: dec("97"), TPPx: dec("108")}}
 	pt.Model = model
 
@@ -1824,7 +1829,7 @@ func TestRunUpdates_RepeatedAdjustmentsAllApplyToSameOrder(t *testing.T) {
 func TestRunUpdates_NoOpActionDoesNotChangeOrder(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
-	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
+	pt.candles = map[string][]domain.Candle{"1m": paperWindow("100"), "15m": nil}
 	pt.Model = &fakeModelClientRL{action: domain.Action{}} // zero adjustment, matches the no-op fail-safe
 
 	sl := dec("95")
@@ -1857,7 +1862,7 @@ func TestRunUpdates_NoOpActionDoesNotChangeOrder(t *testing.T) {
 func TestRunUpdates_SkipsWhenNoOpenOrders(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
-	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
+	pt.candles = map[string][]domain.Candle{"1m": paperWindow("100"), "15m": nil}
 	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionUpdate, SLPx: dec("97")}}
 	pt.Model = model
 
@@ -1875,7 +1880,7 @@ func TestRunUpdates_SkipsWhenNoOpenOrders(t *testing.T) {
 func TestHandleTick_TriggersRLAdjustOnLiveTickPrice(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
-	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
+	pt.candles = map[string][]domain.Candle{"1m": paperWindow("100"), "15m": nil}
 	model := &fakeModelClientRL{action: domain.Action{}}
 	pt.Model = model
 	pt.RLSLTPAdjust = true
@@ -1904,7 +1909,7 @@ func TestHandleTick_TriggersRLAdjustOnLiveTickPrice(t *testing.T) {
 func TestHandleTick_RLAdjustThrottled(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
-	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
+	pt.candles = map[string][]domain.Candle{"1m": paperWindow("100"), "15m": nil}
 	model := &fakeModelClientRL{action: domain.Action{}}
 	pt.Model = model
 	pt.RLSLTPAdjust = true
@@ -1971,9 +1976,7 @@ func TestEvaluateStrategies_PersistsDecisionTimeObservation(t *testing.T) {
 	repo := newFakeRepository()
 	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02"), Confidence: dec("0.8")}}
 	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "1m", Strategy: alwaysBuy, StrategyID: 7}})
-	pt.candles["1m"] = []domain.Candle{
-		{Close: dec("98")}, {Close: dec("99")}, {Close: dec("100")},
-	}
+	pt.candles["1m"] = paperWindow("100")
 	pt.ActiveTokens = []string{"BTC-USDT-SWAP", "XAU-USD-SWAP"}
 
 	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
@@ -1998,11 +2001,21 @@ func TestEvaluateStrategies_PersistsDecisionTimeObservation(t *testing.T) {
 	if obs.InstID != "BTC-USDT-SWAP" {
 		t.Errorf("expected InstID BTC-USDT-SWAP, got %q", obs.InstID)
 	}
-	if len(obs.Timeframes) != 1 || len(obs.Timeframes[0].StrategySignals) != 1 {
-		t.Fatalf("expected 1 timeframe block with 1 strategy signal, got %+v", obs.Timeframes)
+	// v8 carries ONE signal per call on obs.Signal rather than a list on the timeframe block
+	// (§15.10's one-signal-per-call), and the block itself now carries the market state the model
+	// was previously never sent.
+	if obs.Signal == nil || obs.Signal.StrategyID != 7 {
+		t.Errorf("expected the decision's own signal with StrategyID=7, got %+v", obs.Signal)
 	}
-	if obs.Timeframes[0].StrategySignals[0].StrategyID != 7 {
-		t.Errorf("expected strategy signal StrategyID=7, got %d", obs.Timeframes[0].StrategySignals[0].StrategyID)
+	if len(obs.Timeframes) != 1 {
+		t.Fatalf("expected exactly 1 timeframe block, got %d", len(obs.Timeframes))
+	}
+	if len(obs.Timeframes[0].Indicators) != domain.IndicatorsPerTimeframe {
+		t.Errorf("persisted observation carries %d indicators, want %d — the record must be what "+
+			"the model actually saw", len(obs.Timeframes[0].Indicators), domain.IndicatorsPerTimeframe)
+	}
+	if err := obs.Validate(); err != nil {
+		t.Errorf("persisted decision-time observation is not a valid one: %v", err)
 	}
 }
 
@@ -2018,7 +2031,7 @@ func (f *errModelClient) Predict(ctx context.Context, obs domain.Observation) (*
 func newSizingTestPaperTrader(repo port.Repository, model port.ModelClient) *PaperTrader {
 	buy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "1m", Strategy: buy}})
-	pt.candles["1m"] = []domain.Candle{{Open: dec("100"), High: dec("101"), Low: dec("99"), Close: dec("100"), Volume: dec("1")}}
+	pt.candles["1m"] = paperWindow("100")
 	pt.Model = model
 	pt.MaxLeverage = dec("100")
 	return pt
@@ -2550,7 +2563,7 @@ func TestMarketView_CarriesAllMaintainedBars(t *testing.T) {
 	pt := newTestPaperTrader(newFakeRepository(), nil)
 	pt.candles = map[string][]domain.Candle{
 		"5m":  {{Close: dec("1")}, {Close: dec("2")}},
-		"15m": {{Close: dec("3")}},
+		"15m": paperWindow("3"),
 		"1H":  {{Close: dec("4")}},
 	}
 
@@ -2594,7 +2607,7 @@ func TestRunUpdates_RequiresUpdateOrderAction(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	pt := newTestPaperTrader(repo, nil)
-	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
+	pt.candles = map[string][]domain.Candle{"1m": paperWindow("100"), "15m": nil}
 	// Nonzero adjustments, but the model is saying "none" — no fork may be created.
 	pt.Model = &fakeModelClientRL{action: domain.Action{
 		Action: domain.ActionNone, SLPx: dec("97"), TPPx: dec("108"),
@@ -2615,48 +2628,103 @@ func TestRunUpdates_RequiresUpdateOrderAction(t *testing.T) {
 	}
 }
 
-// The observation must carry which strategy produced a signal and on which timeframe (§15.10) —
-// one shared policy has no other way to tell strategies apart.
-func TestBuildObservation_SignalsCarryKindAndBar(t *testing.T) {
+// The observation must carry which decision bar it is about, and an observation that BUILDS must
+// be one that vectorizes — the central guarantee of v8 (docs/RL_V8_PLAN.md).
+func TestBuildObservation_CarriesTheDecisionBarAndValidates(t *testing.T) {
 	repo := newFakeRepository()
 	buy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 	pt := newTestPaperTrader(repo, []StrategyAssignment{
 		{Bar: "1m", Strategy: buy, StrategyID: 7, Kind: "rsi_sma"},
 	})
-	pt.candles["1m"] = []domain.Candle{{Close: dec("100")}, {Close: dec("101")}}
+	pt.candles["1m"] = testCandleWindow(100)
 
-	obs := pt.buildObservation(context.Background(), "1m", dec("101"), testLogger())
-
-	if len(obs.Timeframes) != 1 || len(obs.Timeframes[0].StrategySignals) != 1 {
-		t.Fatalf("expected one signal, got %+v", obs.Timeframes)
+	obs, err := pt.buildObservation(context.Background(), "1m", dec("101"), testLogger())
+	if err != nil {
+		t.Fatalf("buildObservation: %v", err)
 	}
-	sig := obs.Timeframes[0].StrategySignals[0]
-	if sig.Kind != "rsi_sma" {
-		t.Errorf("want kind rsi_sma, got %q", sig.Kind)
-	}
-	if sig.Bar != "1m" {
-		t.Errorf("want bar 1m, got %q", sig.Bar)
+	if len(obs.Timeframes) != 1 || obs.Timeframes[0].Bar != "1m" {
+		t.Fatalf("want one block for bar 1m, got %+v", obs.Timeframes)
 	}
 	if obs.SchemaVersion != domain.ObservationSchemaVersion {
 		t.Errorf("want schema v%d, got v%d", domain.ObservationSchemaVersion, obs.SchemaVersion)
 	}
+	if err := obs.Validate(); err != nil {
+		t.Errorf("a successfully built observation must be valid: %v", err)
+	}
 }
 
-// A fork must be identifiable in the observation: fork outcomes are compared against their baseline
-// parent (§15.4), so the model needs to know which it is reasoning about.
-func TestPositionStateOf_MarksForks(t *testing.T) {
+// buildObservation must REFUSE rather than return something short.
+//
+// This replaces v7's silent padding. A window one candle short changed the vector width, rl_service
+// absorbed it, and the model answered confidently on partly-invented data — for weeks, with no log
+// and no metric.
+func TestBuildObservation_RefusesAShortCandleWindow(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	// Deliberately too short: this is the case v8 must REFUSE rather than pad.
+	pt.candles["1m"] = []domain.Candle{{Close: dec("100")}, {Close: dec("101")}}
+
+	if _, err := pt.buildObservation(context.Background(), "1m", dec("101"), testLogger()); err == nil {
+		t.Fatal("expected an error on a short candle window — a short window must skip the model " +
+			"call, not be padded into one")
+	}
+}
+
+// A missing BTC feed must also refuse. Zeros would read as "BTC is perfectly flat and
+// uncorrelated", a specific false claim about the market rather than an absence of information.
+func TestBuildObservation_RefusesWithoutTheBTCReference(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.candles["1m"] = testCandleWindow(100)
+	pt.BTCCandles = nil
+
+	if _, err := pt.buildObservation(context.Background(), "1m", dec("101"), testLogger()); err == nil {
+		t.Fatal("expected an error with no BTC reference feed, got none")
+	}
+}
+
+// Indicators must actually reach the observation.
+//
+// The v8 headline bug: TimeframeBlock.Features was declared on both sides from 2026-08-26 and Go
+// never wrote it once, so the model had no RSI, no volatility and no volume for the entire life of
+// the schema.
+func TestBuildObservation_PopulatesDerivedIndicators(t *testing.T) {
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.candles["1m"] = testCandleWindow(100)
+
+	obs, err := pt.buildObservation(context.Background(), "1m", dec("101"), testLogger())
+	if err != nil {
+		t.Fatalf("buildObservation: %v", err)
+	}
+	ind := obs.Timeframes[0].Indicators
+	if len(ind) != domain.IndicatorsPerTimeframe {
+		t.Fatalf("got %d indicators, want exactly %d", len(ind), domain.IndicatorsPerTimeframe)
+	}
+	nonZero := 0
+	for _, v := range ind {
+		if !v.IsZero() {
+			nonZero++
+		}
+	}
+	// A block of zeros is what an unpopulated field looks like, and it is indistinguishable from a
+	// perfectly average market — which is precisely how the original bug stayed invisible.
+	if nonZero < len(ind)/2 {
+		t.Errorf("only %d of %d indicators are non-zero; an all-zero block is what the "+
+			"never-populated field looked like", nonZero, len(ind))
+	}
+}
+
+// The position block must carry the trade's own state and trajectory.
+//
+// v7's is_fork is gone: shadow forks were retired and all 2084 paper_orders rows read 'baseline',
+// so the input was a constant false — an always-identical value that costs width and teaches
+// nothing (docs/RL_V8_PLAN.md).
+func TestPositionStateOf_CarriesTheOrderState(t *testing.T) {
 	sl, tp := dec("95"), dec("110")
 	base := port.PaperOrder{EntryPx: dec("100"), SLPx: &sl, TPPx: &tp, Size: dec("25"), Leverage: dec("10"), Variant: "baseline"}
-	fork := base
-	fork.Variant = "rl_adjusted"
 
 	price := dec("104")
-	if positionStateOf(base, price).IsFork {
-		t.Error("baseline must not be marked as a fork")
-	}
-	if !positionStateOf(fork, price).IsFork {
-		t.Error("rl_adjusted variant must be marked as a fork")
-	}
 
 	// Entry/SL/TP live on the signal now (CLAUDE.md §15.11); what the position block adds is the
 	// trade's own state — side, size, and where price sits relative to its levels.
@@ -2728,17 +2796,92 @@ func TestHandleCandle_NewBarAppends(t *testing.T) {
 	}
 }
 
-// The observation's price context must report the live forming candle's OHLC (CLAUDE.md §15.11) —
-// on a 1H bar the last CLOSED candle can be an hour stale.
-func TestBuildPriceContext_ReportsLiveCandleOHLC(t *testing.T) {
-	pc := buildPriceContext([]domain.Candle{
-		{Open: dec("90"), High: dec("95"), Low: dec("89"), Close: dec("94")},
-		{Open: dec("94"), High: dec("99"), Low: dec("93"), Close: dec("98")}, // the forming bar
-	})
+// The market block must report the LIVE FORMING candle's OHLC (CLAUDE.md §15.11) — on a 1H bar the
+// last CLOSED candle can be an hour stale.
+//
+// These four values were built and then TRUNCATED AWAY on every single call in v7: they sit at the
+// front of the feature array and to_vector cut from the left, so the freshest thing in the whole
+// observation was the first casualty (docs/RL_V8_PLAN.md).
+func TestBuildMarketBlock_ReportsLiveCandleOHLC(t *testing.T) {
+	window := testCandleWindow(100)
+	live := domain.Candle{Open: dec("94"), High: dec("99"), Low: dec("93"), Close: dec("98"), Volume: dec("1200")}
+	window[len(window)-1] = live
 
-	if !pc.Open.Equal(dec("94")) || !pc.High.Equal(dec("99")) ||
-		!pc.Low.Equal(dec("93")) || !pc.Close.Equal(dec("98")) {
-		t.Errorf("price context must carry the LAST (forming) candle's OHLC, got %+v", pc)
+	mb, err := BuildMarketBlock("1m", window)
+	if err != nil {
+		t.Fatalf("BuildMarketBlock: %v", err)
+	}
+	if !mb.Open.Equal(live.Open) || !mb.High.Equal(live.High) ||
+		!mb.Low.Equal(live.Low) || !mb.Close.Equal(live.Close) {
+		t.Errorf("market block must carry the LAST (forming) candle's OHLC, got %+v", mb)
+	}
+}
+
+// The returns window must be EXACTLY domain.ReturnsWindow entries, never fewer.
+//
+// v7's builder skipped any candle with a non-positive previous close via `continue`, silently
+// yielding nine returns instead of ten and changing the vector width — one of the things that made
+// padding look necessary downstream.
+func TestBuildReturns_IsExactWidthOrAnError(t *testing.T) {
+	rets, err := BuildReturns(testCandleWindow(100))
+	if err != nil {
+		t.Fatalf("BuildReturns: %v", err)
+	}
+	if len(rets) != domain.ReturnsWindow {
+		t.Errorf("got %d returns, want exactly %d", len(rets), domain.ReturnsWindow)
+	}
+	if _, err := BuildReturns(testCandleWindow(100)[:3]); err == nil {
+		t.Error("expected an error on a short window rather than a short result")
+	}
+	// A zero close is a data fault worth seeing, not something to skip past.
+	bad := testCandleWindow(100)
+	bad[len(bad)-3].Close = decimal.Zero
+	if _, err := BuildReturns(bad); err == nil {
+		t.Error("expected an error on a non-positive close, got a silently shorter window")
+	}
+}
+
+// Volatility must be scale-free, or one shared policy cannot serve instruments at wildly different
+// price levels. Return dispersion rather than price dispersion: strategy.StdDev measures how far
+// PRICE strays from its own mean, which is ~30,000x larger on a $90,000 BTC than on a $3 token for
+// identical percentage moves.
+func TestReturnVolatility_IsScaleFree(t *testing.T) {
+	cheap, err := returnVolatility(testCandleWindow(3), 10)
+	if err != nil {
+		t.Fatalf("cheap: %v", err)
+	}
+	dear, err := returnVolatility(testCandleWindow(90000), 10)
+	if err != nil {
+		t.Fatalf("dear: %v", err)
+	}
+	if cheap.Sub(dear).Abs().GreaterThan(dec("0.0001")) {
+		t.Errorf("identical percentage moves gave different volatility at different price levels: %s vs %s", cheap, dear)
+	}
+}
+
+// Correlation with BTC is fed explicitly because the policy would never learn to compute one at
+// this project's trade volume — and "is this token currently following BTC" is exactly the question
+// that matters when an altcoin reverses the moment BTC's candle turns red.
+func TestCorrelation_TracksAgreementAndDisagreement(t *testing.T) {
+	up := []decimal.Decimal{dec("0.01"), dec("0.02"), dec("0.01"), dec("0.03"), dec("0.02")}
+	down := make([]decimal.Decimal, len(up))
+	for i, v := range up {
+		down[i] = v.Neg()
+	}
+	if got := correlation(up, up); !got.GreaterThan(dec("0.99")) {
+		t.Errorf("a series against itself must correlate ~1, got %s", got)
+	}
+	if got := correlation(up, down); !got.LessThan(dec("-0.99")) {
+		t.Errorf("a series against its inverse must correlate ~-1, got %s", got)
+	}
+	// A flat series has no variation, so there is no relationship to measure — and zero is also
+	// what an uncorrelated pair scores, which is the honest answer in both cases.
+	flat := []decimal.Decimal{dec("0"), dec("0"), dec("0"), dec("0"), dec("0")}
+	if got := correlation(up, flat); !got.IsZero() {
+		t.Errorf("a flat series must report zero correlation, got %s", got)
+	}
+	if got := correlation(up, up[:2]); !got.IsZero() {
+		t.Errorf("mismatched lengths must report zero, got %s", got)
 	}
 }
 
@@ -3198,4 +3341,43 @@ func TestSizingFollowsLiveEquity(t *testing.T) {
 	if !after.Sub(before.Mul(dec("2"))).Abs().LessThan(dec("0.01")) {
 		t.Errorf("equity doubled but per-position budget went %s -> %s, want roughly double", before, after)
 	}
+}
+
+// testCandleWindow builds a candle window long enough for v8's indicators and returns.
+//
+// v8 needs MinCandlesForIndicators candles and exactly domain.ReturnsWindow returns, and it ERRORS
+// rather than padding when either is short (docs/RL_V8_PLAN.md) — which is the point, but it means
+// a test that only cares about, say, strategy identity still needs a real window. Prices drift
+// rather than repeating so volatility and the return series are non-degenerate: a flat window makes
+// several indicators exactly zero, which can hide a wiring bug behind a plausible value.
+func testCandleWindow(base float64) []domain.Candle {
+	const n = 40
+	out := make([]domain.Candle, 0, n)
+	px := base
+	for i := 0; i < n; i++ {
+		px *= 1 + 0.002*float64((i%5)-2)
+		c := decimal.NewFromFloat(px)
+		out = append(out, domain.Candle{
+			Open:   c.Mul(dec("0.999")),
+			High:   c.Mul(dec("1.002")),
+			Low:    c.Mul(dec("0.998")),
+			Close:  c,
+			Volume: decimal.NewFromFloat(1000 + float64(i*7)),
+		})
+	}
+	return out
+}
+
+// paperWindow is a candle window long enough to build a v8 observation, ENDING at `price`.
+//
+// A one- or two-candle window no longer suffices: v8 needs MinCandlesForIndicators candles and
+// exactly domain.ReturnsWindow returns, and refuses rather than padding (docs/RL_V8_PLAN.md). The
+// window ends at the requested price so every existing assertion about entry, stop and target
+// prices is unaffected — only the history behind that price is new.
+func paperWindow(price string) []domain.Candle {
+	f, _ := dec(price).Float64()
+	w := testCandleWindow(f)
+	c := dec(price)
+	w[len(w)-1] = domain.Candle{Open: c, High: c, Low: c, Close: c, Volume: dec("1000")}
+	return w
 }

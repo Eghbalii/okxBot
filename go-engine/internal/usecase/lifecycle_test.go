@@ -66,7 +66,7 @@ func lifecycleTrader(repo port.Repository, model port.ModelClient) *PaperTrader 
 	pt.RLSLTPAdjust = true
 	pt.RLEarlyClose = true
 	pt.MaxLeverage = dec("100")
-	pt.candles = map[string][]domain.Candle{"1m": {{Close: dec("100")}}, "15m": nil}
+	pt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100"), "15m": nil}
 	return pt
 }
 

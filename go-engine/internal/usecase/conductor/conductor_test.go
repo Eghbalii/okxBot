@@ -182,7 +182,7 @@ func TestSignalCarryForward(t *testing.T) {
 		t.Fatal("no signal retained yet")
 	}
 
-	sig := domain.StrategySignal{Side: "buy", Kind: "rsi_sma", Bar: "1H", Confidence: dec("0.8")}
+	sig := domain.StrategySignal{Side: "buy", Kind: "rsi_sma", Bar: "1H", WinRate: dec("0.8")}
 	c.RetainSignal("BTC-USDT-SWAP", "1H", sig)
 
 	got, ok := c.CarriedSignal("BTC-USDT-SWAP", "1H")

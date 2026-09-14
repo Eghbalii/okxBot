@@ -135,6 +135,28 @@ type PaperTrader struct {
 	// this is the paper-mode equivalent so the two produce comparable data.
 	MaxLeverage decimal.Decimal
 
+	// BTCCandles returns BTC's candle window for a bar, for the market-wide reference block
+	// (docs/RL_V8_PLAN.md). Every other input is intra-token, so without this the model cannot see
+	// that an altcoin reverses the moment BTC's candle turns red — the operator's own observation
+	// and the reason the block exists. Wired by cmd/paper-trader from the same candle store every
+	// instrument's engine already reads.
+	//
+	// Nil disables model calls entirely rather than sending a zeroed block: zeros would read as
+	// "BTC is perfectly flat and uncorrelated", a specific and false claim rather than an absence.
+	BTCCandles func(bar string) ([]domain.Candle, bool)
+
+	// TokenStats supplies the roster-wide half of the token profile — volume, its rank, and the 24h
+	// figures — which a single instrument's engine has no other way to know. Sourced from the
+	// discovery scan's market snapshot (§53). Nil leaves those fields zero, which is honest: an
+	// unranked token with unknown volume.
+	TokenStats func(instID string) domain.TokenProfile
+
+	// peak tracks the highest account equity this process has seen, so drawdown reaches the model
+	// measured from the high-water mark rather than from the configured starting balance — which
+	// SetAccountCap rewrites (§32.2), wiping the model's view of drawdown on every cap change.
+	peakMu sync.Mutex
+	peak   decimal.Decimal
+
 	// TradingPaused stops evaluateStrategies from opening any new position (panel control-box
 	// "paused"/"stopped" state) — existing open positions are unaffected, still monitored/closed
 	// normally by monitorOpenOrders. "stopped" additionally force-closes every open position at
@@ -554,7 +576,6 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 		e.conductor().RetainSignal(e.InstID, bar, domain.StrategySignal{
 			StrategyID: a.StrategyID,
 			Side:       string(signal.Side),
-			Confidence: signal.Confidence,
 			EntryPx:    resolved.EntryPx,
 			SLPx:       resolved.SLPx,
 			TPPx:       resolved.TPPx,
@@ -564,7 +585,14 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 
 		// The same observation is used for both the model's open decision and the persisted
 		// decision-time record below, so what's stored is exactly what the model was asked.
-		obs := e.buildObservation(ctx, bar, price, logger)
+		obs, err := e.buildObservation(ctx, bar, price, logger)
+		if err != nil {
+			// No model call and no order: opening one without the decision-time observation would
+			// persist a features_json the model never saw, which is training data describing a
+			// decision that was never made.
+			e.skipModelCall("open", err, logger)
+			continue
+		}
 		obs.Category = conductor.OpenCategory(string(signal.Side))
 		obs.Signal = e.carriedSignalFor(bar)
 

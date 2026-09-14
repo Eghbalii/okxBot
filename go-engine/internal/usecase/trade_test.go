@@ -27,10 +27,14 @@ type fakeExchangeClient struct {
 	// ordSeq gives each placed order its own id (see PlaceOrder).
 	ordSeq int
 
-	placedOrders   []domain.OrderRequest
-	leverageCalls  []domain.LeverageChange
-	placeOrderErr  error
-	setLeverageErr error
+	placedOrders []domain.OrderRequest
+	// noDefaultBalance opts out of the funded-account default below, for the tests that
+	// specifically assert how an EMPTY balance response is handled — an exchange that reports
+	// nothing must never be read as a drained account.
+	noDefaultBalance bool
+	leverageCalls    []domain.LeverageChange
+	placeOrderErr    error
+	setLeverageErr   error
 
 	// orderStatusQueue lets a test script a sequence of GetOrder responses (e.g. "live" then
 	// "filled", to exercise a fill-timeout poll loop) — each call pops the next entry; once
@@ -141,6 +145,14 @@ func (f *fakeExchangeClient) GetBalance(ccy string) ([]domain.Balance, error) {
 	f.callMu.Lock()
 	f.getBalanceCalls++
 	f.callMu.Unlock()
+	if f.balances == nil && !f.noDefaultBalance {
+		// A real exchange always reports SOME balance for a funded account, and v8 treats a missing
+		// one as a reason to skip the model call entirely (a zero equity makes three ratios and the
+		// size budget all read zero, telling the model the account is empty). Defaulting here keeps
+		// the fake faithful to the real thing rather than making every unrelated test seed a
+		// balance — the same "fix the fake, not the test" call §17 made for SaveCandle.
+		return []domain.Balance{{Ccy: ccy, Eq: dec("1000")}}, nil
+	}
 	return f.balances, nil
 }
 
@@ -307,9 +319,7 @@ func TestStep_LeverageClampedToMax(t *testing.T) {
 	riskManager := risk.NewManager(limits, dec("1000"))
 
 	trader := newTestTrader(exchange, model, riskManager)
-	if err := trader.step(context.Background(), testLogger()); err != nil {
-		t.Fatalf("step returned error: %v", err)
-	}
+	stepThroughExecute(t, trader, exchange, model.action)
 
 	if len(exchange.leverageCalls) != 1 {
 		t.Fatalf("expected exactly 1 leverage call, got %d", len(exchange.leverageCalls))
@@ -336,9 +346,7 @@ func TestStep_RejectedWhenLiquidationBufferTooThin(t *testing.T) {
 	riskManager := risk.NewManager(limits, dec("1000"))
 
 	trader := newTestTrader(exchange, model, riskManager)
-	if err := trader.step(context.Background(), testLogger()); err != nil {
-		t.Fatalf("step returned error: %v", err)
-	}
+	stepThroughExecute(t, trader, exchange, model.action)
 
 	if len(exchange.leverageCalls) != 0 {
 		t.Errorf("expected leverage change rejected, but SetLeverage was called %d times", len(exchange.leverageCalls))
@@ -364,9 +372,7 @@ func TestStep_OrderBelowMinSizeSkipped(t *testing.T) {
 	riskManager := risk.NewManager(limits, dec("1000"))
 
 	trader := newTestTrader(exchange, model, riskManager)
-	if err := trader.step(context.Background(), testLogger()); err != nil {
-		t.Fatalf("step returned error: %v", err)
-	}
+	stepThroughExecute(t, trader, exchange, model.action)
 
 	if len(exchange.placedOrders) != 0 {
 		t.Errorf("expected order below MinOrderUSD to be skipped, got %d orders placed", len(exchange.placedOrders))
@@ -391,9 +397,7 @@ func TestStep_ShortTargetSetsHedgePosSide(t *testing.T) {
 
 	trader := newTestTrader(exchange, model, riskManager)
 	trader.PosMode = "long_short"
-	if err := trader.step(context.Background(), testLogger()); err != nil {
-		t.Fatalf("step returned error: %v", err)
-	}
+	stepThroughExecute(t, trader, exchange, model.action)
 
 	if len(exchange.placedOrders) != 1 {
 		t.Fatalf("expected exactly 1 order placed, got %d", len(exchange.placedOrders))
@@ -423,9 +427,7 @@ func TestStep_ExactNotionalNoFloatDrift(t *testing.T) {
 	riskManager := risk.NewManager(limits, dec("1000"))
 
 	trader := newTestTrader(exchange, model, riskManager)
-	if err := trader.step(context.Background(), testLogger()); err != nil {
-		t.Fatalf("step returned error: %v", err)
-	}
+	stepThroughExecute(t, trader, exchange, model.action)
 
 	if len(exchange.placedOrders) != 1 {
 		t.Fatalf("expected exactly 1 order placed, got %d", len(exchange.placedOrders))
@@ -444,54 +446,60 @@ func testLimits() risk.Limits {
 	}
 }
 
-// TestStep_ObservationCarriesTokenIdentityAndAccountEquity covers the live/demo path's train-serve
-// consistency (CLAUDE.md §15.1/§15.6): the global model conditions on a token-identity one-hot
-// built from ActiveTokens and was trained on per-token equity, so cmd/trader must send the same
-// roster and this token's own sub-budget — not an empty roster and total account equity, which is a
-// distribution the model never saw in training.
-func TestStep_ObservationCarriesTokenIdentityAndAccountEquity(t *testing.T) {
+// The legacy poll loop must NOT consult the model (docs/RL_V8_PLAN.md).
+//
+// These two tests replace a pair that asserted this loop sent a correct token roster and equity to
+// the model. That framing no longer holds: v8's observation requires a market block with ten
+// derived indicators, a returns window and a BTC reference, and this loop has no candle window at
+// all — it predates the entire §15.10-§15.12 lifecycle (§27's audit). Before v8 it sent a
+// mostly-empty observation that rl_service padded into a full-width vector and answered
+// confidently, which is exactly the silent degradation this schema exists to end.
+//
+// RealTrader supersedes this loop (§27.3). Until it is retired, running without the model is the
+// only honest option: the alternative is asking for a decision on data that does not exist.
+func TestStep_LegacyLoopDoesNotConsultTheModel(t *testing.T) {
 	exchange := &fakeExchangeClient{
 		ticker:   domain.Ticker{Last: dec("50000")},
 		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("5000")}},
 	}
-	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0"), LeverageFrac: dec("0")}}
+	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5")}}
 	trader := newTestTrader(exchange, model, risk.NewManager(testLimits(), dec("5000")))
-	trader.ActiveTokens = []string{"BTC-USDT-SWAP", "XAU-USD-SWAP"}
-	trader.AccountInitialUSD = dec("100")
 
 	if err := trader.step(context.Background(), testLogger()); err != nil {
 		t.Fatalf("step: %v", err)
 	}
 
-	if len(model.lastObs.ActiveTokens) != 2 {
-		t.Errorf("expected the 2-token roster for the identity one-hot, got %v", model.lastObs.ActiveTokens)
+	if model.predictCalls != 0 {
+		t.Errorf("the legacy loop called the model %d times; it cannot build a valid v8 "+
+			"observation, so it must not ask", model.predictCalls)
 	}
-	// Demo/real equity is the exchange's reported balance (ground truth), reported alongside the
-	// configured starting balance so drawdown is visible the same way it is in paper mode.
-	if !model.lastObs.AccountEquityUSD.Equal(dec("5000")) {
-		t.Errorf("expected the exchange's reported equity (5000), got %s", model.lastObs.AccountEquityUSD)
-	}
-	if !model.lastObs.AccountInitialUSD.Equal(dec("100")) {
-		t.Errorf("expected the configured starting balance (100), got %s", model.lastObs.AccountInitialUSD)
+	if len(exchange.placedOrders) != 0 {
+		t.Errorf("the legacy loop placed %d orders without a model decision", len(exchange.placedOrders))
 	}
 }
 
-// With no configured starting balance, the exchange's current equity stands in for it — the
-// documented fallback, so drawdown reads as zero rather than as a nonsense ratio against zero.
-func TestStep_ObservationFallsBackToLiveEquityWithoutConfiguredInitial(t *testing.T) {
+// The equity timeline must still be recorded even with the model out of the loop — it is
+// bookkeeping about real capital, independent of whether anything is deciding (§15.7).
+func TestStep_LegacyLoopStillRecordsEquity(t *testing.T) {
 	exchange := &fakeExchangeClient{
 		ticker:   domain.Ticker{Last: dec("50000")},
 		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("5000")}},
 	}
-	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0"), LeverageFrac: dec("0")}}
-	trader := newTestTrader(exchange, model, risk.NewManager(testLimits(), dec("5000")))
+	repo := newFakeRepository()
+	trader := newTestTrader(exchange, &fakeModelClient{}, risk.NewManager(testLimits(), dec("5000")))
+	trader.Repo = repo
+	trader.Mode = "demo"
 
 	if err := trader.step(context.Background(), testLogger()); err != nil {
 		t.Fatalf("step: %v", err)
 	}
 
-	if !model.lastObs.AccountInitialUSD.Equal(dec("5000")) {
-		t.Errorf("expected the live-equity fallback (5000), got %s", model.lastObs.AccountInitialUSD)
+	acct, err := repo.GetAccountEquity(context.Background(), "demo", dec("0"))
+	if err != nil {
+		t.Fatalf("get account equity: %v", err)
+	}
+	if !acct.EquityUSD.Equal(dec("5000")) {
+		t.Errorf("expected the exchange's reported equity (5000) recorded, got %s", acct.EquityUSD)
 	}
 }
 
@@ -639,5 +647,39 @@ func TestStep_LiquidationBufferCrossCheckNeverLoosens(t *testing.T) {
 
 	if len(exchange.leverageCalls) != 0 {
 		t.Error("expected the rough estimate's rejection to hold even though the real buffer is wider")
+	}
+}
+
+// stepThroughExecute drives Trader.execute the way step() used to before v8.
+//
+// The legacy loop no longer consults the model at all: v8's observation requires a market block
+// with ten derived indicators, a returns window and a BTC reference, and this loop has no candle
+// window (docs/RL_V8_PLAN.md). But execute() itself — leverage clamping, notional sizing, hedge-mode
+// posSide, the exec-instrument mapping — is unchanged and still worth testing, so these tests now
+// hand it an action directly instead of routing one through a model call that no longer happens.
+func stepThroughExecute(t *testing.T, trader *Trader, exchange *fakeExchangeClient, action domain.Action) {
+	t.Helper()
+	ticker, err := exchange.GetTicker(trader.execInstID())
+	if err != nil {
+		t.Fatalf("get ticker: %v", err)
+	}
+	positions, err := exchange.GetPositions(trader.execInstType())
+	if err != nil {
+		t.Fatalf("get positions: %v", err)
+	}
+	var pos domain.Position
+	if len(positions) > 0 {
+		pos = positions[0]
+	}
+	balances, err := exchange.GetBalance(trader.settleCcy())
+	if err != nil {
+		t.Fatalf("get balance: %v", err)
+	}
+	equity := decimal.Zero
+	if len(balances) > 0 {
+		equity = balances[0].Eq
+	}
+	if err := trader.execute(testLogger(), ticker.Last, pos, pos.Pos, pos.Lever, equity, &action); err != nil {
+		t.Fatalf("execute: %v", err)
 	}
 }

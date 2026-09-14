@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -99,7 +100,19 @@ type RealTrader struct {
 	// function, CLAUDE.md §27's plan commit 2) — same equity-fraction caps PaperTrader.RLSizing
 	// uses, expressed against the exchange's own reported equity here (see buildObservation) rather
 	// than a bookkeeping row this engine owns.
-	MaxLeverage         decimal.Decimal
+	MaxLeverage decimal.Decimal
+
+	// BTCCandles returns BTC's candle window for a bar, for the market-wide reference block
+	// (docs/RL_V8_PLAN.md). Same field PaperTrader carries, wired from the same candle store.
+	BTCCandles func(bar string) ([]domain.Candle, bool)
+
+	// TokenStats supplies the roster-wide half of the token profile — volume, rank, 24h figures.
+	TokenStats func(instID string) domain.TokenProfile
+
+	// peak is the highest equity this process has observed, so drawdown reaches the model measured
+	// from the high-water mark rather than a configured starting balance.
+	peakMu              sync.Mutex
+	peak                decimal.Decimal
 	MaxPositionPct      decimal.Decimal
 	MaxTotalExposurePct decimal.Decimal
 
@@ -791,7 +804,6 @@ func (e *RealTrader) evaluateStrategies(ctx context.Context, bar string, price d
 		e.conductor().RetainSignal(e.InstID, bar, domain.StrategySignal{
 			StrategyID: a.StrategyID,
 			Side:       string(signal.Side),
-			Confidence: signal.Confidence,
 			EntryPx:    resolved.EntryPx,
 			SLPx:       resolved.SLPx,
 			TPPx:       resolved.TPPx,
@@ -799,7 +811,11 @@ func (e *RealTrader) evaluateStrategies(ctx context.Context, bar string, price d
 			Bar:        a.Bar,
 		})
 
-		obs := e.buildObservation(ctx, bar, price, logger)
+		obs, err := e.buildObservation(ctx, bar, price, logger)
+		if err != nil {
+			e.skipModelCall("open", err, logger)
+			continue
+		}
 		obs.Category = conductor.OpenCategory(string(signal.Side))
 		obs.Signal = e.carriedSignalFor(bar)
 
@@ -1231,7 +1247,11 @@ func (e *RealTrader) runUpdates(ctx context.Context, bar string, price decimal.D
 		return
 	}
 
-	obs := e.buildObservation(ctx, bar, price, logger)
+	obs, err := e.buildObservation(ctx, bar, price, logger)
+	if err != nil {
+		e.skipModelCall("update", err, logger)
+		return
+	}
 	obs.Category = domain.CategoryUpdate
 	now := time.Now()
 
@@ -1685,7 +1705,11 @@ func (e *RealTrader) reportTerminalReal(ctx context.Context, o port.RealOrder, c
 	if category == "" {
 		return
 	}
-	obs := e.buildObservation(ctx, e.decisionBar(), closePx, logger)
+	obs, err := e.buildObservation(ctx, e.decisionBar(), closePx, logger)
+	if err != nil {
+		e.skipModelCall("terminal", err, logger)
+		return
+	}
 	obs.Category = category
 	obs.OrderID = o.ID
 	obs.Signal = e.carriedSignalFor(e.decisionBar())
@@ -1716,84 +1740,142 @@ func (e *RealTrader) publishOrderEvent(ctx context.Context, eventType string, or
 	}
 }
 
-// buildObservation assembles the observation for this token, reusing the same shape PaperTrader
-// sends — CLAUDE.md §27's plan §6: AccountEquityUSD/OpenExposureUSD are what differ from paper's
-// version (ground-truth exchange values here, not this engine's own bookkeeping), everything else
-// (candle window, strategy signals, price context, token identity) is identical logic.
-func (e *RealTrader) buildObservation(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) domain.Observation {
+// buildObservation assembles the v8 observation for this token (docs/RL_V8_PLAN.md).
+//
+// Same shape PaperTrader sends, with one deliberate difference: AccountEquityUSD and the exposure
+// figures are GROUND TRUTH FROM THE EXCHANGE, not this engine's own bookkeeping — real trading does
+// not own that number the way paper trading owns its shared account (§27's plan §6 flags this as
+// the spot easiest to get wrong by careless reuse).
+//
+// Returns an error rather than a partly-filled observation, for the same reason PaperTrader's does:
+// a caller must SKIP the model call rather than send a short observation and have rl_service reject
+// it, which would leave a pending decision in the learner that never receives its reward.
+func (e *RealTrader) buildObservation(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) (domain.Observation, error) {
 	view := e.marketView(bar)
 	window := view.Candles
 
-	tb := domain.TimeframeBlock{Bar: bar, PriceContext: buildPriceContext(window)}
-	for _, a := range e.Strategies {
-		if a.Bar != bar {
-			continue
-		}
-		sig, err := strategy.EvaluateWith(a.Strategy, view)
-		if err != nil {
-			continue
-		}
-		resolved := sig.ResolveLevels(price)
-		tb.StrategySignals = append(tb.StrategySignals, domain.StrategySignal{
-			StrategyID: a.StrategyID,
-			Side:       string(sig.Side),
-			Confidence: sig.Confidence,
-			EntryPx:    resolved.EntryPx,
-			SLPx:       resolved.SLPx,
-			TPPx:       resolved.TPPx,
-			Kind:       a.Kind,
-			Bar:        a.Bar,
-		})
+	mb, err := BuildMarketBlock(bar, window)
+	if err != nil {
+		return domain.Observation{}, fmt.Errorf("market block: %w", err)
+	}
+
+	btc, err := e.btcContext(bar, mb.ClosePctChanges)
+	if err != nil {
+		return domain.Observation{}, err
+	}
+
+	// The exchange is the authority on equity here. A failed read is fatal to the observation
+	// rather than warn-and-continue: zero equity makes three ratios plus the size budget read zero,
+	// which tells the model the account is empty — a coherent-looking lie, and on the real path it
+	// would be a lie about actual capital.
+	balances, err := e.Exchange.GetBalance(e.settleCcy())
+	if err != nil {
+		return domain.Observation{}, fmt.Errorf("exchange balance: %w", err)
+	}
+	if len(balances) == 0 {
+		return domain.Observation{}, fmt.Errorf("exchange reported no %s balance", e.settleCcy())
+	}
+	equity := e.tradableEquityFor(ctx, balances[0].Eq)
+
+	margin, leveraged, count, err := e.exposureSnapshotReal(ctx)
+	if err != nil {
+		return domain.Observation{}, fmt.Errorf("open exposure: %w", err)
 	}
 
 	obs := domain.Observation{
-		SchemaVersion:     domain.ObservationSchemaVersion,
-		InstID:            e.InstID,
-		ActiveTokens:      e.ActiveTokens,
-		LastPrice:         price,
-		Timeframes:        []domain.TimeframeBlock{tb},
-		AccountInitialUSD: e.AccountInitialUSD,
-		// The risk budget the model must size within (schema v7) — the per-token even share of the
-		// account, matching PaperTrader.evenShareOfAccount so one policy serving both modes reads
-		// the same meaning from the field. account.max_position_pct still applies afterwards in
-		// sizeFromModelAction as the hard ceiling.
+		SchemaVersion:            domain.ObservationSchemaVersion,
+		InstID:                   e.InstID,
+		LastPrice:                price,
+		TokenProfile:             e.tokenProfile(window),
+		Timeframes:               []domain.MarketBlock{mb},
+		BTC:                      btc,
+		AccountEquityUSD:         equity,
+		AccountInitialUSD:        e.AccountInitialUSD,
+		AccountPeakUSD:           e.peakEquity(equity),
+		OpenExposureUSD:          margin,
+		OpenLeveragedExposureUSD: leveraged,
+		OpenPositionCount:        count,
+		// The per-token even share of the account, matching PaperTrader.evenShareOfAccount so one
+		// policy serving both modes reads the same meaning from the field.
 		MaxPositionPct: e.evenShareOfAccount(),
 		MaxLeverage:    e.MaxLeverage,
 		Category:       domain.CategoryUpdate,
 	}
-
-	// The TOTAL is ground truth from the exchange, not GetAccountEquity's bookkeeping row — real
-	// trading does not own that number the way paper trading owns its shared account (CLAUDE.md
-	// §27's plan §6: the one spot flagged as easy to get wrong by careless reuse). What the model
-	// is allowed to SIZE against is a slice of it, and the reserve is subtracted here so sizing can
-	// never draw against capital held back.
-	balances, err := e.Exchange.GetBalance(e.settleCcy())
-	if err != nil {
-		logger.Warn("real observation: get balance failed", "instId", e.InstID, "error", err)
-	} else if len(balances) > 0 {
-		obs.AccountEquityUSD = e.tradableEquityFor(ctx, balances[0].Eq)
-	}
-	obs.OpenExposureUSD = e.openExposureReal(ctx, logger)
-
-	return obs
+	return obs, nil
 }
 
-// openExposureReal sums the notional of every open real position across ALL tokens, mirroring
-// PaperTrader.openExposure but reading real_orders (CLAUDE.md real-trading readiness plan,
-// 2026-09-04) rather than paper_orders — real trading has no per-mode filter to apply here since
-// every real_orders row already belongs to real trading by construction.
-func (e *RealTrader) openExposureReal(ctx context.Context, logger *slog.Logger) decimal.Decimal {
+// btcContext builds the market-wide reference block from BTC's own candle window on the same bar.
+// See PaperTrader.btcContext — a zeroed block would read as "BTC is flat and uncorrelated", a
+// specific false claim rather than an absence of information.
+func (e *RealTrader) btcContext(bar string, tokenReturns []decimal.Decimal) (domain.BTCContext, error) {
+	if e.BTCCandles == nil {
+		return domain.BTCContext{}, fmt.Errorf("btc context: no reference feed wired")
+	}
+	window, ok := e.BTCCandles(bar)
+	if !ok || len(window) == 0 {
+		return domain.BTCContext{}, fmt.Errorf("btc context: no %s window yet", bar)
+	}
+	return BuildBTCContext(window, tokenReturns)
+}
+
+// tokenProfile describes what this instrument IS, replacing v7's identity one-hot. See
+// PaperTrader.tokenProfile.
+func (e *RealTrader) tokenProfile(window []domain.Candle) domain.TokenProfile {
+	p := domain.TokenProfile{}
+	if len(window) == 0 {
+		return p
+	}
+	last := window[len(window)-1]
+	if last.Close.IsPositive() {
+		f, _ := last.Close.Float64()
+		if f > 0 {
+			p.LogPrice = decimal.NewFromFloat(math.Log10(f))
+		}
+		if atr, err := strategy.ATR(window, atrPeriod); err == nil {
+			p.TypicalVolatility = atr.Div(last.Close)
+		}
+	}
+	if e.TokenStats != nil {
+		s := e.TokenStats(e.InstID)
+		p.LogVolume24h = s.LogVolume24h
+		p.VolumeRank = s.VolumeRank
+		p.Range24h = s.Range24h
+		p.Change24h = s.Change24h
+		p.LogTradeCount = s.LogTradeCount
+	}
+	return p
+}
+
+// peakEquity tracks the high-water mark this process has observed, so drawdown reaches the model
+// measured from the peak rather than from a configured starting balance. See PaperTrader.peakEquity.
+func (e *RealTrader) peakEquity(equity decimal.Decimal) decimal.Decimal {
+	e.peakMu.Lock()
+	defer e.peakMu.Unlock()
+	if equity.GreaterThan(e.peak) {
+		e.peak = equity
+	}
+	return e.peak
+}
+
+// exposureSnapshotReal reports margin committed, leveraged exposure and open position count across
+// every real position. Mirrors PaperTrader.exposureSnapshot but reads real_orders — real trading
+// needs no mode filter, since every row there belongs to it by construction.
+func (e *RealTrader) exposureSnapshotReal(ctx context.Context) (margin, leveraged decimal.Decimal, count int, err error) {
 	openOnly := true
 	positions, err := e.Repo.ListRealPositions(ctx, port.PositionFilter{Open: &openOnly})
 	if err != nil {
-		logger.Warn("real observation: list open positions failed", "mode", e.accountMode(), "error", err)
-		return decimal.Zero
+		return decimal.Zero, decimal.Zero, 0, err
 	}
-	var total decimal.Decimal
 	for _, p := range positions {
-		total = total.Add(p.Size)
+		margin = margin.Add(p.Size)
+		lev := p.Leverage
+		if !lev.IsPositive() {
+			lev = decimal.NewFromInt(1)
+		}
+		leveraged = leveraged.Add(p.Size.Mul(lev))
+		count++
 	}
-	return total
+	return margin, leveraged, count, nil
 }
 
 // runReconcileLoop periodically compares this process's own open real positions against OKX's

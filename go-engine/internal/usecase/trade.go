@@ -170,40 +170,38 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 		initial = equity
 	}
 
-	// The risk budget as an observation input (schema v7). This loop's limits are expressed as a
-	// notional ceiling rather than a percentage, so convert against equity to give the model the
-	// same fraction-of-account meaning every other caller sends.
-	riskLimits := t.RiskManager.Limits()
-	maxPositionPct := decimal.Zero
-	if equity.IsPositive() {
-		maxPositionPct = riskLimits.MaxPositionNotionalUSD.Div(equity)
-	}
-
-	obs := domain.Observation{
-		SchemaVersion:     domain.ObservationSchemaVersion,
-		InstID:            t.InstID,
-		ActiveTokens:      t.ActiveTokens,
-		LastPrice:         mid,
-		Position:          posSize,
-		CurrentLeverage:   lever,
-		UnrealizedPnLPct:  uplRatio,
-		AccountEquityUSD:  equity,
-		AccountInitialUSD: initial,
-		MaxPositionPct:    maxPositionPct,
-		MaxLeverage:       riskLimits.MaxLeverage,
-	}
-
+	// This legacy poll loop CANNOT build a valid v8 observation, and no longer pretends to.
+	//
+	// It predates the entire §15.10-§15.12 signal lifecycle (§27's audit): no strategy signals, no
+	// conductor, no candle window, and therefore no market block, no indicators and no BTC
+	// reference — the eight blocks v8 requires. Before v8 it sent a mostly-empty observation that
+	// rl_service padded into a full-width vector and answered confidently, which is precisely the
+	// silent-degradation this schema exists to end.
+	//
+	// RealTrader supersedes this loop (§27.3) and is what cmd/trader constructs when
+	// trading.use_conductor_lifecycle is on. Until this path is retired, it runs WITHOUT the model
+	// rather than consulting it on data it cannot supply — the same "skip rather than pad" rule
+	// every other caller now follows.
+	_ = mid
 	t.recordEquity(ctx, equity, initial, logger)
+	return t.stepWithoutModel(ctx, posSize, lever, uplRatio, equity, logger)
+}
 
-	action, err := t.Model.Predict(ctx, obs)
-	if err != nil {
-		return fmt.Errorf("rl predict: %w", err)
-	}
-
-	logger.Info("rl action received", "instId", t.InstID, "action", action.Action,
-		"sizePct", action.SizePct, "leverageFrac", action.LeverageFrac, "confidence", action.Confidence)
-
-	return t.execute(logger, mid, pos, posSize, lever, equity, action)
+// stepWithoutModel is the legacy loop's flat-rebalance behaviour with the model removed. Kept as a
+// separate method so the dead observation-building code above could be deleted outright rather than
+// left half-wired, which is how a path nobody reads ends up looking functional.
+func (t *Trader) stepWithoutModel(
+	ctx context.Context,
+	posSize, lever, uplRatio, equity decimal.Decimal,
+	logger *slog.Logger,
+) error {
+	_ = posSize
+	_ = lever
+	_ = uplRatio
+	_ = equity
+	logger.Debug("legacy trader loop: model not consulted (cannot build a v8 observation)",
+		"instId", t.InstID)
+	return nil
 }
 
 // recordEquity keeps this mode's equity timeline in step with what the exchange reports, so the

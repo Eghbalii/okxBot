@@ -1,7 +1,6 @@
 package usecase
 
 import (
-	"context"
 	"testing"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
@@ -66,9 +65,7 @@ func TestStep_UsesExecInstIDNotMarketDataInstID(t *testing.T) {
 	trader.ExecInstType = "FUTURES"
 	trader.SettleCcy = "USDC"
 
-	if err := trader.step(context.Background(), testLogger()); err != nil {
-		t.Fatalf("step returned error: %v", err)
-	}
+	stepThroughExecute(t, trader, exchange, model.action)
 
 	if len(exchange.placedOrders) != 1 {
 		t.Fatalf("expected exactly 1 order placed, got %d", len(exchange.placedOrders))

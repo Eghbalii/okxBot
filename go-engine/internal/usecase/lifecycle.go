@@ -133,7 +133,14 @@ func (e *PaperTrader) runUpdates(ctx context.Context, bar string, price decimal.
 		return
 	}
 
-	obs := e.buildObservation(ctx, bar, price, logger)
+	// An unusable observation SKIPS the model entirely rather than sending a short one and letting
+	// rl_service reject it: a rejected call leaves a pending decision in the learner that never
+	// receives its reward, which is the gap §15.12 closed (docs/RL_V8_PLAN.md).
+	obs, err := e.buildObservation(ctx, bar, price, logger)
+	if err != nil {
+		e.skipModelCall("update", err, logger)
+		return
+	}
 	obs.Category = domain.CategoryUpdate
 	now := time.Now()
 
@@ -252,7 +259,13 @@ func (e *PaperTrader) reportTerminal(ctx context.Context, o port.PaperOrder, clo
 		return // e.g. a manual close: not a decision the model made, so not something to train on
 	}
 
-	obs := e.buildObservation(ctx, e.decisionBar(), closePx, logger)
+	obs, err := e.buildObservation(ctx, e.decisionBar(), closePx, logger)
+	if err != nil {
+		// A terminal call that cannot be built means this trade trains nothing — the decision that
+		// opened it stays pending until it is evicted. Worth an error, not a silent return.
+		e.skipModelCall("terminal", err, logger)
+		return
+	}
 	obs.Category = category
 	obs.OrderID = o.ID
 	obs.Signal = e.carriedSignalFor(e.decisionBar())
