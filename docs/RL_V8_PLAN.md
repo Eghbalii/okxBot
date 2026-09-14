@@ -345,3 +345,80 @@ profile accumulates from the simulation's own books. Order ids per trade — cau
 1. Run the backtest against the server's real candle history; show the operator the summary.
 2. Set the live roster: 16 slots, $40 cap, 10x, all three RL gates ON.
 3. Train from the dataset, show results, deploy only on approval.
+
+---
+
+## The strategy investigation (2026-09-14, after the backtest landed)
+
+The backtest was built to produce a warm-start dataset. Running it produced something more
+important: a measurement of whether the strategies carry any edge at all.
+
+### What was measured
+
+37 strategies, 10 tokens, 2 timeframes, **68,113 trades**. 36 of 37 lost money, at a 35.9% win rate.
+
+Three diagnoses were proposed and **all three were killed by measurement**, which is the part worth
+carrying forward:
+
+| hypothesis | how it died |
+|---|---|
+| fees are eating the edge | computed: 1.00% of margin per round trip against 6.87% average risk — 14.6% of risk, real, but EV is still positive at 3:1 |
+| the SL ratchet shrinks wins | the backtest has no ratchet at all; positions run untouched to SL or TP |
+| the reward:risk floor is too low | swept it: win rate fell almost exactly along the 1/(1+R) breakeven line, PnL barely moved |
+
+That last sweep is the actual finding:
+
+```
+min R:R 1.5 -> 35.2% win (breakeven 40.0%)   -4.8pp
+min R:R 2.0 -> 32.8% win (breakeven 33.3%)   -0.5pp
+min R:R 2.5 -> 28.7% win (breakeven 28.6%)   +0.1pp
+```
+
+Win rate tracking the breakeven line as the ratio changes is what a system with no edge looks like:
+the entry decides WHEN, and the SL/TP geometry decides everything else.
+
+### coin_flip, and why it is shipped code
+
+That was an inference from an arithmetic identity, and acting on it means abandoning parameter
+tuning for the whole roster — so it needed measuring. `internal/strategy/coinflip.go` fires on a
+fixed bar cadence with no reference to price, alternating sides, registered as an ordinary kind so
+it runs through the identical path (same sizing, clamps, fees, SL-wins-a-tie).
+
+On real data it placed 24th of 37. But testing every gap against its own sample size showed **every
+t below 1** — the whole table is one statistical cloud. Reading it as a ranking would have meant
+deleting 13 strategies for noise and keeping 23 for noise. `backtest.SignificanceVsBaseline` now
+reports t for every comparison, so this cannot be misread again.
+
+### The four new kinds
+
+All 36 existing strategies see a pattern on one chart and enter immediately. None asks whether the
+market suits the pattern, none combines opinions, none looks outside its own instrument, none knows
+what time it is. The four fill exactly those gaps, and each carries its own risk in its doc comment:
+
+- **`RegimeFilter`** — a wrapper, so "does this pattern only work in a trend?" becomes one question
+  for all 36 rather than 36 edits.
+- **`confluence`** — the only mechanism that can amplify a small edge. Honest caveat: the members
+  are not independent, so agreement may be one signal counted three times.
+- **`btc_divergence`** — ships in BOTH directions (follow/fade) because which is right is empirical.
+  `strategy.MarketView` gained `Reference` to carry BTC's series.
+- **`session_momentum`** — the easiest to fool yourself with, so its hours are the conventional ones
+  rather than hours found by searching.
+
+**A finding the tests produced**: confluence fired ZERO times in 470 bars while its members fired
+294 times between them — they never agreed on the same bar. Measured by window: 1 bar -> 0, 3 -> 1,
+5 -> 37, 10 -> 203. Strategies react to one setup at different moments, so same-bar agreement asks
+for a coincidence the candle boundary makes rare. Without that test the idea would have scored zero
+trades and been recorded as a failure, having never run.
+
+### Open, and the operator's own framing
+
+The operator's instruction was to spend the time on NEW strategies rather than improving ones that
+are not good — which the measurement supports: tuning parameters of a strategy with no measurable
+edge cannot create one.
+
+Still to do:
+1. Score the four against coin_flip on real data with significance (running).
+2. Archive, not delete, the kinds that lose to the baseline (operator's explicit preference).
+3. TradingView strategies the operator finds — ask for timeframe, market, and crucially whether it
+   has an entry FILTER, since that is what all 36 lack.
+4. Then the warm start and training.
