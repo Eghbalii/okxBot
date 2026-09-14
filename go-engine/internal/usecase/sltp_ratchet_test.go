@@ -110,16 +110,23 @@ func TestRatchetSLTP_LargeSLAdjustmentAppliesInFull(t *testing.T) {
 
 func TestRatchetSLTP_LargeTPAdjustmentAppliesInFull(t *testing.T) {
 	// Same for TP: a large proposed move that stays on the profitable side of entry applies in
-	// full, with no per-step cap. The target chosen here lands inside MaxTPDistPct — this test is
-	// about the absence of a PER-STEP cap (CLAUDE.md §29), which is a different constraint from the
-	// distance-from-entry ceiling covered by TestMoveTP_RejectsTargetBeyondMaxDistance below.
-	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), SLPx: ptr(dec("95")), TPPx: ptr(dec("110"))}
+	// full, with no per-step cap. This test is about the absence of a PER-STEP cap (CLAUDE.md §29),
+	// which is a different constraint from both the distance-from-entry ceiling
+	// (TestMoveTP_RejectsTargetBeyondMaxDistance) and the reward:risk bound
+	// (TestRatchetSLTP_BoundsTargetAgainstTheStop).
+	//
+	// The stop is deliberately wide (10.0 from entry) so the resulting 40.0 target is 4:1 and sits
+	// inside MaxInTradeTPSLRatio. The original fixture used a 5.0 stop, making the same target 8:1 —
+	// which the ratio bound added 2026-09-14 correctly clamps, so the fixture was measuring the new
+	// bound rather than the absence of a per-step cap.
+	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), SLPx: ptr(dec("90")), TPPx: ptr(dec("110"))}
 	price := dec("100")
 	newSL, newTP := RatchetSLTP(o, price, dec("0"), dec("0.30"))
-	if newSL == nil || !newSL.Equal(dec("95")) {
-		t.Errorf("expected SL unchanged at 95, got %v", newSL)
+	if newSL == nil || !newSL.Equal(dec("90")) {
+		t.Errorf("expected SL unchanged at 90, got %v", newSL)
 	}
-	// 30% of 100 = 30 -> 110+30=140, which is 40% from entry and so within the ceiling.
+	// 30% of 100 = 30 -> 110+30=140, which is 40% from entry (inside MaxTPDistPct) and 4:1 against
+	// the 10.0 stop (inside the ratio bound), so it must apply in full.
 	if !newTP.Equal(dec("140")) {
 		t.Errorf("expected TP moved in full to 140, got %s", newTP)
 	}
@@ -356,5 +363,101 @@ func TestRatchetSL_StillTrailsIntoProfitBelowPrice(t *testing.T) {
 	newSL, _ := RatchetSLTP(o, dec("120"), dec("0.125"), dec("0")) // 95 + 0.125*120 = 110
 	if newSL == nil || !newSL.Equal(dec("110")) {
 		t.Fatalf("want stop trailed to 110 (past entry, below price), got %v", newSL)
+	}
+}
+
+// TestRatchetSLTP_BoundsTargetAgainstTheStop reproduces order 3356 (2026-09-14, LINK short): the
+// position opened with a correct 0.75% target and the model walked it to 33.5% away over three
+// in-trade adjustments — a 152:1 reward:risk on a 5m scalp, which price never reaches.
+//
+// The open path's MaxTPSLRatio (3:1) did not apply because this is the ADJUSTMENT path, and
+// MaxTPDistPct (50% of entry) did not catch it because that bound exists only to stop an unbounded
+// walk to infinity (§31.1) and is deliberately far wider than any realistic target.
+func TestRatchetSLTP_BoundsTargetAgainstTheStop(t *testing.T) {
+	// The real order's numbers, to the digit.
+	o := port.PaperOrder{
+		Side:    "sell",
+		EntryPx: dec("11.351"),
+		SLPx:    ptr(dec("11.376365")),
+		TPPx:    ptr(dec("11.2658675")), // the sane target it opened with
+	}
+	price := dec("11.35")
+
+	// The model asks to push the target far below entry, as it did live. For a short,
+	// direction=-1, so a POSITIVE adjustPct is what moves the target down and away — an earlier
+	// version of this test used a negative one, which multiplies to a target ABOVE entry that
+	// moveTP rejects on its own, so the ratio clamp never ran and the test passed with the fix
+	// removed. Caught by mutation testing, not by review.
+	_, newTP := RatchetSLTP(o, price, decimal.Zero, dec("0.30"))
+	if newTP == nil {
+		t.Fatal("expected a target")
+	}
+
+	slDist := o.SLPx.Sub(o.EntryPx).Abs()
+	tpDist := newTP.Sub(o.EntryPx).Abs()
+	ratio := tpDist.Div(slDist)
+	if ratio.GreaterThan(dec("6.01")) {
+		t.Errorf("reward:risk %s (tp %s, %s from entry) — must be bounded to %v",
+			ratio.Round(1), newTP, tpDist, MaxInTradeTPSLRatio)
+	}
+	// A short's target must still sit below entry after clamping.
+	if !newTP.LessThan(o.EntryPx) {
+		t.Errorf("short's target %s is not below entry %s", newTP, o.EntryPx)
+	}
+}
+
+// A target already within the bound must be left exactly alone — the clamp corrects over-wide
+// targets, it does not reshape every proposal the model makes.
+func TestRatchetSLTP_LeavesAReasonableTargetAlone(t *testing.T) {
+	o := port.PaperOrder{
+		Side:    "buy",
+		EntryPx: dec("100"),
+		SLPx:    ptr(dec("99")),  // 1.0 away
+		TPPx:    ptr(dec("102")), // 2.0 away — a 2:1, well inside the bound
+	}
+	_, newTP := RatchetSLTP(o, dec("100.5"), decimal.Zero, dec("0.005"))
+	if newTP == nil {
+		t.Fatal("expected a target")
+	}
+	// The move is small and within bounds, so it must be applied rather than clamped back.
+	if !newTP.GreaterThan(dec("102")) {
+		t.Errorf("a within-bounds widening was blocked: %s", newTP)
+	}
+	if newTP.Sub(dec("100")).GreaterThan(dec("6")) {
+		t.Errorf("target %s exceeds the ratio bound it should not have reached", newTP)
+	}
+}
+
+// The bound measures against the RATCHETED stop, not the original: a tightened stop means less risk
+// is being taken, so the reward leg it can justify shrinks with it.
+func TestRatchetSLTP_RatioUsesTheTightenedStop(t *testing.T) {
+	o := port.PaperOrder{
+		Side:    "buy",
+		EntryPx: dec("100"),
+		SLPx:    ptr(dec("98")),  // 2.0 away initially
+		TPPx:    ptr(dec("110")), // 10.0 away — 5:1 against the ORIGINAL stop, inside the bound
+	}
+	// Tighten the stop toward price: risk drops to ~1.0, so a 10.0 target becomes 10:1.
+	newSL, newTP := RatchetSLTP(o, dec("101"), dec("0.01"), decimal.Zero)
+	if newSL == nil || newTP == nil {
+		t.Fatal("expected both levels")
+	}
+	slDist := newSL.Sub(o.EntryPx).Abs()
+	if !slDist.IsPositive() {
+		t.Skip("stop landed at entry; ratio undefined")
+	}
+	if ratio := newTP.Sub(o.EntryPx).Abs().Div(slDist); ratio.GreaterThan(dec("6.01")) {
+		t.Errorf("ratio %s against the tightened stop (sl %s, tp %s) exceeds the bound",
+			ratio.Round(2), newSL, newTP)
+	}
+}
+
+// With no stop there is no ratio, so the target must pass through untouched rather than being
+// clamped against an invented distance.
+func TestRatchetSLTP_NoStopLeavesTargetUnbounded(t *testing.T) {
+	o := port.PaperOrder{Side: "buy", EntryPx: dec("100"), SLPx: nil, TPPx: ptr(dec("130"))}
+	_, newTP := RatchetSLTP(o, dec("101"), decimal.Zero, decimal.Zero)
+	if newTP == nil || !newTP.Equal(dec("130")) {
+		t.Errorf("target changed with no stop to measure against: %v", newTP)
 	}
 }

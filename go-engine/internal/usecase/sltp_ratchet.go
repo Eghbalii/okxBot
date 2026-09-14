@@ -30,7 +30,55 @@ func RatchetSLTP(o port.PaperOrder, currentPrice, slAdjustPct, tpAdjustPct decim
 
 	newSL = ratchetSL(o.SLPx, direction, currentPrice, slAdjustPct)
 	newTP = moveTP(o.TPPx, direction, currentPrice, o.EntryPx, tpAdjustPct)
+	// Bound the target against the stop the position actually carries, using the RATCHETED stop
+	// rather than the original: newSL is what the trade is now risking, so measuring reward against
+	// the old one would let a tightened stop silently justify a target matched to risk no longer
+	// being taken — the same ordering conductor.Clamps.Apply uses on the open path.
+	newTP = clampTPToRatio(newTP, newSL, o.EntryPx, direction)
 	return newSL, newTP
+}
+
+// MaxInTradeTPSLRatio bounds reward:risk on an IN-TRADE target move, mirroring
+// conductor.Clamps.MaxTPSLRatio on the open path.
+//
+// It exists because that open-path cap turned out to bound only where a target STARTS, not where it
+// ends up (found 2026-09-14 on order 3356: a LINK short that opened with a correct 0.75% target and
+// was walked by the model to 33.5% away over three adjustments — a 152:1 reward:risk on a 5m scalp,
+// and 13 of 19 open positions past the 3:1 cap at the time, the worst at 298:1).
+//
+// MaxTPDistPct (50% of entry) did not catch it and was never meant to: §31.1 chose that number
+// purely to stop an unbounded WALK to infinity, deliberately far wider than any realistic target so
+// it constrains only the runaway case. A ratio bound is what makes a target reachable, for the same
+// reason §45 gives on the open path: it scales with the instrument's own volatility exactly as the
+// stop does, so one bound is right for BTC and PEPE alike.
+//
+// Deliberately LOOSER than the open path's 3:1. A position that has run in profit has usually had
+// its stop ratcheted tighter, which mechanically raises the ratio without the target having moved at
+// all — bounding an in-trade move as tightly as an opening one would drag targets in every time the
+// stop tightened, which is the opposite of letting a winner run.
+const MaxInTradeTPSLRatio = 6.0
+
+// clampTPToRatio pulls a target back to at most MaxInTradeTPSLRatio times the stop distance.
+//
+// Clamped rather than rejected, matching moveTP's own price guard: rejecting would keep whatever
+// over-wide target is already on the order, which is exactly the state being corrected. Returns the
+// target untouched when there is no stop to measure against — with no risk leg there is no ratio,
+// and inventing an absolute distance here would be a different rule than the one this states.
+func clampTPToRatio(tp, sl *decimal.Decimal, entry, direction decimal.Decimal) *decimal.Decimal {
+	if tp == nil || sl == nil || !entry.IsPositive() {
+		return tp
+	}
+	slDist := sl.Sub(entry).Abs()
+	if !slDist.IsPositive() {
+		return tp
+	}
+	maxDist := slDist.Mul(decimal.NewFromFloat(MaxInTradeTPSLRatio))
+	if tp.Sub(entry).Abs().LessThanOrEqual(maxDist) {
+		return tp
+	}
+	// Rebuild on the profitable side of entry: above for a long, below for a short.
+	clamped := entry.Add(direction.Mul(maxDist))
+	return &clamped
 }
 
 // SLPriceGapPct is how far short of the live price a clamped stop is placed, as a fraction of
