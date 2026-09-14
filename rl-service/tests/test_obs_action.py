@@ -1,9 +1,16 @@
-"""Tests for the observation/action schema (CLAUDE.md §15.4, §15.10).
+"""Tests for the observation/action schema (CLAUDE.md §15, docs/RL_V8_PLAN.md).
 
-The bug these exist to prevent: strategy signals were built in Go, sent over the wire, and parsed
-by Pydantic — but never entered the model's input vector, so the policy was asked to reason about
-opinions it could not see. `recent_trades` was dropped the same way. Anything asserting that a
-field REACHES the model is guarding that class of silent failure.
+Two classes of bug these exist to prevent, both of which actually happened:
+
+1. A field is built in Go, sent over the wire, parsed by Pydantic — and never reaches the model's
+   input vector. v5 found strategy signals in that state; v8's audit found the derived indicators
+   there too, never populated at all since the field was created. Anything asserting a field
+   REACHES the model guards that.
+
+2. The vector silently changes width. v7's to_vector padded or truncated the feature block to fit
+   whatever the loaded model wanted, so a 91-dim model against an 85-dim tail left a six-value
+   feature budget and ten inputs vanished per call with no error anywhere. Every width here is
+   asserted exactly, so adding a field without updating its constant fails a test instead.
 """
 from __future__ import annotations
 
@@ -11,358 +18,442 @@ import numpy as np
 import pytest
 
 from rl_service.obs import (
+    ACCOUNT_DIM,
     ACTION_DIM,
-    ACTIONS,
-    MAX_SLTP_OFFSET_PCT,
-    MAX_STRATEGY_KIND_SLOTS,
-    MAX_TIMEFRAME_SLOTS,
-    SIGNAL_CATEGORIES,
-    STRATEGY_KINDS,
+    BTC_BLOCK_DIM,
+    CATEGORY_DIM,
+    INDICATORS_PER_TIMEFRAME,
+    MANAGE_HEAD_DIM,
+    MARKET_BLOCK_DIM,
+    OBSERVATION_DIM,
+    OBSERVATION_SCHEMA_VERSION,
+    POSITION_DIM,
+    RETURNS_WINDOW,
+    SIGNAL_DIM,
+    STRATEGY_PROFILE_DIM,
+    TERMINAL_CATEGORIES,
+    TOKEN_PROFILE_DIM,
+    ZERO_REWARD_CATEGORIES,
+    BTCContext,
+    MarketBlock,
     Observation,
     PositionState,
-    PriceContext,
+    SchemaError,
     StrategySignal,
-    TimeframeBlock,
+    TokenProfile,
+    account_block,
+    btc_block,
+    category_block,
     decode_action,
-    flat_action,
-    observation_features,
-    observation_tail,
+    mask_action_for_learning,
+    market_block,
     position_block,
     signal_block,
+    strategy_profile_block,
     to_vector,
+    token_profile_block,
 )
 
 
-def _obs(**overrides):
+def _market(**overrides) -> MarketBlock:
     base = dict(
-        inst_id="BTC-USDT-SWAP",
-        active_tokens=["BTC-USDT-SWAP", "XAU-USD-SWAP"],
+        bar="5m",
+        indicators=[0.1 * (i + 1) for i in range(INDICATORS_PER_TIMEFRAME)],
+        open=99.0,
+        high=101.0,
+        low=98.0,
+        close=100.0,
+        close_pct_changes=[0.001 * (i + 1) for i in range(RETURNS_WINDOW)],
+        dist_to_swing_high_pct=0.02,
+        dist_to_swing_low_pct=-0.03,
+    )
+    base.update(overrides)
+    return MarketBlock(**base)
+
+
+def _btc(**overrides) -> BTCContext:
+    base = dict(
+        open=64000.0,
+        high=65500.0,
+        low=63800.0,
+        close=65000.0,
+        close_pct_changes=[0.002 * (i + 1) for i in range(RETURNS_WINDOW)],
+        dist_to_swing_high_pct=0.01,
+        dist_to_swing_low_pct=-0.04,
+        correlation=0.7,
+    )
+    base.update(overrides)
+    return BTCContext(**base)
+
+
+def _obs(**overrides) -> Observation:
+    base = dict(
+        inst_id="SOL",
         last_price=100.0,
+        token_profile=TokenProfile(
+            typical_volatility=0.012,
+            log_volume_24h=8.5,
+            volume_rank=0.8,
+            log_price=2.0,
+            range_24h=0.05,
+            change_24h=0.02,
+            log_trade_count=4.0,
+        ),
+        timeframes=[_market()],
+        btc=_btc(),
         category="buy",
         signal=StrategySignal(
-            strategy_id=1, side="buy", confidence=0.8, entry_px=99.0, sl_px=95.0, tp_px=110.0,
-            kind="rsi_sma", bar="5m", win_rate=0.62, trade_count=40.0,
+            strategy_id=7,
+            side="buy",
+            entry_px=100.0,
+            sl_px=99.0,
+            tp_px=102.0,
+            kind="range_breakout_v2",
+            bar="5m",
+            win_rate=0.55,
+            trade_count=40,
+            avg_rr=2.0,
+            avg_hold_hours=1.5,
+            avg_pnl_per_trade=0.03,
         ),
-        account_equity_usd=100.0,
-        account_initial_usd=100.0,
-        timeframes=[TimeframeBlock(bar="5m", features=[0.1] * 10,
-                                   price_context=PriceContext(close_pct_changes=[0.001] * 10))],
+        account_equity_usd=40.0,
+        account_initial_usd=40.0,
+        account_peak_usd=45.0,
+        open_exposure_usd=5.0,
+        open_leveraged_exposure_usd=50.0,
+        open_position_count=2,
+        max_position_pct=0.0625,
+        max_leverage=10.0,
     )
     base.update(overrides)
     return Observation(**base)
 
 
-# --- the bug this redesign exists to fix -------------------------------------------------------
+# --- exact width -------------------------------------------------------------------------------
 
-def test_strategy_signal_reaches_the_model_input():
-    """Two observations differing ONLY in the signal must produce different input vectors.
 
-    Before §15.10 they produced identical vectors: the signal never reached the model at all.
+def test_observation_dim_matches_what_is_actually_built():
+    """The check v7 did not have.
+
+    v7's width came from the loaded model's observation_space, so the code adapted to the model
+    rather than the other way round — and each time a field was added, the same number of inputs
+    was silently dropped from the other end. Pinning the constant against a real build means adding
+    a field without updating it fails here instead of in production.
     """
-    buy = observation_tail(_obs(signal=StrategySignal(strategy_id=1, side="buy", confidence=0.9,
-                                                      kind="rsi_sma", bar="5m")))
-    sell = observation_tail(_obs(signal=StrategySignal(strategy_id=1, side="sell", confidence=0.9,
-                                                       kind="rsi_sma", bar="5m")))
-    assert not np.array_equal(buy, sell), "signal side must change the model's input"
+    assert to_vector(_obs()).shape == (1, OBSERVATION_DIM)
 
 
-def test_strategy_kind_reaches_the_model_input():
-    # One shared policy serves every strategy, so it has to be able to tell them apart.
-    a = observation_tail(_obs(signal=StrategySignal(strategy_id=1, side="buy", kind="rsi_sma", bar="5m")))
-    b = observation_tail(_obs(signal=StrategySignal(strategy_id=1, side="buy", kind="macd_cross", bar="5m")))
-    assert not np.array_equal(a, b)
+@pytest.mark.parametrize(
+    "builder,want,name",
+    [
+        (token_profile_block, TOKEN_PROFILE_DIM, "token_profile"),
+        (account_block, ACCOUNT_DIM, "account"),
+        (category_block, CATEGORY_DIM, "category"),
+        (strategy_profile_block, STRATEGY_PROFILE_DIM, "strategy_profile"),
+        (signal_block, SIGNAL_DIM, "signal"),
+        (position_block, POSITION_DIM, "position"),
+        (market_block, MARKET_BLOCK_DIM, "market"),
+        (btc_block, BTC_BLOCK_DIM, "btc"),
+    ],
+)
+def test_every_block_is_exactly_its_declared_width(builder, want, name):
+    assert builder(_obs()).shape[0] == want, name
 
 
-def test_timeframe_reaches_the_model_input():
-    a = observation_tail(_obs(signal=StrategySignal(strategy_id=1, side="buy", kind="rsi_sma", bar="5m")))
-    b = observation_tail(_obs(signal=StrategySignal(strategy_id=1, side="buy", kind="rsi_sma", bar="1H")))
-    assert not np.array_equal(a, b)
+def test_block_widths_sum_to_the_total():
+    assert (
+        TOKEN_PROFILE_DIM
+        + ACCOUNT_DIM
+        + CATEGORY_DIM
+        + STRATEGY_PROFILE_DIM
+        + SIGNAL_DIM
+        + POSITION_DIM
+        + MARKET_BLOCK_DIM
+        + BTC_BLOCK_DIM
+    ) == OBSERVATION_DIM
 
 
-
-def test_category_reaches_the_model_input():
-    # The category is what tells the model which decision it is being asked to make.
-    opening = observation_tail(_obs(category="buy"))
-    managing = observation_tail(_obs(category="update"))
-    assert not np.array_equal(opening, managing)
+# --- no padding, no truncation, ever -------------------------------------------------------------
 
 
-# --- signal presence must be unambiguous -------------------------------------------------------
+def test_short_returns_window_raises_rather_than_padding():
+    """The v7 behaviour this replaces, and the operator's explicit requirement.
 
-def test_absent_signal_is_distinguishable_from_zero_confidence():
-    """A price-driven update (no strategy spoke) must not look like a signal saying zero.
-
-    Without an explicit `present` flag the model would learn from that ambiguity.
+    A short candle window means the caller should SKIP the model call, not ask for a padded answer.
+    A padded call still returns a well-formed action, so nothing downstream can tell that the model
+    decided on partly-invented data.
     """
-    absent = signal_block(_obs(signal=None))
-    zero = signal_block(_obs(signal=StrategySignal(strategy_id=1, side="", confidence=0.0,
-                                                   kind="rsi_sma", bar="5m")))
-    assert not np.array_equal(absent, zero)
+    obs = _obs(timeframes=[_market(close_pct_changes=[0.001, 0.002])])
+    with pytest.raises(SchemaError, match="returns"):
+        to_vector(obs)
 
 
-def test_signal_block_is_fixed_width_regardless_of_strategy_count():
-    # One signal per call is what removes the ceiling on roster size (§15.10): the vector width
-    # cannot depend on how many strategies happen to be registered or firing.
-    widths = {len(signal_block(_obs(signal=StrategySignal(strategy_id=i, side="buy", kind=k, bar="5m"))))
-              for i, k in enumerate(STRATEGY_KINDS)}
-    assert len(widths) == 1, f"signal block width varies by strategy: {widths}"
+def test_missing_indicators_raise_rather_than_padding():
+    obs = _obs(timeframes=[_market(indicators=[0.1, 0.2])])
+    with pytest.raises(SchemaError, match="indicators"):
+        to_vector(obs)
 
 
-def test_unknown_strategy_kind_does_not_crash():
-    # A newly-registered kind the model was not trained on must degrade to "unrecognized", not raise.
-    block = signal_block(_obs(signal=StrategySignal(strategy_id=1, side="buy",
-                                                    kind="not_a_registered_kind", bar="5m")))
-    assert len(block) == len(signal_block(_obs()))
+def test_extra_returns_raise_rather_than_truncating():
+    """Too much data is as much a mismatch as too little.
 
-
-
-def test_prices_are_relative_to_live_price():
-    """Entry/SL/TP are fed as fractions of live price, never raw levels.
-
-    One shared policy serves BTC at ~65000 and other tokens at ~0.15; raw levels would not
-    generalize across them.
+    Truncating is how v7 lost the live candle's OHLC — the array was longer than the budget and the
+    excess was cut from the left, which happened to be the newest, most useful values.
     """
-    cheap = signal_block(_obs(last_price=100.0, signal=StrategySignal(
-        strategy_id=1, side="buy", kind="rsi_sma", bar="5m",
-        entry_px=99.0, sl_px=95.0, tp_px=110.0)))
-    pricey = signal_block(_obs(last_price=65000.0, signal=StrategySignal(
-        strategy_id=1, side="buy", kind="rsi_sma", bar="5m",
-        entry_px=64350.0, sl_px=61750.0, tp_px=71500.0)))
-    assert np.allclose(cheap, pricey, atol=1e-6), "same relative levels must vectorize identically"
+    obs = _obs(timeframes=[_market(close_pct_changes=[0.001] * (RETURNS_WINDOW + 3))])
+    with pytest.raises(SchemaError, match="returns"):
+        to_vector(obs)
 
 
+def test_wrong_number_of_timeframe_blocks_raises():
+    with pytest.raises(SchemaError, match="exactly 1 timeframe"):
+        to_vector(_obs(timeframes=[_market(), _market()]))
+    with pytest.raises(SchemaError, match="exactly 1 timeframe"):
+        to_vector(_obs(timeframes=[]))
 
 
-# --- action decoding ----------------------------------------------------------------------------
-
-def test_decodes_scalars_and_action():
-    raw = np.zeros(ACTION_DIM, dtype=np.float32)
-    raw[0] = -0.5   # sl offset -> below live price
-    raw[1] = 1.0    # tp offset -> full positive
-    raw[2] = 0.3    # size_pct
-    raw[3] = 0.25   # leverage_frac
-    raw[4 + ACTIONS.index("close")] = 1.0
-
-    # "close" is only legal on an update call — decode_action masks the action head to the
-    # category's legal set, so the category has to match the action being asserted.
-    action = decode_action(raw, _obs(last_price=100.0, category="update"))
-
-    # The model chooses a DISTANCE; decode turns it into a real price level.
-    # float32 round-trip, so compare approximately rather than exactly.
-    assert action.sl_px == pytest.approx(100.0 * (1 - 0.5 * MAX_SLTP_OFFSET_PCT), rel=1e-6)
-    assert action.tp_px == pytest.approx(100.0 * (1 + MAX_SLTP_OFFSET_PCT), rel=1e-6)
-    assert action.size_pct == pytest.approx(0.3, rel=1e-6)
-    assert action.leverage_frac == pytest.approx(0.25, rel=1e-6)
-    assert action.action == "close"
-
-def test_action_is_argmax_so_exactly_one_is_chosen():
-    # Each action is asserted under a category where it is legal (see the masking tests below).
-    for want, category in [
-        ("open", "buy"),
-        ("skip", "sell"),
-        ("none", "update"),
-        ("update", "update"),
-        ("close", "update"),
-    ]:
-        raw = np.zeros(ACTION_DIM, dtype=np.float32)
-        raw[4 + ACTIONS.index(want)] = 1.0
-        assert decode_action(raw, _obs(category=category)).action == want
+def test_missing_btc_returns_raise():
+    """BTC is not optional. Every input except this one is intra-token, so a missing BTC block
+    would leave the model blind to the market-wide move that drives most altcoin reversals."""
+    with pytest.raises(SchemaError, match="btc"):
+        to_vector(_obs(btc=_btc(close_pct_changes=[0.001])))
 
 
-# --- action masking by category ----------------------------------------------------------------
-#
-# Regression coverage for a production bug (2026-08-29): the argmax ran over ALL five actions
-# regardless of category, so a buy/sell call could answer "none" — not a decision about opening at
-# all. openDecision then had no open/skip answer to act on and fell through to fixed sizing without
-# a log line or metric, which made the model look like it was never consulted when in fact it was
-# being asked on every single signal and answering unusably every time.
-
-@pytest.mark.parametrize("category", ["buy", "sell"])
-@pytest.mark.parametrize("forced", ["none", "update", "close"])
-def test_open_categories_never_return_an_update_action(category, forced):
-    raw = np.zeros(ACTION_DIM, dtype=np.float32)
-    raw[4 + ACTIONS.index(forced)] = 1.0  # policy strongly prefers an illegal action
-    action = decode_action(raw, _obs(category=category)).action
-    assert action in ("open", "skip"), f"{category} returned {action!r}"
+# --- fields reach the model ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("forced", ["open", "skip"])
-def test_update_category_never_returns_an_open_action(forced):
-    raw = np.zeros(ACTION_DIM, dtype=np.float32)
-    raw[4 + ACTIONS.index(forced)] = 1.0
-    action = decode_action(raw, _obs(category="update")).action
-    assert action in ("none", "update", "close"), f"update returned {action!r}"
+def test_indicators_reach_the_model_input():
+    """The v8 headline bug: ten indicators declared, parsed, and never in the vector.
 
-
-def test_masking_still_prefers_the_highest_legal_logit():
-    """Masking must pick the best LEGAL action, not just any legal one — otherwise the policy's
-    preference between open and skip would be discarded along with the illegal options."""
-    raw = np.zeros(ACTION_DIM, dtype=np.float32)
-    raw[4 + ACTIONS.index("none")] = 5.0   # illegal on buy, and the global argmax
-    raw[4 + ACTIONS.index("skip")] = 2.0   # legal, and the better of the two legal options
-    raw[4 + ACTIONS.index("open")] = 1.0
-    assert decode_action(raw, _obs(category="buy")).action == "skip"
-
-
-def test_action_width_does_not_scale_with_strategy_count():
-    # The property that lets the roster change without retraining (§15.10).
-    assert ACTION_DIM == 4 + len(ACTIONS)
-
-
-def test_out_of_range_outputs_are_clipped():
-    raw = np.zeros(ACTION_DIM, dtype=np.float32)
-    raw[0] = 10.0   # sl offset far past its bound
-    raw[2] = 5.0    # size_pct past 1
-    raw[3] = -2.0   # leverage_frac below 0
-
-    action = decode_action(raw, _obs(last_price=100.0))
-
-    assert action.sl_px == pytest.approx(100.0 * (1 + MAX_SLTP_OFFSET_PCT), rel=1e-6)
-    assert action.size_pct == 1.0
-    assert action.leverage_frac == 0.0
-
-def test_short_action_vector_is_rejected():
-    # Guards against serving a model trained on an older, narrower action space.
-    try:
-        decode_action(np.zeros(2, dtype=np.float32), _obs())
-        assert False, "expected ValueError for a too-short action vector"
-    except ValueError:
-        pass
-
-
-def test_flat_action_takes_no_trade():
-    action = flat_action()
-    assert action.action == "skip"
-    assert action.size_pct == 0.0
-    assert action.leverage_frac == 0.0
-
-
-def test_categories_and_order_actions_are_stable_vocabularies():
-    # Order defines one-hot/argmax indices; reordering silently reassigns meaning for a trained
-    # model, so these lists are effectively part of the schema version.
-    assert SIGNAL_CATEGORIES[:3] == ["buy", "sell", "update"]
-    assert ACTIONS == ["open", "skip", "none", "update", "close"]
-
-
-def test_null_lists_from_go_are_accepted():
-    """Go marshals a nil slice as JSON `null`, not `[]`.
-
-    An observation with no recent trades — every one on a fresh install — would otherwise fail
-    validation and surface to the caller as a schema mismatch. Same null-vs-[] class of bug
-    CLAUDE.md §14 records hitting on the panel side.
+    TimeframeBlock.features existed on both sides from 2026-08-26 and Go never wrote it once
+    (`git log -S "tb.Features"` returns nothing), so the model had no RSI, no volatility and no
+    volume for the entire life of the schema.
     """
-    raw = (
-        '{"schema_version": 6, "inst_id": "BTC-USDT-SWAP", "active_tokens": ["BTC-USDT-SWAP"],'
-        ' "last_price": "100.5", "timeframes": null, "features": null, "category": "update"}'
+    marker = 0.4242
+    indicators = [0.0] * INDICATORS_PER_TIMEFRAME
+    indicators[6] = marker  # rsi slot
+    vec = to_vector(_obs(timeframes=[_market(indicators=indicators)]))[0]
+    assert marker in vec
+
+
+def test_live_candle_ohlc_reaches_the_model_input():
+    """v7 built these four and truncated all four away, every call.
+
+    They sit at the front of the feature array and to_vector cut from the left, so the LIVE forming
+    candle — the freshest thing in the observation — was the first casualty.
+    """
+    base = to_vector(_obs())[0]
+    moved = to_vector(_obs(timeframes=[_market(high=140.0)]))[0]
+    assert not np.array_equal(base, moved)
+
+
+def test_btc_moves_change_the_vector():
+    """The operator's own observation: an altcoin reverses when BTC's candle turns red.
+
+    Nothing in v7 could express that — every input was intra-token.
+    """
+    base = to_vector(_obs())[0]
+    red = to_vector(_obs(btc=_btc(close_pct_changes=[-0.02] * RETURNS_WINDOW)))[0]
+    assert not np.array_equal(base, red)
+
+
+def test_btc_levels_are_relative_to_btc_not_to_the_token():
+    """A BTC level divided by SOL's price is a number with no meaning.
+
+    Regression guard: the obvious implementation reuses obs.last_price for every _rel call.
+    """
+    vec = btc_block(_obs())
+    # BTC open 64000 against close 65000 is about -1.5%; against SOL's 100 it would be ~639.
+    assert -0.05 < float(vec[0]) < 0.0
+
+
+def test_token_profile_reaches_the_model_input():
+    base = to_vector(_obs())[0]
+    volatile = to_vector(
+        _obs(token_profile=TokenProfile(typical_volatility=0.35, log_volume_24h=5.0))
+    )[0]
+    assert not np.array_equal(base, volatile)
+
+
+def test_strategy_record_reaches_the_model_input():
+    """Win rate and trade count are what replaced both the kind one-hot and the hardcoded
+    confidence — if they did not reach the vector, strategy identity would carry nothing at all."""
+    sig = _obs().signal
+    good = to_vector(_obs(signal=sig.model_copy(update={"win_rate": 0.9})))[0]
+    bad = to_vector(_obs(signal=sig.model_copy(update={"win_rate": 0.1})))[0]
+    assert not np.array_equal(good, bad)
+
+
+def test_absent_signal_is_distinguishable_from_a_zeroed_one():
+    """`present` exists so a price-driven update cannot be confused with a signal of zero
+    conviction — the model would otherwise learn from the ambiguity."""
+    with_signal = signal_block(_obs(signal=StrategySignal(side="buy")))
+    without = signal_block(_obs(signal=None, category="update"))
+    assert with_signal[0] == 1.0
+    assert without[0] == 0.0
+
+
+# --- identity replaced by behaviour --------------------------------------------------------------
+
+
+def test_no_ceiling_on_token_count():
+    """The property the one-hot could not provide.
+
+    65 tokens against 16 slots left most of them as indistinguishable zeros, and the roster grows
+    on its own every 8 hours. A profile has no slots to run out of.
+    """
+    a = to_vector(_obs(inst_id="SOME_TOKEN_DISCOVERED_TOMORROW"))
+    b = to_vector(_obs(inst_id="ANOTHER_ONE"))
+    assert a.shape == b.shape == (1, OBSERVATION_DIM)
+
+
+def test_two_tokens_with_the_same_profile_look_the_same():
+    """The deliberate trade-off, asserted so it is a choice rather than a surprise.
+
+    Identity is gone: two instruments with identical characteristics are identical to the model.
+    That is the mechanism that lets experience transfer to a token discovered tomorrow, and the
+    reason a per-token quirk can no longer be memorized.
+    """
+    p = TokenProfile(typical_volatility=0.02, log_volume_24h=7.0, log_price=1.0)
+    assert np.array_equal(
+        to_vector(_obs(inst_id="AAA", token_profile=p)),
+        to_vector(_obs(inst_id="BBB", token_profile=p)),
     )
-    obs = Observation.model_validate_json(raw)
-    assert obs.timeframes == []
-    assert obs.features == []
-    # And it must still vectorize rather than blowing up downstream.
-    assert len(observation_tail(obs)) > 0
 
 
-def test_decimal_strings_from_go_are_coerced():
-    """decimal.Decimal marshals as a JSON string; every numeric field must accept that form."""
-    raw = (
-        '{"schema_version": 6, "inst_id": "BTC-USDT-SWAP", "active_tokens": ["BTC-USDT-SWAP"],'
-        ' "last_price": "100.5", "category": "buy",'
-        ' "signal": {"strategy_id": 1, "side": "buy", "confidence": "0.8", "entry_px": "99",'
-        '            "sl_px": "95", "tp_px": "110", "kind": "rsi_sma", "bar": "5m",'
-        '            "win_rate": "0.62", "trade_count": 40},'
-        ' "position_state": {"position_open": true, "size_usd": "25", "leverage": "10"},'
-        ' "account_equity_usd": "100"}'
-    )
-    obs = Observation.model_validate_json(raw)
-    assert obs.signal is not None and obs.signal.confidence == 0.8
-    assert obs.signal.sl_px == 95.0
-    assert obs.position_state.size_usd == 25.0
-    assert obs.last_price == 100.5
+def test_timeframe_is_ordered_not_categorical():
+    """5m < 15m < 1H is a real ordering that a one-hot destroys.
 
-
-def test_nested_null_lists_from_go_are_accepted():
-    """Go marshals nil slices as null at EVERY level, not just the top.
-
-    A timeframe block with no strategy signals -- the normal case on a quiet bar -- would otherwise
-    fail validation and surface to the caller as a schema mismatch. Caught by round-tripping Go's
-    real JSON rather than a hand-written sample.
+    With an ordered scalar the policy can learn "longer bar, wider stop" and interpolate to a
+    timeframe it never saw; with 16 unordered slots it had to learn each in isolation.
     """
-    raw = (
-        '{"schema_version": 6, "inst_id": "BTC-USDT-SWAP", "active_tokens": ["BTC-USDT-SWAP"],'
-        ' "last_price": "100.5", "category": "update",'
-        ' "timeframes": [{"bar": "5m", "strategy_signals": null, "features": null,'
-        '                 "price_context": {"open": "99", "close": "100",'
-        '                                   "close_pct_changes": null}}]}'
-    )
-    obs = Observation.model_validate_json(raw)
-    assert obs.timeframes[0].strategy_signals == []
-    assert obs.timeframes[0].features == []
-    assert obs.timeframes[0].price_context.close_pct_changes == []
-    # And it must still vectorize rather than blowing up downstream.
-    assert len(observation_features(obs)) > 0
+    sig = _obs().signal
+    bars = ["5m", "15m", "1H", "4H"]
+    vals = [
+        float(strategy_profile_block(_obs(signal=sig.model_copy(update={"bar": b})))[5])
+        for b in bars
+    ]
+    assert vals == sorted(vals)
+    assert len(set(vals)) == len(bars)
 
 
-def test_live_candle_ohlc_reaches_the_model():
-    """The forming candle's OHLC is fed relative to live price (CLAUDE.md §15.11) -- on a 1H bar the
-    last CLOSED candle can be 59 minutes stale."""
-    flat = observation_features(_obs(timeframes=[TimeframeBlock(
-        bar="5m", price_context=PriceContext(open=100.0, high=100.0, low=100.0, close=100.0))]))
-    ranging = observation_features(_obs(timeframes=[TimeframeBlock(
-        bar="5m", price_context=PriceContext(open=98.0, high=103.0, low=97.0, close=101.0))]))
-    assert not np.array_equal(flat, ranging), "candle shape must change the model's input"
+# --- lifecycle categories -------------------------------------------------------------------------
 
 
-def test_pnl_extremes_reach_the_model():
-    """A trade that ran to +8% and came back must look different from one that drifted sideways."""
-    round_tripped = observation_tail(_obs(position_state=PositionState(
-        position_open=1.0, unrealized_pnl_pct=0.01, pnl_max_pct=0.08, pnl_min_pct=-0.01)))
-    drifted = observation_tail(_obs(position_state=PositionState(
-        position_open=1.0, unrealized_pnl_pct=0.01, pnl_max_pct=0.01, pnl_min_pct=0.0)))
-    assert not np.array_equal(round_tripped, drifted)
+def test_all_five_close_reasons_are_distinguishable():
+    """§15.14 and §20 both had to force `timeout` and `manual` under `closed_early` because
+    widening a one-hot meant a schema bump — collapsing 358 trades, a fifth of all closes, into one
+    label covering three different things. The flag-plus-scalars encoding separates all five."""
+    blocks = {
+        c: tuple(category_block(_obs(category=c)).tolist())
+        for c in ("closed_tp", "closed_sl", "closed_early", "closed_timeout", "closed_manual")
+    }
+    # tp and sl share an encoding by design — the direction is carried by realized PnL, not here.
+    assert blocks["closed_tp"] == blocks["closed_sl"]
+    distinct = {blocks["closed_tp"], blocks["closed_early"], blocks["closed_timeout"], blocks["closed_manual"]}
+    assert len(distinct) == 4
 
 
-# --- to_vector: pad/truncate must always land exactly on expected_dim -------------------------
-#
-# Regression coverage for a real bug found 2026-08-29: a model built from a probe Observation with
-# NO timeframe blocks got obs_dim == len(tail) exactly, so padded_len (expected_dim - len(tail))
-# was 0. features[-padded_len:] with padded_len == 0 is a Python/NumPy footgun — arr[-0:] returns
-# the WHOLE array, not an empty one, since -0 == 0 and arr[0:] is a full-array slice. So instead of
-# truncating features to nothing, the old code left them untouched, overshooting expected_dim and
-# raising "observation vector shape mismatch" on every real /predict call once any timeframe
-# block's price_context contributed even one feature. Never caught because to_vector had zero
-# direct test coverage before this.
-
-def test_to_vector_truncates_to_zero_feature_budget():
-    """expected_dim == len(tail) exactly (no room for ANY features) must produce a vector of
-    exactly expected_dim, not overshoot it. This is the exact shape that crashed in production."""
-    obs = _obs()
-    tail_len = len(observation_tail(obs))
-    vec = to_vector(obs, expected_dim=tail_len)
-    assert vec.shape == (1, tail_len)
+def test_terminal_categories_set_the_terminal_flag():
+    for c in TERMINAL_CATEGORIES:
+        assert category_block(_obs(category=c))[3] == 1.0, c
+    for c in ("buy", "sell", "update"):
+        assert category_block(_obs(category=c))[3] == 0.0, c
 
 
-def test_to_vector_pads_a_short_feature_vector():
-    obs = _obs(timeframes=[])  # no timeframe blocks -> observation_features is empty
-    tail_len = len(observation_tail(obs))
-    vec = to_vector(obs, expected_dim=tail_len + 10)
-    assert vec.shape == (1, tail_len + 10)
+def test_manual_close_is_marked_zero_reward():
+    """§15.12: attributing an operator's action to the policy trains it on a decision it never
+    made. The call still happens so the learner's pending decision resolves rather than leaking."""
+    assert "closed_manual" in ZERO_REWARD_CATEGORIES
+    assert "closed_sl" not in ZERO_REWARD_CATEGORIES
 
 
-def test_to_vector_truncates_an_oversized_feature_vector():
-    obs = _obs()  # has real timeframe features, well over a 1-feature budget
-    tail_len = len(observation_tail(obs))
-    vec = to_vector(obs, expected_dim=tail_len + 1)
-    assert vec.shape == (1, tail_len + 1)
+# --- action decoding ------------------------------------------------------------------------------
 
 
-def test_to_vector_matches_expected_dim_across_a_range_of_budgets():
-    """Sweeps expected_dim across and past the natural feature length, including the exact
-    zero-budget boundary that the bug lived at — every one of these must land exactly on
-    expected_dim, never over or under."""
-    obs = _obs()
-    tail_len = len(observation_tail(obs))
-    natural_features_len = len(observation_features(obs))
-    for offset in range(-2, 5):
-        expected_dim = tail_len + max(natural_features_len + offset, 0)
-        vec = to_vector(obs, expected_dim=expected_dim)
-        assert vec.shape == (1, expected_dim), f"failed at offset={offset}"
+def _raw(open_head=0.0, manage=(0.0, 0.0, 0.0), sl=0.0, tp=0.0, size=0.0, lev=0.0):
+    return np.array([sl, tp, size, lev, open_head, *manage], dtype=np.float32)
+
+
+def test_open_head_sign_decides_open_or_skip():
+    assert decode_action(_raw(open_head=0.5), _obs(category="buy")).action == "open"
+    assert decode_action(_raw(open_head=-0.5), _obs(category="buy")).action == "skip"
+
+
+def test_buy_call_can_never_return_a_manage_action():
+    """§16.9: an unmasked head let a buy call answer `none`, so the caller had no open/skip answer
+    and silently fell back to fixed sizing — the model looked uninvolved while being consulted every
+    time. With split heads the manage head is not even read here."""
+    a = decode_action(_raw(open_head=-1.0, manage=(9.0, 9.0, 9.0)), _obs(category="buy"))
+    assert a.action == "skip"
+
+
+def test_update_call_can_never_return_open_or_skip():
+    a = decode_action(_raw(open_head=9.0, manage=(0.0, 0.0, 1.0)), _obs(category="update"))
+    assert a.action == "close"
+
+
+def test_manage_head_is_an_argmax():
+    for idx, want in enumerate(("none", "update", "close")):
+        manage = [0.0, 0.0, 0.0]
+        manage[idx] = 1.0
+        assert decode_action(_raw(manage=tuple(manage)), _obs(category="update")).action == want
+
+
+def test_wrong_action_width_raises():
+    with pytest.raises(SchemaError):
+        decode_action(np.zeros(ACTION_DIM - 1, dtype=np.float32), _obs())
+
+
+def test_size_is_a_fraction_of_the_allowed_budget():
+    """Asking for 1.0 means "the most I am permitted", not the whole account — so a maximal request
+    is the current fixed-sizing behaviour rather than an account-emptying one."""
+    a = decode_action(_raw(size=1.0), _obs(max_position_pct=0.0625))
+    assert a.size_pct == pytest.approx(0.0625)
+
+
+def test_levels_are_prices_derived_from_the_live_price():
+    a = decode_action(_raw(sl=-0.5, tp=0.5), _obs(last_price=100.0))
+    assert a.sl_px < 100.0 < a.tp_px
+
+
+# --- learning mask ---------------------------------------------------------------------------------
+
+
+def test_manage_head_takes_no_gradient_on_an_open_call():
+    """The half of the split that actually fixes the problem.
+
+    Splitting the heads aligns structure with the question; zeroing here is what stops reward
+    flowing to an output that had no effect. An output that is rewarded without causing anything
+    feels no corrective pressure and drifts to the tanh bound — the state §54.8 measured across all
+    nine outputs.
+    """
+    raw = _raw(open_head=0.8, manage=(0.9, 0.9, 0.9))
+    masked = mask_action_for_learning(raw, "buy")
+    assert masked[4] == pytest.approx(0.8)
+    assert np.all(masked[5 : 5 + MANAGE_HEAD_DIM] == 0.0)
+
+
+def test_open_head_takes_no_gradient_on_an_update_call():
+    raw = _raw(open_head=0.8, manage=(0.9, 0.1, 0.1))
+    masked = mask_action_for_learning(raw, "update")
+    assert masked[4] == 0.0
+    assert masked[5] == pytest.approx(0.9)
+
+
+def test_masking_leaves_the_continuous_outputs_alone():
+    """sl/tp/size/leverage are acted on in every category that opens or manages, so they always
+    earned their gradient."""
+    raw = _raw(sl=0.3, tp=0.4, size=0.5, lev=0.6, open_head=0.7, manage=(0.8, 0.8, 0.8))
+    masked = mask_action_for_learning(raw, "buy")
+    assert masked[:4].tolist() == pytest.approx([0.3, 0.4, 0.5, 0.6])
+
+
+def test_masking_does_not_mutate_the_caller_s_array():
+    raw = _raw(open_head=0.8, manage=(0.9, 0.9, 0.9))
+    mask_action_for_learning(raw, "buy")
+    assert raw[5] == pytest.approx(0.9)
+
+
+def test_schema_version_is_v8():
+    assert OBSERVATION_SCHEMA_VERSION == 8
