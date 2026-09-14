@@ -23,6 +23,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/eghbalii/okxBot/go-engine/internal/backtest"
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
@@ -39,6 +41,19 @@ func main() {
 		fromStr = flag.String("from", "", "start date, YYYY-MM-DD (default: the earliest candle held)")
 		toStr   = flag.String("to", "", "end date, YYYY-MM-DD (default: now)")
 		dry     = flag.Bool("dry", false, "score only — print the per-strategy summary and write no dataset")
+		// Sweepable, because the first screening run found 35 of 36 strategies losing money — at
+		// which point the question stops being "which strategy" and becomes "is the trade economics
+		// survivable at all". A flag means one binary answers that in minutes rather than a rebuild
+		// per hypothesis.
+		lev   = flag.Float64("leverage", 0, "override risk.max_leverage")
+		maxRR = flag.Float64("max-rr", 0, "override rl_clamps.max_tp_sl_ratio")
+		// The measurement that matters most, from the first full screening: Clamps.Apply only CAPS
+		// the ratio, it never raises a modest proposal toward the cap — so with MinTPSLRatio at 1.5
+		// the realized ratio came out at 1.73:1, whose breakeven win rate (36.6%) sits just above
+		// the 36.0% actually achieved. Raising the floor is the one change that moves that number
+		// without touching a single strategy.
+		minRR = flag.Float64("min-rr", 0, "override rl_clamps.min_tp_sl_ratio")
+		fee   = flag.Float64("fee", -1, "override the taker fee rate (e.g. 0.0002)")
 	)
 	flag.Parse()
 
@@ -111,7 +126,7 @@ func main() {
 			// The same account shape live paper trading runs, so the policy learns sizing against
 			// the economics it will actually be served (§15.6).
 			InitialUSD:     cfg.Account.InitialUSD,
-			MaxLeverage:    cfg.Risk.MaxLeverage,
+			MaxLeverage:    overrideDec(cfg.Risk.MaxLeverage, *lev),
 			PositionSlots:  positionSlots(cfg, instIDs),
 			MaxPositionPct: cfg.Account.MaxPositionPct,
 			CandleWindow:   cfg.PaperTrading.CandleLimit,
@@ -120,14 +135,18 @@ func main() {
 			Clamps: conductor.Clamps{
 				MinSLDistPct: cfg.PaperTrading.RLClamps.MinSLDistPct,
 				MaxSLDistPct: cfg.PaperTrading.RLClamps.MaxSLDistPct,
-				MinTPSLRatio: cfg.PaperTrading.RLClamps.MinTPSLRatio,
-				MaxTPSLRatio: cfg.PaperTrading.RLClamps.MaxTPSLRatio,
+				MinTPSLRatio: overrideDec(cfg.PaperTrading.RLClamps.MinTPSLRatio, *minRR),
+				MaxTPSLRatio: overrideDec(cfg.PaperTrading.RLClamps.MaxTPSLRatio, *maxRR),
 				MaxLossPct:   cfg.PaperTrading.RLClamps.MaxLossPct,
 			},
 		},
 		Src:    repo,
 		Sink:   sink,
 		Logger: logger,
+	}
+
+	if *fee >= 0 {
+		backtest.SetTakerFee(decimal.NewFromFloat(*fee))
 	}
 
 	logger.Info("backtest starting",
@@ -161,6 +180,15 @@ func positionSlots(cfg *config.Config, instIDs []string) int {
 		return 1
 	}
 	return n
+}
+
+// overrideDec returns v as a decimal when it is positive, else the configured value. Zero means
+// "not set" rather than "zero leverage", which no caller could mean.
+func overrideDec(cfgVal decimal.Decimal, v float64) decimal.Decimal {
+	if v > 0 {
+		return decimal.NewFromFloat(v)
+	}
+	return cfgVal
 }
 
 func splitList(s string) []string {

@@ -148,3 +148,12 @@ func log10(f float64) float64 { return math.Log10(f) }
 // account is gone. Measured on real history without this floor, the account reached $0.000007 and
 // the run went on producing 21,000 more samples at sizes production would never open.
 var minTradableUSD = decimal.NewFromFloat(1.0)
+
+// SetTakerFee overrides the fee rate for a run.
+//
+// Exposed because the first full screening found 35 of 36 strategies losing money, and the fee is a
+// large enough share of a typical trade to be a candidate cause rather than a rounding detail: at
+// 0.05% taker both ways on 10x leverage it costs 1% of margin per round trip, against an average
+// stop risking ~6.8%. Being able to vary it is how that stops being an assertion and becomes a
+// measurement.
+func SetTakerFee(rate decimal.Decimal) { takerFeeRate = rate }
