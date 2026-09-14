@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { api } from '../api/client'
 import { useCachedResource } from '../hooks/useCachedResource'
 import type { PositionMode } from '../api/types'
@@ -76,9 +76,10 @@ export default function BalanceChart({
   // is the largest the panel fetches — measured at 173KB for real mode — so re-parsing it on every
   // toggle is the expensive part, not the 19ms the server takes to produce it.
   //
-  // refreshSignal is part of the key rather than a dependency that forces a refetch: bumping it
-  // (after a trade closes) moves every range onto fresh entries at once, and the old ones age out
-  // of the bounded cache on their own.
+  // refreshSignal is deliberately NOT part of the key (fixed 2026-09-14), for the same reason it was
+  // removed from the positions table's key on the same day: a key never seen before has nothing
+  // cached, so the chart blanked and redrew every time a trade closed. It calls refresh() instead,
+  // which revalidates the entry already on screen.
   // The cache key carries the RANGE, never a timestamp. Two earlier attempts both failed here in
   // the same way and are worth recording, because each looked correct:
   //
@@ -95,14 +96,24 @@ export default function BalanceChart({
     data: cachedPoints,
     error,
     loading,
+    refresh,
   } = useCachedResource(
-    `equity:${mode}:${range}:${refreshSignal ?? 0}`,
+    `equity:${mode}:${range}`,
     () => api.accountHistory(mode, new Date(Date.now() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000)),
     // Longer than the 15s stats poll around it: the equity timeline only changes when a trade
     // closes, so revalidating every few seconds costs a 173KB re-parse for nothing.
     { maxAgeMs: 120_000 },
   )
   const points = cachedPoints ?? []
+
+  // A bumped signal revalidates the range on screen rather than switching to an uncached key.
+  // Depends on refreshSignal alone: adding refresh would re-run this on every render, since the
+  // hook returns a new callback each time.
+  useEffect(() => {
+    if (refreshSignal === undefined) return
+    refresh()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshSignal])
 
   const series = useMemo<Series | null>(() => {
     if (points.length === 0) return null

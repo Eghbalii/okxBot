@@ -123,7 +123,6 @@ export default function PositionsPage() {
   const [sortBy, setSortByRaw] = useState<SortField>('opened_at')
   const [sortDesc, setSortDesc] = useState(true)
   const [alertsEnabled, setAlertsEnabled] = useState(true)
-  const [wsRefreshCount, setWsRefreshCount] = useState(0)
   const [chartInstId, setChartInstId] = useState<string | null>(null)
   const [detailOrderId, setDetailOrderId] = useState<number | null>(null)
   const [page, setPage] = useState(0)
@@ -157,10 +156,16 @@ export default function PositionsPage() {
   // so re-fetching and re-parsing them on every tab switch is the expensive part, not the ~50ms the
   // server spends.
   //
-  // wsRefreshCount is part of the KEY rather than a dependency that forces a refetch, so an
-  // order opening or closing moves to a fresh entry while the previous one stays available.
-  const queryKey = `positions:${mode}:${instId}:${openFilter}:${sortBy}:${sortDesc}:${page}:${pageSize}:${wsRefreshCount}`
-  const { data, error } = useCachedResource(
+  // wsRefreshCount is deliberately NOT part of the key (fixed 2026-09-14).
+  //
+  // It was, on the reasoning that a new key "moves to a fresh entry while the previous one stays
+  // available" — but nothing reads that previous entry. A key never seen before has nothing cached,
+  // so data comes back null and the table empties until the fetch lands. Since the counter
+  // increments on every order open and close, the whole list visibly blanked and reappeared several
+  // times a minute: the "it suddenly has a seizure, all positions vanish, then come back" the
+  // operator reported. An event must REVALIDATE this query, not ask a different one.
+  const queryKey = `positions:${mode}:${instId}:${openFilter}:${sortBy}:${sortDesc}:${page}:${pageSize}`
+  const { data, error, refresh, loading } = useCachedResource(
     queryKey,
     () =>
       api.listPositions({
@@ -184,7 +189,10 @@ export default function PositionsPage() {
   // immediate refetch here — usePositionAlerts' existing diff-the-snapshot logic then fires the
   // sound/notification off of that fresher data. The 5s poll above still runs as a fallback/
   // consistency check independent of the socket's connection state.
-  usePositionEvents(() => setWsRefreshCount((c) => c + 1), true)
+  // refresh() revalidates the key already on screen, so the rows stay rendered while the request is
+  // in flight — the whole point of the stale-while-revalidate cache, which keying by the counter
+  // bypassed.
+  usePositionEvents(refresh, true)
 
   usePositionAlerts(rows, alertsEnabled)
 
@@ -239,7 +247,7 @@ export default function PositionsPage() {
     setClosingId(p.ID)
     try {
       await api.closePosition(p.ID, p.Mode)
-      setWsRefreshCount((c) => c + 1)
+      refresh()
     } catch (err) {
       alert(`Failed to request close: ${(err as Error).message}`)
     } finally {
@@ -511,7 +519,18 @@ export default function PositionsPage() {
                 </tr>
               )
             })}
-            {total === 0 && (
+            {/* Only claim there are no positions once we actually KNOW. `total` falls back to 0
+                while data is null, so this previously asserted "no positions match" during every
+                load of an uncached key — a false statement rather than a blank, and visible on each
+                mode or filter switch. */}
+            {total === 0 && loading && (
+              <tr>
+                <td colSpan={columnCount} className="text-dim">
+                  Loading positions…
+                </td>
+              </tr>
+            )}
+            {total === 0 && !loading && (
               <tr>
                 <td colSpan={columnCount} className="text-dim">
                   No positions match this filter.
