@@ -215,6 +215,11 @@ func (e *PaperTrader) applyAdjustment(ctx context.Context, o port.PaperOrder, ac
 		}
 	}
 
+	// Counted only now, after the levels actually moved and persisted: a proposal the ratchet
+	// rejected cost the model nothing, so charging churn for it would penalise an intention rather
+	// than an action.
+	e.conductor().RecordAdjustment(o.ID)
+
 	logger.Info("lifecycle: sl/tp adjustment applied", "instId", e.InstID,
 		"orderId", o.ID, "newSL", newSL, "newTP", newTP)
 }
@@ -272,6 +277,11 @@ func (e *PaperTrader) reportTerminal(ctx context.Context, o port.PaperOrder, clo
 
 	ps := positionStateOf(o, closePx)
 	ps.RealizedPnLUSD = pnl
+	// The churn count and the risk actually taken, both of which the reward divides by or
+	// charges against (docs/RL_V8_PLAN.md). Carried on the terminal call because that is the
+	// one call where the reward is computed — sending them on every update would be data the
+	// model reads as position state rather than as scoring inputs.
+	ps.SLTPAdjustments = e.conductor().AdjustmentCount(o.ID)
 	obs.PositionState = ps
 
 	if _, err := e.Model.Predict(ctx, obs); err != nil {

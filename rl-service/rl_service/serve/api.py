@@ -300,6 +300,7 @@ def _learn(obs: Observation, obs_vec: np.ndarray, raw: np.ndarray) -> None:
             leverage=ps.leverage,
             equity_usd=obs.account_equity_usd,
             peak_equity_usd=obs.account_peak_usd or obs.account_initial_usd,
+            sltp_adjustments=ps.sltp_adjustments,
             # An operator's manual close trains nothing: attributing a person's decision to the
             # policy would score it on something it never did (§15.12). The call still happens so
             # the pending decision resolves rather than leaking.

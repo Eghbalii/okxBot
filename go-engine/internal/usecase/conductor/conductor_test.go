@@ -244,3 +244,36 @@ func TestIsTimedOut_StatelessAcrossCalls(t *testing.T) {
 		}
 	}
 }
+
+// ShouldUpdate must advance the cadence baseline WITHOUT resetting the rest of the order's state.
+//
+// The obvious implementation assigns a fresh updateState, which is how this read before the
+// adjustment counter existed — and would zero that counter on every update, so the reward's churn
+// penalty would only ever see moves made since the last cadence tick rather than the trade's whole
+// history. A trade adjusted twenty times would be charged for one.
+func TestShouldUpdate_PreservesTheAdjustmentCount(t *testing.T) {
+	c := New(Config{UpdatePnLThresholdPct: dec("0.01"), UpdateMaxInterval: time.Minute})
+	now := time.Now()
+
+	c.ShouldUpdate(1, dec("0"), now) // first call only establishes the baseline
+	c.RecordAdjustment(1)
+	c.RecordAdjustment(1)
+
+	if !c.ShouldUpdate(1, dec("0.05"), now.Add(time.Second)) {
+		t.Fatal("a 5% PnL move past a 1% threshold must fire an update")
+	}
+	if got := c.AdjustmentCount(1); got != 2 {
+		t.Errorf("the adjustment count must survive a cadence update, got %d want 2", got)
+	}
+}
+
+// Forget must drop the count with the rest of the order's state, or it leaks one entry per closed
+// trade for the life of the process.
+func TestForget_DropsTheAdjustmentCount(t *testing.T) {
+	c := New(Config{})
+	c.RecordAdjustment(7)
+	c.Forget(7)
+	if got := c.AdjustmentCount(7); got != 0 {
+		t.Errorf("Forget must clear the adjustment count, got %d", got)
+	}
+}

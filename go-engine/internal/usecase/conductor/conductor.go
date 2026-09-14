@@ -109,6 +109,17 @@ type Conductor struct {
 type updateState struct {
 	lastPnLPct decimal.Decimal
 	lastAt     time.Time
+	// adjustments counts how many times this order's SL/TP actually MOVED, for the reward's churn
+	// penalty (docs/RL_V8_PLAN.md). §15.5 says every adjustment should earn its keep in realized
+	// outcome rather than being free to try, and §54.9 measured what free costs: 81 stop
+	// adjustments across 66 orders in one hour, walking stops to 0.168% of entry.
+	//
+	// Counted here rather than read back from paper_order_adjustments at close time: the count is
+	// already known where the move happens, and querying for it would put a database round trip on
+	// the close path for a number this process just produced. Lost on restart, which understates
+	// churn for positions already open — the conservative direction, and it corrects itself as
+	// soon as the next adjustment lands.
+	adjustments int
 }
 
 type signalKey struct {
@@ -239,7 +250,13 @@ func (c *Conductor) ShouldUpdate(orderID int64, pnlPct decimal.Decimal, now time
 		return false
 	}
 
-	c.updates[orderID] = updateState{lastPnLPct: pnlPct, lastAt: now}
+	// Advances the baseline WITHOUT resetting the rest of the state. Assigning a fresh
+	// updateState here — the obvious way to write this, and how it read before the adjustment
+	// counter existed — would zero that counter on every update, so the churn penalty would
+	// only ever see moves made since the last cadence tick rather than the trade's whole history.
+	prev.lastPnLPct = pnlPct
+	prev.lastAt = now
+	c.updates[orderID] = prev
 	return true
 }
 
@@ -250,6 +267,27 @@ func (c *Conductor) NoteSignalUpdate(orderID int64, pnlPct decimal.Decimal, now 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.updates[orderID] = updateState{lastPnLPct: pnlPct, lastAt: now}
+}
+
+// RecordAdjustment counts one SL/TP move on this order, for the reward's churn penalty.
+//
+// Call it only when a level ACTUALLY changed — a proposal the ratchet rejected cost the model
+// nothing and moved nothing, so charging for it would penalise the policy for an intention rather
+// than an action.
+func (c *Conductor) RecordAdjustment(orderID int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := c.updates[orderID]
+	st.adjustments++
+	c.updates[orderID] = st
+}
+
+// AdjustmentCount reports how many times this order's levels have moved. Zero for an order this
+// process never adjusted, including one carried across a restart.
+func (c *Conductor) AdjustmentCount(orderID int64) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.updates[orderID].adjustments
 }
 
 // Forget drops an order's update state. Called when the order closes; keeping it would leak one

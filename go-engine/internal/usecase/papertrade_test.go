@@ -3381,3 +3381,105 @@ func paperWindow(price string) []domain.Candle {
 	w[len(w)-1] = domain.Candle{Open: c, High: c, Low: c, Close: c, Volume: dec("1000")}
 	return w
 }
+
+// The reward divides by the risk the trade actually took, so the observation has to carry it
+// (docs/RL_V8_PLAN.md).
+//
+// This is the change the operator singled out from the reward audit: pnl/size scores a 5% gain made
+// with a 1% stop identically to one made with a 15% stop, though the second took three times the
+// risk for the same result. Without RiskPct populated, the reward silently falls back to return on
+// capital and that distinction is lost — a fallback that works, which is exactly why it needs a test.
+func TestPositionStateOf_CarriesTheRiskActuallyTaken(t *testing.T) {
+	tight, wide := dec("99"), dec("85")
+	base := port.PaperOrder{EntryPx: dec("100"), Size: dec("10"), Leverage: dec("10")}
+
+	withTight := base
+	withTight.SLPx = &tight
+	withWide := base
+	withWide.SLPx = &wide
+
+	// 1% of price at 10x is 10% of margin; 15% of price at 10x is 150%, above what §19.2's cap
+	// would ever allow but arithmetically what a stop that far away means.
+	if got := positionStateOf(withTight, dec("100")).RiskPct; !got.Equal(dec("0.1")) {
+		t.Errorf("a 1%% stop at 10x risks 10%% of margin, got %s", got)
+	}
+	if got := positionStateOf(withWide, dec("100")).RiskPct; !got.Equal(dec("1.5")) {
+		t.Errorf("a 15%% stop at 10x risks 150%% of margin, got %s", got)
+	}
+
+	// No stop means no bounded risk to divide by. Zero tells the reward to fall back to return on
+	// capital rather than inventing a denominator — worse, but honest.
+	if got := positionStateOf(base, dec("100")).RiskPct; !got.IsZero() {
+		t.Errorf("a position with no stop must report zero risk, got %s", got)
+	}
+}
+
+// Moving SL/TP must be counted, or the churn penalty is permanently zero.
+//
+// §15.5 says every adjustment should earn its keep in realized outcome rather than being free to
+// try; the penalty was written and then never given a count to charge against. §54.9 measured what
+// free movement costs: 81 stop adjustments across 66 orders in one hour, walking stops to 0.168% of
+// entry, with nothing in the reward objecting.
+func TestRunUpdates_CountsAdjustmentsForTheChurnPenalty(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.candles["1m"] = paperWindow("100")
+	pt.Model = &fakeModelClientRL{action: domain.Action{
+		Action: domain.ActionUpdate, SLPx: dec("97"), TPPx: dec("108"),
+	}}
+	pt.RLSLTPAdjust = true
+
+	sl, tp := dec("95"), dec("110")
+	id, err := repo.OpenPaperOrder(ctx, port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("100"), Leverage: dec("1"),
+	})
+	if err != nil {
+		t.Fatalf("open order: %v", err)
+	}
+
+	if got := pt.conductor().AdjustmentCount(id); got != 0 {
+		t.Fatalf("a fresh order has moved nothing, got %d", got)
+	}
+
+	// The first call only establishes the update cadence baseline (see Conductor.ShouldUpdate), so
+	// a second one is what actually reaches the model.
+	pt.runUpdates(ctx, "1m", dec("100"), testLogger())
+	pt.runUpdates(ctx, "1m", dec("105"), testLogger())
+
+	if got := pt.conductor().AdjustmentCount(id); got == 0 {
+		t.Error("an applied SL/TP move must be counted, or the churn penalty is always zero")
+	}
+}
+
+// A REJECTED proposal must not be counted.
+//
+// The ratchet refuses a move that would widen risk (§15.4), and such a proposal moved nothing and
+// cost nothing — charging churn for it would penalise the policy for an intention rather than an
+// action, which teaches it not to propose rather than not to twitch.
+func TestRunUpdates_DoesNotCountARejectedAdjustment(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.candles["1m"] = paperWindow("100")
+	// A stop further from entry than the current one: the ratchet only tightens, so this is refused.
+	pt.Model = &fakeModelClientRL{action: domain.Action{Action: domain.ActionUpdate, SLPx: dec("90")}}
+	pt.RLSLTPAdjust = true
+
+	sl, tp := dec("95"), dec("110")
+	id, err := repo.OpenPaperOrder(ctx, port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
+		Size: dec("100"), Leverage: dec("1"),
+	})
+	if err != nil {
+		t.Fatalf("open order: %v", err)
+	}
+
+	pt.runUpdates(ctx, "1m", dec("100"), testLogger())
+	pt.runUpdates(ctx, "1m", dec("105"), testLogger())
+
+	if got := pt.conductor().AdjustmentCount(id); got != 0 {
+		t.Errorf("a proposal the ratchet rejected moved nothing and must not be charged, got %d", got)
+	}
+}

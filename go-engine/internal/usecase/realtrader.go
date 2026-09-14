@@ -1715,6 +1715,11 @@ func (e *RealTrader) reportTerminalReal(ctx context.Context, o port.RealOrder, c
 	obs.Signal = e.carriedSignalFor(e.decisionBar())
 	ps := positionStateOf(asPaperOrderView(o), closePx)
 	ps.RealizedPnLUSD = pnl
+	// The churn count and the risk actually taken, both of which the reward divides by or
+	// charges against (docs/RL_V8_PLAN.md). Carried on the terminal call because that is the
+	// one call where the reward is computed — sending them on every update would be data the
+	// model reads as position state rather than as scoring inputs.
+	ps.SLTPAdjustments = e.conductor().AdjustmentCount(o.ID)
 	obs.PositionState = ps
 	if _, err := e.Model.Predict(ctx, obs); err != nil {
 		logger.Warn("real updates: terminal report failed; this trade will not train the model",

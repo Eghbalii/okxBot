@@ -379,6 +379,7 @@ func positionStateOf(o port.PaperOrder, price decimal.Decimal) domain.PositionSt
 		PnLMinPct:        o.PnLMinPct,
 		DistToSLPct:      distPct(o.SLPx, price),
 		DistToTPPct:      distPct(o.TPPx, price),
+		RiskPct:          riskPct(o),
 	}
 	if !o.OpenedAt.IsZero() {
 		ps.AgeSeconds = int64(time.Since(o.OpenedAt).Seconds())
@@ -457,4 +458,27 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// riskPct is what the trade actually put at risk: the entry-to-stop distance scaled by leverage, as
+// a fraction of the margin committed.
+//
+// This is the reward's denominator (docs/RL_V8_PLAN.md), and the reason it is not position size:
+// pnl/size scores a 5% gain made with a 1% stop identically to one made with a 15% stop, though the
+// second took three times the risk for the same result. Dividing by risk taken is what makes the
+// model prefer the first — the change the operator singled out from the reward audit.
+//
+// Zero when there is no stop, which the reward treats as "unknown" and falls back to return on
+// capital for. That is honest rather than convenient: a position with no stop has no bounded risk
+// to divide by, and inventing one would score it as though it did. Note §16.9 made a stopless order
+// impossible on the open path, so this should only be reachable for historical rows.
+func riskPct(o port.PaperOrder) decimal.Decimal {
+	if o.SLPx == nil || !o.EntryPx.IsPositive() {
+		return decimal.Zero
+	}
+	lev := o.Leverage
+	if !lev.IsPositive() {
+		lev = decimal.NewFromInt(1)
+	}
+	return o.EntryPx.Sub(*o.SLPx).Abs().Div(o.EntryPx).Mul(lev)
 }

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 
+from rl_service.obs import ZERO_REWARD_CATEGORIES
 from rl_service.reward import (
     LIQ_BUFFER_FLOOR,
     REWARD_CLIP,
@@ -168,3 +169,88 @@ def test_every_term_is_reported_separately():
     assert d["reward"] == pytest.approx(
         d["return"] - d["churn_penalty"] - d["leverage_penalty"] - d["drawdown_penalty"]
     )
+
+
+# --- the penalties must actually be REACHED from a real observation ---------------------------
+#
+# These exist because the penalties were written, tested in isolation, and then two of the three
+# inputs they need were never carried on the wire — so churn was permanently zero and the reward
+# silently fell back to return on capital for every trade. A penalty that cannot be reached is
+# indistinguishable from one that was never written, and §54.9 measured the consequence: 81 stop
+# adjustments across 66 orders in one hour, with nothing in the reward objecting.
+
+
+def _terminal_obs(**position_overrides):
+    """A terminal observation shaped the way the Go engine actually sends one."""
+    from rl_service.obs import Observation, PositionState
+
+    ps = dict(
+        position_open=1.0,
+        side=1.0,
+        size_usd=2.5,
+        leverage=10.0,
+        realized_pnl_usd=0.125,
+        risk_pct=0.066,
+        sltp_adjustments=0.0,
+    )
+    ps.update(position_overrides)
+    return Observation(
+        inst_id="SOL",
+        last_price=100.0,
+        category="closed_tp",
+        order_id=1,
+        position_state=PositionState(**ps),
+        account_equity_usd=40.0,
+        account_initial_usd=40.0,
+        account_peak_usd=40.0,
+    )
+
+
+def _score(obs):
+    """Scores an observation exactly as serve/api.py's terminal path does."""
+    ps = obs.position_state
+    return trade_reward(
+        realized_pnl_usd=ps.realized_pnl_usd,
+        risk_pct=ps.risk_pct,
+        position_size_usd=ps.size_usd,
+        leverage=ps.leverage,
+        equity_usd=obs.account_equity_usd,
+        peak_equity_usd=obs.account_peak_usd or obs.account_initial_usd,
+        sltp_adjustments=ps.sltp_adjustments,
+        zero_reward=obs.category in ZERO_REWARD_CATEGORIES,
+    )
+
+
+def test_risk_reaches_the_reward_from_an_observation():
+    """risk_pct was a declared field nothing populated, so every trade scored as return on capital."""
+    tight = _score(_terminal_obs(risk_pct=0.02))
+    wide = _score(_terminal_obs(risk_pct=0.15))
+    assert tight.total > wide.total
+
+
+def test_churn_reaches_the_reward_from_an_observation():
+    """sltp_adjustments likewise: the penalty had no count to charge against."""
+    quiet = _score(_terminal_obs(sltp_adjustments=0.0))
+    twitchy = _score(_terminal_obs(sltp_adjustments=20.0))
+    assert quiet.total > twitchy.total
+    assert twitchy.churn_penalty > 0
+
+
+def test_leverage_reaches_the_reward_from_an_observation():
+    low = _score(_terminal_obs(leverage=10.0))
+    high = _score(_terminal_obs(leverage=50.0))
+    assert low.total > high.total
+    assert high.leverage_penalty > 0
+
+
+def test_drawdown_reaches_the_reward_from_an_observation():
+    obs = _terminal_obs()
+    obs.account_equity_usd = 30.0
+    obs.account_peak_usd = 40.0
+    assert _score(obs).drawdown_penalty > 0
+
+
+def test_a_manual_close_scores_nothing_even_with_a_large_gain():
+    obs = _terminal_obs(realized_pnl_usd=5.0)
+    obs.category = "closed_manual"
+    assert _score(obs).total == 0.0

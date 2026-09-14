@@ -345,6 +345,11 @@ class PositionState(BaseModel):
     # divides by this rather than by position size: a 5% gain made with a 1% stop and a 5% gain made
     # with a 15% stop are not the same trade, and dividing by size scores them identically.
     risk_pct: float = 0.0
+    # How many times this position's levels were moved, for the reward's churn penalty. §15.5 says
+    # every adjustment should earn its keep in realized outcome rather than being free to try; the
+    # penalty existed without a count to charge against, and §54.9 measured what free movement
+    # costs — 81 stop adjustments across 66 orders in one hour.
+    sltp_adjustments: float = 0.0
 
 
 class Observation(BaseModel):

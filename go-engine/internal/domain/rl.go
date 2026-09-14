@@ -242,6 +242,11 @@ type PositionState struct {
 
 	// RealizedPnLUSD is meaningful only on a terminal category, where it IS the reward signal.
 	RealizedPnLUSD decimal.Decimal `json:"realized_pnl_usd"`
+	// SLTPAdjustments is how many times this position's levels have been moved, for the reward's
+	// churn penalty (docs/RL_V8_PLAN.md). Without it the churn term is always zero, and §54.9
+	// measured what free movement costs: 81 stop adjustments across 66 orders in one hour.
+	SLTPAdjustments int `json:"sltp_adjustments"`
+
 	// RiskPct is the entry-to-stop distance as a fraction of margin — what the trade actually put
 	// at risk. The reward divides by this rather than by position size, because a 5% gain made with
 	// a 1% stop and one made with a 15% stop are not the same trade (docs/RL_V8_PLAN.md).
