@@ -1283,7 +1283,7 @@ func (e *RealTrader) runUpdates(ctx context.Context, bar string, price decimal.D
 // readiness plan, 2026-09-04's table split). No exchange call: the new levels take effect on this
 // engine's own next tick via monitorOpenPositions.
 func (e *RealTrader) applyRealAdjustment(ctx context.Context, o port.RealOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
-	newSL, newTP, changed := computeAdjustedLevels(asPaperOrderView(o), action, price)
+	newSL, newTP, changed := computeAdjustedLevels(asPaperOrderView(o), action, price, e.RLClamps.MinSLDistPct)
 	if !changed {
 		return
 	}

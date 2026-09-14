@@ -185,7 +185,7 @@ func (e *PaperTrader) runUpdates(ctx context.Context, bar string, price decimal.
 // place and logged as its own row via RecordPaperOrderAdjustment, which is the audit trail a
 // click on the order in the panel reads instead of a fork-vs-baseline comparison.
 func (e *PaperTrader) applyAdjustment(ctx context.Context, o port.PaperOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
-	newSL, newTP, changed := computeAdjustedLevels(o, action, price)
+	newSL, newTP, changed := computeAdjustedLevels(o, action, price, e.RLClamps.MinSLDistPct)
 	if !changed {
 		return
 	}

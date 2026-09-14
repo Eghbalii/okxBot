@@ -22,13 +22,16 @@ import (
 //
 // slAdjustPct/tpAdjustPct are fractions of price; positive/negative sign is interpreted relative
 // to the position's side so the caller doesn't need to reason about buy/sell asymmetry itself.
-func RatchetSLTP(o port.PaperOrder, currentPrice, slAdjustPct, tpAdjustPct decimal.Decimal) (newSL, newTP *decimal.Decimal) {
+// minSLDistPct is the stop's minimum distance from ENTRY, as a fraction of entry price — the same
+// conductor.Clamps.MinSLDistPct the open path enforces, passed in rather than read from a package
+// constant so the two cannot disagree about what "too tight" means. Zero disables the check.
+func RatchetSLTP(o port.PaperOrder, currentPrice, minSLDistPct, slAdjustPct, tpAdjustPct decimal.Decimal) (newSL, newTP *decimal.Decimal) {
 	direction := decimal.NewFromInt(1)
 	if o.Side == "sell" {
 		direction = decimal.NewFromInt(-1)
 	}
 
-	newSL = ratchetSL(o.SLPx, direction, currentPrice, slAdjustPct)
+	newSL = ratchetSL(o.SLPx, direction, currentPrice, o.EntryPx, minSLDistPct, slAdjustPct)
 	newTP = moveTP(o.TPPx, direction, currentPrice, o.EntryPx, tpAdjustPct)
 	// Bound the target against the stop the position actually carries, using the RATCHETED stop
 	// rather than the original: newSL is what the trade is now risking, so measuring reward against
@@ -108,7 +111,7 @@ const SLPriceGapPct = 0.001 // 0.1%
 // making the instant-close outcome unreachable. Rejecting was the safer first move when the
 // failure was fresh and the model's calibration unknown; the data since then shows the cost of
 // that caution was the whole capability.
-func ratchetSL(current *decimal.Decimal, direction, price, adjustPct decimal.Decimal) *decimal.Decimal {
+func ratchetSL(current *decimal.Decimal, direction, price, entry, minDistPct, adjustPct decimal.Decimal) *decimal.Decimal {
 	if current == nil {
 		return nil // no SL set; the ratchet only tightens an existing one, it doesn't create one
 	}
@@ -128,6 +131,37 @@ func ratchetSL(current *decimal.Decimal, direction, price, adjustPct decimal.Dec
 			}
 		} else if limit := price.Add(gap); proposed.LessThan(limit) {
 			proposed = limit
+		}
+	}
+
+	// A stop that has NOT yet crossed entry must keep a minimum distance from it (2026-09-14).
+	//
+	// SLPriceGapPct above bounds the stop against the LIVE PRICE, which stops the instant close, and
+	// nothing bounded it against ENTRY. So the model walked stops to an average of 0.187% from entry
+	// — inside ordinary 5m noise — and positions closed for approximately nothing: 27 of 31 stop
+	// closes in one 45-minute window sat under 0.3%, averaging -$0.16 after 15 minutes. The account
+	// reached zero open positions. conductor.Clamps.MinSLDistPct (0.5%) already forbids exactly this
+	// at open; like §54.7's ratio cap it bounded only where the trade STARTS, not where the model
+	// then moved it.
+	//
+	// Deliberately NOT applied once the stop has crossed entry. Measured on the same window, 8 of
+	// those closes had trailed past entry into profit, which is the mechanic working as intended
+	// (§15.4) — a profit-locking stop is SUPPOSED to sit near price, and bounding its distance from
+	// entry would forbid trailing altogether.
+	//
+	// Clamped rather than rejected, for the reason the comment above records: the first version of
+	// the price guard rejected over-reaching proposals and the measured cost was 5 stop adjustments
+	// against 306 target ones — the model lost control of the stop entirely. Clamping keeps it
+	// dynamic while making the too-tight outcome unreachable.
+	if minDistPct.IsPositive() && entry.IsPositive() {
+		crossedEntry := (direction.IsPositive() && proposed.GreaterThan(entry)) ||
+			(direction.IsNegative() && proposed.LessThan(entry))
+		if !crossedEntry {
+			floor := entry.Mul(minDistPct)
+			if proposed.Sub(entry).Abs().LessThan(floor) {
+				// Push it back to the floor, on the side of entry it was already on.
+				proposed = entry.Sub(direction.Mul(floor))
+			}
 		}
 	}
 

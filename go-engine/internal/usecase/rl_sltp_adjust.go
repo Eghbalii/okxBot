@@ -281,7 +281,7 @@ func levelAdjustPct(current *decimal.Decimal, proposed, price decimal.Decimal) d
 // in-place-edit update path (no shadow fork, §27.3) can reuse the exact same computation the
 // already-proven paper-trading path uses, with the IO (persisting, logging, recording the audit
 // row) left to each caller since paper and real trading write to different places.
-func computeAdjustedLevels(o port.PaperOrder, action *domain.Action, price decimal.Decimal) (newSL, newTP *decimal.Decimal, changed bool) {
+func computeAdjustedLevels(o port.PaperOrder, action *domain.Action, price, minSLDistPct decimal.Decimal) (newSL, newTP *decimal.Decimal, changed bool) {
 	// The model sets levels (§15.11) while the ratchet reasons in relative moves, so convert here.
 	slAdjust := levelAdjustPct(o.SLPx, action.SLPx, price)
 	tpAdjust := levelAdjustPct(o.TPPx, action.TPPx, price)
@@ -289,7 +289,7 @@ func computeAdjustedLevels(o port.PaperOrder, action *domain.Action, price decim
 		return o.SLPx, o.TPPx, false
 	}
 
-	newSL, newTP = RatchetSLTP(o, price, slAdjust, tpAdjust)
+	newSL, newTP = RatchetSLTP(o, price, minSLDistPct, slAdjust, tpAdjust)
 	if samePriceOrNil(newSL, o.SLPx) && samePriceOrNil(newTP, o.TPPx) {
 		return o.SLPx, o.TPPx, false // the ratchet rejected the proposal entirely; nothing to apply
 	}
