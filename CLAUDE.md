@@ -6220,3 +6220,56 @@ Kafka was at **86% of its 768MB cap** at deploy time, with position count about 
 is explicit that a container sitting near its limit trades a host OOM for a crash loop, so that is
 the first thing to fail if this is too much for the box. A resource monitor was left running that
 alerts on low memory, Kafka ≥92%, load ≥8, any container down, or a burst of paper-trader errors.
+
+### 54.7 The reward:risk cap bounded where a target STARTS, not where it ends up (2026-09-14)
+
+Reported directly: order 3356's take-profit sat at 7.55 against an 11.351 entry — **33.5% away**,
+against a 0.22% stop. A 152:1 reward:risk on a 5m scalp, i.e. a target price never reaches. The
+operator remembered a cap existing for exactly this, and was right: §45 added `MaxTPSLRatio` (3:1)
+after measuring the same failure across 1,841 closed orders.
+
+**The order opened correctly.** Its take-profit was 11.2659, a sane 0.75% target. Reading
+`paper_order_adjustments` showed the model walking it out in three in-trade steps —
+11.27 → 10.03 → 7.55 — which is a completely different code path from the one §45 fixed.
+
+| | open path | in-trade path |
+|---|---|---|
+| ratio bound | `conductor.Clamps.MaxTPSLRatio` = 3:1 | **none** |
+| distance bound | — | `MaxTPDistPct` = 50% of entry |
+
+`MaxTPDistPct` did not catch it and was never meant to: §31.1 chose 50% purely to stop an unbounded
+WALK to infinity (order 1851 marching to −566,552), deliberately far wider than any realistic target.
+A distance ceiling bounds a runaway; only a ratio makes a target *reachable*.
+
+Not one bad order either — **13 of 19 open positions** were past the 3:1 cap when checked, the worst
+at **298:1**.
+
+**Fix**: `RatchetSLTP` now clamps the target to `MaxInTradeTPSLRatio` (6:1) of the stop distance,
+measured against the **ratcheted** stop rather than the original — `newSL` is what the trade is now
+risking, so measuring against the old one would let a tightened stop justify a target matched to risk
+no longer being taken. Same ordering `Apply` uses on the open path.
+
+**6:1 rather than the open path's 3:1, deliberately.** A position that has run in profit usually has
+a tightened stop, which raises the ratio mechanically without the target having moved at all.
+Bounding an in-trade move as tightly as an opening one would drag targets in every time the stop
+tightened — the opposite of letting a winner run.
+
+**Nine live positions were corrected in place** (backed up to `paper_orders_tpfix_backup_20260914`
+first) using the same formula the code applies. Targets went from 30%+ to **0.6%–1.5%** from entry;
+zero positions remain over the bound.
+
+#### Two defects mutation testing caught that review did not
+
+Both are worth recording because the tests looked correct:
+
+1. **The headline test passed with the fix removed.** For a short, `direction = -1`, so the negative
+   `adjustPct` I used multiplied to a target *above* entry — which `moveTP` rejects on its own, so the
+   ratio clamp never ran. The test was exercising a rejection path, not the bug. Corrected to
+   reproduce the real production move; removing the clamp now yields 137:1.
+2. **An existing §29 test was silently measuring the new bound.** "A large adjustment applies in
+   full" used a 5.0 stop with a 40.0 target — 8:1, which the new clamp correctly pulls back. The
+   property it means to test (no PER-STEP cap) is unrelated to the ratio, so the fixture was widened
+   to a 10.0 stop rather than the bound being loosened to accommodate it.
+
+The general lesson, and this project has now hit it twice in two days (§53.5): a test that asserts a
+*consequence* another correct mechanism also produces proves nothing about the code it names.
