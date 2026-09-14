@@ -54,6 +54,23 @@ func main() {
 		// without touching a single strategy.
 		minRR = flag.Float64("min-rr", 0, "override rl_clamps.min_tp_sl_ratio")
 		fee   = flag.Float64("fee", -1, "override the taker fee rate (e.g. 0.0002)")
+		// The 15%% loss cap (§19.2) bounds stop DISTANCE as maxLoss/leverage, which means leverage and
+		// stop width are not independent: at 10x the cap allows 1.50%% of price, at 50x only 0.30%% —
+		// one average 5m bar. A stop that narrow is noise-width, crossed routinely without the trade
+		// being wrong, so raising leverage under a fixed cap tightens the stop into the noise rather
+		// than simply scaling the position. Sweepable so that coupling can be measured apart from
+		// leverage itself.
+		maxLoss = flag.Float64("max-loss", 0, "override rl_clamps.max_loss_pct")
+		// Strategy parameter overrides as name=value pairs, applied to every kind in the run; a kind
+		// ignores names it does not declare, so one flag sweeps a parameter across whichever
+		// strategies actually have it.
+		//
+		// Added because the screening's most interesting finding is a parameter question:
+		// stoch_cross reaches its target on 60%% of trades and still loses, because that target is
+		// 1%% against a 1.5%% stop — a 0.67 reward:risk whose breakeven is 64%%. Whether widening it
+		// helps depends on how fast the win rate falls as the target moves away, which a sweep
+		// measures and arithmetic cannot.
+		params = flag.String("param", "", "strategy parameter overrides, name=value[,name=value]")
 	)
 	flag.Parse()
 
@@ -116,6 +133,12 @@ func main() {
 			}
 		}()
 	}
+	overrides, err := parseParams(*params)
+	if err != nil {
+		logger.Error("parse -param", "error", err)
+		os.Exit(1)
+	}
+
 	runner := &backtest.Runner{
 		Cfg: backtest.Config{
 			InstIDs: instIDs,
@@ -130,6 +153,7 @@ func main() {
 			PositionSlots:  positionSlots(cfg, instIDs),
 			MaxPositionPct: cfg.Account.MaxPositionPct,
 			CandleWindow:   cfg.PaperTrading.CandleLimit,
+			Params:         overrides,
 			// The production clamps. Training without them would let the policy learn placements Go
 			// silently rejects — and score them as though they had been taken (§19.2, §45).
 			Clamps: conductor.Clamps{
@@ -137,7 +161,7 @@ func main() {
 				MaxSLDistPct: cfg.PaperTrading.RLClamps.MaxSLDistPct,
 				MinTPSLRatio: overrideDec(cfg.PaperTrading.RLClamps.MinTPSLRatio, *minRR),
 				MaxTPSLRatio: overrideDec(cfg.PaperTrading.RLClamps.MaxTPSLRatio, *maxRR),
-				MaxLossPct:   cfg.PaperTrading.RLClamps.MaxLossPct,
+				MaxLossPct:   overrideDec(cfg.PaperTrading.RLClamps.MaxLossPct, *maxLoss),
 			},
 		},
 		Src:    repo,
@@ -189,6 +213,26 @@ func overrideDec(cfgVal decimal.Decimal, v float64) decimal.Decimal {
 		return decimal.NewFromFloat(v)
 	}
 	return cfgVal
+}
+
+// parseParams turns "a=1,b=2" into decimal overrides.
+func parseParams(s string) (map[string]decimal.Decimal, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	out := map[string]decimal.Decimal{}
+	for _, pair := range strings.Split(s, ",") {
+		kv := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("bad override %q, want name=value", pair)
+		}
+		v, err := decimal.NewFromString(strings.TrimSpace(kv[1]))
+		if err != nil {
+			return nil, fmt.Errorf("bad value in %q: %w", pair, err)
+		}
+		out[strings.TrimSpace(kv[0])] = v
+	}
+	return out, nil
 }
 
 func splitList(s string) []string {

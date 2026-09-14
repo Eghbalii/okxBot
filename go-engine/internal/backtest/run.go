@@ -145,7 +145,14 @@ func (r *Runner) runOne(ctx context.Context, instID, bar string, kinds []string,
 			r.result.Skipped["unknown_kind"]++
 			continue
 		}
-		strats[kind] = f()
+		st := f()
+		if len(r.Cfg.Params) > 0 {
+			// Through WithParams rather than by assignment, so each kind clamps to its own declared
+			// range and resets accumulated state — the contract §16.8's audit found 7 of 14
+			// strategies violating when copied directly.
+			st = st.WithParams(r.Cfg.Params)
+		}
+		strats[kind] = st
 	}
 
 	// One open position per (strategy, instrument), matching the live rule since 2026-09-14.

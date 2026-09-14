@@ -98,6 +98,10 @@ type Config struct {
 	// CandleWindow is how many candles of history each evaluation sees, matching
 	// paper_trading.candle_limit.
 	CandleWindow int
+
+	// Params overrides strategy parameters across the run, applied through each kind's own
+	// WithParams so a kind ignores names it does not declare. Nil leaves every default in place.
+	Params map[string]decimal.Decimal
 }
 
 // Result summarizes one run, for the operator to read before anything is trained on it.
