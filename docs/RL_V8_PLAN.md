@@ -306,3 +306,42 @@ both are now answered rather than ignored:
 
 The backtest must exercise the same three, or the warm start would train a policy on a lifecycle
 different from the one it is then served — the train/serve skew this whole plan exists to remove.
+
+### Done: end-to-end wiring (commit ac35956)
+- `usecase.BTCReference` (shared BTC windows, own consumer group, independent of the traded roster)
+  and `usecase.TokenStatsCache`, wired into both `cmd/paper-trader` and `cmd/trader` with their own
+  source-level regression tests (mutation-checked).
+- `/predict` refuses a model whose observation width differs (503); `/health` reports
+  `observation_compatible`, `observation_dim`, `model_observation_dim`, `entropy_coef`.
+- Entropy repair at load: `target_entropy = -4.5` + alpha reset to 1.0. `gradient_steps` 4 -> 1,
+  `snapshot_every` 25 -> 100.
+- `init_model.py` takes its width from `OBSERVATION_DIM` rather than probing.
+- Removed `rl_service/env`, `train.py`, `pretrain.py`, `augment.py` — superseded, and a
+  half-updated training path would leave two definitions of the observation free to disagree.
+
+### Done: the penalties had no inputs (commit f4cf327)
+Found because the operator asked whether penalties had been forgotten. Two of three could not fire:
+- `sltp_adjustments` was never sent, so the churn penalty was permanently zero.
+- `risk_pct` was declared and never populated, so the reward took its fallback to return on capital
+  on EVERY trade — silently, because the fallback works.
+
+Counted in the Conductor rather than read back from the database at close time. Only an APPLIED
+move counts: a proposal the ratchet rejected moved nothing, and charging for it would penalise an
+intention rather than an action. A real bug surfaced: `ShouldUpdate` assigned a fresh `updateState`
+to advance the cadence baseline, zeroing the count on every update — a trade adjusted twenty times
+would be charged for one.
+
+Five new Python tests score a REAL terminal observation through the same call `api.py` makes. That
+distinction is the lesson: the penalties were already tested in isolation and passing while two of
+their inputs did not exist.
+
+### Done: the backtest (commit 1fb4737)
+`internal/backtest` + `cmd/backtest`. Real strategies, the live observation builders, the reward
+pinned by number against `reward.py`. SL wins a tie when a bar spans both levels. The strategy
+profile accumulates from the simulation's own books. Order ids per trade — caught by
+`Observation.Validate`, which refused a terminal call without one.
+
+### Next
+1. Run the backtest against the server's real candle history; show the operator the summary.
+2. Set the live roster: 16 slots, $40 cap, 10x, all three RL gates ON.
+3. Train from the dataset, show results, deploy only on approval.
