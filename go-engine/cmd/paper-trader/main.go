@@ -213,18 +213,53 @@ func main() {
 	orderEventsPub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "okx.paper-order-events")
 	defer orderEventsPub.Close()
 
-	// CLAUDE.md §31.2: how many tokens actually open new positions right now — the divisor for
-	// dynamic per-position sizing (CurrentEquity / ActiveTokenCount), computed once here from the
-	// same roster/disabled-list every PaperTrader instance below shares, so it is identical across
-	// all of them despite living as a per-instance field. Recomputed only at startup, matching this
-	// service's existing "config changes need a restart" posture (§22) — enabling/disabling a token
-	// mid-run doesn't retroactively resize an order already open, only the next one to open.
-	activeTokenCount := 0
+	// CLAUDE.md §31.2: the divisor for dynamic per-position sizing (CurrentEquity /
+	// PositionSlots). Recomputed only at startup, matching this service's existing "config changes
+	// need a restart" posture (§22) — enabling/disabling a token mid-run doesn't retroactively
+	// resize an order already open, only the next one to open.
+	//
+	// Counts (STRATEGY, token) PAIRS since 2026-09-14, when the open guard widened from one
+	// position per token to one per strategy per token. The divisor MUST equal the real slot count:
+	// dividing by tokens while opening per strategy would over-commit the account by exactly the
+	// number of strategies — 13x here, an account spent thirteen times over.
+	//
+	// Assignments are loaded up front for this reason (they used to be read inside the engine loop
+	// below), and reused there rather than re-queried per instrument.
+	strategiesByInst := make(map[string][]usecase.StrategyAssignment, len(instIDs))
+	positionSlots := 0
 	for _, instID := range instIDs {
-		if !slices.Contains(ptCfg.DisabledInstIDs, instID) {
-			activeTokenCount++
+		if slices.Contains(ptCfg.DisabledInstIDs, instID) {
+			// A disabled token opens nothing, so its assignments hold no slots and must not shrink
+			// every other position's size by claiming some.
+			continue
+		}
+		// Strategy assignments are durable (strategy_assignments table, CLAUDE.md §11.3): loaded
+		// fresh from Postgres on every start, so a crash/restart resumes with exactly the same
+		// token/timeframe->strategy bindings the panel last configured, not whatever was hardcoded
+		// here in Go.
+		strategies, err := loadStrategyAssignments(ctx, repo, instID, logger)
+		if err != nil {
+			logger.Error("failed to load strategy assignments", "instId", instID, "error", err)
+			os.Exit(1)
+		}
+		strategiesByInst[instID] = strategies
+		// Distinct strategy ids, not assignment rows: the same strategy assigned to two decision
+		// bars still holds ONE slot on this token, because hasOpenBaselineFor keys on the strategy.
+		seen := make(map[int64]bool, len(strategies))
+		for _, a := range strategies {
+			if !seen[a.StrategyID] {
+				seen[a.StrategyID] = true
+				positionSlots++
+			}
 		}
 	}
+	if positionSlots == 0 {
+		// Nothing can open, so nothing can be sized. Falling through would divide by the defensive
+		// 1 and open full-account positions the moment an assignment appeared.
+		logger.Error("no enabled (strategy, token) pairs — nothing to trade")
+		os.Exit(1)
+	}
+	logger.Info("dynamic sizing divisor", "positionSlots", positionSlots, "tokens", len(instIDs))
 
 	errCh := make(chan error, len(instIDs)+1+len(candleDispatchers))
 	// Staggering each instrument's engine start (rather than launching every goroutine in the same
@@ -235,15 +270,9 @@ func main() {
 	// 10-token scale.
 	const engineStartStagger = 300 * time.Millisecond
 	for i, instID := range instIDs {
-		// Strategy assignments are durable (strategy_assignments table, CLAUDE.md §11.3): loaded
-		// fresh from Postgres on every start, so a crash/restart resumes with exactly the same
-		// token/timeframe->strategy bindings the panel last configured, not whatever was hardcoded
-		// here in Go.
-		strategies, err := loadStrategyAssignments(ctx, repo, instID, logger)
-		if err != nil {
-			logger.Error("failed to load strategy assignments", "instId", instID, "error", err)
-			os.Exit(1)
-		}
+		// Loaded above, where the slot count needed them — re-querying here would issue one extra
+		// round trip per instrument for rows already in hand, and risk the two disagreeing.
+		strategies := strategiesByInst[instID]
 
 		candleConsumers := make(map[string]port.MarketDataConsumer, len(candleBars))
 		for bar, d := range candleDispatchers {
@@ -254,20 +283,20 @@ func main() {
 			InstID: instID,
 			// Every ingested bar, so the context timeframes get a maintained window (and are seeded
 			// from the database on restart) even though no strategy decides on them.
-			Bars:             candleBars,
-			CandleWindow:     cfg.PaperTrading.CandleLimit,
-			Strategies:       strategies,
-			TickConsumer:     tickDispatcher.ForInstrument(instID),
-			CandleConsumers:  candleConsumers,
-			Repo:             repo,
-			ActiveTokenCount: activeTokenCount,
-			MaxOpenOrders:    cfg.PaperTrading.MaxOpenOrders,
-			Logger:           logger,
-			Model:            model,
-			RLSLTPAdjust:     cfg.PaperTrading.RLSLTPAdjust,
-			RLDecisionBar:    cfg.PaperTrading.RLDecisionBar,
-			RLSizing:         cfg.PaperTrading.RLSizing,
-			MaxLeverage:      cfg.Risk.MaxLeverage,
+			Bars:            candleBars,
+			CandleWindow:    cfg.PaperTrading.CandleLimit,
+			Strategies:      strategies,
+			TickConsumer:    tickDispatcher.ForInstrument(instID),
+			CandleConsumers: candleConsumers,
+			Repo:            repo,
+			PositionSlots:   positionSlots,
+			MaxOpenOrders:   cfg.PaperTrading.MaxOpenOrders,
+			Logger:          logger,
+			Model:           model,
+			RLSLTPAdjust:    cfg.PaperTrading.RLSLTPAdjust,
+			RLDecisionBar:   cfg.PaperTrading.RLDecisionBar,
+			RLSizing:        cfg.PaperTrading.RLSizing,
+			MaxLeverage:     cfg.Risk.MaxLeverage,
 			// Signal-lifecycle conductor (CLAUDE.md §15.12): update cadence, early close, and the
 			// clamps bounding where the model may place stops/targets.
 			RLUpdatePnLThresholdPct: cfg.PaperTrading.RLUpdatePnLThresholdPct,

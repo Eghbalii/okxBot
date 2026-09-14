@@ -56,16 +56,22 @@ type PaperTrader struct {
 	MaxOpenOrders   int
 	Logger          *slog.Logger
 
-	// ActiveTokenCount is how many tokens in the configured roster are NOT currently disabled
-	// (paper_trading_config.disabled_inst_ids) — the divisor for dynamic per-position sizing
-	// (CLAUDE.md §31.2): every new order opens at CurrentEquity/ActiveTokenCount, not a fixed
-	// config constant, so sizing tracks the account the same way a real exchange account would —
-	// grow after a win, shrink after a loss, and immediately reflect a token being enabled/disabled.
-	// Computed once at startup from the same roster/disabled-list every PaperTrader instance
+	// PositionSlots is how many positions can be open at once across the whole account — the
+	// divisor for dynamic per-position sizing (CLAUDE.md §31.2): every new order opens at
+	// CurrentEquity/PositionSlots, not a fixed config constant, so sizing tracks the account the
+	// same way a real exchange account would (grow after a win, shrink after a loss, and
+	// immediately reflect a token or strategy being enabled/disabled).
+	//
+	// It counts (STRATEGY, token) PAIRS, not tokens. Renamed from ActiveTokenCount on 2026-09-14
+	// when the open guard widened from one position per token to one per strategy per token: the
+	// divisor has to equal the real slot count, or the account is over-committed by exactly the
+	// factor it is wrong by. With 13 strategies over 22 tokens that factor would have been 12x —
+	// the account fully spent roughly twelve times over.
+	//
+	// Computed once at startup from the same enabled-assignment set every PaperTrader instance
 	// shares, so it is identical across all of them despite being a per-instance field. Falls back
-	// to 1 if zero/unset (defensive; main.go should never actually pass zero since the roster is
-	// never empty in practice).
-	ActiveTokenCount int
+	// to 1 if zero/unset (defensive; main.go should never pass zero in practice).
+	PositionSlots int
 
 	// Model/ActiveTokens/TokenBudgetUSD wire the RL agent's in-trade SL/TP adjustment pass
 	// (CLAUDE.md §15.4). Model may be nil, in which case the adjustment pass is skipped entirely —
@@ -280,10 +286,10 @@ func (e *PaperTrader) accountMode() string {
 }
 
 // dynamicNotional is what a new position opens at when RLSizing is off: CurrentEquity /
-// ActiveTokenCount, not a fixed config constant (CLAUDE.md §31.2). This is how a real exchange
+// PositionSlots, not a fixed config constant (CLAUDE.md §31.2). This is how a real exchange
 // account actually behaves — the amount committed per position tracks the account's current
 // balance, growing after a win and shrinking after a loss, rather than staying pinned to whatever
-// number was true the day it was configured. AccountInitialUSD/ActiveTokenCount are the fallback
+// number was true the day it was configured. AccountInitialUSD/PositionSlots are the fallback
 // for whichever piece is unavailable, so a transient repository error or a startup
 // misconfiguration degrades to a sane order of magnitude rather than a zero-size order.
 // usdScale bounds the precision of every money value this package computes.
@@ -306,7 +312,7 @@ func (e *PaperTrader) accountMode() string {
 const usdScale = 8
 
 func (e *PaperTrader) dynamicNotional(ctx context.Context, logger *slog.Logger) decimal.Decimal {
-	count := e.ActiveTokenCount
+	count := e.PositionSlots
 	if count <= 0 {
 		count = 1
 	}
@@ -335,12 +341,12 @@ func (e *PaperTrader) dynamicNotional(ctx context.Context, logger *slog.Logger) 
 // roster. Fed to the model as MaxPositionPct (observation schema v7) so its size_pct is a fraction
 // of the budget it actually has rather than of the whole account.
 //
-// Deliberately derived from ActiveTokenCount, not from a config value: the fixed-sizing path this
+// Deliberately derived from PositionSlots, not from a config value: the fixed-sizing path this
 // mirrors (dynamicNotional) divides by the same count, so reading a config constant here would let
 // the two disagree the moment a token is enabled or disabled. Lives beside dynamicNotional for that
 // reason — the two must change together.
 func (e *PaperTrader) evenShareOfAccount() decimal.Decimal {
-	count := e.ActiveTokenCount
+	count := e.PositionSlots
 	if count <= 0 {
 		count = 1
 	}
@@ -504,14 +510,24 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 			continue
 		}
 
-		// A buy/sell decision only exists when this token has NO baseline position open
-		// (CLAUDE.md §15.12): once one is, a firing signal is an `update` about the position that
-		// already exists, not a licence to open another. Without this guard every assigned strategy
-		// opened independently, so two strategies disagreeing on the same token and bar produced a
-		// simultaneous long AND short — positions that cannot both be right and that no single
-		// lifecycle decision ever authorized. Forks are excluded: they shadow their baseline parent
-		// rather than being separate positions (§15.4).
-		if hasOpenBaseline(open) {
+		// One open position per (STRATEGY, token) — widened from one per token on 2026-09-14, by
+		// explicit operator decision, so every strategy accumulates its own track record and the
+		// model sees far more closed trades to learn from.
+		//
+		// What the original per-token guard (§16.9) was actually protecting against was two
+		// strategies disagreeing on the same token producing a simultaneous long AND short that no
+		// single lifecycle decision authorized. Keying by strategy keeps the part that matters: one
+		// strategy still cannot stack a second position on a token before its first resolves, so one
+		// setup is never counted as two independent trials. What it no longer does is let the
+		// fastest strategy monopolize a token's only slot — the starvation §18 documented, where
+		// 12 of 14 strategies produced no trades at all because one got there first.
+		//
+		// Forks are excluded: they shadow their baseline parent rather than being separate
+		// positions (§15.4).
+		//
+		// This is PAPER ONLY. usecase.RealTrader keeps one position per token per side (§27.3) and
+		// shares no code with this path, so real trading is untouched.
+		if hasOpenBaselineFor(open, a.StrategyID) {
 			continue
 		}
 
@@ -905,6 +921,25 @@ var TakerFeeRate decimal.Decimal
 func hasOpenBaseline(orders []port.PaperOrder) bool {
 	for _, o := range orders {
 		if o.Variant == "baseline" || o.Variant == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasOpenBaselineFor is hasOpenBaseline narrowed to ONE strategy — the open-decision guard since
+// 2026-09-14, when paper trading moved from one position per token to one per (strategy, token).
+//
+// A nil StrategyID is treated as matching nothing rather than as a wildcard: every order this path
+// opens sets it (§11.3 made that a requirement, since per-strategy stats are uncomputable without
+// it), so an unset one is historical data from before that fix, and letting it block a live
+// strategy's open would be a silent, permanent starvation with nothing to show why.
+func hasOpenBaselineFor(orders []port.PaperOrder, strategyID int64) bool {
+	for _, o := range orders {
+		if o.Variant != "baseline" && o.Variant != "" {
+			continue
+		}
+		if o.StrategyID != nil && *o.StrategyID == strategyID {
 			return true
 		}
 	}

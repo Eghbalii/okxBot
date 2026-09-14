@@ -813,12 +813,12 @@ func newTestPaperTrader(repo port.Repository, strategies []StrategyAssignment) *
 		Repo: repo,
 		// Shared-account defaults (CLAUDE.md §15.6): a $1000 pool with the production caps, so
 		// sizing tests exercise the real cap arithmetic rather than an unbounded path.
-		// ActiveTokenCount: 10 keeps dynamicNotional's $1000/10 = $100 result identical to the old
+		// PositionSlots: 10 keeps dynamicNotional's $1000/10 = $100 result identical to the old
 		// fixed NotionalUSD: dec("100") this replaced (CLAUDE.md §31.2), so existing tests that
 		// assert a $100 order size don't need to change just because sizing became dynamic.
 		Mode:                "paper",
 		AccountInitialUSD:   dec("1000"),
-		ActiveTokenCount:    10,
+		PositionSlots:       10,
 		MaxPositionPct:      dec("0.25"),
 		MaxTotalExposurePct: dec("0.60"),
 		MaxOpenOrders:       3,
@@ -1111,20 +1111,25 @@ func TestSeedCandlesFromRepo_RespectsWindowLimit(t *testing.T) {
 	}
 }
 
-// Two strategies on the same token+bar disagreeing must NOT produce a simultaneous long and short
-// (CLAUDE.md §15.12: a buy/sell decision exists only when no baseline position is open). Observed
-// in production 2026-08-29 as orders 44 (sell, grid_like) and 45 (buy, weekly_dip_buy) coexisting
-// on TRUMP-USDT-SWAP/5m — positions that cannot both be right and that no lifecycle decision
-// authorized. The guard has to hold WITHIN one evaluation pass too, since the open-order list is
-// read once before the strategy loop.
-func TestEvaluateStrategies_DoesNotOpenOpposingPositionsInOnePass(t *testing.T) {
+// Two DIFFERENT strategies on the same token may now both open, including on opposing sides
+// (2026-09-14, explicit operator decision). This reverses the rule §16.9 established, and the
+// reversal is deliberate rather than a regression: per-strategy slots are what let each strategy
+// build its own track record instead of the fastest one monopolizing a token (§18's starvation,
+// where 12 of 14 strategies produced no trades at all).
+//
+// The cost is real and accepted: two strategies on opposite sides of one token largely cancel, minus
+// fees. What is bought is a per-strategy record clean enough to judge each one on.
+//
+// PAPER ONLY. usecase.RealTrader keeps one position per token per side (§27.3) and shares no code
+// with this path — TestRealTrader_* below still pin that.
+func TestEvaluateStrategies_DistinctStrategiesMayBothOpen(t *testing.T) {
 	repo := newFakeRepository()
 	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 	alwaysSell := &stubStrategy{signal: strategy.Signal{Side: strategy.Sell, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 
 	pt := newTestPaperTrader(repo, []StrategyAssignment{
-		{Bar: "5m", Strategy: alwaysBuy},
-		{Bar: "5m", Strategy: alwaysSell},
+		{Bar: "5m", StrategyID: 1, Strategy: alwaysBuy},
+		{Bar: "5m", StrategyID: 2, Strategy: alwaysSell},
 	})
 	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
 
@@ -1133,8 +1138,8 @@ func TestEvaluateStrategies_DoesNotOpenOpposingPositionsInOnePass(t *testing.T) 
 	}
 
 	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
-	if len(open) != 1 {
-		t.Fatalf("expected exactly 1 open order, got %d (opposing positions on the same token)", len(open))
+	if len(open) != 2 {
+		t.Fatalf("expected both strategies to open, got %d", len(open))
 	}
 }
 
@@ -1266,19 +1271,24 @@ func TestEvaluateStrategies_NeverOpensWithoutStopLoss(t *testing.T) {
 	}
 }
 
-// Each bar has its own consumer goroutine, so two timeframes whose candles close at the same
-// instant must not both open a position on the same token. Observed in production as orders 70
-// (15m) and 71 (5m) on ENA-USDT-SWAP, 13ms apart: the no-open-position guard covered a single
-// evaluateStrategies call but nothing serialized the check against a concurrent one. Run with
-// -race to catch a regression here.
+// Each bar has its own consumer goroutine, so ONE STRATEGY assigned to two timeframes whose candles
+// close at the same instant must not open twice on the same token. Observed in production as orders
+// 70 (15m) and 71 (5m) on ENA-USDT-SWAP, 13ms apart: the guard covered a single evaluateStrategies
+// call but nothing serialized the check against a concurrent one. Run with -race to catch a
+// regression here.
+//
+// Both assignments deliberately carry the SAME StrategyID. Since 2026-09-14 the guard is keyed per
+// strategy, so two DIFFERENT strategies opening together is correct and expected (see
+// TestEvaluateStrategies_DistinctStrategiesMayBothOpen); the race worth pinning is one strategy
+// racing itself across its own two decision bars.
 func TestEvaluateStrategies_ConcurrentBarsDoNotBothOpen(t *testing.T) {
 	repo := newFakeRepository()
 	buy5m := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 	buy15m := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 
 	pt := newTestPaperTrader(repo, []StrategyAssignment{
-		{Bar: "5m", Strategy: buy5m},
-		{Bar: "15m", Strategy: buy15m},
+		{Bar: "5m", StrategyID: 9, Strategy: buy5m},
+		{Bar: "15m", StrategyID: 9, Strategy: buy15m},
 	})
 	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
 	pt.candles["15m"] = []domain.Candle{{Close: dec("100")}}
@@ -1302,13 +1312,17 @@ func TestEvaluateStrategies_ConcurrentBarsDoNotBothOpen(t *testing.T) {
 	}
 }
 
-// A signal firing while a position is already open is an `update` about that position, not a new
-// order — so a second evaluation pass must not stack another one on top.
+// A signal firing while THIS STRATEGY already has a position open on this token is an `update`
+// about that position, not a new order — so a second evaluation pass must not stack another on top.
+//
+// This is the half of the old per-token guard that survived 2026-09-14's widening to per-strategy
+// slots, and it is the load-bearing half: without it one setup is recorded as several independent
+// trials, which corrupts exactly the per-strategy statistics that change exists to produce.
 func TestEvaluateStrategies_SkipsOpenWhenBaselineAlreadyOpen(t *testing.T) {
 	repo := newFakeRepository()
 	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 
-	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", Strategy: alwaysBuy}})
+	pt := newTestPaperTrader(repo, []StrategyAssignment{{Bar: "5m", StrategyID: 7, Strategy: alwaysBuy}})
 	pt.candles["5m"] = []domain.Candle{{Close: dec("100")}}
 
 	for i := 0; i < 3; i++ {
@@ -2111,7 +2125,7 @@ func TestEvaluateStrategies_RLSizingFallsBackWhenModelErrors(t *testing.T) {
 func TestEvaluateStrategies_DynamicSizingTracksCurrentEquity(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newSizingTestPaperTrader(repo, nil) // RLSizing left false
-	pt.ActiveTokenCount = 5
+	pt.PositionSlots = 5
 	// Pre-seed a DIFFERENT equity than newTestPaperTrader's AccountInitialUSD default (1000), so a
 	// pass proves the live value is actually read, not the configured fallback.
 	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("250")}
@@ -2132,7 +2146,7 @@ func TestEvaluateStrategies_DynamicSizingTracksCurrentEquity(t *testing.T) {
 func TestEvaluateStrategies_DynamicSizingTracksActiveTokenCount(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newSizingTestPaperTrader(repo, nil)
-	pt.ActiveTokenCount = 2
+	pt.PositionSlots = 2
 	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
 	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
@@ -2151,7 +2165,7 @@ func TestEvaluateStrategies_DynamicSizingTracksActiveTokenCount(t *testing.T) {
 func TestEvaluateStrategies_DynamicSizingFallsBackWhenEquityNotPositive(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newSizingTestPaperTrader(repo, nil)
-	pt.ActiveTokenCount = 10
+	pt.PositionSlots = 10
 	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("0")}
 
 	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
@@ -2982,7 +2996,7 @@ func TestDynamicNotional_IsRoundedToUsdScale(t *testing.T) {
 	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("40"), EquityUSD: dec("40")}
 	pt := &PaperTrader{
 		InstID: "BTC", Repo: repo, Mode: "paper",
-		AccountInitialUSD: dec("40"), ActiveTokenCount: 9,
+		AccountInitialUSD: dec("40"), PositionSlots: 9,
 	}
 
 	n := pt.dynamicNotional(context.Background(), testLogger())
