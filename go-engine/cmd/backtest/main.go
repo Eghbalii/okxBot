@@ -38,6 +38,7 @@ func main() {
 		kinds   = flag.String("kinds", "", "comma-separated strategy kinds (default: every registered kind)")
 		fromStr = flag.String("from", "", "start date, YYYY-MM-DD (default: the earliest candle held)")
 		toStr   = flag.String("to", "", "end date, YYYY-MM-DD (default: now)")
+		dry     = flag.Bool("dry", false, "score only — print the per-strategy summary and write no dataset")
 	)
 	flag.Parse()
 
@@ -83,20 +84,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	sink, err := backtest.NewJSONLSink(*out)
-	if err != nil {
-		logger.Error("open output", "path", *out, "error", err)
-		os.Exit(1)
-	}
-	// Deferred AND checked: a buffered writer silently drops up to a megabyte of samples if it is
-	// never flushed, and a dataset short by its last thousand trades looks exactly like one that
-	// ended there.
-	defer func() {
-		if err := sink.Close(); err != nil {
-			logger.Error("close output", "error", err)
+	// A screening run writes no dataset. Scoring 26 strategies to decide which few to keep produces
+	// a 125MB file that is discarded the moment the answer is read, and writing it is most of the
+	// run's wall time.
+	var sink backtest.Sink = backtest.DiscardSink{}
+	if !*dry {
+		js, err := backtest.NewJSONLSink(*out)
+		if err != nil {
+			logger.Error("open output", "path", *out, "error", err)
+			os.Exit(1)
 		}
-	}()
-
+		sink = js
+		defer func() {
+			if err := js.Close(); err != nil {
+				logger.Error("close output", "error", err)
+			}
+		}()
+	}
 	runner := &backtest.Runner{
 		Cfg: backtest.Config{
 			InstIDs: instIDs,

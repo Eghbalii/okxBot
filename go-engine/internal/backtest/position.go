@@ -192,6 +192,19 @@ func (r *Runner) closePosition(
 	entryF, _ := p.entryPx.Float64()
 	exitF, _ := exit.Float64()
 
+	ks := r.result.ByStrategy[p.kind]
+	if ks == nil {
+		ks = &KindStats{Kind: p.kind}
+		r.result.ByStrategy[p.kind] = ks
+	}
+	ks.Trades++
+	if pnl.IsPositive() {
+		ks.Wins++
+	}
+	ks.PnLUSD += pnlF
+	ks.rewardSum += reward
+	ks.holdSum += idx - p.openedIdx
+
 	r.result.Samples++
 	r.result.ByReason[reason]++
 	r.result.TotalPnL += pnlF

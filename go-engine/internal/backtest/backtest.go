@@ -111,6 +111,12 @@ type Result struct {
 	// Per-reason counts, because "how did these trades end" is the first question worth asking of a
 	// dataset and an aggregate cannot answer it.
 	ByReason map[string]int `json:"by_reason"`
+	// ByStrategy breaks the run down per kind, which is the whole point of running one: an
+	// aggregate win rate over 26 strategies says only that the MIX loses money, and cannot say
+	// which of them to keep. §15.5 makes the same argument for per-token reward breakdowns — "good
+	// on average, bad for one" is invisible in a total.
+	ByStrategy map[string]*KindStats `json:"by_strategy"`
+
 	// Resets counts how many times the simulated account was drained and topped back up (§15.7).
 	// Surfaced because a dataset built across many resets describes a strategy mix that loses
 	// money, and that is the first thing worth knowing before training on it.
@@ -122,6 +128,24 @@ type Result struct {
 
 	From time.Time `json:"from"`
 	To   time.Time `json:"to"`
+}
+
+// KindStats is one strategy's record over a run.
+type KindStats struct {
+	Kind       string  `json:"kind"`
+	Trades     int     `json:"trades"`
+	Wins       int     `json:"wins"`
+	WinRate    float64 `json:"win_rate"`
+	PnLUSD     float64 `json:"pnl_usd"`
+	MeanReward float64 `json:"mean_reward"`
+	// AvgHoldBars separates a scalp from a swing held for days — two strategies with the same win
+	// rate and very different capital turnover are not equally useful.
+	AvgHoldBars float64 `json:"avg_hold_bars"`
+	// PnLPerTrade is what ranks them: total PnL rewards whichever kind simply traded most.
+	PnLPerTrade float64 `json:"pnl_per_trade"`
+
+	holdSum   int
+	rewardSum float64
 }
 
 // CandleSource reads stored history. Narrower than port.Repository on purpose: a dataset builder

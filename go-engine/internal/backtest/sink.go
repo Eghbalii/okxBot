@@ -76,3 +76,11 @@ func (m *MemorySink) Write(s Sample) error {
 	m.Samples = append(m.Samples, s)
 	return nil
 }
+
+// DiscardSink counts samples without storing them, for a screening run.
+//
+// Scoring 26 strategies to decide which few to keep produces a 125MB file that is discarded the
+// moment the answer is read — and writing it is most of the run's wall time.
+type DiscardSink struct{}
+
+func (DiscardSink) Write(Sample) error { return nil }

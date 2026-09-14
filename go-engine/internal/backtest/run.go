@@ -43,7 +43,11 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	r.peak = r.Cfg.InitialUSD
 	r.records = map[string]*stratRecord{}
 	r.nextOrderID = 0
-	r.result = Result{ByReason: map[string]int{}, Skipped: map[string]int{}}
+	r.result = Result{
+		ByReason:   map[string]int{},
+		Skipped:    map[string]int{},
+		ByStrategy: map[string]*KindStats{},
+	}
 
 	kinds := r.Cfg.Kinds
 	if len(kinds) == 0 {
@@ -83,6 +87,16 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	if r.result.Samples > 0 {
 		r.result.WinRate = float64(r.result.Wins) / float64(r.result.Samples)
 		r.result.MeanReward = r.result.MeanReward / float64(r.result.Samples)
+	}
+	for _, k := range r.result.ByStrategy {
+		if k.Trades == 0 {
+			continue
+		}
+		n := float64(k.Trades)
+		k.WinRate = float64(k.Wins) / n
+		k.MeanReward = k.rewardSum / n
+		k.AvgHoldBars = float64(k.holdSum) / n
+		k.PnLPerTrade = k.PnLUSD / n
 	}
 	return r.result, nil
 }
