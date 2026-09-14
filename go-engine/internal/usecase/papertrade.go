@@ -337,14 +337,28 @@ func (e *PaperTrader) dynamicNotional(ctx context.Context, logger *slog.Logger) 
 }
 
 // evenShareOfAccount is dynamicNotional expressed as a FRACTION rather than a dollar amount: the
-// share of the account one token is expected to take when equity is split evenly across the active
-// roster. Fed to the model as MaxPositionPct (observation schema v7) so its size_pct is a fraction
-// of the budget it actually has rather than of the whole account.
+// share of the account one position is allowed, given equity split evenly across every slot. Fed to
+// the model as MaxPositionPct (observation schema v7), where decode_action multiplies size_pct by
+// it — so the model answers "how much of what I am allowed", and this is what defines allowed.
 //
-// Deliberately derived from PositionSlots, not from a config value: the fixed-sizing path this
-// mirrors (dynamicNotional) divides by the same count, so reading a config constant here would let
-// the two disagree the moment a token is enabled or disabled. Lives beside dynamicNotional for that
-// reason — the two must change together.
+// Deliberately derived from PositionSlots rather than a config constant: the fixed-sizing path this
+// mirrors (dynamicNotional) divides by the same count, so a config value here would let the two
+// disagree the moment a token or strategy is enabled. Lives beside dynamicNotional for that reason —
+// the two must change together, and the invariant that matters is
+// evenShareOfAccount() * equity == dynamicNotional(), which TestSizingFractionMatchesDollarBudget
+// pins directly.
+//
+// WHY THIS IS A RATIO AND NOT A DOLLAR FIGURE, and why that is load-bearing (2026-09-14): on the day
+// slots went 22 -> 273 and the cap went $200 -> $2,600, the dollar budget barely moved ($9.09 ->
+// $9.52) while this ratio fell 4.55% -> 0.37%. The model reads the RATIO, so a change that was
+// economically almost neutral looked like a twelvefold cut in its risk budget — §19.1's
+// distribution-shift cost, arriving through a field nobody thought of as a model input.
+//
+// It stays a ratio because that is what schema v7 defines and what decode_action multiplies by;
+// sending a dollar figure would need a schema bump on both sides. What makes it correct is that it
+// is computed from live equity and the live slot count on every call, so it tracks the real budget
+// automatically rather than being pinned to a constant — the operator's own requirement that this
+// must be dynamic and follow the budget, never hardcoded.
 func (e *PaperTrader) evenShareOfAccount() decimal.Decimal {
 	count := e.PositionSlots
 	if count <= 0 {

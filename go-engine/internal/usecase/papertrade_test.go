@@ -3142,3 +3142,60 @@ func (f *fakeRepository) ListMarketTokens(_ context.Context, exchange string, li
 	}
 	return out, nil
 }
+
+// TestSizingFractionMatchesDollarBudget pins the invariant tying the two sizing paths together:
+// the FRACTION handed to the model (MaxPositionPct) times equity must equal the DOLLARS the
+// fixed-sizing path would open at. They are computed separately — one for the model's observation,
+// one for the order — so nothing but a test stops them drifting.
+//
+// Drift here is invisible rather than loud: the model would optimise against a budget the engine
+// does not actually grant, and every order would still look perfectly normal in the database.
+func TestSizingFractionMatchesDollarBudget(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.AccountInitialUSD = dec("2600")
+
+	for _, slots := range []int{1, 22, 273} {
+		pt.PositionSlots = slots
+
+		dollars := pt.dynamicNotional(ctx, testLogger())
+		fraction := pt.evenShareOfAccount()
+
+		acct, err := repo.GetAccountEquity(ctx, pt.accountMode(), pt.AccountInitialUSD)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := acct.EquityUSD.Mul(fraction)
+
+		// Compared to the cent: both sides round, so exact decimal equality would fail on the
+		// repeating fractions a slot count like 273 produces.
+		if dollars.Sub(want).Abs().GreaterThan(dec("0.01")) {
+			t.Errorf("slots=%d: fixed sizing opens $%s but the model is told it may use %s of $%s = $%s",
+				slots, dollars, fraction, acct.EquityUSD, want)
+		}
+	}
+}
+
+// The budget handed to the model must track LIVE equity, not a value fixed at startup — the
+// operator's explicit requirement that this be dynamic and follow the budget rather than hardcoded.
+// A doubled account must double the dollars each position may use.
+func TestSizingFollowsLiveEquity(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	pt := newTestPaperTrader(repo, nil)
+	pt.AccountInitialUSD = dec("1000")
+	pt.PositionSlots = 10
+
+	before := pt.dynamicNotional(ctx, testLogger())
+
+	// The account grows (a winning streak, or an operator raising the cap).
+	if _, err := repo.SetAccountCap(ctx, pt.accountMode(), dec("2000")); err != nil {
+		t.Fatal(err)
+	}
+
+	after := pt.dynamicNotional(ctx, testLogger())
+	if !after.Sub(before.Mul(dec("2"))).Abs().LessThan(dec("0.01")) {
+		t.Errorf("equity doubled but per-position budget went %s -> %s, want roughly double", before, after)
+	}
+}
