@@ -6141,3 +6141,82 @@ sizes*, not more time — and saying otherwise would have made the change look s
 capital per trade will lose it faster, not slower. The two candidate next steps stay open and
 independent of this change: cutting `scan.top_n` so fewer tokens share the account, and reviewing the
 strategy mix that is producing a 35% win rate.
+
+## 54. Paper trading reconfigured for training: per-strategy slots and early close (2026-09-14)
+
+Operator decision, with real trading stopped first ("I am managing it manually the whole time and
+that is pointless — focus on paper so the model can learn to make money itself"). Three changes,
+one overnight trial.
+
+### 54.1 One position per STRATEGY per token
+
+Widened from one per token. Every strategy now builds its own track record, and the model sees
+roughly twelve times as many closed trades to learn from.
+
+This reverses §16.9's rule deliberately. What that guard actually protected against was two
+strategies disagreeing on one token producing a simultaneous long and short. Keying by strategy
+keeps the load-bearing half — **one strategy still cannot stack a second position before its first
+resolves**, so one setup is never recorded as several independent trials, which would corrupt
+exactly the per-strategy statistics this change exists to produce. What it no longer does is let the
+fastest strategy monopolize a token's only slot: §18 documented that starvation, where 12 of 14
+strategies produced no trades at all because one got there first.
+
+**Opposing simultaneous positions are now allowed**, confirmed explicitly with the operator. They
+largely cancel minus fees; what is bought is a per-strategy record clean enough to judge each
+strategy on.
+
+**PAPER ONLY**, as required. `usecase.RealTrader` keeps one position per token per side (§27.3) and
+shares no code with this path — `git diff realtrader.go cmd/trader/main.go` is empty for this change.
+
+### 54.2 The sizing divisor had to move with it
+
+`ActiveTokenCount` → `PositionSlots`, now counting **(strategy, token) pairs**. Not cosmetic: the
+divisor must equal the real slot count, and dividing by tokens while opening per strategy would
+over-commit the account by exactly the number of strategies — 13x here, an account spent thirteen
+times over. Live value on deploy: **273 slots across 22 tokens**.
+
+Distinct strategy ids rather than assignment rows, since one strategy on two decision bars still
+holds one slot. A disabled token's assignments claim no slots. Zero slots is a startup error rather
+than falling through to the defensive divisor of 1, which would open full-account positions the
+moment an assignment appeared.
+
+The account cap was raised $200 → **$2,600** (the operator's own "balance × number of strategies") so
+each position stays ~$9.50 rather than collapsing to $0.73. **Read the percentages with that in
+mind**: dollar PnL is real, but percent-of-account is now relative to $2,600.
+
+### 54.3 rl_early_close ON, overnight trial
+
+§42 measured the model answering `close` on 84 of 89 update calls with every one discarded — it wants
+out of nearly every position and was never being heard. This makes that judgement testable: if it is
+right, results improve; if it overfit to a losing stretch, they get visibly worse and this reverts.
+
+**The config comment beside this flag was stale and said the opposite** — that the model answers
+`close` on 0% of update calls. True when written, not true now. Behaviour drifted and nothing
+re-checked the claim; the comment now records both readings and their dates.
+
+`trading.allow_rl_early_close` stays **false** — that is the real-money gate, deliberately untouched.
+
+### 54.4 Model backed up first, at the operator's instruction
+
+Weights AND replay buffer, with `rl-service` STOPPED for the copy — §16.9 records a corrected model
+being silently overwritten by a running service's own snapshot hook. Backed up to
+`model-backups/20260914-pre-earlyclose/` on the server and to the operator's machine, md5-verified
+identical in both places (`0e3237cf…` / `8428a429…`), and the same checksum confirmed loaded after
+restart. Weights alone would have been useless: §15.11 is explicit that a model restored without its
+buffer comes back having forgotten every experience it collected.
+
+### 54.5 A win is still a profitable trade, not a TP touch
+
+The operator asked whether an SL that closes IN PROFIT counts as a win. It does, and has since
+2026-08-30 (§11.3) — `realized_pnl > 0`, never `close_reason='tp'`. Re-audited across the codebase
+on this date: `internal/postgres/strategies.go`, `internal/tester/store.go` and `port.Repository` all
+use the PnL definition. The one deliberate exception is `internal/optimizer/runner.go:312`, which
+judges trials purely on SL/TP touch because it must stay independent of anything the RL agent
+touched (§16.1).
+
+### 54.6 What to watch
+
+Kafka was at **86% of its 768MB cap** at deploy time, with position count about to grow ~12x. §16.10
+is explicit that a container sitting near its limit trades a host OOM for a crash loop, so that is
+the first thing to fail if this is too much for the box. A resource monitor was left running that
+alerts on low memory, Kafka ≥92%, load ≥8, any container down, or a burst of paper-trader errors.
