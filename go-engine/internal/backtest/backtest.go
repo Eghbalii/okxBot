@@ -87,6 +87,10 @@ type Config struct {
 	MaxLeverage   decimal.Decimal
 	PositionSlots int
 
+	// MaxPositionPct caps one position as a fraction of equity, the same ceiling production applies
+	// after the even split (§15.6). Zero disables it, which is only sensible in a test.
+	MaxPositionPct decimal.Decimal
+
 	// Clamps bound where levels may be placed, exactly as production does (§19.2, §45). Training
 	// without them would let the policy learn placements Go silently rejects.
 	Clamps conductor.Clamps
@@ -107,6 +111,11 @@ type Result struct {
 	// Per-reason counts, because "how did these trades end" is the first question worth asking of a
 	// dataset and an aggregate cannot answer it.
 	ByReason map[string]int `json:"by_reason"`
+	// Resets counts how many times the simulated account was drained and topped back up (§15.7).
+	// Surfaced because a dataset built across many resets describes a strategy mix that loses
+	// money, and that is the first thing worth knowing before training on it.
+	Resets int `json:"account_resets"`
+
 	// Skipped counts signals that produced no sample, by why. A run that discards most of its
 	// signals is not a run to train on, and without this it would look identical to a quiet market.
 	Skipped map[string]int `json:"skipped"`

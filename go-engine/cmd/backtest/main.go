@@ -106,10 +106,11 @@ func main() {
 			To:      to,
 			// The same account shape live paper trading runs, so the policy learns sizing against
 			// the economics it will actually be served (§15.6).
-			InitialUSD:    cfg.Account.InitialUSD,
-			MaxLeverage:   cfg.Risk.MaxLeverage,
-			PositionSlots: positionSlots(cfg, instIDs),
-			CandleWindow:  cfg.PaperTrading.CandleLimit,
+			InitialUSD:     cfg.Account.InitialUSD,
+			MaxLeverage:    cfg.Risk.MaxLeverage,
+			PositionSlots:  positionSlots(cfg, instIDs),
+			MaxPositionPct: cfg.Account.MaxPositionPct,
+			CandleWindow:   cfg.PaperTrading.CandleLimit,
 			// The production clamps. Training without them would let the policy learn placements Go
 			// silently rejects — and score them as though they had been taken (§19.2, §45).
 			Clamps: conductor.Clamps{

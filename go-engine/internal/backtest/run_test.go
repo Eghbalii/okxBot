@@ -11,6 +11,7 @@ import (
 
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
+	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
@@ -79,13 +80,14 @@ func trendingSeries(n int, base float64) []domain.Candle {
 func testRunner(src *fakeSource, sink Sink, kinds []string) *Runner {
 	return &Runner{
 		Cfg: Config{
-			InstIDs:       []string{"SOL"},
-			Bars:          []string{"5m"},
-			Kinds:         kinds,
-			InitialUSD:    dec("40"),
-			MaxLeverage:   dec("10"),
-			PositionSlots: 16,
-			CandleWindow:  300,
+			InstIDs:        []string{"SOL"},
+			Bars:           []string{"5m"},
+			Kinds:          kinds,
+			InitialUSD:     dec("40"),
+			MaxLeverage:    dec("10"),
+			PositionSlots:  16,
+			MaxPositionPct: dec("0.25"),
+			CandleWindow:   300,
 			Clamps: conductor.Clamps{
 				MinSLDistPct: dec("0.002"),
 				MaxSLDistPct: dec("0.05"),
@@ -351,5 +353,104 @@ func TestRun_EachTradeHasItsOwnOrderID(t *testing.T) {
 		if s.Terminal.OrderID != id {
 			t.Fatalf("sample %d's terminal call carries id %d, the decision %d", i, s.Terminal.OrderID, id)
 		}
+	}
+}
+
+// A drained account must be reset and keep trading, exactly as paper trading does (§15.7).
+//
+// The first version of this package refused to reset, reasoning that it would teach the policy
+// losses are wiped clean. That reasoning was wrong in a way only real data showed: across 26,593
+// trades on the server's real history the account reached $0.000007 after 5,663 of them, and the
+// remaining 21,000 samples were opened at sizes no real account would ever take. Production would
+// have reset and carried on at a normal size, so those samples describe decisions it never makes —
+// precisely the train/serve skew this rewrite exists to remove, and the observation's own equity
+// ratio would have sat near zero throughout, a distribution the live model never sees.
+//
+// Driven directly rather than through a full run: whether a given fixture happens to drain is a
+// property of the fixture, and a test that depends on it would pass or fail for reasons unrelated
+// to the behaviour being asserted.
+func TestOpenPosition_ResetsADrainedAccount(t *testing.T) {
+	src, _, r := fixture([]string{"range_breakout_v2"})
+	r.account = dec("0.004") // drained: below minTradableUSD
+	r.peak = dec("40")
+	r.records = map[string]*stratRecord{}
+	r.result = Result{ByReason: map[string]int{}, Skipped: map[string]int{}}
+
+	window := src.series["SOL/5m"]
+	btc := src.series["BTC/5m"]
+	sig := strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}
+
+	p, err := r.openPosition("SOL", "5m", "range_breakout_v2", sig, window, btc, len(window)-1, window[len(window)-1])
+	if err != nil {
+		t.Fatalf("a drained account must reset and open, not refuse: %v", err)
+	}
+	if !r.account.Equal(r.Cfg.InitialUSD) {
+		t.Errorf("the account must be topped back up to %s, got %s", r.Cfg.InitialUSD, r.account)
+	}
+	// The high-water mark resets with it, or every subsequent trade would be charged a drawdown
+	// penalty measured against a peak the reset account can never reach again.
+	if !r.peak.Equal(r.Cfg.InitialUSD) {
+		t.Errorf("the peak must reset with the balance, got %s", r.peak)
+	}
+	if r.result.Resets != 1 {
+		t.Errorf("the reset must be counted — an account draining repeatedly IS the finding (§15.7), got %d", r.result.Resets)
+	}
+	if p.size.LessThan(dec("0.1")) {
+		t.Errorf("the position must be sized against the restored balance, got %s", p.size)
+	}
+}
+
+// A healthy account is NOT reset. Guards the obvious mistake of resetting unconditionally, which
+// would erase every drawdown before the penalty could ever charge for one.
+func TestOpenPosition_DoesNotResetAHealthyAccount(t *testing.T) {
+	src, _, r := fixture([]string{"range_breakout_v2"})
+	r.account = dec("31")
+	r.peak = dec("40")
+	r.records = map[string]*stratRecord{}
+	r.result = Result{ByReason: map[string]int{}, Skipped: map[string]int{}}
+
+	window := src.series["SOL/5m"]
+	btc := src.series["BTC/5m"]
+	sig := strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}
+
+	if _, err := r.openPosition("SOL", "5m", "range_breakout_v2", sig, window, btc, len(window)-1, window[len(window)-1]); err != nil {
+		t.Fatalf("openPosition: %v", err)
+	}
+	if !r.account.Equal(dec("31")) {
+		t.Errorf("a healthy account must be left alone, got %s", r.account)
+	}
+	if !r.peak.Equal(dec("40")) {
+		t.Errorf("the peak must survive a drawdown, or the penalty can never charge for one; got %s", r.peak)
+	}
+	if r.result.Resets != 0 {
+		t.Errorf("no reset should be counted, got %d", r.result.Resets)
+	}
+}
+
+// One position must never commit the whole account, even with few slots configured.
+//
+// Measured on the test fixture without this cap: a $2 account with one slot at 10x compounded to
+// $124 MILLION, an outcome no live configuration can produce because §15.6's max_position_pct is
+// what prevents it. A dataset built that way would teach the policy that unbounded compounding is
+// available to it.
+func TestOpenPosition_CapsOnePositionAsAFractionOfEquity(t *testing.T) {
+	src, _, r := fixture([]string{"range_breakout_v2"})
+	r.account = dec("40")
+	r.peak = dec("40")
+	r.Cfg.PositionSlots = 1
+	r.Cfg.MaxPositionPct = dec("0.25")
+	r.records = map[string]*stratRecord{}
+	r.result = Result{ByReason: map[string]int{}, Skipped: map[string]int{}}
+
+	window := src.series["SOL/5m"]
+	btc := src.series["BTC/5m"]
+	sig := strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}
+
+	p, err := r.openPosition("SOL", "5m", "range_breakout_v2", sig, window, btc, len(window)-1, window[len(window)-1])
+	if err != nil {
+		t.Fatalf("openPosition: %v", err)
+	}
+	if p.size.GreaterThan(dec("10")) {
+		t.Errorf("one slot must still be capped at 25%% of a $40 account ($10), got %s", p.size)
 	}
 }

@@ -140,3 +140,11 @@ func maxInt(a, b int) int {
 func log10(f float64) float64 { return math.Log10(f) }
 
 // typicalReturn is documentation for the weights above; referenced so it cannot silently rot.
+
+// minTradableUSD is the balance below which the simulated account is considered drained.
+//
+// Not zero: at $0.05 spread across position slots, an order is sized in fractions of a cent, and a
+// trade that small is not a decision anyone would make — it is arithmetic continuing after the
+// account is gone. Measured on real history without this floor, the account reached $0.000007 and
+// the run went on producing 21,000 more samples at sizes production would never open.
+var minTradableUSD = decimal.NewFromFloat(1.0)

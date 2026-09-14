@@ -35,11 +35,20 @@ func (r *Runner) openPosition(
 	idx int,
 	c domain.Candle,
 ) (*position, error) {
-	if !r.account.IsPositive() {
-		// A drained simulated account. The live engine resets it (§15.7); here the run simply stops
-		// producing samples for this instrument, because a reset mid-dataset would teach the policy
-		// that losses are wiped clean — the same lesson §15.6 removed from the old per-token accounts.
-		return nil, errNoEquity
+	// A drained account is RESET, exactly as paper trading resets it (§15.7): a losing streak early
+	// in training is expected noise, not a reason to stop trading, and the live system acts on that
+	// belief. The first version of this refused to reset, reasoning that it would teach the policy
+	// losses are wiped clean — which measured badly on real data: the account reached $0.000007
+	// after 5,663 trades and the remaining 21,000 samples were opened at sizes no real account
+	// would ever take. Training on those would be the train/serve skew this whole rewrite exists to
+	// remove, since production would have reset and carried on at a normal size.
+	//
+	// The reset is recorded in the run summary rather than hidden: an account draining repeatedly
+	// is itself the finding, which is exactly why §15.7 counts resets instead of papering over them.
+	if r.account.LessThan(minTradableUSD) {
+		r.account = r.Cfg.InitialUSD
+		r.peak = r.Cfg.InitialUSD
+		r.result.Resets++
 	}
 
 	price := c.Close
@@ -51,6 +60,16 @@ func (r *Runner) openPosition(
 		slots = 1
 	}
 	size := r.account.Div(decimal.NewFromInt(int64(slots))).Round(8)
+	// The per-position cap production applies on top of the even split (§15.6's
+	// account.max_position_pct). Without it a run configured with few slots lets one trade commit
+	// the whole balance at full leverage — which compounds: measured on the test fixture with one
+	// slot, a $2 account reached $124 million, an outcome no live configuration can produce because
+	// this cap is what prevents it.
+	if cap := r.Cfg.MaxPositionPct; cap.IsPositive() {
+		if limit := r.account.Mul(cap).Round(8); size.GreaterThan(limit) {
+			size = limit
+		}
+	}
 	leverage := r.Cfg.MaxLeverage
 	if !leverage.IsPositive() {
 		leverage = decimal.NewFromInt(1)
