@@ -422,3 +422,111 @@ Still to do:
 3. TradingView strategies the operator finds — ask for timeframe, market, and crucially whether it
    has an entry FILTER, since that is what all 36 lack.
 4. Then the warm start and training.
+
+---
+
+### Everything measured in this session, and what it ruled out
+
+Seven hypotheses tested and rejected by measurement rather than argument:
+
+| hypothesis | result |
+|---|---|
+| fees are eating the edge | 14.6% of risk — real, but EV still positive at 3:1 |
+| the SL ratchet shrinks wins | the backtest has no ratchet at all |
+| raising the reward:risk floor | win rate tracks the breakeven line; PnL barely moves |
+| a higher timeframe is cheaper | per-trade loss is 60% WORSE on 1H than 5m |
+| widening stoch_cross's target | win rate tracks breakeven at every setting |
+| higher leverage suits scalping | 25x cost 2.8x the loss and 10 account resets vs 3 |
+| the loss cap is what binds leverage | a wider cap helps win rate (32.2→34.8%) but not PnL |
+
+The controlled pair that settles leverage: 25x/15% cap and 50x/30% cap give the SAME 0.60% stop
+distance, the same trades and the same 32.2% win rate — and exactly double the loss. Leverage is a
+pure multiplier on a negative expectancy.
+
+---
+
+## The training roster (measured 2026-09-15)
+
+Full per-strategy and per-token tables are in **docs/STRATEGY_STATS.md**. The conclusion, here
+because it is what the next session acts on:
+
+```
+strategies: pmax, trend_confluence, vwap_reversion, vwap_reversion_v2,
+            ict_order_block, macd_momentum_v2, inside_bar_breakout_v2,
+            keltner_trend_scalp
+tokens:     DOGE, ZEC, PEPE, PUMP, BTC, SOL
+timeframe:  5m
+leverage:   10x
+account:    $40
+```
+
+### Why these strategies
+
+Measured over 76,245 simulated trades against `coin_flip` — a null strategy that fires on a fixed
+bar cadence with no reference to price, run through the identical path.
+
+**Only three of 44 differ from chance at all**: `pmax` (t=+3.43, the only profitable kind) and
+`volume_breakout`/`range_breakout` (t=−2.47/−3.52, significantly worse). Every other gap sits under
+|t|=2 — one statistical cloud.
+
+So the eight were chosen for **variety of market read** as much as for rank: a momentum kind, a
+mean-reversion kind, a structural kind, a volatility kind. With no significant gaps, taking the top
+eight by PnL would be selecting on noise, and a selection model needs signals that disagree with
+each other rather than eight versions of one opinion.
+
+Excluded outright: `volume_breakout` and `range_breakout` (the only significantly negative kinds);
+`sweep_reverse` (12 trades) and `gradient_ribbon` (45) — samples too small to judge, their filters
+need loosening first; `stoch_cross`, whose 60% win rate is real and interesting but whose 0.67
+reward:risk makes it a losing trade by construction.
+
+### Why these tokens — and this is the stronger finding
+
+Unlike the strategy table, **the token differences ARE significant**:
+
+| token | pnl/trade | distance from mean |
+|---|---|---|
+| DOGE | −0.0288 | +3.0 se (best) |
+| ZEC | −0.0310 | +2.6 se |
+| PEPE | −0.0316 | +1.7 se |
+| PUMP / BTC / SOL | −0.0319 … −0.0333 | mid |
+| ETH / XRP | −0.0410 / −0.0412 | −2.5 se |
+| **TRUMP** | **−0.0512** | **−8.2 se (worst)** |
+
+**Dropping TRUMP is the most confident single result of the whole investigation** — stronger than
+any strategy finding. And win rate does not explain the spread: PEPE has the highest win rate with
+mid-table PnL, TRUMP an unremarkable one with the worst by far. The difference is move SIZE, not
+direction, consistent with TRUMP being the most volatile instrument on the roster.
+
+BTC is kept despite mid-table performance because it is the reference series the observation's
+market block is built from, and the most liquid instrument available.
+
+### Two settings, both measured rather than assumed
+
+**Leverage 10x.** 25x produced 2.8x the loss and 10 account resets against 3. The controlled pair
+settles it: 25x with a 15% cap and 50x with a 30% cap give the SAME 0.60% stop distance, the same
+trades and the same 32.2% win rate — and exactly double the loss. Leverage is a pure multiplier on a
+negative expectancy.
+
+**Timeframe 5m.** Per-trade loss is 60% WORSE on 1H (−0.0084) than on 5m (−0.0052), contradicting
+the fee-share argument for moving up: the fee does fall as a share of the bar, but the stop scales
+with the bar too, so losses grow faster than the saving. 5m also yields the most training data,
+which is this project's binding constraint (§15.11).
+
+### The gap the model has to close
+
+Across all 76,245 trades: **35.9% win rate against a 39.1% breakeven** at the realized 1.73:1
+reward:risk — short by **3.2 percentage points**. Total PnL of −$194 over 76,245 trades is −$0.0025
+each.
+
+That is the entire deficit, and it is the size a selection model can plausibly close. The model does
+not need to predict the market; it needs to decline roughly the worst fifth of signals.
+
+### Define success before training starts
+
+Every number above was produced with **no model in the loop** — every signal taken, none skipped.
+They are the baseline to beat, not a prediction.
+
+**The criterion**: the win rate of trades the model DECLINES must be measurably lower than those it
+takes. If that difference is absent, the model has learned nothing and further training will not
+help — which is the check §14's first `rl_sizing` attempt lacked, and why it ran for 14 hours
+answering `skip` to everything before anyone noticed.
