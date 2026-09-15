@@ -249,6 +249,16 @@ type position struct {
 	pnlMaxPct   decimal.Decimal
 	pnlMinPct   decimal.Decimal
 	adjustments int
+
+	// updates holds the `update` observations emitted while this position was open, waiting for
+	// the reward. They cannot be written when they happen: an update's answer is judged by what the
+	// trade went on to do, and that is only known at close — the same pairing §15.11 describes for
+	// the live learner, where a decision is held pending until its outcome lands hours later.
+	updates []domain.Observation
+	// lastUpdatePnL/lastUpdateAt are the cadence baseline, mirroring conductor.ShouldUpdate: an
+	// update fires once PnL has moved past the threshold OR the time ceiling has elapsed.
+	lastUpdatePnL decimal.Decimal
+	lastUpdateAt  time.Time
 }
 
 // evaluate runs one strategy over a candle window, returning its signal.

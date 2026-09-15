@@ -191,6 +191,24 @@ def _f(value: float) -> float:
     return v if np.isfinite(v) else 0.0
 
 
+def _body_position(tf_open: float, high: float, low: float, close: float) -> float:
+    """Where the close sits inside its own bar, in [-1, +1]. -1 closed on the low, +1 on the high.
+
+    This slot used to carry `_rel(close, last_price)`, which is STRUCTURALLY ZERO: last_price IS the
+    forming candle's close, so the field divided the close by itself on every observation ever
+    built — one wasted input here and another in the BTC block, measured dead across all 76,305
+    backtest samples.
+
+    Close-within-range is the natural replacement: it is the half of the candle's shape the other
+    three OHLC slots cannot express (open/high/low are all relative to the close, so they describe
+    the bar's extent but not its conviction), and it needs no extra width.
+    """
+    rng = high - low
+    if rng <= 0:
+        return 0.0
+    return float(np.clip(2.0 * (close - low) / rng - 1.0, -1.0, 1.0))
+
+
 def _rel(level: float, price: float) -> float:
     """A price level as a signed fraction of the live price; 0.0 when either is absent."""
     if not level or not price:
@@ -630,7 +648,12 @@ def market_block(obs: Observation) -> np.ndarray:
     price = obs.last_price
     vec = np.array(
         [_f(v) for v in tf.indicators]
-        + [_rel(tf.open, price), _rel(tf.high, price), _rel(tf.low, price), _rel(tf.close, price)]
+        + [
+            _rel(tf.open, price),
+            _rel(tf.high, price),
+            _rel(tf.low, price),
+            _body_position(tf.open, tf.high, tf.low, tf.close),
+        ]
         + [_f(v) for v in tf.close_pct_changes]
         + [_f(tf.dist_to_swing_high_pct), _f(tf.dist_to_swing_low_pct)],
         dtype=np.float32,
@@ -650,8 +673,18 @@ def btc_block(obs: Observation) -> np.ndarray:
     # nothing to do with each other, and dividing one by the other would produce a number with no
     # meaning at all.
     ref = b.close or 0.0
+    # The fourth slot carried a literal 0.0, correctly: _rel(close, close) is zero by construction.
+    # Writing the constant made the waste explicit rather than accidental, but it was still one of
+    # 84 inputs spending itself on a number that never varies. Body position is the same fix applied
+    # in market_block — it says whether BTC's own bar closed strong or weak, which is exactly the
+    # "it just turned red" signal this block exists for (docs/RL_V8_PLAN.md).
     vec = np.array(
-        [_rel(b.open, ref), _rel(b.high, ref), _rel(b.low, ref), 0.0]
+        [
+            _rel(b.open, ref),
+            _rel(b.high, ref),
+            _rel(b.low, ref),
+            _body_position(b.open, b.high, b.low, b.close),
+        ]
         + [_f(v) for v in b.close_pct_changes]
         + [_f(b.dist_to_swing_high_pct), _f(b.dist_to_swing_low_pct), _f(b.correlation)],
         dtype=np.float32,

@@ -164,7 +164,11 @@ func TestRun_TerminalKeepsTheDecisionsLevels(t *testing.T) {
 	if len(sink.Samples) == 0 {
 		t.Skip("no samples")
 	}
-	s := sink.Samples[0]
+	op := opens(sink.Samples)
+	if len(op) == 0 {
+		t.Skip("no open decisions")
+	}
+	s := op[0]
 	if s.Terminal.Signal == nil || s.Observation.Signal == nil {
 		t.Fatal("both calls must carry the signal")
 	}
@@ -225,11 +229,12 @@ func TestRun_StrategyRecordAccumulatesDuringTheRun(t *testing.T) {
 	if _, err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if len(sink.Samples) < 3 {
-		t.Skipf("need several samples, got %d", len(sink.Samples))
+	op := opens(sink.Samples)
+	if len(op) < 3 {
+		t.Skipf("need several open decisions, got %d", len(op))
 	}
-	first := sink.Samples[0].Observation.Signal.TradeCount
-	last := sink.Samples[len(sink.Samples)-1].Observation.Signal.TradeCount
+	first := op[0].Observation.Signal.TradeCount
+	last := op[len(op)-1].Observation.Signal.TradeCount
 	if first != 0 {
 		t.Errorf("the first decision must see no track record, got %d trades", first)
 	}
@@ -247,7 +252,7 @@ func TestRun_OneOpenPositionPerStrategy(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	var prevClose time.Time
-	for i, s := range sink.Samples {
+	for i, s := range opens(sink.Samples) {
 		if i > 0 && s.OpenedAt.Before(prevClose) {
 			t.Fatalf("sample %d opened at %s, before the previous trade closed at %s",
 				i, s.OpenedAt, prevClose)
@@ -296,7 +301,7 @@ func TestRun_NoSampleWithoutAStop(t *testing.T) {
 	if _, err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	for i, s := range sink.Samples {
+	for i, s := range opens(sink.Samples) {
 		if s.Observation.Signal == nil || !s.Observation.Signal.SLPx.IsPositive() {
 			t.Fatalf("sample %d was opened with no stop", i)
 		}
@@ -339,16 +344,24 @@ func TestRun_EachTradeHasItsOwnOrderID(t *testing.T) {
 		t.Skip("need at least two samples")
 	}
 
+	// A trade now emits several samples — one open decision plus an `update` for each cadence tick
+	// while it was held — and they SHARE an id by design: they are the same position, and the id is
+	// what pairs each of them with the same outcome. What must stay unique is one OPEN DECISION per
+	// id; two of those sharing one would mean two trades' rewards training against each other.
 	seen := map[int64]bool{}
 	for i, s := range sink.Samples {
 		id := s.Observation.OrderID
 		if id == 0 {
 			t.Fatalf("sample %d has no order id; its reward could never be paired with its decision", i)
 		}
-		if seen[id] {
-			t.Fatalf("sample %d reuses order id %d — one trade's reward would train another's decision", i, id)
+		isOpen := s.Observation.Category == domain.CategoryBuy || s.Observation.Category == domain.CategorySell
+		if isOpen {
+			if seen[id] {
+				t.Fatalf("sample %d reuses order id %d on a second OPEN decision — one trade's "+
+					"reward would train another's", i, id)
+			}
+			seen[id] = true
 		}
-		seen[id] = true
 
 		if s.Terminal.OrderID != id {
 			t.Fatalf("sample %d's terminal call carries id %d, the decision %d", i, s.Terminal.OrderID, id)
@@ -485,5 +498,120 @@ func TestRun_SignificanceIsComputedFromFilledStats(t *testing.T) {
 	if nonZero == 0 {
 		t.Error("every gap is exactly 0.0000 — significance is reading PnLPerTrade before it is " +
 			"filled, which reports a finished-looking table containing no measurement")
+	}
+}
+
+// opens returns only the open-decision samples. The sink now also carries `update` samples, which
+// deliberately have no Signal (§15.12: `present` is what tells the model no strategy spoke), so a
+// test reading Samples[0].Signal would dereference nil and, worse, assert about the wrong call.
+func opens(samples []Sample) []Sample {
+	var out []Sample
+	for _, s := range samples {
+		if s.Observation.Category == domain.CategoryBuy || s.Observation.Category == domain.CategorySell {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// The dataset must contain `update` samples, not only open decisions and their outcomes.
+//
+// Without them the ten inputs of the position block — position_open, age, unrealized PnL, the two
+// extremes, distance to each level — were zero on every one of 76,305 samples, while production
+// fills them on every update call. That is the train/serve skew docs/RL_V8_PLAN.md exists to
+// remove, and it was invisible until someone printed a vector and counted the zeros.
+func TestRun_EmitsUpdateSamplesWithALivePositionBlock(t *testing.T) {
+	_, sink, r := fixture(nil)
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var updates int
+	for i, s := range sink.Samples {
+		if s.Observation.Category != domain.CategoryUpdate {
+			continue
+		}
+		updates++
+		ps := s.Observation.PositionState
+		if !ps.PositionOpen {
+			t.Fatalf("update %d reports no open position", i)
+		}
+		if ps.AgeSeconds <= 0 {
+			t.Fatalf("update %d has age %d — the position block is still dead", i, ps.AgeSeconds)
+		}
+		if ps.SizeUSD.IsZero() || ps.Leverage.IsZero() {
+			t.Fatalf("update %d carries no size/leverage", i)
+		}
+		if s.Observation.OrderID == 0 {
+			t.Fatalf("update %d has no order id; its reward could not be paired", i)
+		}
+	}
+	if updates == 0 {
+		t.Fatal("no update samples at all — the position block can never be exercised")
+	}
+}
+
+// An update carries the CARRIED signal — the last one this (instrument, bar) produced — exactly as
+// lifecycle.go does via conductor.CarriedSignal. A 1H opinion stays meaningful for the whole hour,
+// and dropping it the moment its candle closed would hide it from every update in between.
+//
+// This test exists because the first version of the backtest's update path sent nil on every
+// cadence tick, reasoning that a carried signal is stale. Production does the opposite, so that
+// produced a dataset where most updates had present=0 against a live path that sends present=1 —
+// the train/serve skew the whole plan exists to remove, reintroduced by the code meant to close it.
+func TestRun_UpdateCarriesTheSignalForwardLikeProduction(t *testing.T) {
+	_, sink, r := fixture(nil)
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var updates, withSignal int
+	for i, s := range sink.Samples {
+		if s.Observation.Category != domain.CategoryUpdate {
+			continue
+		}
+		updates++
+		if s.Observation.Signal == nil {
+			continue
+		}
+		withSignal++
+		// A carried signal must still be coherent: side set and levels on the right sides of entry.
+		// Carrying forward a malformed one would be worse than carrying none.
+		sg := s.Observation.Signal
+		if sg.Side == "" {
+			t.Fatalf("update %d carries a signal with no side", i)
+		}
+		if !sg.EntryPx.IsPositive() {
+			t.Fatalf("update %d carries a signal with no entry price", i)
+		}
+	}
+	if updates == 0 {
+		t.Fatal("no update samples at all")
+	}
+	// Every update should carry one: by the time a position is open, its own signal has fired and
+	// been retained. Nil is reserved for a bar where no strategy has ever spoken, which cannot
+	// happen while a position from that bar is being held.
+	if withSignal != updates {
+		t.Errorf("%d of %d updates carry no signal — carry-forward is not reaching them",
+			updates-withSignal, updates)
+	}
+}
+
+// Age must come from the candle's own timestamp, never from a bar count. A timeframe with a gap —
+// an exchange outage leaves missing candles — ages the position by the real elapsed time, and
+// counting bars would under-report it by exactly the length of the gap.
+func TestRun_UpdateAgeComesFromTimestampsNotBarCount(t *testing.T) {
+	_, sink, r := fixture(nil)
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for i, s := range sink.Samples {
+		if s.Observation.Category != domain.CategoryUpdate {
+			continue
+		}
+		want := int64(s.ClosedAt.Sub(s.OpenedAt).Seconds())
+		got := s.Observation.PositionState.AgeSeconds
+		if got <= 0 || got > want {
+			t.Fatalf("update %d: age %ds is outside the trade's own span of %ds", i, got, want)
+		}
 	}
 }

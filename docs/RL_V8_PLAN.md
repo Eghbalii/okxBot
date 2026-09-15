@@ -346,6 +346,11 @@ profile accumulates from the simulation's own books. Order ids per trade — cau
 2. Set the live roster: 16 slots, $40 cap, 10x, all three RL gates ON.
 3. Train from the dataset, show results, deploy only on approval.
 
+**SUPERSEDED — see "Session 2026-09-15" at the end of this file.** Step 1 was done and step 3 was
+attempted five times; the dataset turned out to have 23 of 84 inputs at zero and an action encoding
+that could not represent the strategies' own levels. Three of those defects are fixed; the action
+encoding is still open and is the blocker.
+
 ---
 
 ## The strategy investigation (2026-09-14, after the backtest landed)
@@ -530,3 +535,137 @@ They are the baseline to beat, not a prediction.
 takes. If that difference is absent, the model has learned nothing and further training will not
 help — which is the check §14's first `rl_sizing` attempt lacked, and why it ran for 14 hours
 answering `skip` to everything before anyone noticed.
+
+---
+
+## Session 2026-09-15: the dataset was not fit to train on
+
+The previous section defined the roster and the success criterion. This session tried to train
+against it, failed five times, and only then looked at what was actually being fed to the model.
+**That order was the mistake** — the defects below took three minutes to find by printing one
+observation vector, and five training runs to not find by tuning hyperparameters.
+
+Recorded in the order they were discovered, because the sequence is the lesson.
+
+### What was built
+
+- **`rl_service/warmstart.py`** (new) — the missing consumer of `cmd/backtest`'s JSONL. Reads the
+  dataset, vectorises through the same `to_vector` `/predict` uses, fills the replay buffer, runs
+  gradient steps, saves weights AND buffer together (§15.11). 10 tests, mutation-checked.
+- **`rl_service/newmodel.py` DELETED.** It was a second model builder that did NOT apply
+  `target_entropy` from config, so every model it produced ran SAC's default of `-8` — the exact
+  value §54.8 records as having collapsed the previous model. `init_model.py` already existed and
+  does it correctly. Having two ways to build a model is what let the wrong one be picked.
+
+### Four training runs, and what they actually measured
+
+Each: model from scratch, trained on the first 80% chronologically, scored on the unseen 20%.
+`rank_t` asks whether trades the model rates higher actually do better — it survives even when the
+policy declines nothing, which a skip-count cannot.
+
+| dataset | entropy | steps | mean rank_t | sd | positive |
+|---|---|---|---|---|---|
+| 8×5, 5m only (4,166) | −8 | 3,332 | +0.59 | 0.70 | 4/5 |
+| 8×5, 3 timeframes (6,649) | −8 | 5,319 | +0.37 | 0.77 | 2/4 |
+| 44×10, 3 tf (76,305) | −8 | 20,000 | +0.56 | 3.64 | 3/5 |
+| 44×10, 3 tf (76,305) | **−4.5** | 2,500 | −1.21 | 2.83 | 3/5 |
+
+**No configuration produced a significant signal.** Every mean sits inside its own noise. Seed
+variance dominates everything: on one dataset the skip count ranged 23 to 656 across seeds, and
+`rank_t` from −4.72 to +3.94 — so any single run reports the seed, not the data.
+
+A staged curve (1 → 500 → 2,500 → 5,000 → 10,000 steps on one seed) appeared to show a clean
+progression from −4.77 to +1.21 and back down, suggesting an optimum near 2,500. **That curve was
+not reproducible**: the same seed re-run gave +1.21 then +0.61, because `init_model` runs before the
+seed is set, so each stage started from different initial weights. It was presented with confidence
+and should not have been.
+
+### Then the observation was printed, and the dataset was the problem
+
+Dumping one 84-dim vector with named fields — three minutes of work, never done before five training
+runs — found **23 of 84 inputs at exact zero**, and across 40,000 samples:
+
+| block | finding |
+|---|---|
+| token profile | **5 of 7 dead**: volume, volume rank, 24h range, 24h change, trade count. The block exists specifically to replace the token one-hot so the policy can tell a BTC from a PEPE; it could see only price and volatility. |
+| position (10 inputs) | **all dead on every sample** — see the update section below |
+| `close_rel` (×2) | **structurally zero forever**: `_rel(close, last_price)` where `last_price` IS the close. Divides a number by itself, in both the market and BTC blocks. |
+| strategy profile | correctly zero only on a strategy's first trade; 99.7% populated overall. An early report called these dead, from a single sample — wrong. |
+
+### Fixes applied (code only — NO dataset was regenerated)
+
+1. **Token profile now computes all five fields from the candle window.** `candles.volume` was in
+   the database the whole time; the code's own comment said these "come from the discovery scan and
+   have no historical record", which was true of the rank and false of the rest. Volume is quote
+   volume (base × close) per §33.4's lesson that a contract count orders the market by contract
+   size. Rank is median volume across the roster, computed once per run. Trade count accumulates
+   from the simulation's own books, exactly like the strategy profile.
+2. **`close_rel` replaced with `_body_position`** — where the close sits within its own high/low
+   range, in [−1, +1]. Real information (did the bar close strong or weak) at no width cost, and the
+   half of candle shape the other three OHLC slots cannot express.
+3. **`update` samples added to the backtest**, with two triggers, both mirroring `conductor`:
+   - **a strategy firing while that (strategy, token) already holds a position.** These were being
+     DROPPED — 125,000 of them, three for every trade taken. §15.12 routes them as `update` in
+     production; the backtest discarded them silently.
+   - **cadence**: unrealized PnL moved ≥1% or 15 minutes elapsed, from
+     `conductor.DefaultUpdatePnLThresholdPct` / `DefaultUpdateMaxInterval` rather than a local copy.
+   - Age comes from the candle's own timestamp, never a bar count: a gap in the series (an exchange
+     outage leaves missing candles) ages the position by real elapsed time.
+   - Reward is the trade's own outcome and the `order_id` is shared: an `update` answers "keep
+     holding", and only what the holding produced can judge it.
+4. **Signal carry-forward on updates.** The first implementation sent `nil` on every cadence update,
+   on the reasoning that a carried signal is stale. **Production does the opposite** —
+   `lifecycle.go:159` sends `conductor.CarriedSignal`, because a 1H opinion stays meaningful for the
+   whole hour. Sending nil would have produced a dataset where most updates carry `present=0`
+   against a live path that sends `present=1`: the train/serve skew this plan exists to remove,
+   reintroduced by the code meant to close it. Caught only because the operator asked why.
+   `signalProfile` was extracted so the open and update paths build the signal from one function.
+
+Three new tests (`TestRun_EmitsUpdateSamplesWithALivePositionBlock`,
+`TestRun_UpdateCarriesTheSignalForwardLikeProduction`, `TestRun_UpdateAgeComesFromTimestampsNotBarCount`),
+all mutation-checked. Four existing tests assumed every sample was an open decision — one crashed on
+a nil `Signal`; they now select the sample they mean rather than the assumption being loosened.
+23 backtest tests pass, `go build` and `go vet` clean.
+
+### STILL OPEN — do these before generating another dataset
+
+Found by inspecting the model's answer on a real sample. All three have one root cause: **the
+backtest runs without a model, so no sizing or SL/TP decision is ever made**, and the plan's own
+"all three RL gates ON" (the 2026-09-14 instruction above) is not implemented in `internal/backtest`
+at all — `grep` for `rl_sizing|RLSizing|RLEarlyClose` there returns nothing.
+
+1. **`MAX_SLTP_OFFSET_PCT = 0.10` is ~20x the real range.** Strategies on 5m propose stops at
+   0.5–0.75%, so every training sample sits inside `[-0.075, +0.05]` of a `[-1, +1]` output range.
+   Over 90% of the action space has never seen a sample, and the policy's output goes there: on a
+   real BTC short at 77,403 the trained model answered `tp_px = 83,241` — 7.5% ABOVE entry, i.e.
+   "take profit once you have lost". Nothing in the encoding prevents it.
+2. **No variance in `size_pct` or `leverage`.** Every one of 76,305 samples carries `+1.0` for both,
+   because the backtest opens at a fixed slot size. The model cannot learn when to size down from a
+   dataset in which nothing ever did.
+3. **Whether to run the backtest with a model in the loop at all.** The clean fix for 1 and 2 is for
+   the backtest to ask a model for size/leverage/levels, which makes dataset generation depend on a
+   model — the chicken-and-egg the warm start exists to break. Decide the approach before building:
+   a fixed-range rescale (cheap, fixes 1 only), randomised sizing (rejected once already in §14 as
+   noise the policy cannot learn from), or a two-pass generate-train-regenerate loop.
+
+### Operating notes for the next session
+
+- **The dataset is regenerated by `cmd/backtest`**, ~7 minutes for 76k samples on the server, ~12
+  for the full roster across three timeframes. The candle history is the durable part; no dataset
+  file is worth preserving across a schema change.
+- **Train on the operator's machine, not the server.** A training run alongside the live services
+  drove load average to 120, made SSH unreachable, and OOM-killed `rl-service` (recovered). §35.7's
+  one-thing-at-a-time rule applies to training as much as to builds.
+- **Run each seed in its OWN process.** Five seeds in one process died with no output every time —
+  each SAC model plus its replay buffer stays resident.
+- **Detach long server jobs with `setsid`**, or they die with the SSH session. One 40-minute
+  training run was lost that way.
+- `paper-trader` is the ONLY writer of the `candles` table (§14). While it is stopped, candle
+  history stops accumulating even though the ingestor is publishing to Kafka normally.
+
+### The honest summary
+
+Nothing has been trained that is worth deploying. The five runs measured a dataset in which the
+position block was entirely dead, five of seven token inputs were zero, two inputs were structurally
+constant, and the action encoding could not represent what the strategies actually proposed. The
+code is now fixed for the first three; the fourth is open and is the one that matters most.

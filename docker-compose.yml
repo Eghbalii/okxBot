@@ -62,6 +62,31 @@ services:
       # roughly 4x — this was the single largest disk consumer on the box (CLAUDE.md's own
       # resource-scaling discussion). There's no per-topic override here, just the broker default.
       KAFKA_LOG_RETENTION_HOURS: 6
+      # Retention can only delete a CLOSED segment, so the segment size is what actually bounds
+      # disk on a high-volume topic. At the 1GB default, okx.tickers (~1.2M msgs/hour) held a full
+      # closed 1GB segment plus a growing active one — 1.4GB for a topic nothing reads past the
+      # last few minutes of, with 6h retention unable to reclaim any of it. 128MB segments rolled
+      # hourly let retention work as intended (measured 2026-09-15: 2.3GB of /tmp/kafka-logs).
+      KAFKA_LOG_SEGMENT_BYTES: 134217728
+      KAFKA_LOG_ROLL_HOURS: 1
+      # The same closed-segment rule applies to COMPACTED topics: __consumer_offsets had reached
+      # 332MB across its 50 partitions because the cleaner had literally never run (0 entries in
+      # log-cleaner.log since the cluster was created 2026-09-02) — its segments never closed, so
+      # there was never anything eligible to compact. With a 20MB segment and a 10m roll it
+      # compacted 332MB -> 55MB on first pass, one partition reporting a 100% size reduction
+      # (370,096 messages -> 9). min.cleanable.dirty.ratio is deliberately low: these partitions
+      # are almost entirely superseded offset commits, so nearly every byte is reclaimable.
+      KAFKA_OFFSETS_TOPIC_SEGMENT_BYTES: 20971520
+      KAFKA_LOG_CLEANER_MIN_CLEANABLE_RATIO: 0.01
+      # __consumer_offsets is compacted, not time-retained, and had grown to ~370MB across its
+      # 50 partitions. Segment+roll bounds apply to it too via these broker-wide defaults.
+      KAFKA_LOG_CLEANER_ENABLE: "true"
+      # NOTE (2026-09-15): the kafka-data volume below is mounted but UNUSED — the apache/kafka
+      # image defaults log.dirs to /tmp/kafka-logs, so topic data lives in the container's own
+      # writable layer on the root filesystem. Deliberately NOT repointed: in KRaft mode the log
+      # dir also holds __cluster_metadata and meta.properties, so moving it to the empty volume
+      # needs a kafka-storage.sh format against the existing cluster id and discards every topic
+      # and consumer offset. The segment bounds above solve the disk problem without that risk.
     ports:
       - "9094:9094" # host-reachable listener, for local dev tooling outside compose
     volumes:

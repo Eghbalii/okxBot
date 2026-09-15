@@ -24,6 +24,10 @@ rl-service/models/
 # since git keeps every version forever. They live on disk here and on the server under
 # model-backups/ — the point is having them recoverable, not versioned.
 models/backup/
+# Trained model artifacts, for the same reason: a warm-start run writes 4MB of weights plus a ~70MB
+# replay buffer, and §15.11 requires them to travel together. The reproducible input is the dataset
+# and the code, both of which ARE versioned; the artifact is rebuilt by rl_service.warmstart.
+/models/
 *.log
 
 # OS / editor

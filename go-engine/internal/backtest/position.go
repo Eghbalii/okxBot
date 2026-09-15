@@ -2,6 +2,7 @@ package backtest
 
 import (
 	"errors"
+	"math"
 
 	"github.com/shopspring/decimal"
 
@@ -116,6 +117,10 @@ func (r *Runner) openPosition(
 		size: size, leverage: leverage,
 		openedAt: c.Timestamp, openedIdx: idx,
 		openObs: obs,
+		// The cadence baseline starts at the open, matching conductor.ShouldUpdate's first call
+		// which records state and returns false. Left at the zero time, every position would fire
+		// an update on its very next candle because "now minus zero" exceeds any ceiling.
+		lastUpdateAt: c.Timestamp,
 	}, nil
 }
 
@@ -206,10 +211,39 @@ func (r *Runner) closePosition(
 	ks.holdSum += idx - p.openedIdx
 
 	r.pnls = append(r.pnls, pnlF)
+	// Counted at CLOSE, not at open: the profile answers "how much has this token taught me", and
+	// an open trade has taught nothing yet. Same rule the strategy profile already follows.
+	r.tokenTrades[p.instID]++
 	r.result.Samples++
 	r.result.ByReason[reason]++
 	r.result.TotalPnL += pnlF
 	r.result.MeanReward += reward
+
+	// Every buffered `update` resolves to the same outcome, because each of them answered the same
+	// question — keep holding this position — and this is what holding produced. The terminal
+	// observation is their next_obs for the same reason it is the open decision's.
+	for _, u := range p.updates {
+		if err := r.Sink.Write(Sample{
+			Observation: u,
+			Terminal:    term,
+			Reward:      reward,
+			RealizedPnL: pnlF,
+			CloseReason: reason,
+			InstID:      p.instID,
+			Bar:         p.bar,
+			Kind:        p.kind,
+			Side:        p.side,
+			OpenedAt:    p.openedAt,
+			ClosedAt:    c.Timestamp,
+			EntryPx:     entryF,
+			ExitPx:      exitF,
+			HoldBars:    idx - p.openedIdx,
+			Adjustments: p.adjustments,
+		}); err != nil {
+			r.Logger.Warn("backtest: sink write failed", "error", err)
+		}
+		r.result.Samples++
+	}
 
 	if err := r.Sink.Write(Sample{
 		Observation: p.openObs,
@@ -276,7 +310,7 @@ func (r *Runner) buildObservation(
 		SchemaVersion:     domain.ObservationSchemaVersion,
 		InstID:            instID,
 		LastPrice:         price,
-		TokenProfile:      tokenProfile(window),
+		TokenProfile:      tokenProfile(window, barsPerDay(bar), r.volumeRank[instID], r.tokenTrades[instID]),
 		Timeframes:        []domain.MarketBlock{mb},
 		BTC:               btc,
 		Signal:            &profile,
@@ -295,11 +329,19 @@ func (r *Runner) buildObservation(
 
 // tokenProfile describes the instrument from its own candles.
 //
-// Only the candle-derived half: volatility and price magnitude. The roster-wide figures (volume,
-// rank, 24h change) come from the discovery scan's live snapshot, which has no historical record —
-// so they are left zero here rather than backfilled with today's values, which would be lookahead
-// on a field the policy reads as current market state.
-func tokenProfile(window []domain.Candle) domain.TokenProfile {
+// Every field is computed from the candle window AS IT STOOD at the decision, never from a live
+// snapshot. An earlier version left volume, rank, 24h range and 24h change at zero on the reasoning
+// that they come from the discovery scan and have no historical record. That reasoning was right
+// about the scan and wrong about the data: `candles.volume` is stored per bar, so the same window
+// that yields ATR yields all four — measured over the trailing 24h rather than read from today.
+//
+// This mattered more than it looks. The profile replaced the token one-hot (docs/RL_V8_PLAN.md) so
+// the policy could tell a BTC from a PEPE by what the token IS. With five of its seven inputs dead,
+// it could see only price magnitude and volatility, and every other token distinction was invisible.
+//
+// barsPerDay scales the lookback to the timeframe (288 on 5m, 24 on 1H). rank is the token's
+// position in the run's volume ordering, which the caller supplies because it is roster-wide.
+func tokenProfile(window []domain.Candle, barsPerDay int, rank decimal.Decimal, tradeCount int) domain.TokenProfile {
 	p := domain.TokenProfile{}
 	if len(window) == 0 {
 		return p
@@ -313,6 +355,41 @@ func tokenProfile(window []domain.Candle) domain.TokenProfile {
 	}
 	if atr, err := strategy.ATR(window, 14); err == nil {
 		p.TypicalVolatility = atr.Div(last.Close)
+	}
+	p.VolumeRank = rank
+	// log1p, not log10: a token's first trade is 0 and log10(0) is -Inf, which would poison the
+	// whole vector rather than reading as "nothing known here yet".
+	p.LogTradeCount = decimal.NewFromFloat(math.Log1p(float64(tradeCount)))
+
+	// The trailing day, or the whole window when history is shorter — a short window is the normal
+	// warm-up case, not an error, and reporting zero there would be the very defect this fixes.
+	if barsPerDay <= 0 {
+		barsPerDay = 288
+	}
+	day := window
+	if len(day) > barsPerDay {
+		day = day[len(day)-barsPerDay:]
+	}
+	hi, lo, vol := day[0].High, day[0].Low, decimal.Zero
+	for _, c := range day {
+		if c.High.GreaterThan(hi) {
+			hi = c.High
+		}
+		if c.Low.LessThan(lo) {
+			lo = c.Low
+		}
+		// Quote volume: base volume times price. §33.4's own ranking lesson — a contract count
+		// orders the market by contract size rather than by liquidity.
+		vol = vol.Add(c.Volume.Mul(c.Close))
+	}
+	if lo.IsPositive() {
+		p.Range24h = hi.Sub(lo).Div(lo)
+	}
+	if open := day[0].Open; open.IsPositive() {
+		p.Change24h = last.Close.Sub(open).Div(open)
+	}
+	if f, _ := vol.Float64(); f > 0 {
+		p.LogVolume24h = decimal.NewFromFloat(log10(f))
 	}
 	return p
 }
@@ -354,4 +431,122 @@ func maxDec(a, b decimal.Decimal) decimal.Decimal {
 		return a
 	}
 	return b
+}
+
+// barsPerDay is how many candles of a given timeframe span 24 hours.
+//
+// Unknown bars fall back to the 5m count rather than erroring: the caller is mid-observation and a
+// slightly wrong lookback is a far smaller defect than no token profile at all. Every bar this
+// project actually decides on is listed.
+func barsPerDay(bar string) int {
+	switch bar {
+	case "1m":
+		return 1440
+	case "3m":
+		return 480
+	case "5m":
+		return 288
+	case "15m":
+		return 96
+	case "30m":
+		return 48
+	case "1H":
+		return 24
+	case "4H":
+		return 6
+	case "1D":
+		return 1
+	default:
+		return 288
+	}
+}
+
+// recordUpdate emits one `update` sample for a position that is still open.
+//
+// Without these the dataset held only open decisions and their outcomes, so the ten inputs of the
+// position block — is a position open, how old, current PnL, how far it travelled each way, distance
+// to each level — were ZERO on every one of 76,305 samples, while production fills them on every
+// update call. That is the train/serve skew this plan exists to remove (docs/RL_V8_PLAN.md's
+// "the backtest must exercise the same three, or the warm start would train a policy on a lifecycle
+// different from the one it is then served").
+//
+// The reward is the trade's own eventual outcome, not a separate score. An `update` that says
+// "keep holding" is answerable only by what the holding produced, and the reward function already
+// charges the churn penalty against the adjustment count carried here (§15.5).
+//
+// sig is the signal to attach. A cadence-driven update passes the CARRIED signal — the last one
+// this (instrument, bar) produced — exactly as lifecycle.go does via conductor.CarriedSignal: a 1H
+// opinion stays meaningful for the whole hour, and dropping it the moment its candle closed would
+// hide it from every update in between. Nil only when no strategy has spoken on this bar yet, where
+// `present=false` is the truthful answer.
+//
+// An earlier version of this function sent nil for every cadence update, reasoning that a carried
+// signal is stale. That produced a dataset where most updates had present=0 while production sends
+// present=1 — the train/serve skew this whole plan exists to remove, reintroduced by the very code
+// meant to close it.
+func (r *Runner) recordUpdate(
+	p *position,
+	c domain.Candle,
+	sig *domain.StrategySignal,
+) {
+	obs := p.openObs
+	obs.Category = domain.CategoryUpdate
+	obs.LastPrice = c.Close
+	obs.AccountEquityUSD = r.account
+	obs.AccountPeakUSD = r.peak
+	// Assigned unconditionally, including nil: the opening observation's own signal must not leak
+	// into an update as though it had just fired.
+	obs.Signal = sig
+
+	upl := pnlPct(p, c.Close)
+	obs.PositionState = domain.PositionState{
+		PositionOpen: true,
+		Side:         sideSign(p.side),
+		SizeUSD:      p.size,
+		Leverage:     p.leverage,
+		// From the candle's own timestamp, never wall-clock or a bar count: a replay's "now" is
+		// the bar being replayed, and an elapsed-bars estimate would drift the moment a timeframe
+		// has a gap (an exchange outage leaves missing candles, and the position aged through it).
+		AgeSeconds:       int64(c.Timestamp.Sub(p.openedAt).Seconds()),
+		UnrealizedPnLPct: upl,
+		PnLMaxPct:        p.pnlMaxPct,
+		PnLMinPct:        p.pnlMinPct,
+		RiskPct:          riskPct(p),
+		SLTPAdjustments:  p.adjustments,
+	}
+	if p.slPx != nil && c.Close.IsPositive() {
+		obs.PositionState.DistToSLPct = p.slPx.Sub(c.Close).Div(c.Close)
+	}
+	if p.tpPx != nil && c.Close.IsPositive() {
+		obs.PositionState.DistToTPPct = p.tpPx.Sub(c.Close).Div(c.Close)
+	}
+
+	if err := obs.Validate(); err != nil {
+		r.result.Skipped["update_invalid"]++
+		return
+	}
+
+	p.updates = append(p.updates, obs)
+}
+
+// signalProfile builds the signal exactly as the model receives it on an open decision.
+//
+// Shared by the open path and the busy-signal update path so the two cannot drift: a strategy
+// firing while a position is held must reach the model in the same shape it would have on a fresh
+// open, differing only in the category that frames the question.
+//
+// The levels are the strategy's own, unclamped — the clamp applies to an order being placed, and no
+// order is placed here. Resolved so a strategy that emits only percentages still reports prices.
+func (r *Runner) signalProfile(kind, bar string, sig strategy.Signal, price decimal.Decimal) *domain.StrategySignal {
+	rec := r.records[kind]
+	if rec == nil {
+		rec = &stratRecord{}
+	}
+	p := rec.profile(kind, bar)
+	resolved := sig.ResolveLevels(price)
+	p.Side = string(sig.Side)
+	p.EntryPx = resolved.EntryPx
+	p.SLPx = resolved.SLPx
+	p.TPPx = resolved.TPPx
+	return &p
 }
