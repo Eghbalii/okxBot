@@ -669,3 +669,358 @@ Nothing has been trained that is worth deploying. The five runs measured a datas
 position block was entirely dead, five of seven token inputs were zero, two inputs were structurally
 constant, and the action encoding could not represent what the strategies actually proposed. The
 code is now fixed for the first three; the fourth is open and is the one that matters most.
+
+---
+
+## Session 2026-09-15 (new): decode_action's side-blind TP fix, and three gates deliberately deferred
+
+Operator asked directly about the reported bug — a short whose take-profit landed ABOVE entry, ran
+to a real loss, and was scored as a legitimate trade — from the previous session. The full trace,
+plus a decision on the three ON/OFF gates from 2026-09-14, both landed this session.
+
+### The TP-above-entry bug: diagnosed, and it never reached a real order
+
+Confirmed against the live database before writing anything: `paper_orders` (2,102 rows),
+`real_orders` (150 rows), and `paper_order_adjustments` (0 `tp_px` rows, ever) all contain **zero**
+wrong-side levels. Every Go call site that turns a model answer into a stored order —
+`lifecycle.go` (paper open), `realtrader.go` (real open), `sltp_ratchet.go`'s `moveTP` (in-trade,
+both paths) — routes the raw decode through `conductor.Clamps.Apply`, which drops (not clamps) a
+level on the wrong side of entry, exactly as designed since §15.12/§29. That guard has held for
+every trade in the system's history.
+
+**The bug is real, and lives entirely in `rl_service/obs.py`'s `decode_action`**, confirmed at
+obs.py:753-772 (pre-fix): `tp_px = last_price * (1 + tp_offset)`, with `tp_offset` computed from
+the raw policy output and **no reference to `obs.category`/side at all**. A positive `tp_offset`
+always pushed TP above price — correct for a long, backwards for a short. The 77,403 -> 83,241 BTC
+short in the earlier session's finding was produced by directly inspecting the model's raw output
+during dataset-quality checking (no persisted script found; nothing in `cmd/backtest` or
+`warmstart.py` calls a model to decide anything — both were confirmed to use only
+already-clamped, strategy-native levels). That direct-inspection path is the one place in the whole
+system where nothing downstream corrects the raw answer, which is exactly why the bad number was
+visible there and nowhere else.
+
+**Fix**: `resolved_direction(obs)` (obs.py) returns `+1.0`/`-1.0` — the category itself for
+`buy`/`sell` (no position exists yet to consult), the open position's own recorded side
+(`obs.position_state.side`) for `update` and every terminal category, never the carried signal
+(which can name a stale side across a candle boundary per §15.12's carry-forward design). A flat/
+unknown position (`side == 0.0`, e.g. a synthetic observation) makes no direction claim and passes
+offsets through unflipped — the exact pre-fix behavior for that one case, rather than guessing.
+`decode_action` multiplies both `sl_offset` and `tp_offset` by this direction, so the SAME raw
+policy output now opens a favorable position on either side: unchanged for a long, mirrored for a
+short. This does not replace Go's clamp — the docstring says so — it removes the nonsensical raw
+value at the one place (`/predict`, direct inspection) nothing downstream corrects it.
+
+**`warmstart.py`'s `action_for`** (the inverse of `decode_action`, reconstructing what action vector
+would explain a trade the backtest already took) needed the identical correction — it round-trips
+`sig.sl_px`/`sig.tp_px` back into `vec[0]`/`vec[1]` and, being unmirrored, agreed with the OLD
+buggy `decode_action` by construction. Left alone, the direction fix would have silently broken this
+round trip for every short in the dataset: the module's own docstring's warning ("an action vector
+that does not describe the trade... nothing downstream can detect it") would have applied to the
+fix itself. Now divides by the same `resolved_direction` (self-inverse, since it's always ±1.0)
+before clamping.
+
+4 new tests (2 in `test_obs_action.py` covering `sell`/`update`-with-a-short-position/
+flat-position, 2 more folded into the same file for the long/flat no-op cases; 1 round-trip test in
+`test_warmstart.py` for a short). All mutation-checked: reverting `decode_action`'s multiplier
+reproduces the exact reported symptom (`tp_px=105.0` above a `100.0` entry) and fails both new tests
+for that reason; reverting only `action_for`'s companion fix (leaving `decode_action` fixed) fails
+the round-trip test with a level on the wrong side. 88 Python tests pass (was 87).
+
+Not yet deployed to the server — this is a Python-only, `rl_service`-scoped fix with no Go changes
+and no interaction with any running service (the server's `rl-service` container serves whatever
+checkpoint is currently loaded; this changes how a NEXT dataset/training run's decode behaves, not
+the currently-running one). Deploy alongside whichever training-run change ships next, not as its
+own hot-fix, since nothing live depends on it today.
+
+### Operator decision: all three 2026-09-14 gates deferred, not wired into the backtest
+
+Investigated feasibility of wiring `rl_sizing`/`rl_sltp_adjust`/`rl_early_close` into
+`internal/backtest` per the 2026-09-14 instruction. Verdict, confirmed against the actual code: this
+is **not a mechanical addition** for two of the three.
+
+- **`rl_sizing`/`rl_sltp_adjust` both require an already-trained model checkpoint present DURING
+  dataset generation** — the model decides size/leverage/levels, so there is nothing to imitate
+  without calling one. This is the exact chicken-and-egg the plan already named (STILL OPEN item 3):
+  the dataset is meant to warm-start the first model, so it cannot depend on that model already
+  existing. The Go wiring cost is genuinely small (`sizeFromModelAction`, `conductor.Clamps.Apply`,
+  `RatchetSLTP` are already free functions `internal/backtest` can import), but the prerequisite —
+  a trained model — does not exist yet.
+- **`rl_sltp_adjust` has a second, structural blocker**: live trading manages SL/TP on the **tick**
+  stream (2s throttle); the backtest replays candle-only history (`domain.Candle` is OHLCV, no tick
+  granularity exists in the schema at all). Approximating this at candle cadence is itself a design
+  decision, not a free substitution.
+- **`rl_early_close` is the smallest of the three** but still needs a model to call, and
+  `internal/backtest` has no `Model` field today (`grep` confirms zero references) — adding one
+  would be inert scaffolding until a checkpoint exists to plug into it.
+
+**Operator's explicit decision, given this: defer all three.** No `Model` field added to
+`internal/backtest`. Confirmed instruction: "بزار دیتا رو فیکس کنیم ببینیم چجوری میشه مدل" — fix
+the dataset first, decide the model-in-the-loop question once there is something to loop in. This
+supersedes the 2026-09-14 "all three RL gates ON" instruction for the CURRENT dataset/training
+round; revisit once a first warm-start model exists to break the dependency.
+
+### Re-assessed: `MAX_SLTP_OFFSET_PCT` and zero size/leverage variance are correctly deferred, not urgent
+
+Checked both remaining STILL OPEN items against the gates decision above before touching either.
+Both are about the model's OWN sl/tp/size/leverage proposals being under-trained or unrepresented
+— and with `rl_sizing`/`rl_sltp_adjust` deferred, **nothing in this training round ever reads those
+outputs live**: `cmd/paper-trader/main.go:189-192` only constructs an `rlclient` at all when one of
+those two flags is true, so with both off the model isn't even called over the network for
+open/update decisions — `lifecycle.go`'s `if e.Model == nil || !e.RLSizing { return ..., false }`
+and the equivalent `RLSLTPAdjust` gate make `action.SLPx`/`SizePct`/`LeverageFrac` unreachable code
+this round. A bad output there is inert dead weight, not a live-safety issue (distinct from the
+`decode_action` fix above, which mattered because a human directly inspecting the model IS a real,
+currently-used diagnostic path with nothing downstream to correct it). Both items are real training-
+signal-quality concerns worth fixing once `rl_sizing`/`rl_sltp_adjust` are actually turned on in a
+future round — not this one.
+
+### A real bug found while verifying the prior session's claimed fixes (commit pending)
+
+Operator asked to independently verify all four defects the prior session claimed to have fixed
+(token profile, `close_rel`, update samples, signal carry-forward) before allowing dataset
+generation to proceed. Three were confirmed correct by direct code reading, not just re-reading the
+doc. **The fourth's own claim was false**, and led to finding a real, previously undocumented bug:
+
+`signalProfile`'s doc comment claimed it was "shared by the open path and the busy-signal update
+path so the two cannot drift" — but `grep` showed the open path (`buildObservation`, called from
+`openPosition`) never called it at all. It built the signal profile inline instead, using `lv` — the
+**clamped order levels** — for `SLPx`/`TPPx`. Checked against production
+(`usecase.PaperTrader.evaluateStrategies`, `papertrade.go:573-583`): `obs.Signal` there is always
+built from `resolved.SLPx`/`TPPx` — the strategy's **raw, unclamped** proposal, retained via
+`conductor.RetainSignal` *before* the model is even asked; clamping (`EnsureStop`/`Apply`) happens
+afterward and only ever bears on `order.SLPx`/`TPPx`, never retroactively updating what the model
+was shown as the signal.
+
+So every open-decision sample in the dataset was showing the model **the placed order's clamped
+levels** where production always shows **the strategy's raw ask** — a genuine train/serve skew, and
+not a rare one: §45/§19.2's clamps (the 3:1 reward:risk cap, the 15%-of-margin loss cap) are
+documented as actively binding on a real fraction of live orders (§54.7 found 13/19 open real
+positions past the ratio cap when checked), so this corrupted a meaningful share of open samples,
+not an edge case.
+
+**Fix**: `buildObservation` now calls `signalProfile` directly (dropped its now-unused `resolved`/
+`lv` parameters), making the doc comment's claim actually true. 1 new test
+(`TestOpenObservation_SignalCarriesTheUnclampedProposal`, mutation-checked: reverting the fix
+reproduces the exact divergence — `Signal.SLPx`/`TPPx` showing the clamped price instead of the raw
+one — with a stop chosen wide enough that clamping provably changed it, not a coincidence). One
+existing test (`TestRun_NoSampleWithoutAStop`) had been asserting the WRONG invariant as a side
+effect of the bug — it read `Observation.Signal.SLPx` expecting it always positive, which was only
+true because Signal was accidentally always the clamped (always-has-a-stop) level. Since a strategy
+with no structural stop (§16.8: `stoch_cross` and others) legitimately produces an absent
+`Signal.SLPx` in both production and the fix, the test now asserts against
+`Terminal.PositionState.RiskPct.IsPositive()` — derived from the position's actual entry-to-stop
+distance, which `openPosition`'s pre-existing `errNoStop` check already unconditionally guarantees.
+895 Go tests pass repo-wide (was 895 before backtest's own count went 23→24; no other package
+affected), `go build`/`go vet` clean.
+
+Synced to the server and rebuilt (isolated `docker run golang:1.26-alpine` container mounting the
+source, no service touched — see below); operator approved sample inspection and a re-run of
+`STRATEGY_STATS.md`'s screening scope before choosing the training roster.
+
+### Confirmed live: production DOES re-evaluate a strategy while it already holds a position
+
+Re-running the full `STRATEGY_STATS.md` screening scope (10 tokens x 44 firing kinds x 5m+15m) with
+the fixed code produced numbers that diverged sharply from the original table — most strategies'
+per-trade PnL got WORSE while win rates stayed close to the original (e.g. `pmax` 31.3%→29.3% win
+rate but +0.0032→−0.00021 PnL/trade). Traced to a DIFFERENT change already inside commit `c141c25`
+(the same commit this session's earlier verification pass checked three other claims from): the
+busy-signal handling in `run.go`'s `runOne` now calls `evaluate(s, view)` **before** checking
+whether that strategy already holds a position, where it used to skip evaluation entirely while
+busy. Stateful strategies (`pmax` mutates `prevTrend`/`prevLongStop`/`prevShortStop` on every call)
+now keep advancing their internal state throughout a held trade's life, changing what signal they
+produce once the position closes — a real change to WHICH trades get opened, not a bookkeeping
+detail.
+
+Checked directly against `usecase.PaperTrader.evaluateStrategies` (`papertrade.go:533`,
+`strategy.EvaluateWith(s, view)`) before accepting this as correct rather than reverting it:
+production calls `EvaluateWith` unconditionally on every strategy assigned to the bar that just
+closed, and only checks `hasOpenBaselineFor(open, a.StrategyID)` **afterward** (`papertrade.go:566`)
+to decide whether the resulting signal opens a position. This is the exact same ordering the
+backtest now uses. So the OLD backtest behavior (freezing a stateful strategy's state while it held
+a position) was itself a train/serve skew that `STRATEGY_STATS.md`'s numbers were quietly built on;
+the new behavior is the correct match to production, and the old table is retired, not the new one.
+
+### A second, independent sizing bug found while re-running the screening (fixed, commit pending)
+
+The re-run's numbers were suspicious for an unrelated reason too: dollar PnL per trade came out
+implausibly small relative to the exchange fee even after accounting for the ordering fix above.
+Traced to `cmd/backtest/main.go`'s `positionSlots()`: it hardcoded `len(instIDs) * 4` — a guess
+sized for production's small live roster (a handful of assigned strategies per token) — regardless
+of how many kinds a screening run actually passes. This screening run passes 44 (46 registered,
+minus 2 that fire zero trades on this window), so real concurrent capacity was `10 * 44 = 440`
+slots against the formula's answer of 40 — an 11x overcommitment that sized every position roughly
+11x too large relative to what the $40 account could actually support if every slot filled, since
+`internal/backtest.openPosition` sizes each new position as `account / PositionSlots` regardless of
+how many kinds are truly running (`position.go:63`).
+
+Confirmed this is sizing-only, not a second execution bug: a controlled pair (1 instrument, 1 kind,
+`-account 40` vs `-account 4`, i.e. the same 10x ratio as the slot-count error) produced identical
+win rate and PnL scaled by exactly 10x — proving trade selection is untouched and only dollar sizing
+was wrong. Also independently verified the dollar-PnL FORMULA itself (`pnlPct(p, exit).Mul(p.size)`
+in `backtest.go`'s `realizedPnL`) against production's `usecase.papertrade.go`'s `grossPnL` — same
+formula, leverage applied exactly once in both, not a double-counting bug as first suspected and
+then ruled out by direct comparison.
+
+**Fix**: `positionSlots(instIDs, kinds []string) int` now counts `len(instIDs) * len(kinds)`,
+falling back to `len(strategy.Factories)` when `-kinds` is empty (matching `main`'s own "empty
+means every registered kind" convention) instead of a fixed per-token guess. Also added `-account`
+(overrides `cfg.Account.InitialUSD`) so a screening run's account can scale with its own, wider
+roster independently of production's real $40 — and fixed the startup log line, which was still
+printing `cfg.Account.InitialUSD`/`cfg.Risk.MaxLeverage` (the pre-override config values) instead of
+`runner.Cfg`'s actually-applied ones, a real bug found only by using the new `-account` flag myself
+and noticing the log didn't reflect it. 3 new tests in `cmd/backtest/main_test.go`, mutation-checked
+(reverting to the old `* 4` formula fails both the explicit-kinds and empty-kinds cases with the
+exact wrong numbers). 898 Go tests pass repo-wide, `go build`/`go vet` clean.
+
+### Roster decision (operator, 2026-09-15): drop V1 where a V2 exists, target $4/slot
+
+Of the registry's 46 total kinds, 12 have a `_v2` sibling that is a data-driven revision of the same
+idea (§45's history: ATR-scaled levels, a bounded reward:risk, mostly a regime filter). Operator's
+instruction: exclude the 12 superseded V1s from screening/training entirely — keep them registered
+(so historical/production rows referencing them still resolve, per §11.3's locked-origin rule) but
+do not spend training-data budget on a strategy whose own revision is running instead. This leaves
+**34 kinds**. On the 10-token roster that is `34 * 10 = 340` slots; at the operator's target of $4
+per slot, the screening account is **$1,360** — independent of production's real $40, exactly what
+`-account` was added for.
+
+### Corrected screening run (2026-09-15/16): `docs/STRATEGY_STATS.md`'s table is retired
+
+Re-ran the full screening (34 kinds excluding V1-of-V2, 10 tokens, `-account 1360`, `-dry`) with
+both fixes from this session (`signalProfile`, `positionSlots`) in place — this superseded
+`STRATEGY_STATS.md` outright, not just its numbers. Full per-strategy result:
+
+```
+kind                        trades    win%   pnl/tr($)       t  sig
+sweep_reverse                   13   46.2%    +0.02866   +0.92
+macd_momentum_v2               406   40.6%    -0.00219   +2.19  *
+sma_cross_fixed_exit          1069   33.2%    -0.01126   +2.13  *
+pmax                           450   29.3%    -0.01264   +1.25
+rsi_sma                        316   33.9%    -0.01482   +0.86
+rsi_sma_fuzzy                  476   33.6%    -0.01530   +1.00
+confluence                    1707   29.5%    -0.01585   +1.79
+btc_divergence                 759   28.1%    -0.01660   +1.10
+ict_order_block_v2            1817   35.6%    -0.01716   +1.58
+stoch_cross                   2349   60.4%    -0.01748   +1.73
+btc_divergence_fade           3176   28.7%    -0.01774   +1.94
+grid_like                     1678   33.1%    -0.01835   +1.29
+inside_bar_breakout_v2        3501   34.8%    -0.02008   +1.38
+pivot_reversal                1026   33.9%    -0.02082   +0.63
+ema_ribbon_pullback_v2        2880   35.5%    -0.02114   +0.98
+ict_liquidity_sweep_v2        2610   37.3%    -0.02154   +0.83
+session_momentum              1418   28.7%    -0.02263   +0.42
+keltner_trend_scalp_v2        4372   35.4%    -0.02372   +0.39
+ict_fvg_v2                    3846   32.4%    -0.02473   +0.07
+engulfing_reversal_v2          754   34.9%    -0.02495   +0.00
+coin_flip                     2732   32.1%    -0.02496     n/a
+volume_breakout_v2            1509   32.8%    -0.02532   -0.07
+range_breakout_v2             2965   31.8%    -0.02577   -0.21
+gradient_ribbon                 43   25.6%    -0.02673   -0.06
+weekly_dip_buy                2002   27.7%    -0.02689   -0.41
+dual_ma_atr                    877   44.8%    -0.02777   -0.40
+trendshift                    1194   31.3%    -0.02779   -0.47
+ema_cross_trailing             809   47.7%    -0.02913   -0.57
+bb_squeeze_breakout_v2         553   30.9%    -0.03507   -1.13
+stepped_trailing               471   20.4%    -0.06164   -3.79  *  (significantly WORSE)
+
+overall: 48,441 open decisions, win_rate=34.6%, total_pnl_usd=-$1,059
+```
+
+**No kind is significantly profitable.** `macd_momentum_v2`/`sma_cross_fixed_exit` clear `|t|>=2` but
+both still have negative PnL/trade — statistically distinguishable from `coin_flip`, not from
+breakeven. `pmax`, the sole significant-positive kind in the OLD table (t=+3.43), is no longer
+significant at all (t=+1.25) once measured correctly. Only `stepped_trailing` clears significance,
+and in the wrong direction. This matches §16.1's own precedent (the first screening's whole table
+sitting under |t|=1) — reading either table as a ranking would be selecting on noise.
+
+**Operator's decision, given this: keep the "diversity over rank" selection principle** used for
+`STRATEGY_STATS.md`'s original pick, re-derived from the corrected table. Final roster (8 kinds,
+chosen for distinct market read since none is provably better than another):
+
+| kind | style |
+|---|---|
+| `macd_momentum_v2` | momentum |
+| `trend_confluence` | structural/trend |
+| `vwap_reversion_v2` | mean-reversion (VWAP) |
+| `sma_cross_fixed_exit` | trend-cross |
+| `pmax` | volatility/trailing |
+| `confluence` | multi-signal combiner |
+| `stoch_cross` | oscillator (highest win rate, 60%, still loses on R:R) |
+| `btc_divergence` | cross-market (BTC-relative) |
+
+Excluded for style overlap with a kept pick: `grid_like` (mean-reversion, overlaps `vwap_reversion_v2`),
+`btc_divergence_fade` (overlaps `btc_divergence`), `rsi_sma_fuzzy` (oscillator, overlaps `stoch_cross`).
+`stepped_trailing` excluded as the one proven-worse-than-chance kind. Tokens unchanged from
+`STRATEGY_STATS.md`'s own token-level finding (DOGE/ZEC/PEPE/PUMP/BTC/SOL, TRUMP excluded at 8.2
+standard errors below the mean) — that result is about instrument volatility, not strategy
+selection, and wasn't affected by either fix.
+
+8 strategies x 6 tokens = 48 slots; at $4/slot the roster's own training account is **$192**.
+
+### Real warm-start dataset built (2026-09-16, not yet trained on for real)
+
+```
+go run ./cmd/backtest -inst DOGE,ZEC,PEPE,PUMP,BTC,SOL -bars 5m \
+  -kinds macd_momentum_v2,trend_confluence,vwap_reversion_v2,sma_cross_fixed_exit,pmax,confluence,stoch_cross,btc_divergence \
+  -account 192 -out data/warmstart_v8.jsonl
+```
+
+**53,965 samples** (2,906 completed trades plus their `update` samples), built on the server in
+~90 seconds, transferred to the operator's machine via gzip (254MB -> 6.4MB — JSONL compresses
+extremely well on repeated field names; the uncompressed transfer over the VPN was measured at
+~85KB/s and would have taken ~30 minutes, the compressed one under a minute). File lives at
+`rl-service/data/warmstart_v8.jsonl`, gitignored (`/rl-service/data/`).
+
+### Entropy-collapse re-check: PASSED across 3 seeds (2026-09-16)
+
+Operator's specific ask before trusting any of the above: does §54.8's entropy collapse
+(`target_entropy=-8` default -> alpha 1.0 -> 0.0009 in 66 steps) recur now that the dataset bugs
+are fixed and `target_entropy=-4.5` is the baked-in default? Confirmed BOTH halves of the existing
+fix are still in place before testing anything: `rl_service/config.py:111`
+(`target_entropy: float = -4.5`) and `serve/api.py`'s `reset_entropy_coef: bool = True` default,
+which resets alpha to 1.0 on every model load — both apply automatically, no action needed to
+"turn them on" for this dataset.
+
+Built `rl-service/tools/check_entropy_stability.py` (promoted from a one-off scratch script,
+kept in the repo since future dataset/config changes will want this same check again) — trains a
+fresh SAC model on a given dataset in stages, logging alpha at each cumulative step count. Run
+against `warmstart_v8.jsonl` with 3 independent seeds (42, 1, 100), each in its own process
+(§15.11's own operating note: multiple SAC models plus replay buffers must not share a process):
+
+```
+                      seed 42   seed 1   seed 100
+cumulative_steps=0      1.000    1.000      1.000
+             ~1000      0.744    0.744      0.744
+             ~5000      0.301    0.232      0.233
+            ~10000      0.086    0.069      0.070
+             19100      0.065    0.056      0.061
+```
+
+**All three seeds converge to a similar, stable alpha (0.056-0.065) with a smooth decline —
+no collapse.** The three seeds tracked each other almost exactly at every checkpoint (0.744 at
+1000 steps for all three; within 0.001 of each other at 5000), which is itself informative: this
+is not seed-sensitive behavior the way the earlier five training runs were (`rank_t` swinging
+-4.72 to +3.94 across seeds on the OLD, buggy dataset). §54.8's failure mode does not recur.
+
+Test model artifacts (`sac_v8_entropy_check_seed*.zip`, `sac_v8_test*.zip`) were diagnostic-only
+and deleted after the check — not meant to be trained further or deployed; `models/` is gitignored
+regardless.
+
+### Next
+1. **Train the real model** on `warmstart_v8.jsonl` (not the throwaway entropy-check runs) —
+   using `rl_service.warmstart` proper (not the diagnostic tool), producing a real checkpoint,
+   before any live deployment.
+2. **Show the operator results before any deploy** — win rate the model would have taken vs.
+   declined, per the success criterion already defined (§"Define success before training starts"):
+   the win rate of DECLINED trades must be measurably lower than TAKEN ones, or the model learned
+   nothing.
+3. **Open question, raised by the operator 2026-09-16, not yet decided**: whether connecting to
+   TradingView (its strategy/indicator library, its own backtesting) would materially help beyond
+   what this project's own 34-kind measurement already found. Given the measured 3.2pp gap to
+   breakeven and that NO existing strategy (including the TradingView ports already added, §30) is
+   significantly profitable, the working hypothesis is that the binding constraint is signal
+   SELECTION (declining the worst ~20% of takes), not signal SOURCE — more indicators from a
+   different platform are not obviously the missing piece, though a genuinely novel idea (not
+   another single-pattern entry rule, which is what all 34 current kinds already are) could still
+   be worth adding for diversity, the same reasoning that justified the original TradingView ports.
+   Revisit after step 2's result is in — if the model can't close the 3.2pp gap with the current
+   roster, that's the concrete evidence for or against needing new strategy sources.

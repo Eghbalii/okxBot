@@ -417,6 +417,49 @@ def test_levels_are_prices_derived_from_the_live_price():
     assert a.sl_px < 100.0 < a.tp_px
 
 
+def test_sell_call_mirrors_levels_to_the_short_s_profitable_side():
+    """Found 2026-09-15: decode_action used to compute tp_px as last_price * (1 + tp_offset) with
+    no reference to direction, so a positive tp_offset always landed ABOVE price — correct for a
+    long, backwards for a short (a short's take-profit realizes a loss on touch if it sits above
+    entry). Reproduced against a real BTC short whose tp_px landed 7.5% above entry. The SAME raw
+    action that opens a favorable long here must open a favorable short: sl on the losing (higher)
+    side, tp on the profitable (lower) side.
+    """
+    a = decode_action(_raw(sl=-0.5, tp=0.5), _obs(category="sell", last_price=100.0))
+    assert a.tp_px < 100.0 < a.sl_px
+
+
+def test_update_call_mirrors_levels_by_the_open_position_s_own_side():
+    """An update call has no buy/sell category of its own — the position already open is what the
+    levels must be coherent against, not the (possibly carried-forward, §15.12) signal."""
+    short_position = PositionState(position_open=True, side=-1.0)
+    a = decode_action(
+        _raw(sl=-0.5, tp=0.5),
+        _obs(category="update", last_price=100.0, position_state=short_position),
+    )
+    assert a.tp_px < 100.0 < a.sl_px
+
+
+def test_update_call_with_a_long_position_keeps_the_long_convention():
+    long_position = PositionState(position_open=True, side=1.0)
+    a = decode_action(
+        _raw(sl=-0.5, tp=0.5),
+        _obs(category="update", last_price=100.0, position_state=long_position),
+    )
+    assert a.sl_px < 100.0 < a.tp_px
+
+
+def test_flat_position_state_does_not_flip_the_encoding():
+    """A synthetic/terminal observation with no position side recorded makes no direction claim —
+    offsets pass through as the pre-fix behavior did, rather than guessing a side."""
+    flat = PositionState(position_open=False, side=0.0)
+    a = decode_action(
+        _raw(sl=-0.5, tp=0.5),
+        _obs(category="closed_tp", last_price=100.0, position_state=flat),
+    )
+    assert a.sl_px < 100.0 < a.tp_px
+
+
 # --- learning mask ---------------------------------------------------------------------------------
 
 

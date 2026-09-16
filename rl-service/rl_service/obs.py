@@ -732,6 +732,39 @@ def to_vector(obs: Observation) -> np.ndarray:
 # --- action decoding ---------------------------------------------------------------------------
 
 
+def resolved_direction(obs: Observation) -> float:
+    """+1.0 for a long, -1.0 for a short, for whichever position/signal this call is about.
+
+    Found 2026-09-15: `decode_action` used to compute `sl_px`/`tp_px` as `last_price * (1 +
+    offset)` with no reference to direction at all, so a positive `tp_offset` always pushed TP
+    ABOVE price — correct for a long, backwards for a short (a short's take-profit must sit BELOW
+    entry; above it is a level that realizes a loss on touch, not a profit). Reproduced against a
+    real BTC short: `tp_px` landed 7.5% above entry. Go's `conductor.Clamps.Apply` catches this
+    downstream for every live/paper order (it drops a wrong-side level and derives a fresh one, per
+    CLAUDE.md §15.12/§29) — this fix does not replace that guard, it removes the nonsensical raw
+    value at the one place callers observe the model directly (a `/predict` call, an inspection
+    script) with nothing downstream to correct it.
+
+    `buy`/`sell` categories carry no open position yet, so the category IS the direction. `update`
+    and the terminal categories are about an already-open position, so its own recorded side is
+    authoritative — not the carried signal, which can persist across a candle boundary (§15.12)
+    and could in principle name a different side than the position it is attached to. A position
+    whose side is unreadable (0.0 — flat, or a synthetic/test observation) makes no direction claim
+    at all: offsets pass through unflipped, matching the pre-fix behavior for exactly that case
+    rather than guessing.
+    """
+    if obs.category == "buy":
+        return 1.0
+    if obs.category == "sell":
+        return -1.0
+    side = obs.position_state.side
+    if side > 0.0:
+        return 1.0
+    if side < 0.0:
+        return -1.0
+    return 1.0
+
+
 def decode_action(raw: np.ndarray, obs: Observation) -> Action:
     """Turns the policy's raw ACTION_DIM vector into the typed Action the Go caller consumes.
 
@@ -745,13 +778,20 @@ def decode_action(raw: np.ndarray, obs: Observation) -> Action:
 
     Two heads rather than one masked five-way head: the mask worked at serving time but SAC trains
     on the raw vector, so reward reached outputs that had been discarded. See ACTION_SCHEMA_VERSION.
+
+    sl_offset/tp_offset are direction-relative, not literal above/below price: a positive
+    tp_offset always means "toward profit" and a positive sl_offset always means "toward loss",
+    for whichever side this call concerns (see `resolved_direction`). For a long that is
+    unchanged from the raw offset; for a short both are mirrored, so the encoding cannot itself
+    produce a take-profit on the losing side of entry.
     """
     vec = np.asarray(raw, dtype=np.float32).reshape(-1)
     if vec.shape[0] != ACTION_DIM:
         raise SchemaError(f"action vector is {vec.shape[0]} wide, want exactly {ACTION_DIM}")
 
-    sl_offset = float(np.clip(vec[0], -1.0, 1.0)) * MAX_SLTP_OFFSET_PCT
-    tp_offset = float(np.clip(vec[1], -1.0, 1.0)) * MAX_SLTP_OFFSET_PCT
+    direction = resolved_direction(obs)
+    sl_offset = float(np.clip(vec[0], -1.0, 1.0)) * MAX_SLTP_OFFSET_PCT * direction
+    tp_offset = float(np.clip(vec[1], -1.0, 1.0)) * MAX_SLTP_OFFSET_PCT * direction
     # Scaled by the budget the observation carried, so the policy's "how much of what I am allowed"
     # becomes the fraction-of-equity the caller expects.
     size_pct = float(np.clip(vec[2], 0.0, 1.0)) * obs.max_position_pct

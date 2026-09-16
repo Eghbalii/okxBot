@@ -100,7 +100,7 @@ func (r *Runner) openPosition(
 		return nil, errNoStop
 	}
 
-	obs, err := r.buildObservation(instID, bar, kind, price, window, btcWindow, sig, resolved, lv)
+	obs, err := r.buildObservation(instID, bar, kind, price, window, btcWindow, sig)
 	if err != nil {
 		return nil, errObsInvalid
 	}
@@ -272,8 +272,6 @@ func (r *Runner) buildObservation(
 	price decimal.Decimal,
 	window, btcWindow []domain.Candle,
 	sig strategy.Signal,
-	resolved strategy.Signal,
-	lv conductor.Levels,
 ) (domain.Observation, error) {
 	mb, err := usecase.BuildMarketBlock(bar, window)
 	if err != nil {
@@ -284,22 +282,15 @@ func (r *Runner) buildObservation(
 		return domain.Observation{}, err
 	}
 
-	// The strategy's profile is what THIS RUN has recorded so far — not the production database's
-	// figures. That is what makes a forward simulation coherent where rebuilding historical rows is
-	// not: the simulation always knows its own books, and starts from zero like a fresh install.
-	rec := r.records[kind]
-	if rec == nil {
-		rec = &stratRecord{}
-	}
-	profile := rec.profile(kind, bar)
-	profile.Side = string(sig.Side)
-	profile.EntryPx = resolved.EntryPx
-	if lv.SLPx != nil {
-		profile.SLPx = *lv.SLPx
-	}
-	if lv.TPPx != nil {
-		profile.TPPx = *lv.TPPx
-	}
+	// Found 2026-09-15: this used to build the profile inline from `lv`, the CLAMPED order levels
+	// — but production (usecase.PaperTrader.evaluateStrategies, papertrade.go) always retains the
+	// strategy's raw, UNCLAMPED `resolved` levels for what the model is shown as `obs.Signal`; the
+	// clamp only ever bears on the order actually placed, a separate and later question. Using the
+	// clamped levels here was a real train/serve skew: the dataset would have taught the model that
+	// "the signal" already reflects §45's reward:risk cap and §19.2's loss cap, which live inference
+	// never shows it. `signalProfile` is the single function both this open path and the busy-signal
+	// update path call, so they cannot drift apart again.
+	profile := r.signalProfile(kind, bar, sig, price)
 
 	slots := r.Cfg.PositionSlots
 	if slots <= 0 {
@@ -313,7 +304,7 @@ func (r *Runner) buildObservation(
 		TokenProfile:      tokenProfile(window, barsPerDay(bar), r.volumeRank[instID], r.tokenTrades[instID]),
 		Timeframes:        []domain.MarketBlock{mb},
 		BTC:               btc,
-		Signal:            &profile,
+		Signal:            profile,
 		AccountEquityUSD:  r.account,
 		AccountInitialUSD: r.Cfg.InitialUSD,
 		AccountPeakUSD:    r.peak,

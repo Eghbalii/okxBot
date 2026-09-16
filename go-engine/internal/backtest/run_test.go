@@ -296,15 +296,69 @@ func TestRun_RefusesWithoutBTCHistory(t *testing.T) {
 // Every opened trade must carry a stop. §16.9 records a real position opened with none — unbounded
 // downside — because four independent gaps lined up; a dataset containing such trades would teach
 // the policy that they are normal.
+//
+// Asserted against Terminal.PositionState.RiskPct, not Observation.Signal.SLPx: the signal is now
+// (2026-09-15) the strategy's raw, unclamped proposal, exactly matching what production shows the
+// model (papertrade.go retains resolved.SLPx/TPPx before the model is even asked, then clamps
+// separately onto the ORDER) — a strategy with no structural stop of its own (§16.8: stoch_cross and
+// others) legitimately has no Signal.SLPx, in production and here alike. RiskPct is computed from
+// the position's actual entry-to-stop distance (backtest.go's riskPct, mirroring usecase.riskPct),
+// which openPosition's own errNoStop check already guarantees is never nil — this is the invariant
+// that must hold, not that the raw signal happened to propose one.
 func TestRun_NoSampleWithoutAStop(t *testing.T) {
 	_, sink, r := fixture(nil)
 	if _, err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	for i, s := range opens(sink.Samples) {
-		if s.Observation.Signal == nil || !s.Observation.Signal.SLPx.IsPositive() {
+		if !s.Terminal.PositionState.RiskPct.IsPositive() {
 			t.Fatalf("sample %d was opened with no stop", i)
 		}
+	}
+}
+
+// The open decision's Signal must carry the strategy's OWN, unclamped proposal — never the level
+// the order was actually clamped to.
+//
+// Found 2026-09-15: buildObservation used to build Signal from `lv`, the clamps output, so a
+// dataset built from a strategy proposing a wide stop would show the model a level §19.2/§45's
+// clamps had already tightened — a real train/serve skew, since production
+// (usecase.PaperTrader.evaluateStrategies, papertrade.go) always retains resolved.SLPx/TPPx BEFORE
+// the model is even asked, and clamps only bear on the order placed afterwards. This test forces a
+// real divergence: a 20% stop at 10x leverage is far outside both MaxSLDistPct (5%) and MaxLossPct
+// (15%/10x = 1.5%), so the clamped order and the raw signal cannot coincide by chance.
+func TestOpenObservation_SignalCarriesTheUnclampedProposal(t *testing.T) {
+	_, _, r := fixture(nil)
+	window := trendingSeries(300, 150)
+	btcWindow := trendingSeries(300, 64000)
+	c := window[len(window)-1]
+	price := c.Close
+
+	sig := strategy.Signal{Side: strategy.Buy, SLPct: dec("0.20"), TPPct: dec("0.40")}
+	pos, err := r.openPosition("SOL", "5m", "test_kind", sig, window, btcWindow, len(window)-1, c)
+	if err != nil {
+		t.Fatalf("openPosition: %v", err)
+	}
+
+	resolved := sig.ResolveLevels(price)
+	got := pos.openObs.Signal
+	if got == nil {
+		t.Fatal("open observation carries no signal")
+	}
+	if !got.SLPx.Equal(resolved.SLPx) {
+		t.Errorf("Signal.SLPx = %s, want the raw proposal %s (unclamped)", got.SLPx, resolved.SLPx)
+	}
+	if !got.TPPx.Equal(resolved.TPPx) {
+		t.Errorf("Signal.TPPx = %s, want the raw proposal %s (unclamped)", got.TPPx, resolved.TPPx)
+	}
+
+	// The clamp must still have actually bound the ORDER — proving this test exercises a real
+	// divergence, not a coincidence where clamping happened to be a no-op.
+	if pos.slPx == nil {
+		t.Fatal("the order itself has no stop")
+	}
+	if pos.slPx.Equal(resolved.SLPx) {
+		t.Fatal("the fixture's clamps did not actually tighten this stop — test proves nothing")
 	}
 }
 

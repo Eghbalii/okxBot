@@ -35,6 +35,7 @@ from rl_service.obs import (
     OBSERVATION_SCHEMA_VERSION,
     Observation,
     mask_action_for_learning,
+    resolved_direction,
     to_vector,
 )
 
@@ -105,6 +106,13 @@ def action_for(sample: Sample) -> np.ndarray:
       [3] leverage_frac in [0, 1]
       [4] open head: >= 0 opens, < 0 skips
       [5:8] manage head — zeroed here, see below
+
+    sl/tp offsets are divided by `resolved_direction` (self-inverse, since it is always +-1.0) to
+    match decode_action's own direction-relative encoding (fixed 2026-09-15 — see obs.py). Getting
+    this wrong is the same silent-and-total failure the docstring above already warns about, just
+    one level deeper: for a short, a raw offset that once round-tripped through the pre-fix
+    decode_action would now decode to a level on the WRONG side of entry, teaching the critic to
+    value an action that does not describe the trade that was actually taken.
     """
     obs = sample.observation
     vec = np.zeros(ACTION_DIM, dtype=np.float32)
@@ -112,10 +120,11 @@ def action_for(sample: Sample) -> np.ndarray:
     price = obs.last_price
     sig = obs.signal
     if price > 0 and sig is not None:
+        direction = resolved_direction(obs)
         if sig.sl_px > 0:
-            vec[0] = np.clip((sig.sl_px / price - 1.0) / MAX_SLTP_OFFSET_PCT, -1.0, 1.0)
+            vec[0] = np.clip((sig.sl_px / price - 1.0) / MAX_SLTP_OFFSET_PCT / direction, -1.0, 1.0)
         if sig.tp_px > 0:
-            vec[1] = np.clip((sig.tp_px / price - 1.0) / MAX_SLTP_OFFSET_PCT, -1.0, 1.0)
+            vec[1] = np.clip((sig.tp_px / price - 1.0) / MAX_SLTP_OFFSET_PCT / direction, -1.0, 1.0)
 
     # Size and leverage come from the TERMINAL observation, not the decision one. On a buy/sell
     # call position_state is zero-valued by design — the decision is whether to open at all, so

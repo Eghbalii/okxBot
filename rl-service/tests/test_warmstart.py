@@ -90,6 +90,53 @@ def test_action_decodes_back_to_the_trade_that_was_taken():
     assert got.leverage_frac == pytest.approx(1.0, abs=1e-6)
 
 
+def test_action_decodes_back_to_a_short_trade_on_the_correct_side():
+    """Found 2026-09-15 alongside decode_action's own direction fix: for a short, sl_px sits ABOVE
+    entry and tp_px BELOW it — the opposite arrangement from a long. action_for must divide out the
+    same direction decode_action now multiplies back in, or the round trip silently reconstructs a
+    long's encoding for a short's trade: the exact "action does not describe the trade" failure this
+    file's own module docstring warns about, just introduced by the direction fix itself rather than
+    predating it.
+    """
+    price, sl, tp = 100.0, 102.0, 96.0
+    obs = Observation(
+        inst_id="DOGE",
+        last_price=price,
+        category="sell",
+        signal=StrategySignal(side="sell", entry_px=price, sl_px=sl, tp_px=tp),
+        account_equity_usd=40.0,
+        max_position_pct=0.25,
+        max_leverage=10.0,
+        order_id=9,
+    )
+    term = Observation(
+        inst_id="DOGE",
+        last_price=price,
+        category="closed_tp",
+        signal=obs.signal,
+        position_state=PositionState(position_open=1.0, side=-1.0, size_usd=2.5, leverage=10.0),
+        account_equity_usd=40.0,
+        max_position_pct=0.25,
+        max_leverage=10.0,
+        order_id=9,
+    )
+    s = Sample(
+        observation=obs,
+        terminal=term,
+        reward=1.0,
+        inst_id="DOGE",
+        kind="pmax",
+        close_reason="tp",
+        realized_pnl=0.5,
+    )
+
+    got = decode_action(action_for(s), s.observation)
+
+    assert got.sl_px == pytest.approx(sl, abs=1e-6)
+    assert got.tp_px == pytest.approx(tp, abs=1e-6)
+    assert got.tp_px < price < got.sl_px
+
+
 def test_open_head_is_positive_because_the_trade_was_taken():
     """Every dataset sample is a trade that happened. A negative head would decode as `skip`,
     teaching the policy that these observations were declined — the exact opposite of the truth."""

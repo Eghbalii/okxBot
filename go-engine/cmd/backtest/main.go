@@ -28,6 +28,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/backtest"
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
+	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
@@ -71,6 +72,14 @@ func main() {
 		// helps depends on how fast the win rate falls as the target moves away, which a sweep
 		// measures and arithmetic cannot.
 		params = flag.String("param", "", "strategy parameter overrides, name=value[,name=value]")
+		// Found 2026-09-15: positionSlots used a fixed `instruments * 4` guess regardless of how
+		// many kinds were actually running, sized for production's small live roster. A screening
+		// run passes dozens of kinds at once — at 10 instruments x 34 kinds that is 340 real
+		// concurrent slots against the guess's 40, an 8.5x overcommitment per position that made
+		// every dollar figure in a screening run's dataset too large by roughly that factor. This
+		// override lets the account scale with the roster actually being run, independent of
+		// production's real $40 (cfg.Account.InitialUSD), which stays what a live deploy uses.
+		account = flag.Float64("account", 0, "override account.initial_usd (default: config's real value)")
 	)
 	flag.Parse()
 
@@ -147,10 +156,12 @@ func main() {
 			From:    from,
 			To:      to,
 			// The same account shape live paper trading runs, so the policy learns sizing against
-			// the economics it will actually be served (§15.6).
-			InitialUSD:     cfg.Account.InitialUSD,
+			// the economics it will actually be served (§15.6) — unless -account overrides it for a
+			// screening run whose roster is wider than production's, where $40 split across every
+			// slot would size positions far below anything meaningful (see -account's own comment).
+			InitialUSD:     overrideDec(cfg.Account.InitialUSD, *account),
 			MaxLeverage:    overrideDec(cfg.Risk.MaxLeverage, *lev),
-			PositionSlots:  positionSlots(cfg, instIDs),
+			PositionSlots:  positionSlots(instIDs, splitList(*kinds)),
 			MaxPositionPct: cfg.Account.MaxPositionPct,
 			CandleWindow:   cfg.PaperTrading.CandleLimit,
 			Params:         overrides,
@@ -175,7 +186,8 @@ func main() {
 
 	logger.Info("backtest starting",
 		"instruments", instIDs, "bars", barList, "out", *out,
-		"account", cfg.Account.InitialUSD, "maxLeverage", cfg.Risk.MaxLeverage)
+		"account", runner.Cfg.InitialUSD, "maxLeverage", runner.Cfg.MaxLeverage,
+		"positionSlots", runner.Cfg.PositionSlots)
 
 	started := time.Now()
 	res, err := runner.Run(ctx)
@@ -195,11 +207,24 @@ func main() {
 }
 
 // positionSlots mirrors the live sizing divisor: equity is split evenly across (strategy, token)
-// pairs (§32.4). Approximated here as instruments x a nominal per-token strategy count, because the
-// dataset deliberately runs every registered kind while live trading runs a small roster — using
-// the live divisor would size dataset positions far larger than production ever opens.
-func positionSlots(cfg *config.Config, instIDs []string) int {
-	n := len(instIDs) * 4
+// pairs (§32.4) — one slot per kind actually being run, not a guess.
+//
+// Found 2026-09-15: this used to hardcode `instruments * 4`, a nominal per-token strategy count
+// sized for production's small live roster. A screening run passes dozens of kinds at once — one
+// real run (10 instruments, 34 kinds after excluding the 12 V1s superseded by a V2) has 340 real
+// concurrent slots against the guess's 40, an 8.5x overcommitment that inflated every position
+// (and therefore every dollar PnL/reward figure in the resulting dataset) by roughly that factor,
+// while every strategy's WIN RATE stayed correct — the trade-selection logic never depended on
+// this number, only its dollar sizing did. Slots is instruments x kinds actually running, matching
+// production's own rule exactly rather than approximating it.
+func positionSlots(instIDs, kinds []string) int {
+	nKinds := len(kinds)
+	if nKinds == 0 {
+		// -kinds empty means "every registered kind" (main's own default, splitList("")==nil),
+		// so the divisor must count the same set the run will actually iterate.
+		nKinds = len(strategy.Factories)
+	}
+	n := len(instIDs) * nKinds
 	if n <= 0 {
 		return 1
 	}
