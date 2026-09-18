@@ -186,18 +186,22 @@ func (r *Repository) CloseManualOrder(ctx context.Context, id int64, closePx dec
 	return nil
 }
 
-// RequestManualOrderClose flags an open (filled) manual order for ManualTrader to close on its next
-// tick. Mirrors RequestRealManualClose. Errors if id is not currently open.
+// RequestManualOrderClose flags an order for ManualTrader to end on its next tick — either flatten
+// (status filled/partial) or cancel (status resting, an unfilled limit order). One flag covers
+// both cases safely because a row's status is never simultaneously "resting" and "filled/partial"
+// (docs/MANUAL_TRADE_PLAN.md §8.1): ManualTrader.Run reads the CURRENT status when it processes the
+// flag and picks the matching action, so there is no ambiguity about which one applies. Mirrors
+// RequestRealManualClose's async-intent shape (flag now, act on the process's own next tick).
 func (r *Repository) RequestManualOrderClose(ctx context.Context, id int64) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE manual_orders SET manual_close_requested = true
-		WHERE id = $1 AND closed_at IS NULL AND status IN ('filled', 'partial')
+		WHERE id = $1 AND closed_at IS NULL AND status IN ('filled', 'partial', 'resting')
 	`, id)
 	if err != nil {
 		return fmt.Errorf("request manual close for manual order %d: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("manual order %d is not open", id)
+		return fmt.Errorf("manual order %d is not open or resting", id)
 	}
 	return nil
 }
@@ -206,6 +210,11 @@ func (r *Repository) RequestManualOrderClose(ctx context.Context, id int64) erro
 // (CancelOrder, not a flatten) and a different terminal state (close_reason='canceled', no position
 // ever existed) than RequestManualOrderClose, so this is its own method rather than overloading
 // that one's semantics (docs/MANUAL_TRADE_PLAN.md §8.1).
+//
+// Zero rows affected is reported as ErrOrderAlreadyClosed regardless of whether the row was never
+// resting at all or a second racing caller already resolved it — the same idempotency guard
+// CloseManualOrder/CloseRealOrderConfirmed use, since both cases mean the same thing to a caller
+// here: there is nothing left for this call to do.
 func (r *Repository) CancelManualOrder(ctx context.Context, id int64) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE manual_orders
@@ -216,7 +225,7 @@ func (r *Repository) CancelManualOrder(ctx context.Context, id int64) error {
 		return fmt.Errorf("cancel manual order %d: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("manual order %d is not a resting order", id)
+		return fmt.Errorf("manual order %d: %w", id, port.ErrOrderAlreadyClosed)
 	}
 	return nil
 }

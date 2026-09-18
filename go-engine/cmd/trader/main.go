@@ -447,6 +447,49 @@ func runRealTrader(
 		}()
 	}
 
+	// Manual/discretionary trading (docs/MANUAL_TRADE_PLAN.md): one account-wide ManualTrader,
+	// unlike RealTrader which is one-per-configured-instrument — a manual order can be placed on
+	// ANY token the operator picks from a live search, not just the pre-configured roster.
+	manualTrader := &usecase.ManualTrader{
+		Repo:          repo,
+		Exchange:      exchangeClient,
+		Logger:        logger,
+		ExecInstType:  cfg.Trading.ExecInstType,
+		SettleCcy:     cfg.Trading.ExecSettleCcy,
+		TdMode:        cfg.Trading.TdMode,
+		PosMode:       cfg.Trading.PosMode,
+		ExecInstIDFor: okx.SymbolMap(cfg.Trading.SymbolMap).Resolve,
+		FillTimeout:   time.Duration(cfg.FillTimeout.OrderFillTimeoutSec) * time.Second,
+		OrderEvents:   orderEventsPub,
+		// §8.4: a manual order and a strategy position can share ONE net exchange position, and
+		// OKX's conditional orders for a position don't stack cleanly — so before placing its own
+		// protective order, ManualTrader checks whether RealTrader already holds a live one on this
+		// token. A pure in-memory/DB check against the already-running engines map, no extra
+		// exchange call: RealTrader itself is the source of truth for whether IT protects a token,
+		// via the algo order id it already recorded when it opened.
+		RealTraderProtects: func(instID string) bool {
+			if _, ok := engines[instID]; !ok {
+				// Not a token RealTrader watches at all — nothing it could be protecting.
+				return false
+			}
+			open := true
+			positions, err := repo.ListRealPositions(ctx, port.PositionFilter{InstID: instID, Open: &open})
+			if err != nil {
+				logger.Warn("manual trader: could not check for an existing strategy position", "instId", instID, "error", err)
+				return false
+			}
+			for _, p := range positions {
+				if p.ExchangeAlgoOrderID != nil && *p.ExchangeAlgoOrderID != "" {
+					return true
+				}
+			}
+			return false
+		},
+	}
+	go func() {
+		errCh <- manualTrader.Run(ctx)
+	}()
+
 	// Keeps the active roster in step with what the account can actually afford (2026-09-08
 	// request): the per-token budget is equity/tokenCount, so profit can make a previously
 	// untradeable token affordable and losses can push one out. Runs in-process rather than as a

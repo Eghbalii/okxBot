@@ -171,7 +171,7 @@ func (r *fakeRepository) CancelManualOrder(ctx context.Context, id int64) error 
 	defer r.mu.Unlock()
 	o, ok := r.manualOrders[id]
 	if !ok || o.ClosedAt != nil || o.Status != "resting" {
-		return fmt.Errorf("manual order %d is not a resting order", id)
+		return fmt.Errorf("manual order %d: %w", id, port.ErrOrderAlreadyClosed)
 	}
 	now := time.Now()
 	o.ClosedAt = &now
