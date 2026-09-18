@@ -46,6 +46,17 @@ type ExchangeSource struct {
 	// with no entry scans nothing rather than guessing at its naming, since a wrong guess silently
 	// admits dated futures or spot pairs to a perpetual-futures bot.
 	QuoteSuffixes []string
+	// TradesLive marks an exchange whose admitted tokens actually reach a running PaperTrader
+	// engine (2026-09-18 fix): paper-trader's own roster load is hardcoded to "okx" (no MEXC
+	// execution wiring exists yet, §46.6), so a MEXC admission can never spend a share of the
+	// paper account's sizing budget the way an OKX one does. Scan discovers and ranks MEXC tokens
+	// regardless (useful for future real-money candidates, §53's own reasoning) but the account
+	// top-up (topUpForNewTokens) counts only admissions from exchanges with this set — topping up
+	// for a MEXC discovery would grow the account for a token that never uses that growth, diluting
+	// every OKX position's size further than PerTokenCapUSD was meant to allow. Found in production:
+	// the operator noticed the paper account's equity had grown well past what the OKX-only roster's
+	// own token count justified, and 4 of the last admissions turned out to all be MEXC.
+	TradesLive bool
 }
 
 // Scan weights. Deliberately a small, explicit set rather than a tuned model: the scan's job is to
@@ -206,13 +217,18 @@ type ScanResult struct {
 // opposite of useful (ReplaceMarketTokens declines an empty write for exactly this).
 func (s *MarketScanner) Scan(ctx context.Context) []ScanResult {
 	out := make([]ScanResult, 0, len(s.Exchanges))
-	newTokens := 0
+	newTradeableTokens := 0
 	for _, ex := range s.Exchanges {
 		res := s.scanOne(ctx, ex)
 		out = append(out, res)
-		newTokens += res.NewlyAdmitted
+		// Only an exchange paper-trader actually loads can spend a share of the top-up — counting a
+		// non-tradeable exchange's admissions here would grow the account for tokens that never use
+		// that growth, diluting every real position's size (see TradesLive's own doc comment).
+		if ex.TradesLive {
+			newTradeableTokens += res.NewlyAdmitted
+		}
 	}
-	s.topUpForNewTokens(ctx, newTokens)
+	s.topUpForNewTokens(ctx, newTradeableTokens)
 	return out
 }
 

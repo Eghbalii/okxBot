@@ -52,6 +52,11 @@ func buildExchangeSources(cfg *config.Config, logger *slog.Logger) []usecase.Exc
 		switch ex.Name {
 		case "okx":
 			src.Client = gatewayclient.New(cfg.Gateway.URL, "api")
+			// The only exchange a running PaperTrader engine actually loads (cmd/paper-trader's
+			// roster load is hardcoded to "okx", no MEXC execution wiring exists yet, §46.6) — see
+			// TradesLive's own doc comment for why this must stay in sync with that hardcoding, not
+			// derived from it, until MEXC trading is wired up.
+			src.TradesLive = true
 		case "mexc":
 			src.Client = mexcrest.New(cfg.MEXC.RESTBaseURL, cfg.MEXC.APIKey, cfg.MEXC.APISecret)
 		default:

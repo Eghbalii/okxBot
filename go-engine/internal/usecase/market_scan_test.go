@@ -147,7 +147,9 @@ func scannerFor(repo port.Repository, client allTickerFetcher, topN int) *Market
 	return &MarketScanner{
 		Repo: repo,
 		Exchanges: []ExchangeSource{{
-			Name: "okx", Client: client, InstType: "FUTURES", QuoteSuffixes: okxSuffixes,
+			// TradesLive: true matches production's own cmd/api wiring for "okx" — this helper
+			// always builds an okx source, which genuinely is the exchange paper-trader loads.
+			Name: "okx", Client: client, InstType: "FUTURES", QuoteSuffixes: okxSuffixes, TradesLive: true,
 		}},
 		TopN: topN,
 	}
@@ -355,5 +357,82 @@ func TestScan_ZeroPerTokenCapDisablesTopUp(t *testing.T) {
 	}
 	if !ae.EquityUSD.Equal(decimal.NewFromInt(40)) {
 		t.Errorf("equity = %s, want unchanged at 40 — PerTokenCapUSD is zero, the top-up must be a no-op", ae.EquityUSD)
+	}
+}
+
+// A newly-admitted token on an exchange with TradesLive=false must NOT top up the account (found
+// in production, 2026-09-18): paper-trader's own roster load is hardcoded to "okx" only (no MEXC
+// execution wiring exists yet), so a MEXC admission can never spend a share of the sizing budget
+// the way an OKX one does. Before this fix, Scan topped up for every admission across every
+// configured exchange regardless — the operator noticed the paper account's equity had grown well
+// past what the OKX-only roster's own token count justified, traced to four MEXC-only admissions.
+func TestScan_DoesNotTopUpForANonTradingExchange(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "paper", decimal.NewFromInt(40)); err != nil {
+		t.Fatal(err)
+	}
+
+	sc := &MarketScanner{
+		Repo: repo,
+		Exchanges: []ExchangeSource{{
+			Name: "mexc", Client: stubTickers{toks: []domain.MarketTicker{
+				mt("BTCUSDT", 77000, 76000, 78000, 75500, 69_000_000),
+			}}, InstType: "FUTURES", QuoteSuffixes: []string{"USDT"},
+			// TradesLive deliberately left false — the exact MEXC-shaped case this test pins.
+		}},
+		TopN:           10,
+		PerTokenCapUSD: decimal.NewFromInt(4),
+	}
+
+	if res := sc.Scan(ctx); res[0].Err != nil || res[0].NewlyAdmitted != 1 {
+		t.Fatalf("scan: %+v", res[0])
+	}
+
+	ae, err := repo.GetAccountEquity(ctx, "paper", decimal.NewFromInt(40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ae.EquityUSD.Equal(decimal.NewFromInt(40)) {
+		t.Errorf("equity = %s, want unchanged at 40 — a non-tradeable exchange's admission must never top up the account", ae.EquityUSD)
+	}
+}
+
+// The mixed case: one exchange trades live, one does not. Only the tradeable one's admission
+// should count toward the top-up.
+func TestScan_OnlyTradesLiveExchangeCountsTowardTopUp(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "paper", decimal.NewFromInt(40)); err != nil {
+		t.Fatal(err)
+	}
+
+	sc := &MarketScanner{
+		Repo: repo,
+		Exchanges: []ExchangeSource{
+			{
+				Name: "okx", Client: stubTickers{toks: []domain.MarketTicker{
+					mt("BTC-USD_UM_XPERP-310404", 77000, 76000, 78000, 75500, 69_000_000),
+				}}, InstType: "FUTURES", QuoteSuffixes: okxSuffixes, TradesLive: true,
+			},
+			{
+				Name: "mexc", Client: stubTickers{toks: []domain.MarketTicker{
+					mt("ETHUSDT", 3000, 2900, 3100, 2850, 50_000_000),
+				}}, InstType: "FUTURES", QuoteSuffixes: []string{"USDT"},
+			},
+		},
+		TopN:           10,
+		PerTokenCapUSD: decimal.NewFromInt(4),
+	}
+
+	sc.Scan(ctx)
+
+	ae, err := repo.GetAccountEquity(ctx, "paper", decimal.NewFromInt(40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly ONE top-up (the OKX admission), not two.
+	if !ae.EquityUSD.Equal(decimal.NewFromInt(44)) {
+		t.Errorf("equity = %s, want 44 (one $4 top-up for the OKX admission only, MEXC's must not count)", ae.EquityUSD)
 	}
 }
