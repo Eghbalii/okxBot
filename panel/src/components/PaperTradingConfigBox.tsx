@@ -307,7 +307,6 @@ function TradingControls({ mode }: { mode: PositionMode }) {
       {showTokenModal && (
         <TokenModal
           mode={mode}
-          allInstIds={cfg.allInstIds}
           disabledInstIds={cfg.disabledInstIds}
           onClose={() => setShowTokenModal(false)}
           onSave={saveDisabledInstIds}

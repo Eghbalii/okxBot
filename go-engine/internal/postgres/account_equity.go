@@ -269,6 +269,46 @@ func (r *Repository) SetAccountCap(ctx context.Context, mode string, newCapUSD d
 	return ae, nil
 }
 
+// AdjustAccountCap ADDS deltaUSD to both EquityUSD and AccountBalanceUSD — see the port interface's
+// doc comment for why this is a separate operation from SetAccountCap rather than a mode of it.
+//
+// Requires an existing row (same precondition as SetTradingCap): a per-token top-up only makes
+// sense once GetAccountEquity has already seeded the mode, and seeding here too would let a caller
+// that forgot to seed first silently create the account at whatever the first delta happened to be.
+func (r *Repository) AdjustAccountCap(ctx context.Context, mode string, deltaUSD decimal.Decimal) (port.AccountEquity, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return port.AccountEquity{}, fmt.Errorf("begin adjust account cap: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+
+	var ae port.AccountEquity
+	row := tx.QueryRow(ctx, `
+		UPDATE account_equity
+		SET equity_usd = equity_usd + $2,
+			account_balance_usd = account_balance_usd + $2,
+			updated_at = now()
+		WHERE mode = $1
+		RETURNING `+accountEquityCols, mode, deltaUSD)
+	if err := scanAccountEquity(row, &ae); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("adjust account cap for mode %s: no existing row (call GetAccountEquity first): %w", mode, err)
+	}
+
+	// reason="cap": this is sizing-budget bookkeeping following the roster's own growth, not a
+	// trading outcome — it must never reach the PnL/win-rate figures a reason="trade" row would.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO account_equity_history (mode, equity_usd, delta_usd, reason)
+		VALUES ($1, $2, $3, 'cap')
+	`, mode, ae.EquityUSD, deltaUSD); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("record account cap adjustment for mode %s: %w", mode, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("commit adjust account cap: %w", err)
+	}
+	return ae, nil
+}
+
 // SetTradingCap sets how much of the REAL balance this engine may trade with, without ever
 // touching AccountBalanceUSD — see the port interface's doc comment for why that separation is
 // mandatory in real mode (AccountBalanceUSD is RecordExchangeBalance's reconciliation anchor

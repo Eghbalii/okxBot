@@ -88,10 +88,11 @@ func buildBalanceSources(cfg *config.Config) []api.ExchangeBalanceSource {
 
 func newMarketScanner(cfg *config.Config, repo port.Repository, logger *slog.Logger) *usecase.MarketScanner {
 	return &usecase.MarketScanner{
-		Repo:         repo,
-		Exchanges:    buildExchangeSources(cfg, logger),
-		Logger:       logger,
-		TopN:         cfg.Scan.TopN,
-		MinVolumeUSD: cfg.Scan.MinVolumeUSD,
+		Repo:           repo,
+		Exchanges:      buildExchangeSources(cfg, logger),
+		Logger:         logger,
+		TopN:           cfg.Scan.TopN,
+		MinVolumeUSD:   cfg.Scan.MinVolumeUSD,
+		PerTokenCapUSD: cfg.Scan.PerTokenCapUSD,
 	}
 }

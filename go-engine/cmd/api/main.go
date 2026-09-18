@@ -159,6 +159,7 @@ func main() {
 		// and a memory footprint on a 3.9GB box (§35.7) and nothing else.
 		ExchangeBalances: buildBalanceSources(cfg),
 		Scanner:          scannerAdapter{inner: scanner},
+		PerTokenCapUSD:   cfg.Scan.PerTokenCapUSD,
 	}
 	routes := srv.Routes() // must be called before Hub() usage below so the same *wsHub backs both
 

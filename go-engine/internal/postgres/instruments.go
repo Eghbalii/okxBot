@@ -12,15 +12,15 @@ const instrumentCols = `id, symbol, exchange, exec_inst_id, inst_type,
 	coalesce(vol_24h_usd, 0), coalesce(change_24h_pct, 0), coalesce(scan_score, 0),
 	created_at, updated_at`
 
-// ListInstruments reads the tradeable-instrument roster (migration 000031). Ordered by symbol so
-// the panel's roster view and each service's startup log are stable between reads rather than
-// following Postgres's physical row order.
-func (r *Repository) ListInstruments(ctx context.Context, f port.InstrumentFilter) ([]port.Instrument, error) {
-	// The enabled filter maps a consumer name onto its own column rather than taking a column name
-	// from the caller — a caller-supplied identifier would be either an injection surface or a
-	// silent no-op on a typo, and there are exactly three legal values.
-	where := ``
-	args := []any{}
+// instrumentWhere builds f's Exchange/Enabled predicate, shared by ListInstruments and
+// CountInstruments so the two can never disagree about which rows a filter matches — a paginated
+// list and its page-count query silently drifting apart is worse than either alone, since the
+// panel would show a page count that does not match what paging through the list actually finds.
+//
+// The enabled filter maps a consumer name onto its own column rather than taking a column name
+// from the caller — a caller-supplied identifier would be either an injection surface or a silent
+// no-op on a typo, and there are exactly three legal values.
+func instrumentWhere(f port.InstrumentFilter) (where string, args []any, err error) {
 	if f.Exchange != "" {
 		args = append(args, f.Exchange)
 		where += fmt.Sprintf(" AND exchange = $%d", len(args))
@@ -34,11 +34,27 @@ func (r *Repository) ListInstruments(ctx context.Context, f port.InstrumentFilte
 	case "real":
 		where += " AND enabled_real"
 	default:
-		return nil, fmt.Errorf("list instruments: unknown enabled filter %q", f.Enabled)
+		return "", nil, fmt.Errorf("unknown enabled filter %q", f.Enabled)
+	}
+	return where, args, nil
+}
+
+// ListInstruments reads the tradeable-instrument roster (migration 000031). Ordered by symbol so
+// the panel's roster view and each service's startup log are stable between reads rather than
+// following Postgres's physical row order.
+func (r *Repository) ListInstruments(ctx context.Context, f port.InstrumentFilter) ([]port.Instrument, error) {
+	where, args, err := instrumentWhere(f)
+	if err != nil {
+		return nil, fmt.Errorf("list instruments: %w", err)
 	}
 
-	rows, err := r.pool.Query(ctx, `SELECT `+instrumentCols+`
-		FROM instruments WHERE true`+where+` ORDER BY symbol`, args...)
+	query := `SELECT ` + instrumentCols + ` FROM instruments WHERE true` + where + ` ORDER BY symbol`
+	if f.Limit > 0 {
+		args = append(args, f.Limit, f.Offset)
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+	}
+
+	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list instruments: %w", err)
 	}
@@ -58,6 +74,22 @@ func (r *Repository) ListInstruments(ctx context.Context, f port.InstrumentFilte
 	return out, rows.Err()
 }
 
+// CountInstruments returns how many rows f's Exchange/Enabled filters match, ignoring
+// f.Limit/f.Offset — see the port interface's doc comment for why this exists as its own method
+// rather than a COUNT(*) OVER() window column on ListInstruments (matches CountPositions' own
+// precedent elsewhere in this file).
+func (r *Repository) CountInstruments(ctx context.Context, f port.InstrumentFilter) (int, error) {
+	where, args, err := instrumentWhere(f)
+	if err != nil {
+		return 0, fmt.Errorf("count instruments: %w", err)
+	}
+	var n int
+	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM instruments WHERE true`+where, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count instruments: %w", err)
+	}
+	return n, nil
+}
+
 // UpsertInstrument adds a roster row or refreshes an existing one, keyed by (exchange, symbol).
 //
 // An existing row's THREE ENABLE FLAGS ARE DELIBERATELY NOT OVERWRITTEN. A scan re-finding a token
@@ -66,8 +98,12 @@ func (r *Repository) ListInstruments(ctx context.Context, f port.InstrumentFilte
 // from its own earlier one), and the same mistake is available here. Only the market snapshot and
 // the exec id are refreshed, the latter because OKX's X-Perp ids carry a rolling expiry that
 // genuinely changes under an unchanged symbol (CLAUDE.md §33.4).
-func (r *Repository) UpsertInstrument(ctx context.Context, in port.Instrument) (port.Instrument, error) {
+func (r *Repository) UpsertInstrument(ctx context.Context, in port.Instrument) (port.Instrument, bool, error) {
 	var out port.Instrument
+	// xmax = 0 is the same "did THIS statement insert it" signal GetAccountEquity already uses
+	// (internal/postgres/account_equity.go) — true only for a row this exact call created, false for
+	// one the DO UPDATE branch merely touched.
+	var inserted bool
 	err := r.pool.QueryRow(ctx, `
 		INSERT INTO instruments (symbol, exchange, exec_inst_id, inst_type,
 			enabled_ingest, enabled_paper, enabled_real, source,
@@ -80,18 +116,18 @@ func (r *Repository) UpsertInstrument(ctx context.Context, in port.Instrument) (
 			change_24h_pct = EXCLUDED.change_24h_pct,
 			scan_score     = EXCLUDED.scan_score,
 			updated_at     = now()
-		RETURNING `+instrumentCols,
+		RETURNING `+instrumentCols+`, (xmax = 0)`,
 		in.Symbol, in.Exchange, in.ExecInstID, in.InstType,
 		in.EnabledIngest, in.EnabledPaper, in.EnabledReal, in.Source,
 		in.Vol24hUSD, in.Change24hPct, in.ScanScore).
 		Scan(&out.ID, &out.Symbol, &out.Exchange, &out.ExecInstID, &out.InstType,
 			&out.EnabledIngest, &out.EnabledPaper, &out.EnabledReal, &out.Source,
 			&out.Vol24hUSD, &out.Change24hPct, &out.ScanScore,
-			&out.CreatedAt, &out.UpdatedAt)
+			&out.CreatedAt, &out.UpdatedAt, &inserted)
 	if err != nil {
-		return port.Instrument{}, fmt.Errorf("upsert instrument %s/%s: %w", in.Exchange, in.Symbol, err)
+		return port.Instrument{}, false, fmt.Errorf("upsert instrument %s/%s: %w", in.Exchange, in.Symbol, err)
 	}
-	return out, nil
+	return out, inserted, nil
 }
 
 // SetInstrumentFlags applies patch's non-nil fields to one roster row. Each field is coalesced onto

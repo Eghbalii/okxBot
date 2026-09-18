@@ -180,14 +180,59 @@ type instrumentView struct {
 	Change24hPct  string `json:"change24hPct"`
 	ScanScore     string `json:"scanScore"`
 	UpdatedAt     string `json:"updatedAt"`
+	// Active is true only when this symbol has at least one ENABLED strategy_assignments row for
+	// activeMode (2026-09-17 request) — deliberately NOT the same thing as EnabledPaper/EnabledReal.
+	// A token can be enabled_paper=true and still never trade: MEXC tokens are enabled_paper on
+	// admission (the scan's own §53.1 rule) but paper-trader's roster load is hardcoded to the "okx"
+	// exchange only (no MEXC execution wiring yet, §46.6) — those rows are real and selectable, they
+	// are just not active. This is the field the Manage Tokens list uses to answer "is this token
+	// actually open for trading right now", which enabledPaper alone cannot.
+	Active bool `json:"active"`
 }
 
-// handleListInstruments serves the roster — the tokens actually being collected and traded.
+// instrumentListResponse pages the roster (2026-09-17): the discovery scan keeps growing it on its
+// own, and returning every row unpaginated stopped being reasonable once it passed the ~10-token
+// config-file era this endpoint was first written for. Total is the filtered count BEFORE paging,
+// so the panel can render "page X of Y" rather than only "here are up to Limit rows".
+type instrumentListResponse struct {
+	Items []instrumentView `json:"items"`
+	Total int              `json:"total"`
+}
+
+// handleListInstruments serves the roster — the full set of tokens SELECTABLE for trading, not
+// only the ones currently active (see instrumentView.Active's own doc comment for why those two
+// differ). limit/offset are optional query params; omitting both returns every matching row
+// unpaginated, which is what every trading service's own startup load needs (they want the full
+// working set, never a page of it) — only the panel passes them.
 func (s *Server) handleListInstruments(w http.ResponseWriter, r *http.Request) {
 	f := port.InstrumentFilter{
 		Exchange: r.URL.Query().Get("exchange"),
 		Enabled:  r.URL.Query().Get("enabled"),
 	}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		f.Limit = n
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return
+		}
+		f.Offset = n
+	}
+	// activeMode decides which assignment set Active is computed against — defaults to "paper"
+	// since that's this endpoint's only caller today (Manage Tokens), matching every other
+	// paper-vs-real-scoped endpoint's own default in this file.
+	activeMode := r.URL.Query().Get("mode")
+	if activeMode == "" {
+		activeMode = "paper"
+	}
+
 	roster, err := s.Repo.ListInstruments(r.Context(), f)
 	if err != nil {
 		// An unknown enabled filter is the caller's mistake, not a server fault — ListInstruments
@@ -195,6 +240,19 @@ func (s *Server) handleListInstruments(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	// One query for every symbol with a live assignment, not one per roster row — a per-row
+	// ListAssignments call would turn a single paginated page into N round trips.
+	assignments, err := s.Repo.ListAssignments(r.Context(), "", true, activeMode)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	activeSymbols := make(map[string]bool, len(assignments))
+	for _, a := range assignments {
+		activeSymbols[a.InstID] = true
+	}
+
 	out := make([]instrumentView, 0, len(roster))
 	for _, in := range roster {
 		out = append(out, instrumentView{
@@ -204,9 +262,21 @@ func (s *Server) handleListInstruments(w http.ResponseWriter, r *http.Request) {
 			Vol24hUSD: in.Vol24hUSD.String(), Change24hPct: in.Change24hPct.String(),
 			ScanScore: in.ScanScore.String(),
 			UpdatedAt: in.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+			Active:    activeSymbols[in.Symbol],
 		})
 	}
-	writeJSON(w, http.StatusOK, out)
+
+	// Total is only meaningful (and only worth a second query) when the caller actually paginated —
+	// an unpaginated request already returns every matching row, so len(out) already is the total.
+	total := len(out)
+	if f.Limit > 0 {
+		total, err = s.Repo.CountInstruments(r.Context(), f)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, instrumentListResponse{Items: out, Total: total})
 }
 
 // handleCreateInstrument adds a token to the roster by hand — the operator's own path for a token
@@ -242,10 +312,22 @@ func (s *Server) handleCreateInstrument(w http.ResponseWriter, r *http.Request) 
 		EnabledPaper:  boolOr(body.EnabledPaper, true),
 		EnabledReal:   boolOr(body.EnabledReal, false),
 	}
-	out, err := s.Repo.UpsertInstrument(r.Context(), in)
+	out, wasNew, err := s.Repo.UpsertInstrument(r.Context(), in)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// Same top-up a scan-discovered token gets (usecase.MarketScanner.topUpForNewTokens) — one
+	// operator decision to add a token should have one consistent consequence regardless of which of
+	// the two paths added it. Only for a genuinely new row and only when paper trading is enabled on
+	// it: re-adding an already-known token, or adding one with paper trading off, must not grow the
+	// account. Best-effort, matching the scanner's own posture — a failed top-up must not make an
+	// otherwise-successful instrument creation look like it failed.
+	if wasNew && out.EnabledPaper && s.PerTokenCapUSD.IsPositive() {
+		if _, err := s.Repo.AdjustAccountCap(r.Context(), "paper", s.PerTokenCapUSD); err != nil {
+			s.Logger.Warn("manual instrument add: could not top up paper account",
+				"symbol", out.Symbol, "err", err)
+		}
 	}
 	writeJSON(w, http.StatusOK, instrumentView{
 		ID: out.ID, Symbol: out.Symbol, Exchange: out.Exchange, ExecInstID: out.ExecInstID,

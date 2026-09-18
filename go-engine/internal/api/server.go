@@ -82,6 +82,11 @@ type Server struct {
 	// Scanner runs token discovery. Optional: nil disables POST /api/market/scan with a clear error
 	// rather than a panic, so cmd/api still runs anywhere the exchange clients are not wired.
 	Scanner marketScanner
+	// PerTokenCapUSD mirrors usecase.MarketScanner's own field, applied here too so a MANUALLY added
+	// token (handleCreateInstrument) gets the same sizing-budget top-up a scan-discovered one does —
+	// one operator decision to add a token, one consistent consequence, regardless of which of the
+	// two paths added it. Zero disables the top-up, same as the scanner's own zero-value meaning.
+	PerTokenCapUSD decimal.Decimal
 
 	// hub fans out real-time paper-order open/close events to connected panel WebSocket clients
 	// (CLAUDE.md §11.4). Lazily initialized by Routes/Hub so callers never need to construct it

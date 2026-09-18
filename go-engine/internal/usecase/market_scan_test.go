@@ -274,3 +274,86 @@ func TestScan_ExchangeFailureKeepsPreviousSnapshot(t *testing.T) {
 		t.Errorf("snapshot has %d tokens after a failed scan, want the previous 1 retained", len(after))
 	}
 }
+
+// A genuinely new token tops up the paper account by PerTokenCapUSD (2026-09-17 request): the
+// account cap now follows the live enabled-token count rather than staying fixed while the roster
+// grows underneath it, which had fragmented every position toward a few cents as discovery kept
+// adding tokens the fixed $40 was never resized for.
+func TestScan_ToppedUpAccountForANewlyAdmittedToken(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "paper", decimal.NewFromInt(40)); err != nil {
+		t.Fatal(err)
+	}
+
+	sc := scannerFor(repo, stubTickers{toks: []domain.MarketTicker{
+		mt("BTC-USD_UM_XPERP-310404", 77000, 76000, 78000, 75500, 69_000_000),
+	}}, 10)
+	sc.PerTokenCapUSD = decimal.NewFromInt(4)
+
+	if res := sc.Scan(ctx); res[0].Err != nil || res[0].NewlyAdmitted != 1 {
+		t.Fatalf("scan: %+v", res[0])
+	}
+
+	ae, err := repo.GetAccountEquity(ctx, "paper", decimal.NewFromInt(40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ae.EquityUSD.Equal(decimal.NewFromInt(44)) {
+		t.Errorf("equity = %s, want 44 (40 + one $4 top-up)", ae.EquityUSD)
+	}
+	if !ae.AccountBalanceUSD.Equal(decimal.NewFromInt(44)) {
+		t.Errorf("balance = %s, want 44 — a top-up must move both figures together", ae.AccountBalanceUSD)
+	}
+}
+
+// A token the scan re-finds (already on the roster, only its market snapshot refreshed) must NOT
+// top up the account a second time — that would inflate the account for a roster that did not grow,
+// exactly what topUpForNewTokens's wasNew check exists to prevent.
+func TestScan_DoesNotTopUpForARefreshedToken(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "paper", decimal.NewFromInt(40)); err != nil {
+		t.Fatal(err)
+	}
+
+	toks := []domain.MarketTicker{mt("BTC-USD_UM_XPERP-310404", 77000, 76000, 78000, 75500, 69_000_000)}
+	sc := scannerFor(repo, stubTickers{toks: toks}, 10)
+	sc.PerTokenCapUSD = decimal.NewFromInt(4)
+
+	sc.Scan(ctx) // first sighting: tops up once
+	sc.Scan(ctx) // same token again: must not top up a second time
+
+	ae, err := repo.GetAccountEquity(ctx, "paper", decimal.NewFromInt(40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ae.EquityUSD.Equal(decimal.NewFromInt(44)) {
+		t.Errorf("equity = %s, want 44 — a re-scan of the same token must not top up again", ae.EquityUSD)
+	}
+}
+
+// PerTokenCapUSD left at its zero value must disable the top-up entirely — a caller (or an
+// exchange with no account concept) that never opted in must never see Scan touch money.
+func TestScan_ZeroPerTokenCapDisablesTopUp(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepository()
+	if _, err := repo.GetAccountEquity(ctx, "paper", decimal.NewFromInt(40)); err != nil {
+		t.Fatal(err)
+	}
+
+	sc := scannerFor(repo, stubTickers{toks: []domain.MarketTicker{
+		mt("BTC-USD_UM_XPERP-310404", 77000, 76000, 78000, 75500, 69_000_000),
+	}}, 10)
+	// PerTokenCapUSD deliberately left at its zero value.
+
+	sc.Scan(ctx)
+
+	ae, err := repo.GetAccountEquity(ctx, "paper", decimal.NewFromInt(40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ae.EquityUSD.Equal(decimal.NewFromInt(40)) {
+		t.Errorf("equity = %s, want unchanged at 40 — PerTokenCapUSD is zero, the top-up must be a no-op", ae.EquityUSD)
+	}
+}

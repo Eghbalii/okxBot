@@ -468,6 +468,12 @@ type Config struct {
 		// database table later (operator's instruction): everything downstream reads
 		// usecase.ExchangeSource, never this struct, so that move touches one wiring function.
 		Exchanges []ScanExchange `yaml:"exchanges"`
+		// PerTokenCapUSD is how much paper-trading sizing budget one newly-admitted token adds to
+		// the shared paper account (2026-09-17 request): the account cap now follows the live
+		// enabled-token count rather than staying fixed while the roster grows underneath it, which
+		// previously fragmented every position toward a few cents as discovery kept adding tokens.
+		// Zero disables the top-up. Real money is never touched by this — only "paper".
+		PerTokenCapUSD decimal.Decimal `yaml:"per_token_cap_usd"`
 	} `yaml:"scan"`
 }
 

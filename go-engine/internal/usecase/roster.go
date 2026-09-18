@@ -174,7 +174,7 @@ func SeedRoster(
 			EnabledIngest: true, EnabledPaper: true, EnabledReal: true,
 			Source: "seed",
 		}
-		if _, err := repo.UpsertInstrument(ctx, in); err != nil {
+		if _, _, err := repo.UpsertInstrument(ctx, in); err != nil {
 			return fmt.Errorf("seed roster: %s: %w", sym, err)
 		}
 	}

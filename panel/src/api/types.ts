@@ -419,6 +419,11 @@ export interface Instrument {
   change24hPct: string
   scanScore: string
   updatedAt: string
+  // True only when this symbol has a live, enabled strategy assignment for the queried mode
+  // (2026-09-17) — NOT the same as enabledPaper/enabledReal, which a token can carry without ever
+  // actually trading (e.g. a MEXC row: enabled_paper is set on admission, but paper-trader's
+  // roster load is OKX-only, so it never gets an assignment and is never truly active).
+  active: boolean
 }
 
 export interface ScanResult {

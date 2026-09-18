@@ -107,7 +107,7 @@ func TestRosterFor_SeedsConfiguredSymbolsMissedByAScan(t *testing.T) {
 	// The scan got there first, and found tokens the operator never configured while missing two the
 	// operator did.
 	for _, sym := range []string{"BTC", "FIL", "TAO"} {
-		if _, err := repo.UpsertInstrument(ctx, port.Instrument{
+		if _, _, err := repo.UpsertInstrument(ctx, port.Instrument{
 			Symbol: sym, Exchange: "okx", ExecInstID: sym + "-X", InstType: "FUTURES",
 			EnabledIngest: true, EnabledPaper: true, Source: "scan",
 		}); err != nil {
@@ -146,7 +146,7 @@ func TestRosterFor_SeedsConfiguredSymbolsMissedByAScan(t *testing.T) {
 func TestRosterFor_DoesNotReseedADisabledConfiguredSymbol(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
-	if _, err := repo.UpsertInstrument(ctx, port.Instrument{
+	if _, _, err := repo.UpsertInstrument(ctx, port.Instrument{
 		Symbol: "BTC", Exchange: "okx", ExecInstID: "BTC-X",
 		EnabledIngest: false, EnabledPaper: false, Source: "seed",
 	}); err != nil {
@@ -169,7 +169,7 @@ func TestRosterFor_RespectsEachConsumerIndependently(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	// A scanned token: ingest + paper on, real off — exactly what MarketScanner.admit writes.
-	if _, err := repo.UpsertInstrument(ctx, port.Instrument{
+	if _, _, err := repo.UpsertInstrument(ctx, port.Instrument{
 		Symbol: "NEW", Exchange: "okx", ExecInstID: "NEW-X", InstType: "FUTURES",
 		EnabledIngest: true, EnabledPaper: true, EnabledReal: false, Source: "scan",
 	}); err != nil {

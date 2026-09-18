@@ -443,6 +443,13 @@ type InstrumentFilter struct {
 	// rows regardless of their flags — which is what the panel's roster view wants, and what no
 	// trading service should ever ask for.
 	Enabled string
+	// Limit/Offset page the result for the panel's Manage Tokens list (2026-09-17): the roster
+	// grows on its own as the discovery scan admits tokens, and returning every row unpaginated
+	// stopped being reasonable once it passed the ~10-token config-file era this filter was first
+	// written for. Limit<=0 means no cap, matching every other paginated list in this codebase
+	// (e.g. ListPositions).
+	Limit  int
+	Offset int
 }
 
 // InstrumentPatch updates one roster row's flags. Nil fields are left unchanged, so enabling a
@@ -713,6 +720,16 @@ type Repository interface {
 	// equity chart and the dynamic per-position sizing (equity / active token count) both anchor to,
 	// so this single value is the one and only definition of "the balance since I last chose one."
 	SetAccountCap(ctx context.Context, mode string, newCapUSD decimal.Decimal) (AccountEquity, error)
+	// AdjustAccountCap ADDS deltaUSD (may be negative) to both EquityUSD and AccountBalanceUSD,
+	// recording a reason="cap" history point — deliberately NOT SetAccountCap: that resets
+	// ResetCount/LastResetAt and stamps a whole new baseline, appropriate for an operator choosing
+	// "trade with $X from here", but wrong for a per-token top-up (2026-09-17 request, following a
+	// scan-discovered token onto the roster) where every genuinely new paper token should add its
+	// own $4 of sizing budget without resetting the account's history or hiding the PnL curve behind
+	// a fresh LastResetAt on every scan. reason="cap" matches SetTradingCap's own precedent: the
+	// balance stepped, but it is a bookkeeping change, not a trade outcome, so it must never reach
+	// PnL/win-rate figures the same way a reason="trade" row would.
+	AdjustAccountCap(ctx context.Context, mode string, deltaUSD decimal.Decimal) (AccountEquity, error)
 	// SetTradingCap is real trading's counterpart to SetAccountCap, and deliberately a DIFFERENT
 	// operation rather than a mode branch inside it (2026-09-08 request). The distinction is what
 	// AccountBalanceUSD means per mode: in paper it is bookkeeping this system owns, so a cap
@@ -755,12 +772,26 @@ type Repository interface {
 	// replacement for config.yaml's trading.inst_ids + trading.symbol_map. Every trading service
 	// loads its own working set through this at startup, so a token the discovery scan admitted is
 	// picked up on the next restart without a config edit.
+	//
+	// f.Limit/f.Offset page the result (2026-09-17) for the panel's Manage Tokens list, which reads
+	// the same roster and has grown well past a page-in-one-request size as the discovery scan keeps
+	// admitting new tokens. A trading service's own startup load leaves both at zero (unpaginated —
+	// every service needs its FULL working set, not a page of it).
 	ListInstruments(ctx context.Context, f InstrumentFilter) ([]Instrument, error)
+	// CountInstruments returns how many rows f's Exchange/Enabled filters match, ignoring
+	// f.Limit/f.Offset — mirrors CountPositions' own pattern, for the panel's page-count display.
+	CountInstruments(ctx context.Context, f InstrumentFilter) (int, error)
 	// UpsertInstrument adds a roster row or refreshes an existing one, keyed by (exchange, symbol).
 	// The enable flags of an EXISTING row are never overwritten — a scan re-finding a token it
 	// already admitted must not resurrect a token an operator has since disabled, which is the same
 	// provenance mistake migration 000030 was written to fix.
-	UpsertInstrument(ctx context.Context, in Instrument) (Instrument, error)
+	//
+	// The returned bool is true only when this call actually INSERTED a new row, not when it
+	// refreshed an existing one's market snapshot — the discovery scan's own per-token account-cap
+	// top-up (CLAUDE.md, 2026-09-17) depends on being able to tell "a token newly joined paper
+	// trading" apart from "a token already trading got its volume/score numbers refreshed", since
+	// topping up on every refresh would inflate the account on a fixed roster doing nothing new.
+	UpsertInstrument(ctx context.Context, in Instrument) (Instrument, bool, error)
 	// SetInstrumentFlags applies patch's non-nil fields to one roster row.
 	SetInstrumentFlags(ctx context.Context, id int64, patch InstrumentPatch) error
 	// DeleteInstrument removes a roster row outright — an operator action, for a token that should

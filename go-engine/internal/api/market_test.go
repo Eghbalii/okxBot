@@ -22,6 +22,10 @@ type marketStubRepo struct {
 	port.Repository
 	tokens      []port.MarketToken
 	instruments []port.Instrument
+	// assignments backs ListAssignments, for the 2026-09-17 Active-column computation in
+	// handleListInstruments: a symbol has an enabled row here IFF it currently trades, distinct
+	// from EnabledPaper/EnabledReal which a roster row can carry without ever actually trading.
+	assignments []port.StrategyAssignment
 
 	patches        map[int64]port.InstrumentPatch
 	upserted       []port.Instrument
@@ -56,11 +60,11 @@ func (r *marketStubRepo) ListInstruments(_ context.Context, f port.InstrumentFil
 	return out, nil
 }
 
-func (r *marketStubRepo) UpsertInstrument(_ context.Context, in port.Instrument) (port.Instrument, error) {
+func (r *marketStubRepo) UpsertInstrument(_ context.Context, in port.Instrument) (port.Instrument, bool, error) {
 	in.ID = int64(len(r.upserted) + 1)
 	in.UpdatedAt = time.Now()
 	r.upserted = append(r.upserted, in)
-	return in, nil
+	return in, true, nil
 }
 
 func (r *marketStubRepo) SetInstrumentFlags(_ context.Context, id int64, p port.InstrumentPatch) error {
@@ -74,6 +78,23 @@ func (r *marketStubRepo) SetInstrumentFlags(_ context.Context, id int64, p port.
 func (r *marketStubRepo) DeleteInstrument(_ context.Context, id int64) error {
 	r.deleted = append(r.deleted, id)
 	return nil
+}
+
+func (r *marketStubRepo) ListAssignments(_ context.Context, instID string, enabledOnly bool, mode string) ([]port.StrategyAssignment, error) {
+	var out []port.StrategyAssignment
+	for _, a := range r.assignments {
+		if instID != "" && a.InstID != instID {
+			continue
+		}
+		if enabledOnly && !a.Enabled {
+			continue
+		}
+		if a.Mode != mode {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, nil
 }
 
 func marketServer(repo *marketStubRepo) *Server {
@@ -146,6 +167,61 @@ func TestListMarketTokens_KeepsExchangesSeparate(t *testing.T) {
 // Enabling a token for real money is its own explicit operator action (2026-09-13 instruction), and
 // the patch must carry ONLY the field that was sent — a patch that also cleared ingest would stop
 // the token's data collection as a side effect of enabling its trading.
+// A token can carry EnabledPaper=true and still never trade — the exact MEXC situation this field
+// was built for (2026-09-17 request): the discovery scan admits every token with enabled_paper set
+// (CLAUDE.md §53.1), but paper-trader's roster load is hardcoded to the "okx" exchange (no MEXC
+// execution wiring yet, §46.6), so a MEXC row is real, selectable, and enabled_paper — and never
+// actually opens a position. Active must reflect that: it is computed from a live, enabled
+// strategy_assignments row, never from the enable flags alone.
+func TestHandleListInstruments_ActiveReflectsAssignmentsNotEnabledFlag(t *testing.T) {
+	repo := &marketStubRepo{
+		instruments: []port.Instrument{
+			{ID: 1, Symbol: "BTC", Exchange: "okx", EnabledPaper: true},
+			{ID: 2, Symbol: "DOGE_MEXC", Exchange: "mexc", EnabledPaper: true}, // enabled, never assigned
+		},
+		assignments: []port.StrategyAssignment{
+			{ID: 1, StrategyID: 1, InstID: "BTC", Bar: "5m", Enabled: true, Mode: "paper"},
+		},
+	}
+	rec := do(t, marketServer(repo), "GET", "/api/instruments", "")
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var resp instrumentListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, in := range resp.Items {
+		got[in.Symbol] = in.Active
+	}
+	if !got["BTC"] {
+		t.Error("BTC has a live assignment and must report active=true")
+	}
+	if got["DOGE_MEXC"] {
+		t.Error("DOGE_MEXC is enabledPaper but has no assignment — must report active=false, not derived from the flag")
+	}
+}
+
+// A DISABLED assignment (the panel's per-token/per-timeframe toggle, CLAUDE.md §11.3) must not
+// count as active — enabledOnly=true is threaded through to ListAssignments for exactly this.
+func TestHandleListInstruments_DisabledAssignmentIsNotActive(t *testing.T) {
+	repo := &marketStubRepo{
+		instruments: []port.Instrument{{ID: 1, Symbol: "ETH", Exchange: "okx", EnabledPaper: true}},
+		assignments: []port.StrategyAssignment{
+			{ID: 1, StrategyID: 1, InstID: "ETH", Bar: "5m", Enabled: false, Mode: "paper"},
+		},
+	}
+	rec := do(t, marketServer(repo), "GET", "/api/instruments", "")
+	var resp instrumentListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Items) != 1 || resp.Items[0].Active {
+		t.Errorf("ETH's only assignment is disabled — active must be false, got %+v", resp.Items)
+	}
+}
+
 func TestSetInstrumentFlags_PatchesOnlyWhatWasSent(t *testing.T) {
 	repo := &marketStubRepo{}
 	rec := do(t, marketServer(repo), "PATCH", "/api/instruments/7", `{"enabledReal":true}`)

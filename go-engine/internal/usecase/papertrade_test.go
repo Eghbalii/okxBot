@@ -767,6 +767,25 @@ func (r *fakeRepository) SetAccountCap(ctx context.Context, mode string, newCapU
 	return ae, nil
 }
 
+// AdjustAccountCap mirrors the real implementation: ADDS deltaUSD to both EquityUSD and
+// AccountBalanceUSD, records a reason="cap" point, and touches neither ResetCount nor
+// LastResetAt — the property that distinguishes it from SetAccountCap above.
+func (r *fakeRepository) AdjustAccountCap(ctx context.Context, mode string, deltaUSD decimal.Decimal) (port.AccountEquity, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ae, ok := r.accounts[mode]
+	if !ok {
+		return port.AccountEquity{}, fmt.Errorf("adjust account cap: no existing row for mode %s", mode)
+	}
+	ae.EquityUSD = ae.EquityUSD.Add(deltaUSD)
+	ae.AccountBalanceUSD = ae.AccountBalanceUSD.Add(deltaUSD)
+	r.accounts[mode] = ae
+	r.equityPoints = append(r.equityPoints, port.EquityPoint{
+		Mode: mode, EquityUSD: ae.EquityUSD, DeltaUSD: deltaUSD, Reason: "cap",
+	})
+	return ae, nil
+}
+
 // SetTradingCap mirrors the real implementation: sets ONLY the cap and the derived equity
 // (clamped to the real balance), never AccountBalanceUSD — a fake that rewrote the balance here
 // would let a test pass against behavior the real repository deliberately forbids in real mode.
@@ -1176,7 +1195,12 @@ func TestSeedCandlesFromRepo_RespectsWindowLimit(t *testing.T) {
 //
 // PAPER ONLY. usecase.RealTrader keeps one position per token per side (§27.3) and shares no code
 // with this path — TestRealTrader_* below still pin that.
-func TestEvaluateStrategies_DistinctStrategiesMayBothOpen(t *testing.T) {
+// Reverted 2026-09-17 back to one-open-position-per-TOKEN (the original §16.9 rule) after a
+// 2026-09-14 trial widened this to one-per-(strategy,token) — see the comment on the
+// hasOpenBaseline call site in evaluateStrategies for why. This test now asserts the reverted
+// behavior: two distinct strategies disagreeing on the same token must NOT both open, since that
+// is exactly the simultaneous-long-and-short failure §16.9 introduced this guard to prevent.
+func TestEvaluateStrategies_DistinctStrategiesOnSameTokenOnlyOneOpens(t *testing.T) {
 	repo := newFakeRepository()
 	alwaysBuy := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
 	alwaysSell := &stubStrategy{signal: strategy.Signal{Side: strategy.Sell, SLPct: dec("0.01"), TPPct: dec("0.02")}}
@@ -1192,8 +1216,8 @@ func TestEvaluateStrategies_DistinctStrategiesMayBothOpen(t *testing.T) {
 	}
 
 	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
-	if len(open) != 2 {
-		t.Fatalf("expected both strategies to open, got %d", len(open))
+	if len(open) != 1 {
+		t.Fatalf("expected only one position open per token, got %d", len(open))
 	}
 }
 
@@ -1331,10 +1355,11 @@ func TestEvaluateStrategies_NeverOpensWithoutStopLoss(t *testing.T) {
 // call but nothing serialized the check against a concurrent one. Run with -race to catch a
 // regression here.
 //
-// Both assignments deliberately carry the SAME StrategyID. Since 2026-09-14 the guard is keyed per
-// strategy, so two DIFFERENT strategies opening together is correct and expected (see
-// TestEvaluateStrategies_DistinctStrategiesMayBothOpen); the race worth pinning is one strategy
-// racing itself across its own two decision bars.
+// Both assignments deliberately carry the SAME StrategyID. The guard is keyed per TOKEN (reverted
+// 2026-09-17 from a 2026-09-14 per-strategy trial — see
+// TestEvaluateStrategies_DistinctStrategiesOnSameTokenOnlyOneOpens), so two different strategies
+// would already be blocked from opening together; the race worth pinning here specifically is one
+// strategy racing itself across its own two decision bars.
 func TestEvaluateStrategies_ConcurrentBarsDoNotBothOpen(t *testing.T) {
 	repo := newFakeRepository()
 	buy5m := &stubStrategy{signal: strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}}
@@ -3203,9 +3228,7 @@ func TestDynamicNotional_IsRoundedToUsdScale(t *testing.T) {
 // row's enable flags, and ReplaceMarketTokens must scope its clear to one exchange. A fake that
 // diverged from its counterpart would quietly weaken every test built on it (CLAUDE.md §17).
 
-func (f *fakeRepository) ListInstruments(_ context.Context, filter port.InstrumentFilter) ([]port.Instrument, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+func (f *fakeRepository) filterInstruments(filter port.InstrumentFilter) ([]port.Instrument, error) {
 	var out []port.Instrument
 	for _, in := range f.instruments {
 		if filter.Exchange != "" && in.Exchange != filter.Exchange {
@@ -3234,7 +3257,37 @@ func (f *fakeRepository) ListInstruments(_ context.Context, filter port.Instrume
 	return out, nil
 }
 
-func (f *fakeRepository) UpsertInstrument(_ context.Context, in port.Instrument) (port.Instrument, error) {
+func (f *fakeRepository) ListInstruments(_ context.Context, filter port.InstrumentFilter) ([]port.Instrument, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out, err := f.filterInstruments(filter)
+	if err != nil {
+		return nil, err
+	}
+	if filter.Limit > 0 {
+		end := filter.Offset + filter.Limit
+		if filter.Offset >= len(out) {
+			return []port.Instrument{}, nil
+		}
+		if end > len(out) {
+			end = len(out)
+		}
+		out = out[filter.Offset:end]
+	}
+	return out, nil
+}
+
+func (f *fakeRepository) CountInstruments(_ context.Context, filter port.InstrumentFilter) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out, err := f.filterInstruments(filter)
+	if err != nil {
+		return 0, err
+	}
+	return len(out), nil
+}
+
+func (f *fakeRepository) UpsertInstrument(_ context.Context, in port.Instrument) (port.Instrument, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.upsertInstrumentCalls++
@@ -3249,7 +3302,7 @@ func (f *fakeRepository) UpsertInstrument(_ context.Context, in port.Instrument)
 			existing.ScanScore = in.ScanScore
 			existing.UpdatedAt = time.Now()
 			f.instruments[id] = existing
-			return existing, nil
+			return existing, false, nil
 		}
 	}
 	f.nextInstrumentID++
@@ -3257,7 +3310,7 @@ func (f *fakeRepository) UpsertInstrument(_ context.Context, in port.Instrument)
 	in.CreatedAt = time.Now()
 	in.UpdatedAt = in.CreatedAt
 	f.instruments[in.ID] = in
-	return in, nil
+	return in, true, nil
 }
 
 func (f *fakeRepository) SetInstrumentFlags(_ context.Context, id int64, patch port.InstrumentPatch) error {

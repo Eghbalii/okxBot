@@ -74,11 +74,22 @@ export const api = {
     if (opts.limit) params.set('limit', String(opts.limit))
     return requestList<MarketToken>(`/market/tokens?${params}`)
   },
-  instruments: (opts: { exchange?: string; enabled?: string } = {}) => {
+  // Paginated (2026-09-17): the roster grows on its own as the discovery scan admits tokens, so
+  // Manage Tokens pages through it rather than fetching every row at once. limit/offset omitted
+  // returns everything unpaginated, for any future caller that genuinely wants the full roster.
+  instruments: (
+    opts: { exchange?: string; enabled?: string; mode?: string; limit?: number; offset?: number } = {},
+  ) => {
     const params = new URLSearchParams()
     if (opts.exchange) params.set('exchange', opts.exchange)
     if (opts.enabled) params.set('enabled', opts.enabled)
-    return requestList<Instrument>(`/instruments?${params}`)
+    if (opts.mode) params.set('mode', opts.mode)
+    if (opts.limit) params.set('limit', String(opts.limit))
+    if (opts.offset) params.set('offset', String(opts.offset))
+    return request<{ items: Instrument[] | null; total: number }>(`/instruments?${params}`).then((r) => ({
+      items: r.items ?? [],
+      total: r.total,
+    }))
   },
   createInstrument: (body: {
     symbol: string

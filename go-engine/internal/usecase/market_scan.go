@@ -170,17 +170,31 @@ type MarketScanner struct {
 	TopN int
 	// MinVolumeUSD overrides MinScanVolumeUSD when positive.
 	MinVolumeUSD decimal.Decimal
+
+	// PerTokenCapUSD is how much paper-trading sizing budget one newly-admitted token adds to the
+	// account (2026-09-17 request). Zero disables the top-up entirely — a scan can run with no
+	// account-cap side effect at all, which matters for any caller (tests, a future exchange with
+	// its own separate account) that must not have Scan silently touching money.
+	//
+	// Applied only to genuinely NEW roster rows (admit's wasNew signal), never to a refresh of an
+	// already-trading token — a token whose market snapshot merely updated has not grown the
+	// roster and must not grow the account. Only PAPER mode is topped up: real capital is never
+	// moved by an automated discovery process (§27's own real-money caution), and enabling a
+	// discovered token for real trading stays the separate, explicit operator action §53.1 already
+	// requires (enabled_real defaults false on admission).
+	PerTokenCapUSD decimal.Decimal
 }
 
 // ScanResult reports one exchange's outcome. Per-exchange rather than aggregate so one exchange
 // failing is visible as itself rather than as a smaller total — the same reasoning as §17's
 // per-instrument BackfillResult.
 type ScanResult struct {
-	Exchange   string
-	Scanned    int // instruments returned by the exchange
-	Candidates int // USD-quoted perpetuals clearing the volume floor
-	Admitted   int // roster rows created or refreshed
-	Err        error
+	Exchange      string
+	Scanned       int // instruments returned by the exchange
+	Candidates    int // USD-quoted perpetuals clearing the volume floor
+	Admitted      int // roster rows created or refreshed
+	NewlyAdmitted int // of Admitted, how many were genuinely NEW rows (not a refresh)
+	Err           error
 }
 
 // Scan fetches every configured exchange's whole market, stores the ranked snapshot, and admits the
@@ -192,10 +206,36 @@ type ScanResult struct {
 // opposite of useful (ReplaceMarketTokens declines an empty write for exactly this).
 func (s *MarketScanner) Scan(ctx context.Context) []ScanResult {
 	out := make([]ScanResult, 0, len(s.Exchanges))
+	newTokens := 0
 	for _, ex := range s.Exchanges {
-		out = append(out, s.scanOne(ctx, ex))
+		res := s.scanOne(ctx, ex)
+		out = append(out, res)
+		newTokens += res.NewlyAdmitted
 	}
+	s.topUpForNewTokens(ctx, newTokens)
 	return out
+}
+
+// topUpForNewTokens adds newTokens * PerTokenCapUSD to the paper account, so a token the scan just
+// admitted has real sizing budget the moment it starts trading rather than sharing an unchanged
+// account with every token already on the roster.
+//
+// A failure here is logged, not propagated: Scan's whole point is admitting tokens to the roster,
+// and a sizing top-up that could not be written must not make that look like it failed too — the
+// next scan (or a manual account-cap edit from the panel) can still correct it, and the alternative
+// of the roster and the balance drifting apart resolves itself as soon as this succeeds again.
+func (s *MarketScanner) topUpForNewTokens(ctx context.Context, newTokens int) {
+	if newTokens <= 0 || !s.PerTokenCapUSD.IsPositive() {
+		return
+	}
+	delta := s.PerTokenCapUSD.Mul(decimal.NewFromInt(int64(newTokens)))
+	if _, err := s.Repo.AdjustAccountCap(ctx, "paper", delta); err != nil {
+		s.log().Warn("scan: could not top up paper account for newly admitted tokens",
+			"newTokens", newTokens, "deltaUsd", delta, "err", err)
+		return
+	}
+	s.log().Info("scan: topped up paper account for newly admitted tokens",
+		"newTokens", newTokens, "deltaUsd", delta)
 }
 
 func (s *MarketScanner) scanOne(ctx context.Context, ex ExchangeSource) ScanResult {
@@ -244,7 +284,7 @@ func (s *MarketScanner) scanOne(ctx context.Context, ex ExchangeSource) ScanResu
 		return res
 	}
 
-	res.Admitted = s.admit(ctx, ex, toks)
+	res.Admitted, res.NewlyAdmitted = s.admit(ctx, ex, toks)
 	return res
 }
 
@@ -270,7 +310,11 @@ func (s *MarketScanner) candidates(ex ExchangeSource, tickers []domain.MarketTic
 	return out
 }
 
-// admit writes the top candidates into the roster.
+// admit writes the top candidates into the roster, returning how many upserts succeeded and, of
+// those, how many were genuinely NEW rows (as opposed to an existing token's market snapshot being
+// refreshed) — the latter is what CapFollower needs to size a per-token account top-up correctly,
+// since topping up on every refresh of an already-trading token would inflate the account for no
+// reason.
 //
 // The per-mode flags encode the operator's own instruction (2026-09-13): a discovered token joins
 // the WebSocket subscriptions and paper trading straight away — that is how it earns a track record
@@ -279,12 +323,11 @@ func (s *MarketScanner) candidates(ex ExchangeSource, tickers []domain.MarketTic
 //
 // Note UpsertInstrument does not touch an existing row's flags, so re-finding a token an operator
 // disabled leaves it disabled; only its market snapshot is refreshed.
-func (s *MarketScanner) admit(ctx context.Context, ex ExchangeSource, toks []port.MarketToken) int {
+func (s *MarketScanner) admit(ctx context.Context, ex ExchangeSource, toks []port.MarketToken) (admitted, newlyAdmitted int) {
 	limit := s.TopN
 	if limit <= 0 || limit > len(toks) {
 		limit = len(toks)
 	}
-	var n int
 	for _, t := range toks[:limit] {
 		in := port.Instrument{
 			Symbol: t.Symbol, Exchange: ex.Name, ExecInstID: t.ExecInstID, InstType: ex.InstType,
@@ -294,16 +337,20 @@ func (s *MarketScanner) admit(ctx context.Context, ex ExchangeSource, toks []por
 			Source:        "scan",
 			Vol24hUSD:     t.Vol24hUSD, Change24hPct: t.Change24hPct, ScanScore: t.Score,
 		}
-		if _, err := s.Repo.UpsertInstrument(ctx, in); err != nil {
+		_, wasNew, err := s.Repo.UpsertInstrument(ctx, in)
+		if err != nil {
 			// One token failing must not abandon the rest — the same partial-failure posture as the
 			// per-exchange loop above.
 			s.log().Warn("scan: could not admit token to roster",
 				"exchange", ex.Name, "symbol", t.Symbol, "err", err)
 			continue
 		}
-		n++
+		admitted++
+		if wasNew {
+			newlyAdmitted++
+		}
 	}
-	return n
+	return admitted, newlyAdmitted
 }
 
 // RunEvery runs Scan on a ticker until ctx is done, starting with one immediate scan so a freshly
@@ -337,7 +384,8 @@ func (s *MarketScanner) logResults(results []ScanResult) {
 			continue
 		}
 		s.log().Info("market scan complete", "exchange", r.Exchange,
-			"scanned", r.Scanned, "candidates", r.Candidates, "admitted", r.Admitted)
+			"scanned", r.Scanned, "candidates", r.Candidates, "admitted", r.Admitted,
+			"newlyAdmitted", r.NewlyAdmitted)
 	}
 }
 
