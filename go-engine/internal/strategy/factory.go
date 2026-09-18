@@ -97,11 +97,16 @@ var Factories = map[string]Factory{
 	"volume_breakout_v2":     func() Strategy { return NewVolumeBreakoutV2() },
 	"ema_ribbon_pullback_v2": func() Strategy { return NewEMARibbonPullbackV2() },
 
-	// Ported from TradingView, 17 strategies requested by operator, 2026-09-16. Each implements the
-	// well-known, standard algorithm the named strategy is built around (classic default parameter
-	// values, per each file's own doc comment) rather than a literal PineScript transliteration,
-	// since raw source could not be extracted for any of them. See each file's header comment for
-	// the specific defaults used and their published origin.
+	// Ported from TradingView, 2026-09-16, revised 2026-09-18 against the operator-supplied real
+	// PineScript sources (pinescript/tv_ports_20260916/*.pine). The first pass (2026-09-16) had no
+	// access to the real source — TradingView's script viewer renders client-side, so an automated
+	// fetch only ever saw each listing page's description text — and was implemented from the
+	// well-known standard algorithm each title/description suggested. Checking the real sources
+	// found every one of the 16 that had a free/public source differed from the guessed
+	// implementation in at least one load-bearing way (wrong periods, wrong indicator, inverted
+	// cross direction, or an entirely different algorithm than the title implied); see each file's
+	// own header comment for the specific real-vs-guessed delta. `most_strategy` had no free source
+	// available and was DELETED rather than left as an unverifiable guess.
 	"philakones_fib":           func() Strategy { return NewPhilakonesFib() },
 	"ut_bot":                   func() Strategy { return NewUTBot() },
 	"scalper_macd_psar_ema200": func() Strategy { return NewScalperMACDPsarEMA200() },
@@ -111,7 +116,6 @@ var Factories = map[string]Factory{
 	"bb_breakout":              func() Strategy { return NewBBBreakout() },
 	"hammers_stars":            func() Strategy { return NewHammersStars() },
 	"price_volume_breakout":    func() Strategy { return NewPriceVolumeBreakout() },
-	"most_strategy":            func() Strategy { return NewMostStrategy() },
 	"zigzag_pa":                func() Strategy { return NewZigZagPA() },
 	"open_close_cross":         func() Strategy { return NewOpenCloseCross() },
 	"rsi_divergence":           func() Strategy { return NewRSIDivergence() },

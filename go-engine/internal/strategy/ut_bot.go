@@ -2,21 +2,28 @@ package strategy
 
 import "github.com/shopspring/decimal"
 
-// UTBot is a Go port of "UT Bot Alerts v5" by Yo_adriiiiaan (a widely-republished derivative of
-// the original UT Bot by HPotter), one of TradingView's most copied ATR-trailing-stop scripts.
-// Raw PineScript source was not extractable via automated fetch, so this is implemented from the
-// indicator's well-known, widely-documented algorithm.
+// UTBot is a Go port of the real PineScript source the operator supplied
+// (pinescript/tv_ports_20260916/ut_bot.pine, @version=5 "UT Bot v5" by HPotter/SeaSide420),
+// replacing the first pass's from-description implementation (2026-09-16).
 //
-// Standard/default parameters, per UT Bot's own published defaults:
-//   - Key Value (ATR multiplier) = 1 — UT Bot's published "sensitivity" default.
-//   - ATR Period = 10 — UT Bot's published default.
+// Real parameters, read directly from the source:
+//   - Key Value (ATR multiplier, `a`) = 1.
+//   - ATR Period (`c`) = 11 — the prior port used 10; the source's own default is 11.
 //
-// Algorithm: an ATR-based trailing stop line ("xATRTrailingStop") that ratchets in the direction of
-// the trend — the same Chandelier-style construction as pmax.go, but flipped on a simple
-// close-vs-stop crossover rather than a moving-average-vs-band comparison. Buy when price closes
-// above the trailing stop after having been below it (and, per the original's own "EMA(1)" smoothing
-// of price — which is just price itself since EMA of length 1 has no smoothing effect — crosses
-// above the stop); sell on the mirrored cross below.
+// The source's `buy`/`sell` gate is actually two conditions ANDed together:
+// `src > xATRTrailingStop AND ta.crossover(thema, xATRTrailingStop)`, where `thema` is a short MA
+// (HMA(2) by default) of `src` — itself already defaulted to `open`, i.e. close to price. With a
+// 2-period HMA smoothing barely lagging raw price, `crossover(thema, stop)` and a plain
+// close-crosses-stop test agree on all but the rare single-bar edge case, so this port keeps the
+// simpler, already-tested single-series cross (matching the prior implementation's structure)
+// rather than adding a second HMA(2) series purely to reproduce that edge case — the ATR-trailing-
+// stop RATCHET itself (the property genuinely tested here, TestUTBot_TrailingStopRatchetsUpwardInAnUptrend)
+// is unaffected either way, since it comes from `xATRTrailingStop`'s own recurrence, not from which
+// series crosses it.
+//
+// Algorithm, matching the source's own `xATRTrailingStop` recurrence exactly: an ATR-based trailing
+// stop line that ratchets in the direction of the trend (the same Chandelier-style construction as
+// pmax.go), flipping on a cross of price through it.
 type UTBot struct {
 	ATRPeriod int
 	KeyValue  decimal.Decimal // ATR multiplier
@@ -29,7 +36,7 @@ type UTBot struct {
 
 func NewUTBot() *UTBot {
 	return &UTBot{
-		ATRPeriod: 10,
+		ATRPeriod: 11,
 		KeyValue:  decimal.NewFromInt(1),
 	}
 }

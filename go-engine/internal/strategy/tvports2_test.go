@@ -18,7 +18,7 @@ import (
 var portedKinds = []string{
 	"philakones_fib", "ut_bot", "scalper_macd_psar_ema200", "ichimoku_tk_cross", "hma_swing",
 	"micurobert_ema_cross", "bb_breakout", "hammers_stars", "price_volume_breakout",
-	"most_strategy", "zigzag_pa", "open_close_cross", "rsi_divergence", "flawless_victory",
+	"zigzag_pa", "open_close_cross", "rsi_divergence", "flawless_victory",
 	"hull_suite", "adx_dmi_quality", "anchored_vwap_trend",
 }
 
@@ -234,91 +234,45 @@ func TestHMA_TracksATrendReversal(t *testing.T) {
 	}
 }
 
-// most_strategy's band must ratchet the same way ut_bot's/pmax's do: in a clean uptrend the lower
-// band must never retreat once established, or the whole "trailing stop" premise the strategy is
-// named for does not hold.
-func TestMostStrategy_BandRatchetsUpwardInAnUptrend(t *testing.T) {
-	s := NewMostStrategy()
-	var candles []Candle
-	px := 100.0
-	var bands []decimal.Decimal
-	for i := 0; i < 60; i++ {
-		px += 0.5
-		c := decimal.NewFromFloat(px)
-		candles = append(candles, Candle{
-			Timestamp: barTime(i),
-			Open:      c, High: c.Add(decimal.NewFromFloat(0.2)), Low: c.Sub(decimal.NewFromFloat(0.2)), Close: c,
-			Volume: decimal.NewFromInt(10),
-		})
-		if _, err := s.Evaluate(candles); err != nil {
-			t.Fatalf("evaluate at %d: %v", i, err)
-		}
-		bands = append(bands, s.prevMOST)
-	}
-	for i := s.EMALen + 3; i < len(bands); i++ {
-		if bands[i].LessThan(bands[i-1]) {
-			t.Fatalf("MOST band fell from %s to %s at step %d in a clean uptrend — the ratchet is not holding",
-				bands[i-1], bands[i], i)
-		}
-	}
-}
-
-// flawless_victory's majority vote must actually require agreement — requiring all 3 of 3
-// conditions to agree (MinAgree=3, unanimity) must produce strictly fewer signals than requiring
-// only 1, which is the check that the vote count is real rather than any single member's opinion
-// passed straight through. (MinAgree is clamped to the 1..3 range Params() declares — the strategy
-// only has 3 conditions to vote, so an "unreachable" threshold isn't expressible; unanimity is the
-// strictest real one.)
-func TestFlawlessVictory_RequiresAgreement(t *testing.T) {
+// flawless_victory's real source (confirmed 2026-09-18 against the operator-supplied PineScript) is
+// a Bollinger Band + RSI confluence with a HIGHER rsi_sell_guard producing FEWER exit/close signals
+// — this is the load-bearing threshold in the real algorithm, replacing the first pass's invented
+// 3-way majority vote (which had no basis in the actual source and is why MinAgree is gone).
+func TestFlawlessVictory_HigherSellGuardProducesFewerCloseSignals(t *testing.T) {
 	candles := loadRealCandles(t, "BTC")
 
 	loose := NewFlawlessVictory()
-	loose.MinAgree = 1
+	loose.RSISellGuard = decimal.NewFromInt(55)
 	looseFires := 0
 	for i := 250; i <= len(candles); i++ {
 		sig, err := loose.Evaluate(candles[:i])
 		if err != nil {
 			t.Fatalf("evaluate at i=%d: %v", i, err)
 		}
-		if sig.Side != Hold {
+		if sig.Side == Sell {
 			looseFires++
 		}
 	}
 
 	strict := NewFlawlessVictory()
-	strict.MinAgree = 3
+	strict.RSISellGuard = decimal.NewFromInt(95)
 	strictFires := 0
 	for i := 250; i <= len(candles); i++ {
 		sig, err := strict.Evaluate(candles[:i])
 		if err != nil {
 			t.Fatalf("evaluate at i=%d: %v", i, err)
 		}
-		if sig.Side != Hold {
+		if sig.Side == Sell {
 			strictFires++
 		}
 	}
 
 	if looseFires == 0 {
-		t.Skip("MinAgree=1 never fired on this fixture — nothing to compare against")
+		t.Skip("RSISellGuard=55 never fired a close signal on this fixture — nothing to compare against")
 	}
 	if strictFires >= looseFires {
-		t.Errorf("requiring unanimity (MinAgree=3, %d fires) did not reduce signals below requiring "+
-			"just 1 vote (%d fires) — the agreement count is not being enforced", strictFires, looseFires)
-	}
-}
-
-// MinAgree must be clamped into Params()' declared [1,3] range, since the strategy only ever
-// produces 3 votes — a value above 3 would otherwise silently make the strategy permanently unable
-// to fire, which is not what an out-of-range proposal should do (ClampParam's whole contract).
-func TestFlawlessVictory_ClampsMinAgreeIntoRange(t *testing.T) {
-	f := NewFlawlessVictory()
-	f.MinAgree = 4
-	// Rebuild through WithParams, the real path a proposed value arrives through.
-	out := f.WithParams(map[string]decimal.Decimal{
-		"min_agree": decimal.NewFromInt(4),
-	}).(*FlawlessVictory)
-	if out.MinAgree > 3 {
-		t.Errorf("MinAgree %d was not clamped to the declared max of 3", out.MinAgree)
+		t.Errorf("requiring RSI>95 to close (%d fires) did not reduce signals below requiring RSI>55 "+
+			"(%d fires) — the sell guard threshold is not being enforced", strictFires, looseFires)
 	}
 }
 

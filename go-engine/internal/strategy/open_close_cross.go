@@ -2,44 +2,40 @@ package strategy
 
 import "github.com/shopspring/decimal"
 
-// OpenCloseCross is a Go port of the widely-known TradingView "Open/Close Cross Strategy R5" by
-// JustUncleL (raw PineScript source not extractable via automated fetch even on a second, targeted
-// re-check — TradingView's code viewer renders client-side; implemented from the standard,
-// well-documented algorithm the title describes plus the one mechanically-specific detail the
-// listing page's own text confirms, see DelayBars below).
+// OpenCloseCross is a Go port of the real PineScript source the operator supplied
+// (pinescript/tv_ports_20260916/open_close_cross.pine, @version=3 "Open Close Cross Strategy R5.1"
+// by JayRogers/JustUncleL), replacing the first pass's from-description implementation (2026-09-16),
+// which used a plain SMA(14) and had the cross direction backwards.
 //
-// Distinctive vs. an ordinary moving-average cross: this smooths the OPEN and CLOSE price series
-// SEPARATELY with their own moving averages, then trades the cross between those two smoothed
-// series rather than crossing two MAs of the same (close) price. A widely-published, well-known
-// lagging trend-following technique credited to JustUncleL's original indicator.
-//
-// Standard/default parameters: SMA(14) applied to both the Open and Close series — 14 is the
-// commonly cited default length for this indicator family (matching, e.g., RSI's own classic
-// period, which JustUncleL's published version reuses).
-//
-// Signal logic: buy when the smoothed Open series crosses above the smoothed Close series (JustUncleL's
-// own published convention — the smoothed open catching up to and overtaking the smoothed close
-// signals the trend has turned bullish enough that new opens are outpacing the settling closes);
-// sell on the mirrored cross below.
+// Real parameters/behavior, read directly from the source:
+//   - MA type "SMMA" (Smoothed Moving Average, a recursive RMA-style average — `v7 := (v7[1]*(len-1)
+//     + src) / len`), not a plain SMA. Default period (`basisLen`) 8, not 14.
+//   - The source smooths OPEN and CLOSE as two SEPARATE series and crosses THEM against each other:
+//     `xlong = crossover(closeSeriesAlt, openSeriesAlt)`, `xshort = crossunder(...)` — i.e. the
+//     smoothed CLOSE crossing above the smoothed OPEN signals long, the mirror signals short. The
+//     first pass had this inverted (open crossing close).
+//   - `delayOffset` ("Delay Open/Close MA (Forces Non-Repainting)") shifts which candle the
+//     open/close series are read FROM (`close[delayOffset]`, `open[delayOffset]`) before smoothing —
+//     i.e. it delays the INPUT to the moving average, not merely which bar the cross is read against
+//     (the distinction this port's DelayBars field already modeled correctly by shifting the whole
+//     evaluated window; kept as-is since the practical effect — the cross reacting DelayBars bars
+//     later — is the same either way).
+//   - The source's own default alternate-resolution multiplier (`useRes`/`intRes`) evaluates the
+//     smoothed series on a coarser timeframe than the chart; not modeled here, since this package
+//     assigns a strategy to one fixed decision timeframe already (CLAUDE.md §9).
 type OpenCloseCross struct {
 	Period       int
 	SLPct, TPPct decimal.Decimal
-	// DelayBars is the original script's "Delay Open/Close MA" input, confirmed from the listing
-	// page's own text (2026-09-18 re-check, prompted directly by the operator after the first port
-	// omitted it): "To enable non-Repainting mode set 'Delay Open/Close MA' to 1 or more, but expect
-	// the reported performance to drop dramatically." The page does not show the source line itself,
-	// but the described trade-off — a repaint-proof signal at the cost of measurably worse backtest
-	// performance — has exactly one standard meaning for a moving-average cross: evaluate the cross
-	// against MA values from DelayBars candles ago rather than the just-closed bar, so nothing the
-	// signal used can still be revised by data that arrives later. Default 0 (JustUncleL's own
-	// documented default is repainting/no delay) reproduces the original code exactly as before this
-	// field existed; WithParams's own zero-value default keeps every existing caller unaffected.
+	// DelayBars is the source's own "Delay Open/Close MA" input (confirmed directly against the real
+	// source, 2026-09-18): 0 (repainting, the source's own documented default) evaluates the cross
+	// on the just-closed bar; 1+ trades reaction speed for a signal that cannot be revised by a
+	// later-arriving close.
 	DelayBars int
 }
 
 func NewOpenCloseCross() *OpenCloseCross {
 	return &OpenCloseCross{
-		Period:    14,
+		Period:    8,
 		SLPct:     decimal.NewFromFloat(0.008),
 		TPPct:     decimal.NewFromFloat(0.014),
 		DelayBars: 0,
@@ -53,9 +49,6 @@ func (s *OpenCloseCross) Params() []ParamSpec {
 		{Name: "period", Default: decimal.NewFromInt(int64(s.Period)), Min: decimal.NewFromInt(2), Max: decimal.NewFromInt(200)},
 		{Name: "sl_pct", Default: s.SLPct, Min: decimal.NewFromFloat(0.001), Max: decimal.NewFromFloat(0.2)},
 		{Name: "tp_pct", Default: s.TPPct, Min: decimal.NewFromFloat(0.001), Max: decimal.NewFromFloat(0.5)},
-		// 0 = repainting (the original's own default), matching this port's pre-existing behavior
-		// exactly; 1+ trades reaction speed for a signal that cannot un-happen once seen, per the
-		// source page's own documented trade-off (see DelayBars' doc comment).
 		{Name: "delay_bars", Default: decimal.NewFromInt(int64(s.DelayBars)), Min: decimal.Zero, Max: decimal.NewFromInt(20)},
 	}
 }
@@ -78,44 +71,46 @@ func (s *OpenCloseCross) WithParams(values map[string]decimal.Decimal) Strategy 
 	return &cp
 }
 
-// smaOfField computes a plain SMA series over a field selected by `sel`, reusing the general
-// windowed-average shape SMA() already implements but over the Open series instead of Close —
-// SMA() itself is hardwired to Close, so this is a small, deliberately separate helper rather than
-// changing that widely-used function's signature.
-func smaOfField(candles []Candle, period int, sel func(Candle) decimal.Decimal) []decimal.Decimal {
+// smmaOfField computes the source's own recursive SMMA over a field selected by sel:
+// v[0] = SMA(period) seed, v[i] = (v[i-1]*(period-1) + src[i]) / period thereafter.
+func smmaOfField(candles []Candle, period int, sel func(Candle) decimal.Decimal) []decimal.Decimal {
 	out := make([]decimal.Decimal, len(candles))
+	if len(candles) < period {
+		return out
+	}
 	periodDec := decimal.NewFromInt(int64(period))
-	for i := period - 1; i < len(candles); i++ {
-		sum := decimal.Zero
-		for _, c := range candles[i-period+1 : i+1] {
-			sum = sum.Add(sel(c))
-		}
-		out[i] = sum.Div(periodDec)
+	sum := decimal.Zero
+	for _, c := range candles[:period] {
+		sum = sum.Add(sel(c))
+	}
+	out[period-1] = sum.Div(periodDec)
+	for i := period; i < len(candles); i++ {
+		out[i] = out[i-1].Mul(periodDec.Sub(decimal.NewFromInt(1))).Add(sel(candles[i])).Div(periodDec)
 	}
 	return out
 }
 
 func (s *OpenCloseCross) Evaluate(candles []Candle) (Signal, error) {
-	// DelayBars shifts which bar the cross is read from, not how many bars the MAs need — the
-	// window requirement is unchanged by it (it only says how far back to LOOK, not how much
-	// history the smoothing itself consumes).
+	// DelayBars shifts which bar the cross is read from, not how many bars the smoothing itself
+	// needs to warm up (it only says how far back to LOOK, not how much history is consumed).
 	need := s.Period + 1 + s.DelayBars
 	if len(candles) < need {
 		return Signal{Side: Hold}, nil
 	}
-	smoothedOpen := smaOfField(candles, s.Period, func(c Candle) decimal.Decimal { return c.Open })
-	smoothedClose := smaOfField(candles, s.Period, func(c Candle) decimal.Decimal { return c.Close })
+	smoothedOpen := smmaOfField(candles, s.Period, func(c Candle) decimal.Decimal { return c.Open })
+	smoothedClose := smmaOfField(candles, s.Period, func(c Candle) decimal.Decimal { return c.Close })
 
-	// last is offset back by DelayBars (0 = the just-closed bar, the original's own repainting
+	// last is offset back by DelayBars (0 = the just-closed bar, the source's own repainting
 	// default): the cross is evaluated against MA values from DelayBars candles ago, so nothing the
-	// signal used can still be revised by a later-arriving close — the non-repainting trade-off the
-	// source page documents, at the cost of reacting DelayBars bars later than the repainting mode.
+	// signal used can still be revised by a later-arriving close.
 	last := len(candles) - 1 - s.DelayBars
 	openNow, openPrev := smoothedOpen[last], smoothedOpen[last-1]
 	closeNow, closePrev := smoothedClose[last], smoothedClose[last-1]
 
-	crossedUp := openPrev.LessThanOrEqual(closePrev) && openNow.GreaterThan(closeNow)
-	crossedDown := openPrev.GreaterThanOrEqual(closePrev) && openNow.LessThan(closeNow)
+	// The source's own convention: smoothed CLOSE crossing above smoothed OPEN is long, the mirror
+	// is short (`xlong = crossover(closeSeriesAlt, openSeriesAlt)`).
+	crossedUp := closePrev.LessThanOrEqual(openPrev) && closeNow.GreaterThan(openNow)
+	crossedDown := closePrev.GreaterThanOrEqual(openPrev) && closeNow.LessThan(openNow)
 
 	switch {
 	case crossedUp:

@@ -1,0 +1,170 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © ZenAndTheArtOfTrading / PineScriptMastery
+// @version=6
+strategy("Hammers & Stars Strategy [v1.2]", shorttitle="HSS[v1.2]", overlay=true, margin_long=0, margin_short=0)
+
+// Library
+import ZenAndTheArtOfTrading/ZenLibrary/12 as zen
+
+// Strategy Settings
+var const string g_strategy     = "Strategy Settings"
+atrMinFilterSize                = input.float(title=">= ATR Filter", defval=0.0, minval=0.0, group=g_strategy, tooltip="Minimum size of entry candle compared to ATR")
+atrMaxFilterSize                = input.float(title="<= ATR Filter", defval=3.0, minval=0.0, group=g_strategy, tooltip="Maximum size of entry candle compared to ATR")
+stopMultiplier                  = input.float(title="Stop Loss ATR", defval=1.0, group=g_strategy, tooltip="Stop loss multiplier (x ATR)")
+rr                              = input.float(title="R:R", defval=1.0, group=g_strategy, tooltip="Risk:Reward profile")
+fibLevel                        = input.float(title="Fib Level", defval=0.333, group=g_strategy, tooltip="Used to calculate upper/lower third of candle. (For example, setting it to 0.5 will mean hammers must close >= 50% mark of the total candle size)")
+// Filter Settings
+var const string g_filter       = "Filter Settings"
+emaFilter                       = input.int(title="EMA Filter", defval=0, group=g_filter, tooltip="EMA length to filter trades - set to zero to disable")
+i_startTime                     = input.time(title="Start Date Filter", defval=timestamp("01 Jan 2000 13:30 +0000"), group=g_filter, tooltip="Date & time to begin trading from")
+i_endTime                       = input.time(title="End Date Filter", defval=timestamp("1 Jan 2099 19:30 +0000"), group=g_filter, tooltip="Date & time to stop trading")
+// External Filter Settings 
+var const string g_extfilter    = "External Filter Settings"
+useExternalFilter               = input.bool(title="Use External Filter", defval=false, group=g_extfilter, tooltip="Enable external setup filter (eg. use a 3rd-party indicator value)", display=display.none)
+externalFilterSrc               = input.source(title="External Source", defval=close, group=g_extfilter, tooltip="External indicator value source", display=display.none)
+minExternalFilterValLong        = input.float(title="Minimum Value Long", defval=0, group=g_extfilter, tooltip="Minimum indicator value to validate long setups", display=display.none)
+minExternalFilterValShort       = input.float(title="Minimum Value Short", defval=0, group=g_extfilter, tooltip="Minimum indicator value to validate short setups", display=display.none)
+// Backtester Settings
+var g_tester                    = "Backtester Settings"
+drawTester                      = input.bool(title="Draw Stats", defval=true, group=g_tester, tooltip="Turn on/off inbuilt backtester display")
+useFixedFraction                = input.bool(title="Use Fixed Fractional Qty", defval=true, group=g_tester, tooltip="Use fixed fractional position size formula")
+riskPerTrade                    = input.float(title="Risk Per Trade", defval=1.0, group=g_tester, tooltip="Your desired % risk per trade (as a whole number)")
+
+// =============================================================================
+// STRATEGY CODE
+// =============================================================================
+
+// See if this bar"s time happened within date filter
+bool dateFilter = time >= i_startTime and time <= i_endTime
+
+// Get indicator values
+float atr = ta.atr(14)
+float ema = ta.ema(close, emaFilter == 0 ? 1 : emaFilter)
+
+// Check EMA Filter
+bool emaFilterLong  = emaFilter == 0 or close > ema
+bool emaFilterShort = emaFilter == 0 or close < ema
+
+// Check ATR filter
+bool atrMinFilter = math.abs(high - low) >= atrMinFilterSize * atr or atrMinFilterSize == 0
+bool atrMaxFilter = math.abs(high - low) <= atrMaxFilterSize * atr or atrMaxFilterSize == 0
+bool atrFilter    = atrMinFilter and atrMaxFilter
+
+// Calculate 33.3% fibonacci level for current candle
+float bullFib = (low - high) * fibLevel + high
+float bearFib = (high - low) * fibLevel + low
+
+// Determine which price source closes or opens highest/lowest
+float lowestBody = close < open ? close : open
+float highestBody = close > open ? close : open
+
+// Determine if we have a valid setup
+bool validHammer = lowestBody >= bullFib and atrFilter and close != open and not na(atr) and emaFilterLong
+bool validStar   = highestBody <= bearFib and atrFilter and close != open and not na(atr) and emaFilterShort
+
+// External filters 
+bool longExternalFilter  = not useExternalFilter or (externalFilterSrc != close and externalFilterSrc > minExternalFilterValLong)
+bool shortExternalFilter = not useExternalFilter or (externalFilterSrc != close and externalFilterSrc < minExternalFilterValShort)
+
+// Check if we have confirmation for our setup
+bool validLong = validHammer and strategy.position_size == 0 and dateFilter and longExternalFilter and barstate.isconfirmed
+bool validShort = validStar and strategy.position_size == 0 and dateFilter and shortExternalFilter and barstate.isconfirmed
+
+// Calculate our stop distance & size for the current bar
+float stopSize              = atr * stopMultiplier
+float longStopPrice         = low < low[1] ? low - stopSize : low[1] - stopSize
+float longStopDistance      = close - longStopPrice
+float longTargetPrice       = close + longStopDistance * rr
+float shortStopPrice        = high > high[1] ? high + stopSize : high[1] + stopSize
+float shortStopDistance     = shortStopPrice - close
+float shortTargetPrice      = close - shortStopDistance * rr
+
+// Save trade stop & target & position size if a valid setup is detected
+var float t_entry     = na
+var float t_stop      = na
+var float t_target    = na
+
+// Detect valid long setups & trigger alert
+float longQty = zen.getPositionSize(riskPerTrade, longStopDistance)
+if (validLong)
+    t_entry := close
+    t_stop := longStopPrice
+    t_target := longTargetPrice
+    if (useFixedFraction)
+        strategy.entry(id="Long", direction=strategy.long, qty=longQty, comment="(SL=" + str.tostring(zen.truncate(zen.toWhole(longStopDistance), 2)) + " pips)")
+    else
+        strategy.entry(id="Long", direction=strategy.long, comment="(SL=" + str.tostring(zen.truncate(zen.toWhole(longStopDistance), 2)) + " pips)")
+   
+    // Fire alerts
+    alert(message="Bullish Hammer Detected!", freq=alert.freq_once_per_bar_close)
+
+// Detect valid short setups & trigger alert
+float shortQty = zen.getPositionSize(riskPerTrade, shortStopDistance)
+if (validShort)
+    t_entry := close
+    t_stop := shortStopPrice
+    t_target := shortTargetPrice
+    if (useFixedFraction)
+        strategy.entry(id="Short", direction=strategy.short, qty=shortQty, comment="(SL=" + str.tostring(zen.truncate(zen.toWhole(shortStopDistance), 2)) + " pips)")
+    else
+        strategy.entry(id="Short", direction=strategy.short, comment="(SL=" + str.tostring(zen.truncate(zen.toWhole(shortStopDistance), 2)) + " pips)")
+   
+    // Fire alerts
+    alert(message="Bearish Star Detected!", freq=alert.freq_once_per_bar_close)
+
+// Exit trades whenever our stop or target is hit
+strategy.exit(id="Long Exit", from_entry="Long", limit=t_target, stop=t_stop)
+strategy.exit(id="Short Exit", from_entry="Short", limit=t_target, stop=t_stop)
+
+// =============================================================================
+// PLOTS
+// =============================================================================
+
+// Draw trade data
+plot(strategy.position_size != 0 or validLong or validShort ? t_stop : na, title="Trade Stop Price", color=color.new(color.red, 0), style=plot.style_linebr)
+plot(strategy.position_size != 0 or validLong or validShort ? t_target : na, title="Trade Target Price", color=color.new(color.green, 0), style=plot.style_linebr)
+
+// Draw EMA if it"s enabled
+plot(emaFilter == 0 ? na : ema, color=emaFilterLong ? color.green : color.red, linewidth=2, title="EMA")
+
+// Draw price action setup arrows
+plotshape(validLong ? 1 : na, style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), title="Bullish Setup")
+plotshape(validShort ? 1 : na, style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), title="Bearish Setup")
+
+// External filter 
+plotColor = longExternalFilter ? color.green : shortExternalFilter ? color.red : color.black
+plotshape(useExternalFilter ? 1 : na, "Ext. Filter", shape.square, color=plotColor, location=location.bottom)
+
+// =============================================================================
+// STATS
+// =============================================================================
+
+// Prepare stats table
+var table perfTable = table.new(position.top_right, 7, 2, border_width=1, force_overlay = true)
+var table testTable = table.new(position.bottom_right, 3, 2, border_width=1, force_overlay = true)
+
+// Draw stats table
+var bgcolor = color.new(color.black, 0)
+if (barstate.islastconfirmedhistory and drawTester)
+    // Draw performance statistics
+    float winRate = (strategy.wintrades / strategy.closedtrades) * 100
+    float avgRR = zen.averageRR()
+    float dangerZone = 1 / (1 + avgRR) * 100
+    zen.fillCell(perfTable, 1, 0, "Trades:", str.tostring(zen.tradeCount()), bgcolor, color.white)
+    zen.fillCell(perfTable, 1, 1, "Avg RR:", str.tostring(avgRR, "#.##"), bgcolor, color.white)
+    zen.fillCell(perfTable, 2, 0, "Wins:", str.tostring(strategy.wintrades), bgcolor, color.white)
+    zen.fillCell(perfTable, 2, 1, "Loss:", str.tostring(strategy.losstrades), bgcolor, color.white)
+    zen.fillCell(perfTable, 3, 0, "Long:", str.tostring(zen.longWinPercent(), "#.##") + "%", bgcolor, color.white)
+    zen.fillCell(perfTable, 3, 1, "Short:", str.tostring(zen.shortWinPercent(), "#.##") + "%", bgcolor, color.white)
+    zen.fillCell(perfTable, 4, 0, "B/E:", str.tostring(zen.breakEvenCount()), bgcolor, color.white)
+    zen.fillCell(perfTable, 4, 1, "B/E:", str.tostring(zen.breakEvenPercent(), "#.##") + "%", bgcolor, color.white)
+    zen.fillCell(perfTable, 5, 0, "Return:", (strategy.netprofit > 0 ? "+" : "") + str.tostring(strategy.netprofit_percent, "#.##") + "%", strategy.netprofit > 0 ? color.green : color.red, color.white)
+    zen.fillCell(perfTable, 5, 1, "Max DD:", str.tostring(zen.maxDrawdownRealized(), "#.##") + "%", color.red, color.white, tooltip="This is based on closed trades (ie. realized P&L).\nStrategy tester is based on open trades (unrealized).")
+    zen.fillCell(perfTable, 6, 0, "Win Rate:", str.tostring(winRate, "#.##") + "%", winRate <= dangerZone ? color.new(color.red, 0) : color.new(color.green, 0), color.white)
+    zen.fillCell(perfTable, 6, 1, "Danger Zone:", str.tostring(dangerZone, "#.##") + "%", bgcolor, color.red, tooltip = str.tostring(winRate - dangerZone, "#.##") + "%")
+    // Draw backtester statistics
+    float totalPips = zen.totalPipReturn()
+    zen.fillCell(testTable, 0, 0, "Starting:", "$" + str.tostring(strategy.initial_capital), bgcolor, color.white)
+    zen.fillCell(testTable, 0, 1, "Ending:", "$" + str.tostring(strategy.initial_capital + strategy.netprofit, "#.##"), bgcolor, color.white)
+    zen.fillCell(testTable, 1, 0, "Return:", "$" + str.tostring(strategy.netprofit, "#.##"), bgcolor, strategy.netprofit > 0 ? color.green : color.red)
+    zen.fillCell(testTable, 1, 1, "Pips:", (totalPips > 0 ? "+" : "") + str.tostring(totalPips, "#.##"), bgcolor, color.white)
