@@ -52,15 +52,25 @@ type fakeRepository struct {
 	// the outside — only the call count separates them.
 	upsertInstrumentCalls int
 	marketTokens          map[string][]port.MarketToken
+
+	// Manual-order state (docs/MANUAL_TRADE_PLAN.md) — independent counters/maps, same
+	// cross-table-id-collision reasoning as realOrders/nextRealID above.
+	nextManualID           int64
+	manualOrders           map[int64]port.ManualOrder
+	manualOrderAdjustments []port.ManualOrderAdjustment
+	nextIntentID           int64
+	manualOrderIntents     map[int64]port.ManualOrderIntent
 }
 
 func newFakeRepository() *fakeRepository {
 	return &fakeRepository{
-		orders:       make(map[int64]port.PaperOrder),
-		accounts:     make(map[string]port.AccountEquity),
-		realOrders:   make(map[int64]port.RealOrder),
-		instruments:  make(map[int64]port.Instrument),
-		marketTokens: make(map[string][]port.MarketToken),
+		orders:             make(map[int64]port.PaperOrder),
+		accounts:           make(map[string]port.AccountEquity),
+		realOrders:         make(map[int64]port.RealOrder),
+		instruments:        make(map[int64]port.Instrument),
+		marketTokens:       make(map[string][]port.MarketToken),
+		manualOrders:       make(map[int64]port.ManualOrder),
+		manualOrderIntents: make(map[int64]port.ManualOrderIntent),
 	}
 }
 

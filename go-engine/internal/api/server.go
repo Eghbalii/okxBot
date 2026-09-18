@@ -51,6 +51,11 @@ type Server struct {
 	// place or cancel an order, and the type system is a better guarantee of that than care.
 	// Optional: nil makes the check report "cannot verify" rather than a misleading "safe".
 	Positions positionLister
+	// ManualTrade is the exchange capability the manual/discretionary trading page needs
+	// (docs/MANUAL_TRADE_PLAN.md §3/§6): reading instrument metadata for the token picker, plus —
+	// once the order-placing endpoints land — leverage/order/algo-order calls. Optional: nil makes
+	// the manual-trade endpoints fail loudly (503) rather than silently do nothing.
+	ManualTrade manualTradeClient
 	// ExecInstType is the instType those instruments live under ("FUTURES"), needed to read their
 	// price tick when rounding a manually-edited SL/TP.
 	ExecInstType string
@@ -132,6 +137,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/instruments", s.handleCreateInstrument)
 	mux.HandleFunc("PATCH /api/instruments/{id}", s.handleSetInstrumentFlags)
 	mux.HandleFunc("DELETE /api/instruments/{id}", s.handleDeleteInstrument)
+	// Manual/discretionary trading page (docs/MANUAL_TRADE_PLAN.md): a live instrument-metadata
+	// lookup for the token picker/order form, deliberately bypassing enabled_real (§8.3) and not
+	// limited to the pre-scanned roster.
+	mux.HandleFunc("GET /api/manual/instruments", s.handleManualInstrumentLookup)
 	// Service health + the real-trading halt, with the drift evidence that gates its reset
 	// (CLAUDE.md §47/§48 — two outages that looked identical from the panel and were not).
 	mux.HandleFunc("GET /api/health", s.handleHealth)

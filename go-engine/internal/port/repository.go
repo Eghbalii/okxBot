@@ -302,6 +302,98 @@ type RealOrder struct {
 	ExchangeAlgoOrderID *string
 }
 
+// ManualOrder is a discretionary, operator-placed real-money order (docs/MANUAL_TRADE_PLAN.md),
+// stored in its own table fully independent of RealOrder/PaperOrder — a manual order has no
+// strategy signal, no conductor category, and no observation vector, so it must never be picked up
+// by anything that iterates real_orders expecting those things (the RL reward pipeline,
+// StrategyStatsFor, the SL/TP-adjustment A/B comparison). No Mode field: every row IS real by
+// construction, matching RealOrder's own "the table is the discriminator" precedent.
+type ManualOrder struct {
+	ID         int64
+	InstID     string
+	ExecInstID string
+	Side       string // "buy" or "sell" — matches RealOrder.Side's convention, not PosSide's
+	// OrderType/LimitPx: both market and limit orders are supported from day one (§8.1) — unlike
+	// every automated order elsewhere in this codebase, which is market-only. LimitPx is nil for a
+	// market order.
+	OrderType string // "market" or "limit"
+	LimitPx   *decimal.Decimal
+
+	// Status tracks the fill lifecycle. "resting" is the one state RealOrder has never needed: a
+	// limit order accepted by the exchange but not yet filled, distinct from "pending" (this
+	// process hasn't finished submitting it yet). See RealOrder.Status's own doc comment for the
+	// other states' meaning, which this mirrors.
+	Status string
+
+	EntryPx     *decimal.Decimal // nil while resting/unfilled; set once the entry actually fills
+	SLPx        *decimal.Decimal
+	TPPx        *decimal.Decimal
+	Size        decimal.Decimal // USD notional requested (§8.2)
+	Leverage    decimal.Decimal
+	Contracts   *decimal.Decimal
+
+	// ProtectedByStrategy is true when RealTrader already held a protective algo order on this
+	// token at open time, so ManualTrader deliberately did not place a second one (§8.4: a manual
+	// order and a strategy position can share one net exchange position in net mode, and OKX's
+	// conditional orders for a position don't stack cleanly). ExchangeAlgoOrderID stays nil in that
+	// case, and the panel must say so rather than imply an independent SL/TP exists.
+	ProtectedByStrategy bool
+
+	OpenedAt    *time.Time
+	ClosedAt    *time.Time
+	CloseReason *string // "sl", "tp", "manual", "liquidation", "canceled"
+	ClosePx     *decimal.Decimal
+	RealizedPnL *decimal.Decimal
+
+	ExchangeOrderID      *string
+	ExchangeAlgoOrderID  *string
+	ExchangeCloseOrderID *string
+	ExchangeFee          *decimal.Decimal
+
+	ManualCloseRequested bool
+
+	LastError   *string
+	LastErrorAt *time.Time
+
+	CreatedAt time.Time
+}
+
+// ManualOrderAdjustment is one in-place SL/TP edit on a manual order — exact mirror of
+// PaperOrderAdjustment/the real_order_adjustments shape, minus Source (every adjustment on a manual
+// order is manual by construction, so the column doesn't exist on manual_order_adjustments).
+type ManualOrderAdjustment struct {
+	ID        int64
+	OrderID   int64
+	Field     string // "sl" or "tp"
+	OldValue  *decimal.Decimal
+	NewValue  *decimal.Decimal
+	CreatedAt time.Time
+}
+
+// ManualOrderIntent is the open-order handshake row (docs/MANUAL_TRADE_PLAN.md §2.3/§4): cmd/api
+// writes one on POST /api/manual/orders; cmd/trader's ManualTrader is the ONLY thing that ever
+// claims one and calls PlaceOrder for it. This is what keeps "only one process holds credentials
+// and talks to the exchange" (CLAUDE.md §27.1) intact for manual trading, and is what avoids
+// RealTrader's reconcile loop halting real trading on what would otherwise look like an untracked
+// exchange position (CLAUDE.md §48) — ManualTrader knows about its own order from the moment it
+// claims the intent, before it ever reaches the exchange.
+type ManualOrderIntent struct {
+	ID            int64
+	RequestedAt   time.Time
+	InstID        string
+	Side          string
+	OrderType     string
+	LimitPx       *decimal.Decimal
+	SizeUSD       decimal.Decimal
+	Leverage      decimal.Decimal
+	SLPx          *decimal.Decimal
+	TPPx          *decimal.Decimal
+	Status        string // "pending", "claimed", "done", "failed"
+	ManualOrderID *int64
+	Error         *string
+	ClaimedAt     *time.Time
+}
+
 // AccountEquity is one trading mode's shared running balance (CLAUDE.md §15.6, revised
 // 2026-08-28). This replaced the per-token sub-budgets: every token trades against ONE pool, and
 // how much of it goes into any single position is the RL agent's decision (bounded by Go-side
@@ -684,6 +776,67 @@ type Repository interface {
 	// ListRealOrderAdjustments mirrors ListPaperOrderAdjustments. Reuses the PaperOrderAdjustment
 	// shape (the fields are identical) rather than a parallel RealOrderAdjustment struct.
 	ListRealOrderAdjustments(ctx context.Context, orderID int64) ([]PaperOrderAdjustment, error)
+
+	// CreateManualOrderIntent inserts a new open-order request (docs/MANUAL_TRADE_PLAN.md §2.3),
+	// status "pending", and returns its id — cmd/api's POST /api/manual/orders handler calls this
+	// and returns the id immediately; the actual exchange call happens later, in cmd/trader's
+	// ManualTrader.
+	CreateManualOrderIntent(ctx context.Context, in ManualOrderIntent) (int64, error)
+	// ClaimPendingManualOrderIntents atomically claims every "pending" intent (UPDATE ... SET
+	// status='claimed' WHERE status='pending' RETURNING *, the same conditional-UPDATE-not-mutex
+	// pattern as RequestManualClose/CloseRealOrderConfirmed's own idempotency guards) and returns
+	// them — called by ManualTrader's poll loop. A row claimed here is guaranteed not to be claimed
+	// by a second concurrent caller (relevant if ManualTrader is ever run with more than one
+	// instance, or during a restart race).
+	ClaimPendingManualOrderIntents(ctx context.Context) ([]ManualOrderIntent, error)
+	// FinishManualOrderIntent marks a claimed intent "done" (manualOrderID set) or "failed"
+	// (errMsg set) — the terminal write once ManualTrader knows the outcome.
+	FinishManualOrderIntent(ctx context.Context, id int64, manualOrderID *int64, errMsg *string) error
+	// GetManualOrderIntent fetches a single intent by id, for the panel to poll while an order is
+	// still being placed (status="pending"/"claimed") before a manual_orders row exists yet.
+	GetManualOrderIntent(ctx context.Context, id int64) (ManualOrderIntent, error)
+
+	// OpenManualOrder inserts a new manual order and returns its id. Mirrors OpenRealOrder: callers
+	// must set o.Status explicitly.
+	OpenManualOrder(ctx context.Context, o ManualOrder) (int64, error)
+	// GetManualOrder fetches a single manual order by id.
+	GetManualOrder(ctx context.Context, id int64) (ManualOrder, error)
+	// UpdateManualOrderStatus mirrors UpdateRealOrderStatus, widened for the "resting" (limit order
+	// accepted, not yet filled) state RealOrder has never needed. entryPx/size/contracts are
+	// nil-able the same way: non-nil for a "filled"/"partial" transition (corrected to the
+	// exchange-confirmed values), nil for "resting"/"canceled" (nothing to correct yet, or ever).
+	UpdateManualOrderStatus(ctx context.Context, id int64, status string, entryPx, size, contracts *decimal.Decimal) error
+	// SetManualOrderProtection records the outcome of ManualTrader's post-fill protection step
+	// (§8.4/§4): either algoOrderID is set (a fresh protective order was placed) or
+	// protectedByStrategy is true (RealTrader already had one on this token, so none was placed) —
+	// never both, and the caller is responsible for that invariant.
+	SetManualOrderProtection(ctx context.Context, id int64, algoOrderID *string, protectedByStrategy bool) error
+	// CloseManualOrder mirrors CloseRealOrderConfirmed (an exchange-confirmed close, not just an
+	// intent) — exchangeFee is nil-able, matching RealOrder's "nil means the exchange did not
+	// report it" convention.
+	CloseManualOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal, exchangeFee *decimal.Decimal) error
+	// RequestManualOrderClose mirrors RequestRealManualClose — flags an open manual order for
+	// ManualTrader's own tick loop to close on its next tick, the same intent-not-action pattern
+	// every cross-process close request in this codebase uses.
+	RequestManualOrderClose(ctx context.Context, id int64) error
+	// CancelManualOrder mirrors RequestManualOrderClose but for a still-RESTING (unfilled) limit
+	// order — canceling a resting order is a different exchange call (CancelOrder, not a flatten)
+	// and a different terminal state (close_reason='canceled', no position ever existed), so this
+	// is a separate method rather than overloading RequestManualOrderClose's semantics (§8.1).
+	CancelManualOrder(ctx context.Context, id int64) error
+	// SetManualOrderError / ClearManualOrderError mirror the RealOrder equivalents.
+	SetManualOrderError(ctx context.Context, id int64, message string) error
+	ClearManualOrderError(ctx context.Context, id int64) error
+	// ListOpenManualOrders mirrors ListOpenRealOrders, restricted to Status IN ('filled','partial')
+	// — a still-pending/resting order is not yet a real position.
+	ListOpenManualOrders(ctx context.Context, instID string) ([]ManualOrder, error)
+	// ListManualOrders lists manual orders for the panel, filtered/sorted/paged per f (f.Mode is
+	// ignored — every row is real by construction, matching ListRealPositions).
+	ListManualOrders(ctx context.Context, f PositionFilter) ([]ManualOrder, error)
+	// RecordManualOrderAdjustment / ListManualOrderAdjustments mirror the real_order_adjustments
+	// equivalents, minus a Source column (every adjustment here is manual by construction).
+	RecordManualOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal) error
+	ListManualOrderAdjustments(ctx context.Context, orderID int64) ([]ManualOrderAdjustment, error)
 
 	// GetAccountEquity returns mode's current balance row, creating it (seeded at initialUSD, with
 	// a reason="seed" history point) if it doesn't exist yet — CLAUDE.md §15.6.

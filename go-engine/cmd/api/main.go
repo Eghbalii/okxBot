@@ -135,7 +135,10 @@ func main() {
 		// Positions backs GET /api/health's drift check — the evidence that decides whether clearing
 		// a halt is safe (CLAUDE.md §48). Routed through the gateway like every other exchange call,
 		// so it shares the same rate limit and credential boundary (§27.1).
-		Positions:     gatewayclient.New(cfg.Gateway.URL, "api"),
+		Positions: gatewayclient.New(cfg.Gateway.URL, "api"),
+		// ManualTrade backs the manual/discretionary trading page (docs/MANUAL_TRADE_PLAN.md) —
+		// same gateway/consumer identity as every other cmd/api exchange call above.
+		ManualTrade:   gatewayclient.New(cfg.Gateway.URL, "api"),
 		ExecInstIDFor: okx.SymbolMap(cfg.Trading.SymbolMap).Resolve,
 		ExecInstType:  cfg.Trading.ExecInstType,
 		ProcessMgr:    cfg.API.ProcessMgr,
