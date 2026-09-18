@@ -356,6 +356,305 @@ func smoothedDM(candles []Candle, period, at int) (plusDI, minusDI decimal.Decim
 		minusSum.Div(trSum).Mul(hundred).Round(emaScale), true, nil
 }
 
+// WMASeries returns the linearly-weighted moving average of closes over `period`, one value per
+// candle from index period-1 onward (earlier indices are the zero value) — the building block HMA
+// needs for its own recursive weighting. Weight increases linearly toward the most recent close in
+// the window, same convention as pmax.go's own wma() but exposed as a full series since HMA needs
+// two different WMA lengths computed over the same window at every bar, not just the latest value.
+func WMASeries(candles []Candle, period int) ([]decimal.Decimal, error) {
+	if len(candles) < period {
+		return nil, errNeedMore(period, len(candles))
+	}
+	out := make([]decimal.Decimal, len(candles))
+	weightTotal := decimal.NewFromInt(int64(period * (period + 1) / 2))
+	for i := period - 1; i < len(candles); i++ {
+		window := candles[i-period+1 : i+1]
+		weightedSum := decimal.Zero
+		for j, c := range window {
+			weightedSum = weightedSum.Add(c.Close.Mul(decimal.NewFromInt(int64(j + 1))))
+		}
+		out[i] = weightedSum.Div(weightTotal)
+	}
+	return out, nil
+}
+
+// HMASeries returns the Hull Moving Average over `period`, one value per candle from the point
+// enough history exists onward (earlier indices are the zero value).
+//
+// HMA = WMA(2*WMA(close, period/2) - WMA(close, period), round(sqrt(period))) — Alan Hull's
+// published construction: it halves lag by extrapolating a fast WMA past a slow one, then smooths
+// that extrapolation with a further WMA over a shorter window. Building the whole series (not just
+// the latest value) is what a slope/turning-point strategy needs, since "did it turn" requires
+// comparing consecutive HMA values computed the same way.
+func HMASeries(candles []Candle, period int) ([]decimal.Decimal, error) {
+	if period < 2 {
+		period = 2
+	}
+	halfLen := period / 2
+	if halfLen < 1 {
+		halfLen = 1
+	}
+	sqrtLen := int(math.Round(math.Sqrt(float64(period))))
+	if sqrtLen < 1 {
+		sqrtLen = 1
+	}
+	if len(candles) < period {
+		return nil, errNeedMore(period, len(candles))
+	}
+
+	wmaHalf, err := WMASeries(candles, halfLen)
+	if err != nil {
+		return nil, err
+	}
+	wmaFull, err := WMASeries(candles, period)
+	if err != nil {
+		return nil, err
+	}
+
+	// raw[i] = 2*WMA(half) - WMA(full), valid from index period-1 onward (WMA(full) is the longer of
+	// the two and gates when both are defined).
+	raw := make([]Candle, len(candles))
+	for i := period - 1; i < len(candles); i++ {
+		v := wmaHalf[i].Mul(decimal.NewFromInt(2)).Sub(wmaFull[i])
+		raw[i] = Candle{Close: v}
+	}
+	validRaw := raw[period-1:]
+	if len(validRaw) < sqrtLen {
+		return nil, errNeedMore(period+sqrtLen-1, len(candles))
+	}
+	smoothed, err := WMASeries(validRaw, sqrtLen)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]decimal.Decimal, len(candles))
+	for i, v := range smoothed {
+		if v.IsZero() && i < sqrtLen-1 {
+			continue // still zero-valued warm-up from WMASeries' own convention
+		}
+		out[period-1+i] = v
+	}
+	return out, nil
+}
+
+// HMA returns the latest Hull Moving Average over `period`.
+func HMA(candles []Candle, period int) (decimal.Decimal, error) {
+	series, err := HMASeries(candles, period)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	last := series[len(series)-1]
+	if last.IsZero() {
+		return decimal.Zero, errNeedMore(period, len(candles))
+	}
+	return last, nil
+}
+
+// Ichimoku returns the Tenkan-sen (conversion line) and Kijun-sen (base line): the midpoint of the
+// highest-high/lowest-low over `tenkanPeriod` and `kijunPeriod` bars respectively — Goichi
+// Hosoda's published construction (standard defaults 9/26). Only the two lines a TK-cross strategy
+// needs are computed; the cloud (Senkou spans, plotted 26 bars forward) and Chikou span are display
+// elements this codebase's Strategy interface has no forward-plotting concept for for and aren't
+// needed by a TK-cross signal.
+func Ichimoku(candles []Candle, tenkanPeriod, kijunPeriod int) (tenkan, kijun decimal.Decimal, err error) {
+	tenkanHigh, err := Highest(candles, tenkanPeriod)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, err
+	}
+	tenkanLow, err := Lowest(candles, tenkanPeriod)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, err
+	}
+	kijunHigh, err := Highest(candles, kijunPeriod)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, err
+	}
+	kijunLow, err := Lowest(candles, kijunPeriod)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, err
+	}
+	two := decimal.NewFromInt(2)
+	tenkan = tenkanHigh.Add(tenkanLow).Div(two)
+	kijun = kijunHigh.Add(kijunLow).Div(two)
+	return tenkan, kijun, nil
+}
+
+// Stochastic returns the classic %K/%D oscillator: %K is smoothed by kSmooth (1 = raw %K, the
+// "fast" stochastic; >1 = "slow" stochastic, George Lane's own recommended default 3), %D is a
+// further period-length SMA of %K. Reuses stoch_cross.go's own rawStochK/smaSeries series builders
+// so the two implementations of the same indicator can't drift.
+func Stochastic(candles []Candle, kPeriod, kSmooth, dPeriod int) (k, d decimal.Decimal, err error) {
+	need := kPeriod + kSmooth + dPeriod
+	if len(candles) < need {
+		return decimal.Zero, decimal.Zero, errNeedMore(need, len(candles))
+	}
+	rawK := rawStochK(candles, kPeriod)
+	kLine := smaSeries(rawK, kSmooth)
+	dLine := smaSeries(kLine, dPeriod)
+	last := len(candles) - 1
+	return kLine[last], dLine[last], nil
+}
+
+// ParabolicSARState is one bar's SAR state, carried forward by the caller between calls — SAR is
+// inherently recursive (the next bar's dot depends on this one's trend, extreme point, and
+// acceleration factor), so unlike the other indicators here it cannot be recomputed standalone from
+// a single call without replaying the whole series. ParabolicSARSeries below does that replay once;
+// a stateful strategy may instead carry a ParabolicSARState across calls if replaying the full
+// window on every candle becomes a real cost.
+type ParabolicSARState struct {
+	SAR          decimal.Decimal
+	Uptrend      bool
+	ExtremePoint decimal.Decimal
+	AF           decimal.Decimal
+}
+
+// ParabolicSARSeries computes Welles Wilder's Parabolic SAR over the whole candle series, returning
+// one SAR value and trend-direction flag per candle from index 1 onward (index 0 has no prior bar
+// to seed from and is the zero value / false). afStart/afStep/afMax are Wilder's own published
+// defaults when passed 0.02/0.02/0.2.
+func ParabolicSARSeries(candles []Candle, afStart, afStep, afMax decimal.Decimal) ([]decimal.Decimal, []bool, error) {
+	if len(candles) < 2 {
+		return nil, nil, errNeedMore(2, len(candles))
+	}
+	sars := make([]decimal.Decimal, len(candles))
+	trends := make([]bool, len(candles))
+
+	// Seed from the first two bars: trend is up if the second bar's close rose, SAR starts at the
+	// first bar's low (uptrend) or high (downtrend) — Wilder's own initialization.
+	uptrend := candles[1].Close.GreaterThanOrEqual(candles[0].Close)
+	var sar, ep decimal.Decimal
+	if uptrend {
+		sar = candles[0].Low
+		ep = candles[1].High
+	} else {
+		sar = candles[0].High
+		ep = candles[1].Low
+	}
+	af := afStart
+	sars[1], trends[1] = sar, uptrend
+
+	for i := 2; i < len(candles); i++ {
+		prevSAR := sar
+		nextSAR := prevSAR.Add(af.Mul(ep.Sub(prevSAR)))
+
+		if uptrend {
+			// SAR must never sit inside the prior two bars' range.
+			if nextSAR.GreaterThan(candles[i-1].Low) {
+				nextSAR = candles[i-1].Low
+			}
+			if i >= 2 && nextSAR.GreaterThan(candles[i-2].Low) {
+				nextSAR = candles[i-2].Low
+			}
+			if candles[i].Low.LessThan(nextSAR) {
+				// Flip to downtrend: SAR resets to the prior extreme point, AF resets.
+				uptrend = false
+				nextSAR = ep
+				ep = candles[i].Low
+				af = afStart
+			} else if candles[i].High.GreaterThan(ep) {
+				ep = candles[i].High
+				af = af.Add(afStep)
+				if af.GreaterThan(afMax) {
+					af = afMax
+				}
+			}
+		} else {
+			if nextSAR.LessThan(candles[i-1].High) {
+				nextSAR = candles[i-1].High
+			}
+			if i >= 2 && nextSAR.LessThan(candles[i-2].High) {
+				nextSAR = candles[i-2].High
+			}
+			if candles[i].High.GreaterThan(nextSAR) {
+				uptrend = true
+				nextSAR = ep
+				ep = candles[i].High
+				af = afStart
+			} else if candles[i].Low.LessThan(ep) {
+				ep = candles[i].Low
+				af = af.Add(afStep)
+				if af.GreaterThan(afMax) {
+					af = afMax
+				}
+			}
+		}
+		sar = nextSAR
+		sars[i], trends[i] = sar, uptrend
+	}
+	return sars, trends, nil
+}
+
+// ZigZagPivot is one detected swing point.
+type ZigZagPivot struct {
+	Index int
+	Price decimal.Decimal
+	High  bool // true = swing high, false = swing low
+}
+
+// ZigZagPivots finds local swing highs/lows using a simple `depth`-bar fractal: a candle whose High
+// is the highest of the `depth` bars on each side is a swing high, mirrored for lows. This is the
+// standard, well-known "fractal" pivot definition (the same shape TradingView's own ZigZag/Williams
+// Fractals indicators use), not the percentage-reversal ZigZag variant — a fractal needs no
+// reversal-percentage parameter and reacts to structure alone, which is what a swing-anchored
+// strategy wants to key off.
+//
+// Only pivots with `depth` confirmed bars on both sides are returned, so every result is final (a
+// pivot near the end of the series that hasn't yet been confirmed on its right side is correctly
+// omitted rather than guessed at).
+func ZigZagPivots(candles []Candle, depth int) []ZigZagPivot {
+	if depth < 1 {
+		depth = 2
+	}
+	var out []ZigZagPivot
+	for i := depth; i < len(candles)-depth; i++ {
+		isHigh, isLow := true, true
+		for j := i - depth; j <= i+depth; j++ {
+			if j == i {
+				continue
+			}
+			if candles[j].High.GreaterThanOrEqual(candles[i].High) {
+				isHigh = false
+			}
+			if candles[j].Low.LessThanOrEqual(candles[i].Low) {
+				isLow = false
+			}
+		}
+		if isHigh {
+			out = append(out, ZigZagPivot{Index: i, Price: candles[i].High, High: true})
+		}
+		if isLow {
+			out = append(out, ZigZagPivot{Index: i, Price: candles[i].Low, High: false})
+		}
+	}
+	return out
+}
+
+// AnchoredVWAP returns the volume-weighted average price computed from `fromIndex` (inclusive)
+// through the end of candles — a VWAP anchored to a specific bar (typically a significant swing
+// high/low) rather than a fixed rolling window, matching how a discretionary trader draws an
+// anchored VWAP from a chart pivot. Falls back to a plain average when the anchored window's total
+// volume is zero, same convention as SessionVWAP.
+func AnchoredVWAP(candles []Candle, fromIndex int) (decimal.Decimal, error) {
+	if fromIndex < 0 || fromIndex >= len(candles) {
+		return decimal.Zero, fmt.Errorf("anchor index %d out of range [0,%d)", fromIndex, len(candles))
+	}
+	window := candles[fromIndex:]
+	sumPV, sumV := decimal.Zero, decimal.Zero
+	for _, c := range window {
+		typical := c.High.Add(c.Low).Add(c.Close).Div(decimal.NewFromInt(3))
+		sumPV = sumPV.Add(typical.Mul(c.Volume))
+		sumV = sumV.Add(c.Volume)
+	}
+	if sumV.IsZero() {
+		sum := decimal.Zero
+		for _, c := range window {
+			sum = sum.Add(c.Close)
+		}
+		return sum.Div(decimal.NewFromInt(int64(len(window)))), nil
+	}
+	return sumPV.Div(sumV), nil
+}
+
 // directionalMove returns one bar's true range and its directional movement.
 //
 // Only the LARGER of the two moves counts, and only when it is positive: a bar that extends beyond

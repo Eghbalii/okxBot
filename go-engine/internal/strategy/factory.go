@@ -96,6 +96,29 @@ var Factories = map[string]Factory{
 	"macd_momentum_v2":       func() Strategy { return NewMACDMomentumV2() },
 	"volume_breakout_v2":     func() Strategy { return NewVolumeBreakoutV2() },
 	"ema_ribbon_pullback_v2": func() Strategy { return NewEMARibbonPullbackV2() },
+
+	// Ported from TradingView, 17 strategies requested by operator, 2026-09-16. Each implements the
+	// well-known, standard algorithm the named strategy is built around (classic default parameter
+	// values, per each file's own doc comment) rather than a literal PineScript transliteration,
+	// since raw source could not be extracted for any of them. See each file's header comment for
+	// the specific defaults used and their published origin.
+	"philakones_fib":           func() Strategy { return NewPhilakonesFib() },
+	"ut_bot":                   func() Strategy { return NewUTBot() },
+	"scalper_macd_psar_ema200": func() Strategy { return NewScalperMACDPsarEMA200() },
+	"ichimoku_tk_cross":        func() Strategy { return NewIchimokuTKCross() },
+	"hma_swing":                func() Strategy { return NewHMASwing() },
+	"micurobert_ema_cross":     func() Strategy { return NewMicuRobertEMACross() },
+	"bb_breakout":              func() Strategy { return NewBBBreakout() },
+	"hammers_stars":            func() Strategy { return NewHammersStars() },
+	"price_volume_breakout":    func() Strategy { return NewPriceVolumeBreakout() },
+	"most_strategy":            func() Strategy { return NewMostStrategy() },
+	"zigzag_pa":                func() Strategy { return NewZigZagPA() },
+	"open_close_cross":         func() Strategy { return NewOpenCloseCross() },
+	"rsi_divergence":           func() Strategy { return NewRSIDivergence() },
+	"flawless_victory":         func() Strategy { return NewFlawlessVictory() },
+	"hull_suite":               func() Strategy { return NewHullSuite() },
+	"adx_dmi_quality":          func() Strategy { return NewADXDMIQuality() },
+	"anchored_vwap_trend":      func() Strategy { return NewAnchoredVWAPTrend() },
 }
 
 // FromConfig builds a live Strategy for kind, applying config as WithParams overrides (config is
