@@ -3,7 +3,11 @@
 Status: **in progress**, started 2026-09-19. All operator decisions in §8 are settled (Market+Limit
 both in scope, USD notional sizing, manual bypasses `enabled_real`, a strategy-held position warns
 but never blocks a manual order). Only §8.5 (orderbook depth) remains open, defaulted to `books5`
-until told otherwise. Requested
+until told otherwise. §9 build-order steps 1-3 are DONE (schema, `GET /api/manual/instruments`,
+`usecase.ManualTrader`'s core lifecycle) — see step 3's own note for one deliberate deviation from
+the original reconcile-driver plan, and a real open gap it leaves (no drift/protection
+re-verification for manual positions yet). Steps 4-6 (the rest of the `cmd/api` surface, the panel
+page, the orderbook WebSocket) are not started. Requested
 by the operator: a discretionary, exchange-style manual trading page — 3-column layout (chart |
 orderbook | order ticket), token picker, leverage, price/SL/TP by price-or-percent, update/close,
 own database table fully independent of strategy-driven trading, orderbook WebSocket scoped to only
@@ -482,13 +486,37 @@ and revisit only if the operator asks for more depth after using it.
 
 Roughly in dependency order, each independently shippable/testable:
 
-1. Migrations: `manual_orders`, `manual_order_adjustments`, `manual_order_intents`.
-2. Widen `cmd/api`'s gateway-client interface (§6) + `GET /api/manual/instruments` (unblocks the
-   panel's token picker and metadata early, independent of everything else).
-3. `usecase.ManualTrader` core open/close/adjust lifecycle in `cmd/trader`, wired into the shared
-   `ReconcileDriver` from day one (§4.6) — do not ship a version that reconciles independently, even
-   temporarily, given how directly gap #4 is the documented cause of a real past incident (§48).
-4. `cmd/api` manual-order HTTP surface (§3), built against the now-real `ManualTrader`.
+1. **DONE (2026-09-19).** Migrations: `manual_orders`, `manual_order_adjustments`,
+   `manual_order_intents`.
+2. **DONE (2026-09-19).** Widened `cmd/api`'s gateway-client interface (`manualTradeClient`,
+   `internal/api/manual_orders.go`) + `GET /api/manual/instruments` (tick/lot/min size, contract
+   value — closes gap #5, deliberately bypasses `enabled_real` per §8.3, not limited to the
+   pre-scanned roster).
+3. **DONE (2026-09-19), with one deliberate deviation from the original plan below.**
+   `usecase.ManualTrader`'s core open/protect/close lifecycle now lives in `cmd/trader`
+   (`internal/usecase/manualtrader.go`), reusing `RealTrader`'s proven mechanics
+   (`waitForFill`/`sizeToContracts`/protect-or-close-immediately) rather than reinventing them.
+   Market and limit orders both open correctly; §8.4's protection-sharing check works; the
+   close-request sweep flattens filled positions and cancels resting ones from one shared flag.
+   8 tests, all passing.
+
+   **Deviation**: this does NOT register `ManualTrader` with the shared `ReconcileDriver`
+   (§4/§4.6's original plan) — `ReconcileDriver.Engines` is a concrete `map[string]*RealTrader`
+   with no interface, and widening it was judged too risky to do blind, mid-feature, against
+   production-critical reconciliation code with no chance yet to verify the change against a real
+   account. Instead, §8.4's "does RealTrader already protect this token" check reads
+   `Repo.ListRealPositions` directly (a DB read, no live exchange call) from a closure wired in
+   `cmd/trader/main.go`. **Concrete consequence, not yet closed**: a manually-opened position is
+   NOT currently re-verified against exchange drift the way every `RealTrader` position is (no
+   equivalent of `ensureProtection`/the untracked-position halt runs for it). This is an open gap,
+   not a resolved design choice — before manual trading is used with meaningful size, either (a)
+   extend `ReconcileDriver` with a small interface both `*RealTrader` and `*ManualTrader` can
+   satisfy, or (b) give `ManualTrader` its own periodic protection-verification pass calling
+   `GetAlgoOrder` per open manual order, mirroring `ensureProtection`'s own logic. Flagging this
+   explicitly rather than letting "it's in cmd/trader now" read as "it has full parity with
+   RealTrader's safety net" — it does not, yet.
+4. `cmd/api` manual-order HTTP surface (§3: `POST /api/manual/orders`, `POST /api/manual/leverage`,
+   `GET /api/manual/orders`, close/cancel/adjust endpoints) — NOT yet built. This is the next step.
 5. Panel `/trade` page skeleton: 3-column layout, chart (reusing existing internals), order ticket
    wired to the new endpoints, Home-page/`TokenChartModal` "Trade" button deep link. Ship this
    BEFORE the orderbook WS if useful — a manual trade page with a chart and no live orderbook ladder
