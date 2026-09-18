@@ -546,24 +546,23 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 			continue
 		}
 
-		// One open position per (STRATEGY, token) — widened from one per token on 2026-09-14, by
-		// explicit operator decision, so every strategy accumulates its own track record and the
-		// model sees far more closed trades to learn from.
+		// One open position per TOKEN — reverted 2026-09-17 back to the original §16.9 rule, after
+		// a 2026-09-14 trial widened this to one per (strategy, token) so every strategy could build
+		// its own track record. Reverted by explicit operator decision ahead of deploying the v9
+		// warm-started model: training and live evaluation should use the same slot rule the model
+		// was trained under (cmd/backtest's own positionSlots = instruments x kinds notwithstanding —
+		// that only sizes the TRAINING dataset's account, not this live guard), and a single position
+		// per token keeps the per-token dynamic-sizing math (dynamicNotional) matching what it looked
+		// like when $40/roster was last tuned, rather than fragmenting each token's slot across every
+		// assigned strategy again.
 		//
-		// What the original per-token guard (§16.9) was actually protecting against was two
-		// strategies disagreeing on the same token producing a simultaneous long AND short that no
-		// single lifecycle decision authorized. Keying by strategy keeps the part that matters: one
-		// strategy still cannot stack a second position on a token before its first resolves, so one
-		// setup is never counted as two independent trials. What it no longer does is let the
-		// fastest strategy monopolize a token's only slot — the starvation §18 documented, where
-		// 12 of 14 strategies produced no trades at all because one got there first.
-		//
-		// Forks are excluded: they shadow their baseline parent rather than being separate
-		// positions (§15.4).
+		// hasOpenBaselineFor (per-strategy) is kept below, unused by this call site, since the
+		// per-strategy track-record benefit §54.1 documented is real and may be worth revisiting once
+		// the roster is stable — this revert does not delete that capability, only stops using it.
 		//
 		// This is PAPER ONLY. usecase.RealTrader keeps one position per token per side (§27.3) and
 		// shares no code with this path, so real trading is untouched.
-		if hasOpenBaselineFor(open, a.StrategyID) {
+		if hasOpenBaseline(open) {
 			continue
 		}
 

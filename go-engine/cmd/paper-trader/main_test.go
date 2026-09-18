@@ -8,6 +8,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
@@ -97,5 +98,44 @@ func TestPaperTraderWiresTheV8ObservationInputs(t *testing.T) {
 			t.Errorf("cmd/paper-trader no longer wires %q — without it the engine builds no valid "+
 				"observation and silently never calls the model", want)
 		}
+	}
+}
+
+// countPositionSlots is the dynamic-sizing divisor (CurrentEquity / PositionSlots). This pins the
+// 2026-09-17 revert: it must count distinct TOKENS with at least one enabled assignment, not
+// (strategy, token) pairs — the latter under-sized every position by however many strategies were
+// assigned to a token, once the open guard went back to one position per TOKEN (papertrade.go's
+// own revert of the 2026-09-14 per-strategy trial). Measured in production: 13 strategies turned a
+// $4-per-token target into roughly $0.10/position.
+func TestCountPositionSlots_CountsTokensNotStrategyPairs(t *testing.T) {
+	got := countPositionSlots(map[string][]usecase.StrategyAssignment{
+		"BTC": {{StrategyID: 1}, {StrategyID: 2}, {StrategyID: 3}}, // 3 strategies, still 1 token
+		"ETH": {{StrategyID: 1}},
+		"SOL": {{StrategyID: 4}, {StrategyID: 5}},
+	})
+	if got != 3 {
+		t.Errorf("slots = %d, want 3 (one per token, regardless of how many strategies each carries)", got)
+	}
+}
+
+// A token present in the map with zero assignments (the panel enabled it, but nothing is assigned
+// to trade it yet) must not claim a slot — it can never open, so dividing the account for it would
+// shrink every real position's size for a token that will never spend its share.
+func TestCountPositionSlots_IgnoresTokensWithNoAssignments(t *testing.T) {
+	got := countPositionSlots(map[string][]usecase.StrategyAssignment{
+		"BTC": {{StrategyID: 1}},
+		"ETH": {}, // enabled, but nothing assigned
+	})
+	if got != 1 {
+		t.Errorf("slots = %d, want 1 — a token with zero assignments must not claim a slot", got)
+	}
+}
+
+// An empty roster (nothing enabled, or every enabled token has zero assignments) sizes to zero,
+// which main() must refuse to divide by rather than falling through to the defensive default of 1
+// and opening full-account positions the moment an assignment later appears.
+func TestCountPositionSlots_EmptyRosterIsZero(t *testing.T) {
+	if got := countPositionSlots(map[string][]usecase.StrategyAssignment{}); got != 0 {
+		t.Errorf("slots = %d, want 0", got)
 	}
 }

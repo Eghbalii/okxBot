@@ -258,19 +258,13 @@ func main() {
 	// need a restart" posture (§22) — enabling/disabling a token mid-run doesn't retroactively
 	// resize an order already open, only the next one to open.
 	//
-	// Counts (STRATEGY, token) PAIRS since 2026-09-14, when the open guard widened from one
-	// position per token to one per strategy per token. The divisor MUST equal the real slot count:
-	// dividing by tokens while opening per strategy would over-commit the account by exactly the
-	// number of strategies — 13x here, an account spent thirteen times over.
-	//
 	// Assignments are loaded up front for this reason (they used to be read inside the engine loop
 	// below), and reused there rather than re-queried per instrument.
 	strategiesByInst := make(map[string][]usecase.StrategyAssignment, len(instIDs))
-	positionSlots := 0
 	for _, instID := range instIDs {
 		if slices.Contains(ptCfg.DisabledInstIDs, instID) {
-			// A disabled token opens nothing, so its assignments hold no slots and must not shrink
-			// every other position's size by claiming some.
+			// A disabled token opens nothing, so its assignments must not be loaded as tradeable —
+			// countPositionSlots below relies on an absent map entry meaning "holds no slot".
 			continue
 		}
 		// Strategy assignments are durable (strategy_assignments table, CLAUDE.md §11.3): loaded
@@ -283,20 +277,12 @@ func main() {
 			os.Exit(1)
 		}
 		strategiesByInst[instID] = strategies
-		// Distinct strategy ids, not assignment rows: the same strategy assigned to two decision
-		// bars still holds ONE slot on this token, because hasOpenBaselineFor keys on the strategy.
-		seen := make(map[int64]bool, len(strategies))
-		for _, a := range strategies {
-			if !seen[a.StrategyID] {
-				seen[a.StrategyID] = true
-				positionSlots++
-			}
-		}
 	}
+	positionSlots := countPositionSlots(strategiesByInst)
 	if positionSlots == 0 {
 		// Nothing can open, so nothing can be sized. Falling through would divide by the defensive
 		// 1 and open full-account positions the moment an assignment appeared.
-		logger.Error("no enabled (strategy, token) pairs — nothing to trade")
+		logger.Error("no enabled tokens with assignments — nothing to trade")
 		os.Exit(1)
 	}
 	logger.Info("dynamic sizing divisor", "positionSlots", positionSlots, "tokens", len(instIDs))
@@ -411,6 +397,33 @@ func buildRLClamps(cfg *config.Config) conductor.Clamps {
 		MinTPSLRatio: cfg.PaperTrading.RLClamps.MinTPSLRatio,
 		MaxTPSLRatio: cfg.PaperTrading.RLClamps.MaxTPSLRatio,
 	}
+}
+
+// countPositionSlots is the dynamic-sizing divisor (CurrentEquity / PositionSlots, CLAUDE.md
+// §31.2/§32.4), extracted so a change to its counting rule fails a test rather than only being
+// caught by watching real positions come out too small — the exact way the bug this function fixes
+// was actually found. strategiesByInst holds only tokens eligible to open at all: a disabled token
+// is never a key (see the caller's loop), and its own value may still legitimately be empty if the
+// panel has no strategy assigned there.
+//
+// Counts distinct TOKENS, not (strategy, token) pairs, as of 2026-09-17 — reverted back alongside
+// papertrade.go's own revert of the 2026-09-14 one-per-strategy open guard (hasOpenBaseline, not
+// hasOpenBaselineFor). With the guard back to one open position per TOKEN, a (strategy,token)-pair
+// divisor under-sizes every position by however many strategies are assigned to that token: at 13
+// strategies this was closer to $0.10/position than the intended $4, since equity was being split
+// ~390 ways for a roster that can only ever hold ~34 real open positions (one per token) at once.
+// Counting tokens matches what the account actually needs to be able to size for.
+func countPositionSlots(strategiesByInst map[string][]usecase.StrategyAssignment) int {
+	slots := 0
+	for _, strategies := range strategiesByInst {
+		// A token holds exactly one slot as long as at least one strategy is actually assigned and
+		// enabled on it — a token with zero enabled assignments can never open, so it must not claim
+		// a slot either, for the same reason a disabled token (never a key here at all) does not.
+		if len(strategies) > 0 {
+			slots++
+		}
+	}
+	return slots
 }
 
 func envOr(key, fallback string) string {
