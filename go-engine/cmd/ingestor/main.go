@@ -184,10 +184,53 @@ func main() {
 		})
 	}
 
+	// Order book (docs/MANUAL_TRADE_PLAN.md §7): books5 (5 levels/side) permanently for the WHOLE
+	// roster, matching tickers/candles' own "always on" lifecycle rather than a per-viewer dynamic
+	// subscription — OKX pushes it at almost exactly the same rate as tickers (measured ~6/s on
+	// BTC, the busiest configured instrument), so this does not meaningfully change the ingestor's
+	// existing WS/Kafka load. books5 sends a full 5-level snapshot on every push, so unlike the
+	// deeper `books` channel there is no delta merge or checksum to maintain — every message is
+	// immediately displayable on its own. Aggregating to a wider grouping (10/100/1000) needs more
+	// real depth than 5 levels can honestly provide; that is deferred to a future per-instrument
+	// upgrade to the full `books` channel when a viewer actually asks for it, not built here.
+	orderbookPub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "okx.orderbook")
+	defer orderbookPub.Close()
+	orderbookClient := &ws.PublicClient{
+		URL:     cfg.OKX.PublicWSURL,
+		Channel: "books5",
+		InstIDs: wsInstIDs,
+		Logger:  logger,
+		Handler: func(msg ws.Message) {
+			sym, err := resolveSymbol(msg.Arg.InstID)
+			if err != nil {
+				logger.Warn("failed to resolve inbound orderbook instId to a symbol", "error", err)
+				return
+			}
+			var raw []json.RawMessage
+			if err := json.Unmarshal(msg.Data, &raw); err != nil {
+				logger.Warn("failed to decode orderbook payload", "error", err)
+				return
+			}
+			for _, r := range raw {
+				rewritten, err := rewriteInstID(r, sym)
+				if err != nil {
+					logger.Warn("failed to rewrite orderbook instId", "error", err)
+					continue
+				}
+				if err := orderbookPub.Publish(ctx, sym, rewritten); err != nil {
+					logger.Warn("failed to publish orderbook snapshot to kafka", "error", err)
+					continue
+				}
+				metrics.IngestorEventsTotal.WithLabelValues("orderbook", sym).Inc()
+			}
+		},
+	}
+
 	logger.Info("starting okx ingestor", "instIds", roster.Symbols, "bars", cfg.Ingestion.Bars)
 
-	errCh := make(chan error, 1+len(candleClients))
+	errCh := make(chan error, 2+len(candleClients))
 	go func() { errCh <- tickerClient.Run(ctx) }()
+	go func() { errCh <- orderbookClient.Run(ctx) }()
 	for _, c := range candleClients {
 		c := c
 		go func() { errCh <- c.Run(ctx) }()

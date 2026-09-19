@@ -576,8 +576,68 @@ go/no-go decision, never a side effect of a rename deploy.
    (`hooks/useCachedResource.ts`) to treat its absence as `null` rather than forcing a cast.
    Verified in-browser afterward: zero console errors across token search/switch, side/order-type/
    level-mode toggles, and both deep-link buttons.
-6. Orderbook WebSocket (§7) — the dynamic-subscription design needs its own focused session given
-   its lifecycle differs from every existing WS consumer in this codebase.
+6. **DONE (2026-09-19).** Orderbook WebSocket, revised after a design discussion with the operator
+   away from §7's original "dynamic per-viewer subscribe/unsubscribe" sketch:
+
+   **Final design** — one shared, permanent, full-roster `books5` subscription in `cmd/ingestor`
+   (the same lifecycle tickers/candles already have), not a per-viewer dynamic one. The operator's
+   own reasoning, confirmed against a real measurement: reconnecting to OKX on every token switch
+   would be slow, but OKX lets many instruments' `books5` channels share ONE WebSocket connection —
+   so the fix isn't a connection per viewer/session, it's one connection for the whole roster,
+   always on. Measured live against OKX before committing to this: `books5` on BTC pushes at
+   roughly the same rate as `tickers` (~6/s each), so broadcasting every instrument's book to every
+   connected panel client — the exact pattern prices/candles already use on this bridge — doesn't
+   meaningfully change the existing WS bridge's load. This also means no per-connection
+   subscription-tracking was needed in `internal/api/ws.go`'s hub; the panel filters client-side by
+   `instId`, matching `usePriceStream`/`useLiveCandles`'s own established pattern.
+
+   **Depth/grouping**: `books5` (5 levels/side) by default, sufficient for the fine-grained ladder
+   and cheap to run permanently across the whole roster. Confirmed live: 5 levels is genuinely NOT
+   enough real depth to aggregate into wide buckets (100/1000) accurately — a wide bucket needs
+   depth spanning that price range, which 5 top-of-book levels usually don't have. Rather than
+   defer grouping entirely, the UI supports 1/10/100/1000 grouping honestly against whatever depth
+   exists (a wide bucket on a thin book correctly collapses toward 1-2 rows, which is the accurate
+   picture, not a bug) — an upgrade to the full `books` channel (400 levels, checksum-validated) for
+   one instrument when a viewer picks a wide grouping is the architected-for future step, not built
+   yet (aggregation already happens entirely backend-adjacent in the panel's `OrderbookLadder`
+   component, so only the DATA source needs to widen later, not this logic).
+
+   **Delivery path**: `cmd/ingestor` (`internal/okx/ws.PublicClient`, `Channel: "books5"`) →
+   `okx.orderbook` Kafka topic, instId already rewritten to the short internal symbol like every
+   other event on this bus → `cmd/api`'s existing WS bridge (`GET /api/ws`) decodes and reshapes
+   into `{type:"orderbook", instId, asks:[{px,sz}], bids:[{px,sz}], ts}` → broadcast to every
+   connected client. `books5`'s own payload is a full 5-level snapshot on every push, so — unlike
+   the deeper `books` channel — there is no delta merge or checksum to maintain; every message is
+   immediately displayable on its own.
+
+   **Panel**: `useOrderbook(instId)` hook (mirrors `useLiveCandles`'s reset-on-identity-change
+   pattern), `OrderbookLadder` component — split two-column layout (bids left, asks right, explicit
+   operator preference, matching most exchanges' desktop UI), cumulative-depth bars, and the
+   1/10/100/1000 grouping toggle.
+
+   **A real bug found and fixed while testing in a real browser** (not caught by `tsc`/`vite
+   build`): the first version of the grouping bucketer rounded bids UP and asks DOWN toward their
+   bucket's edge (the "adjacent buckets shouldn't overlap" reasoning at the time), which could round
+   a bid's bucket label PAST an ask's and render a negative spread (observed live: "spread -100").
+   Fixed by flooring BOTH sides onto the same shared price grid (labeled by the bucket's lower
+   edge) — the standard exchange convention — so a bid bucket's label can never exceed an ask
+   bucket's, since both are always <= every raw price that fell into them. Verified across all four
+   grouping levels afterward: spread is never negative, and collapses to exactly 0 when a wide
+   bucket correctly merges both sides (the honest result on a 5-level book, not an error state).
+
+   **Also found and fixed the same session, unrelated to the orderbook itself**: `cmd/api`'s own
+   `api-ws-bridge-tickers` Kafka consumer group had 559,000+ messages of lag left over from an
+   earlier disk-full/Kafka-restart incident in this session, silently burning CPU (measured 45%
+   sustained) while never reaching live data — this was reported directly ("panel isn't showing
+   live price, CPU stuck at 80%") and fixed by resetting that one consumer group's offset to the
+   live tail, the same safe operation already established earlier for `paper-trader`'s own stale
+   backlog (every message in it was going to be discarded as stale anyway).
+
+   Verified end-to-end against the real deployed server (not just locally): `cmd/ingestor` publishing
+   `okx.orderbook` for every configured instrument (confirmed via Prometheus metrics, one counter per
+   symbol), `cmd/api` relaying it over the WS bridge (confirmed via a raw WebSocket client counting
+   837 orderbook frames in an 8s window), and the panel rendering a live, correctly-ordered ladder
+   with working grouping — all with zero browser console errors after the fixes above.
 
 ## 10. What this plan deliberately does not cover
 

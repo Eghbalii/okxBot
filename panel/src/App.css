@@ -2082,16 +2082,61 @@ input[type='number'] {
   padding: 12px;
 }
 
-.trade-orderbook-placeholder { min-height: 200px; }
-.trade-orderbook-head {
+.orderbook-ladder { min-height: 200px; display: flex; flex-direction: column; gap: 8px; }
+.ob-head { display: flex; align-items: center; justify-content: space-between; }
+.ob-head-title {
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-dim);
-  margin-bottom: 12px;
 }
-.trade-orderbook-last { margin-top: 8px; }
-.trade-orderbook-last span { color: var(--text); }
+.ob-grouping { display: flex; gap: 2px; }
+.ob-group-btn {
+  padding: 2px 6px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--text-dim);
+}
+.ob-group-btn.active { border-color: var(--accent); color: var(--text); }
+
+.ob-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.ob-col { display: flex; flex-direction: column; }
+/* Bids grow toward the spread from the top; asks the mirror, so both sides read best-price-first
+   nearest the middle of the ladder, matching how every exchange lays this out. */
+.ob-col-bids { flex-direction: column-reverse; }
+
+.ob-row {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 6px;
+  font-size: 12px;
+  overflow: hidden;
+  border-radius: 2px;
+}
+.ob-row-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 0;
+}
+.ob-row-ask .ob-row-bar { right: 0; background: rgba(248, 81, 73, 0.12); }
+.ob-row-bid .ob-row-bar { left: 0; background: rgba(63, 185, 80, 0.12); }
+.ob-px, .ob-sz { position: relative; z-index: 1; }
+.ob-sz { color: var(--text-dim); }
+
+.ob-spread {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.ob-spread-val { font-size: 11px; }
 
 .order-ticket { display: flex; flex-direction: column; gap: 10px; }
 .order-ticket-side { display: flex; gap: 6px; }

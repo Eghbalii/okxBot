@@ -401,7 +401,19 @@ export interface CandleUpdate {
   confirmed: boolean
 }
 
-export type WSEvent = PaperOrderEvent | PriceUpdate | CandleUpdate
+// OrderbookUpdate mirrors cmd/api's orderbookUpdate — a full books5 snapshot (5 levels/side) for
+// one instrument, pushed at roughly the ticker rate (docs/MANUAL_TRADE_PLAN.md §7). Broadcast to
+// every connected client the same as prices/candles; the panel filters to the instId it cares
+// about, matching useLiveCandles/usePriceStream's own pattern.
+export interface OrderbookUpdate {
+  type: 'orderbook'
+  instId: string
+  asks: { px: string; sz: string }[]
+  bids: { px: string; sz: string }[]
+  ts: string
+}
+
+export type WSEvent = PaperOrderEvent | PriceUpdate | CandleUpdate | OrderbookUpdate
 
 // openEventsSocket connects to cmd/api's WebSocket bridge and calls onEvent for every message
 // received (paper order open/close, or a live price tick — discriminate on `type`), reconnecting

@@ -5,8 +5,10 @@ import type { ManualOrder, Position } from '../api/types'
 import { useCachedResource } from '../hooks/useCachedResource'
 import { useLiveCandles } from '../hooks/useLiveCandles'
 import { usePriceStream } from '../hooks/usePriceStream'
+import { useOrderbook } from '../hooks/useOrderbook'
 import { usePolling } from '../hooks/usePolling'
 import { CandleChart } from '../components/CandleChart'
+import OrderbookLadder from '../components/OrderbookLadder'
 import { fmtPctLabel } from '../components/ChartAdjustPanel'
 import { pctOnMargin } from '../components/PositionZones'
 import { tokenSymbol, trimPrice } from '../utils/format'
@@ -83,6 +85,7 @@ export default function TradePage() {
 
   const livePrices = usePriceStream(true)
   const lastPrice = livePrices[symbol]
+  const book = useOrderbook(symbol)
 
   // Candles cached the same way TokenChartModal does (CLAUDE.md §50), so switching here from a
   // Home-page chart modal for the same token shares one cache entry.
@@ -189,7 +192,7 @@ export default function TradePage() {
         </div>
 
         <div className="trade-col trade-col-book">
-          <OrderbookPlaceholder symbol={symbol} lastPrice={lastPrice} />
+          <OrderbookLadder book={book} lastPrice={lastPrice} />
         </div>
 
         <div className="trade-col trade-col-ticket">
@@ -206,22 +209,6 @@ export default function TradePage() {
   )
 }
 
-// OrderbookPlaceholder stands in for the orderbook WebSocket (docs/MANUAL_TRADE_PLAN.md §7) —
-// deliberately built last per §9's own stated risk ordering. Shows the live last-traded price so
-// the column is not empty while that work is pending.
-function OrderbookPlaceholder({ symbol, lastPrice }: { symbol: string; lastPrice?: string }) {
-  return (
-    <div className="trade-orderbook-placeholder">
-      <div className="trade-orderbook-head">Order book</div>
-      <p className="text-dim">Live depth for {tokenSymbol(symbol)} is not wired up yet.</p>
-      {lastPrice && (
-        <p className="mono trade-orderbook-last">
-          Last: <span>{trimPrice(lastPrice)}</span>
-        </p>
-      )}
-    </div>
-  )
-}
 
 type LevelMode = 'price' | 'pct'
 

@@ -76,6 +76,46 @@ type candleUpdate struct {
 	Confirmed bool   `json:"confirmed"`
 }
 
+// bookLevel mirrors one row of OKX's books5 payload: [price, size, deprecated, numOrders]. Decoded
+// as a fixed-shape struct (not passed through as a raw string array) so the panel receives named
+// fields rather than needing to know OKX's own positional convention.
+type bookLevel [4]string
+
+// orderbookEvent is the ingestor's own Kafka payload for one books5 push (docs/MANUAL_TRADE_PLAN.md
+// §7) — the same full-snapshot shape OKX sends, just with instId already rewritten to the short
+// internal symbol (cmd/ingestor's own rewriteInstID, matching every other event type on this bus).
+type orderbookEvent struct {
+	InstID string      `json:"instId"`
+	Asks   []bookLevel `json:"asks"`
+	Bids   []bookLevel `json:"bids"`
+	Ts     string      `json:"ts"`
+}
+
+// orderbookUpdate is the panel's live order-book WebSocket message. Reshaped from OKX's raw
+// [price, size, _, numOrders] rows into {px, sz} pairs — the panel has no use for the deprecated
+// third field or the order count, and shipping named fields keeps the wire shape independent of
+// OKX's own positional convention (same reasoning as priceUpdate/candleUpdate above).
+type orderbookUpdate struct {
+	Type   string        `json:"type"` // "orderbook"
+	InstID string        `json:"instId"`
+	Asks   []bookLevelKV `json:"asks"`
+	Bids   []bookLevelKV `json:"bids"`
+	Ts     string        `json:"ts"`
+}
+
+type bookLevelKV struct {
+	Px string `json:"px"`
+	Sz string `json:"sz"`
+}
+
+func reshapeBookLevels(rows []bookLevel) []bookLevelKV {
+	out := make([]bookLevelKV, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, bookLevelKV{Px: r[0], Sz: r[1]})
+	}
+	return out
+}
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
@@ -255,6 +295,37 @@ func main() {
 			}
 		}()
 	}
+
+	// Live order book (docs/MANUAL_TRADE_PLAN.md §7) — books5 snapshots for every configured
+	// instrument, broadcast to every connected panel client the same way prices/candles already
+	// are (measured: books5 pushes at roughly the same rate as tickers, so this doesn't change the
+	// bridge's existing broadcast-everything-filter-client-side shape, CLAUDE.md §11.4). A
+	// dedicated consumer group so this never competes for offsets with anything else reading
+	// okx.orderbook in the future.
+	orderbookConsumer := kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.orderbook", "api-ws-bridge-orderbook")
+	go func() {
+		err := orderbookConsumer.Run(ctx, func(_ context.Context, data []byte) error {
+			var ev orderbookEvent
+			if err := json.Unmarshal(data, &ev); err != nil {
+				return nil // malformed: skip rather than fail the consumer loop
+			}
+			out, err := json.Marshal(orderbookUpdate{
+				Type:   "orderbook",
+				InstID: ev.InstID,
+				Asks:   reshapeBookLevels(ev.Asks),
+				Bids:   reshapeBookLevels(ev.Bids),
+				Ts:     ev.Ts,
+			})
+			if err != nil {
+				return nil
+			}
+			srv.Broadcast(out)
+			return nil
+		})
+		if err != nil && ctx.Err() == nil {
+			logger.Error("orderbook consumer exited", "error", err)
+		}
+	}()
 
 	httpServer := &http.Server{
 		Addr:    cfg.API.Addr,
