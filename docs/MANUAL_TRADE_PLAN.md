@@ -553,11 +553,29 @@ correctly 400s. `cmd/trader` itself was rebuilt (confirmed to compile and contai
 but deliberately NOT started — `okx-gateway` currently holds real, non-simulated credentials
 (`GET /health` -> `{"simulated":false}`), and starting the live trader is a separate, explicit
 go/no-go decision, never a side effect of a rename deploy.
-5. Panel `/trade` page skeleton: 3-column layout, chart (reusing existing internals), order ticket
-   wired to the new endpoints, Home-page/`TokenChartModal` "Trade" button deep link. Ship this
-   BEFORE the orderbook WS if useful — a manual trade page with a chart and no live orderbook ladder
-   is still a functioning (if incomplete) manual trading page, whereas the orderbook is the single
-   largest and riskiest new piece.
+5. **DONE (2026-09-19).** Panel `/trade` page skeleton: 3-column layout (chart | orderbook
+   placeholder | order ticket), token search, market/limit order form with price-or-percent SL/TP,
+   Update/Close controls once a position is open, "Trade" deep-link on the Home page's market table
+   and `TokenChartModal`'s header. Ships before the orderbook WS per this section's own risk
+   ordering. Reuses `CandleChart`/`PositionZones` via a thin display-only `ManualOrder` -> `Position`
+   adapter (safe: neither component mutates the value, verified against `CandleChart`'s own
+   `positions.map(...)`), plus `useLiveCandles`/`usePriceStream`/`useCachedResource` as-is.
+
+   **Found and fixed a real, previously-latent bug in `useCachedResource` while testing this in a
+   real browser** (headless Chromium via Playwright — required per this project's own "test the
+   golden path in a browser" standard, and it's what caught this; `tsc`/`vite build` both stayed
+   green through it). A key's first-ever load wrote `value: undefined as T` into the shared
+   module-level cache as an in-flight placeholder; React StrictMode's double-invoked mount effect
+   then read that placeholder back and called `setData(undefined)` — a real, different state from
+   "nothing loaded yet" (`null`) that crashed `useLiveCandles`'s `fetched === null` guard
+   (`TypeError: Cannot read properties of undefined (reading 'length')`, caught by the panel's own
+   `ErrorBoundary`). Every existing caller (`TokenChartModal`, the balance chart) happened not to
+   trigger it — their cache keys were typically already populated by the time StrictMode's second
+   mount ran. This page's genuinely first-ever key (`candles:BTC:5m` on a cold cache) hit it on
+   every load. Fixed by making `Entry<T>.value` optional and updating every read site
+   (`hooks/useCachedResource.ts`) to treat its absence as `null` rather than forcing a cast.
+   Verified in-browser afterward: zero console errors across token search/switch, side/order-type/
+   level-mode toggles, and both deep-link buttons.
 6. Orderbook WebSocket (§7) — the dynamic-subscription design needs its own focused session given
    its lifecycle differs from every existing WS consumer in this codebase.
 
