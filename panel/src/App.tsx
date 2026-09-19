@@ -9,9 +9,11 @@ import StrategiesPage from './pages/StrategiesPage'
 import PositionsPage from './pages/PositionsPage'
 import HomePage from './pages/HomePage'
 import StrategyTesterPage from './pages/StrategyTesterPage'
+import TradePage from './pages/TradePage'
 
 const tabs = [
   { to: '/home', label: 'Home' },
+  { to: '/trade', label: 'Trade' },
   { to: '/positions/paper', label: 'Positions' },
   { to: '/strategies', label: 'Strategies' },
   { to: '/strategy-tester', label: 'Strategy Tester' },
@@ -33,10 +35,13 @@ export default function App() {
           {tabs.map((tab) => {
             // Positions' own link target is /positions/paper, but /positions/bot should still
             // highlight this tab — match on the /positions prefix rather than the exact path.
+            // Trade is the same story once a token is in the URL (/trade/BTC).
             const active =
               tab.to === '/positions/paper'
                 ? location.pathname.startsWith('/positions')
-                : location.pathname === tab.to
+                : tab.to === '/trade'
+                  ? location.pathname.startsWith('/trade')
+                  : location.pathname === tab.to
             return (
               <NavLink key={tab.to} to={tab.to} className={'nav-link' + (active ? ' active' : '')}>
                 {tab.label}
@@ -62,6 +67,11 @@ export default function App() {
           <Route path="/home" element={<HomePage />} />
           <Route path="/positions" element={<Navigate to="/positions/paper" replace />} />
           <Route path="/positions/:mode" element={<PositionsPage />} />
+          {/* :symbol is optional, defaulting to BTC inside the page itself (docs/MANUAL_TRADE_PLAN.md
+              §5.4) — the default must live in the page, not be silently assumed by a caller that
+              renders it with no symbol. */}
+          <Route path="/trade" element={<TradePage />} />
+          <Route path="/trade/:symbol" element={<TradePage />} />
           <Route path="/strategies" element={<StrategiesPage />} />
           <Route path="/strategy-tester" element={<StrategyTesterPage />} />
           <Route path="/model" element={<ModelStatusPage />} />

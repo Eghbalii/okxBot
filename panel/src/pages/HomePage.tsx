@@ -388,6 +388,7 @@ export default function HomePage() {
                   Score
                 </SortableTh>
                 <th>Status</th>
+                <th />
               </tr>
             </thead>
             <tbody>
@@ -455,6 +456,11 @@ export default function HomePage() {
                           untracked
                         </span>
                       )}
+                    </td>
+                    <td>
+                      <Link to={`/trade/${r.symbol}`} className="btn-trade-link" title={`Trade ${r.symbol}`}>
+                        Trade
+                      </Link>
                     </td>
                   </tr>
                 )

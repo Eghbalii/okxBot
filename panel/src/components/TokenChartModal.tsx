@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { useCachedResource } from '../hooks/useCachedResource'
 import type { Position, PositionMode } from '../api/types'
@@ -327,6 +328,12 @@ export default function TokenChartModal({
               ))}
             </div>
           )}
+
+          {/* Deep-links to the manual/discretionary trading page for the token currently showing
+              (docs/MANUAL_TRADE_PLAN.md §5.3), not the strip's active one if they differ. */}
+          <Link to={`/trade/${instId}`} className="btn-trade-link chart-trade-link" title={`Trade ${tokenSymbol(instId)}`}>
+            Trade
+          </Link>
 
           <button
             className="chart-close-x"

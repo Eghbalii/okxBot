@@ -24,6 +24,10 @@ import type {
   MarketToken,
   Instrument,
   ScanResult,
+  ManualInstrument,
+  ManualOrder,
+  ManualOrderIntent,
+  ManualOrderAdjustment,
 } from './types'
 
 // Same-origin in production (the panel is served from behind the OpenVPN-only cmd/api host, per
@@ -324,6 +328,45 @@ export const api = {
     requestList<EquityPoint>(
       `/account/history?mode=${mode}&since=${encodeURIComponent(since.toISOString())}&limit=${limit}`,
     ),
+
+  // Manual/discretionary trading page (docs/MANUAL_TRADE_PLAN.md). Every write here is an async
+  // intent — cmd/trader's ManualTrader is the only thing that ever calls the exchange — matching
+  // the plan's own "DB-mediated handshake, not a direct call" design.
+  manualInstrument: (symbol: string) =>
+    request<ManualInstrument>(`/manual/instruments?symbol=${encodeURIComponent(symbol)}`),
+  setManualLeverage: (body: { symbol: string; leverage: string; side?: 'buy' | 'sell' }) =>
+    request<{ ok: boolean }>('/manual/leverage', { method: 'POST', body: JSON.stringify(body) }),
+  createManualOrder: (body: {
+    instId: string
+    side: 'buy' | 'sell'
+    orderType?: 'market' | 'limit'
+    limitPx?: string
+    sizeUsd: string
+    leverage: string
+    slPx?: string
+    slPct?: number
+    tpPx?: string
+    tpPct?: number
+  }) => request<{ intentId: number }>('/manual/orders', { method: 'POST', body: JSON.stringify(body) }),
+  manualOrderIntent: (id: number) => request<ManualOrderIntent>(`/manual/order-intents/${id}`),
+  listManualOrders: (opts?: { instId?: string; open?: boolean }) => {
+    const params = new URLSearchParams()
+    if (opts?.instId) params.set('instId', opts.instId)
+    if (opts?.open !== undefined) params.set('open', String(opts.open))
+    return request<{ items: ManualOrder[] | null; total: number }>(`/manual/orders?${params}`).then((r) => ({
+      items: r.items ?? [],
+      total: r.total,
+    }))
+  },
+  manualOrder: (id: number) => request<ManualOrder>(`/manual/orders/${id}`),
+  closeManualOrder: (id: number) => request<{ ok: boolean }>(`/manual/orders/${id}/close`, { method: 'POST' }),
+  cancelManualOrder: (id: number) => request<{ ok: boolean }>(`/manual/orders/${id}/cancel`, { method: 'POST' }),
+  adjustManualOrder: (id: number, body: { slPct?: number; tpPct?: number }) =>
+    request<{ slPx: string | null; tpPx: string | null }>(`/manual/orders/${id}/adjust`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  manualOrderAdjustments: (id: number) => requestList<ManualOrderAdjustment>(`/manual/orders/${id}/adjustments`),
 }
 
 // PaperOrderEvent mirrors Go's usecase.PaperOrderEvent — the lightweight message pushed over

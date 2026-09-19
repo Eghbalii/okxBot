@@ -1992,3 +1992,150 @@ input[type='number'] {
 }
 .flag-on { background: rgba(63, 185, 80, 0.16); color: var(--green); }
 .flag-off { background: var(--border); color: var(--text-dim); }
+
+/* --- Trade page (manual/discretionary trading, docs/MANUAL_TRADE_PLAN.md) --- */
+.btn-trade-link {
+  display: inline-block;
+  padding: 3px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.btn-trade-link:hover { background: rgba(31, 111, 235, 0.12); }
+.chart-trade-link { margin-right: 8px; }
+
+.trade-page { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
+
+.trade-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.trade-token-picker { position: relative; }
+.trade-search {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 6px 10px;
+  width: 180px;
+}
+.trade-search-results {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-top: 2px;
+  min-width: 180px;
+  max-height: 240px;
+  overflow-y: auto;
+  list-style: none;
+  padding: 4px;
+}
+.trade-search-results li button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  background: none;
+  border: none;
+  color: var(--text);
+  border-radius: 3px;
+}
+.trade-search-results li button:hover { background: var(--border); }
+
+.trade-symbol { font-size: 1.3rem; font-weight: 700; }
+.trade-price { font-size: 1.1rem; color: var(--text-dim); }
+
+.trade-bars { display: flex; gap: 4px; margin-left: auto; }
+.trade-bar-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-panel);
+  color: var(--text-dim);
+}
+.trade-bar-btn.active { border-color: var(--accent); color: var(--text); }
+
+.trade-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 2.4fr) minmax(220px, 0.9fr) minmax(280px, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+@media (max-width: 1100px) {
+  .trade-columns { grid-template-columns: 1fr; }
+}
+
+.trade-col {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.trade-orderbook-placeholder { min-height: 200px; }
+.trade-orderbook-head {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+.trade-orderbook-last { margin-top: 8px; }
+.trade-orderbook-last span { color: var(--text); }
+
+.order-ticket { display: flex; flex-direction: column; gap: 10px; }
+.order-ticket-side { display: flex; gap: 6px; }
+.ot-side-btn {
+  flex: 1;
+  padding: 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-dim);
+  font-weight: 700;
+}
+.ot-side-btn.ot-long.active { border-color: var(--green); color: var(--green); background: rgba(63, 185, 80, 0.1); }
+.ot-side-btn.ot-short.active { border-color: var(--red); color: var(--red); background: rgba(248, 81, 73, 0.1); }
+
+.ot-type, .ot-mode { display: flex; gap: 4px; }
+.ot-type-btn, .ot-mode-btn {
+  flex: 1;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.ot-type-btn.active, .ot-mode-btn.active { border-color: var(--accent); color: var(--text); }
+
+.ot-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-dim); }
+.ot-field input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 6px 8px;
+}
+
+.ot-contracts { margin: 0; font-size: 12px; }
+.ot-warning {
+  background: rgba(210, 153, 34, 0.12);
+  border: 1px solid #d29922;
+  color: #d29922;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+.ot-submit-long, .ot-submit-short { padding: 10px; font-size: 14px; }
+.ot-position-head { display: flex; align-items: center; gap: 8px; }

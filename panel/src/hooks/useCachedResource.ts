@@ -21,9 +21,13 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 //   - `loading` is true only when there is genuinely nothing to show. Components use it to decide
 //     between "Loading…" and rendering what they have, so a background refresh never blanks a view.
 
-// Entry is one cached value plus when it was stored.
+// Entry is one cached value plus when it was stored. `value` is absent for a key's first-ever
+// load, between the fetch being issued and resolving — deliberately not defaulted to `undefined
+// as T`, which used to happen and let StrictMode's double-invoked mount effect read that
+// placeholder back and call `setData(undefined)`, a real, different state from "nothing loaded
+// yet" (null) that broke a downstream `=== null` check (useLiveCandles crashed on it).
 interface Entry<T> {
-  value: T
+  value?: T
   storedAt: number
   // inFlight de-duplicates concurrent requests for the same key: two components mounting at once
   // (the chart and its position panel, say) share one network call rather than racing.
@@ -85,7 +89,7 @@ export function useCachedResource<T>(
   // this in an effect instead would paint one empty frame first, which is the flicker this exists
   // to remove.
   const cached = store.get(key) as Entry<T> | undefined
-  const [data, setData] = useState<T | null>(cached ? cached.value : null)
+  const [data, setData] = useState<T | null>(cached?.value ?? null)
   const [error, setError] = useState<string | null>(null)
   const [revalidating, setRevalidating] = useState(false)
 
@@ -98,8 +102,11 @@ export function useCachedResource<T>(
     async (force: boolean) => {
       const existing = store.get(key) as Entry<T> | undefined
 
-      // Fresh enough, and not forced: show it and do nothing.
-      if (!force && existing && Date.now() - existing.storedAt < maxAgeMs) {
+      // Fresh enough, and not forced: show it and do nothing. existing.value can only be absent
+      // here while its own fetch is still in flight, which the branch below already handles via
+      // existing.inFlight — so reaching this branch with no value would mean a stale timestamp on
+      // an empty entry, which "not fresh enough" correctly falls through on its own.
+      if (!force && existing?.value !== undefined && Date.now() - existing.storedAt < maxAgeMs) {
         setData(existing.value)
         setError(null)
         return
@@ -121,9 +128,11 @@ export function useCachedResource<T>(
 
       setRevalidating(true)
       const promise = fetcherRef.current()
-      // Record the in-flight promise against the EXISTING value, so concurrent callers keep seeing
-      // the stale data rather than a gap while it resolves.
-      put(key, { value: existing?.value as T, storedAt: existing?.storedAt ?? 0, inFlight: promise })
+      // Record the in-flight promise against whatever value already exists (undefined for a
+      // key's first-ever load), so a concurrent caller — including React StrictMode's
+      // double-invoked mount effect — reads back a genuinely-still-loading entry instead of a
+      // `value: undefined as T` placeholder that used to be indistinguishable from a real value.
+      put(key, { value: existing?.value, storedAt: existing?.storedAt ?? 0, inFlight: promise })
 
       try {
         const value = await promise
@@ -148,8 +157,10 @@ export function useCachedResource<T>(
 
     // Adopt this key's cached value synchronously on a key change, so switching to an
     // already-loaded position shows its data in the same frame rather than after a round trip.
+    // `hit.value` can be absent while a fetch for this key is still in flight (see load() above)
+    // — that is exactly "nothing to show yet", i.e. null, never `undefined` itself.
     const hit = store.get(key) as Entry<T> | undefined
-    setData(hit ? hit.value : null)
+    setData(hit?.value ?? null)
     setError(null)
 
     void load(false)

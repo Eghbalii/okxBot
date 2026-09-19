@@ -433,3 +433,84 @@ export interface ScanResult {
   admitted: number
   err?: string
 }
+
+// Manual/discretionary trading page ("Trade" tab, docs/MANUAL_TRADE_PLAN.md). ManualOrder mirrors
+// go-engine's port.ManualOrder JSON shape directly — a fully independent table from
+// paper_orders/bot_orders, so this is its own type rather than reusing Position.
+export interface ManualInstrument {
+  symbol: string
+  execInstId: string
+  tickSz: string
+  lotSz: string
+  minSz: string
+  ctVal: string
+}
+
+export type ManualOrderStatus =
+  | 'pending'
+  | 'opening'
+  | 'resting'
+  | 'partial'
+  | 'filled'
+  | 'closing'
+  | 'closed'
+  | 'canceled'
+
+export interface ManualOrder {
+  ID: number
+  InstID: string
+  ExecInstID: string
+  Side: 'buy' | 'sell'
+  OrderType: 'market' | 'limit'
+  LimitPx: string | null
+  Status: ManualOrderStatus
+  EntryPx: string | null
+  SLPx: string | null
+  TPPx: string | null
+  Size: string
+  Leverage: string
+  Contracts: string | null
+  // True when a strategy position already protects this token's shared net exchange position, so
+  // this manual order deliberately carries no protective order of its own (§8.4) — the panel must
+  // say so rather than imply an independent SL/TP exists.
+  ProtectedByStrategy: boolean
+  OpenedAt: string | null
+  ClosedAt: string | null
+  CloseReason: 'sl' | 'tp' | 'manual' | 'liquidation' | 'canceled' | null
+  ClosePx: string | null
+  RealizedPnL: string | null
+  ExchangeOrderID: string | null
+  ExchangeAlgoOrderID: string | null
+  ExchangeCloseOrderID: string | null
+  ExchangeFee: string | null
+  ManualCloseRequested: boolean
+  LastError: string | null
+  LastErrorAt: string | null
+  CreatedAt: string
+}
+
+export interface ManualOrderIntent {
+  ID: number
+  RequestedAt: string
+  InstID: string
+  Side: 'buy' | 'sell'
+  OrderType: 'market' | 'limit'
+  LimitPx: string | null
+  SizeUSD: string
+  Leverage: string
+  SLPx: string | null
+  TPPx: string | null
+  Status: 'pending' | 'claimed' | 'done' | 'failed'
+  ManualOrderID: number | null
+  Error: string | null
+  ClaimedAt: string | null
+}
+
+export interface ManualOrderAdjustment {
+  ID: number
+  OrderID: number
+  Field: 'sl' | 'tp'
+  OldValue: string | null
+  NewValue: string | null
+  CreatedAt: string
+}
