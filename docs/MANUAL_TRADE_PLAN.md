@@ -515,8 +515,44 @@ Roughly in dependency order, each independently shippable/testable:
    `GetAlgoOrder` per open manual order, mirroring `ensureProtection`'s own logic. Flagging this
    explicitly rather than letting "it's in cmd/trader now" read as "it has full parity with
    RealTrader's safety net" — it does not, yet.
-4. `cmd/api` manual-order HTTP surface (§3: `POST /api/manual/orders`, `POST /api/manual/leverage`,
-   `GET /api/manual/orders`, close/cancel/adjust endpoints) — NOT yet built. This is the next step.
+4. **DONE (2026-09-19).** `cmd/api` manual-order HTTP surface: `POST /api/manual/leverage`,
+   `POST /api/manual/orders` (writes the intent row per §2.3/§4, converting slPct/tpPct to a price
+   via the existing `priceFromMarginPct` helper before the intent is written so ManualTrader's own
+   open sequence never has to re-derive a percent with a possibly-different reference price),
+   `GET /api/manual/orders` (list), `GET /api/manual/order-intents/{id}` (poll while an order is
+   still being placed — named `order-intents` rather than `orders/intent/{id}` to avoid an
+   ambiguous route registration against `GET /api/manual/orders/{id}/adjustments`: net/http's
+   `ServeMux` rejects two patterns of the same segment depth where one has a literal and the other
+   a wildcard at the same position with more segments following), `GET /api/manual/orders/{id}`,
+   `POST /api/manual/orders/{id}/close`, `POST /api/manual/orders/{id}/cancel` (resting-limit-only,
+   §8.1), `POST /api/manual/orders/{id}/adjust` (same unclamped-manual-edit posture as
+   `handleAdjustPosition`, refuses when `ProtectedByStrategy` since there is no algo order this
+   order itself owns to amend), `GET /api/manual/orders/{id}/adjustments`. 11 new tests, all
+   passing; 984 Go tests total.
+
+## 9a. Rename: "Real Trader" -> "Bot Trader" (2026-09-19)
+
+Done alongside starting steps 4-6, per explicit operator request to make the three trading
+services' names read clearly: **paper trader**, **bot trader** (was "real trader" —
+`usecase.RealTrader` -> `usecase.BotTrader`, `real_orders`/`real_order_adjustments` tables ->
+`bot_orders`/`bot_order_adjustments`, mode value `"real"` -> `"bot"` everywhere in the DB/API/panel),
+and **Trade** (this manual/discretionary trader, `usecase.ManualTrader` — already correctly named).
+Full rename across the Go backend, database schema/data (applied directly on the server rather than
+via a versioned migration, per explicit operator decision since the project is still in active
+development — migration `000033` mirrors the same change for a fresh database), and the panel.
+`trading.allow_real_money`/`UseConductorLifecycle` were deliberately left untouched (they describe
+real capital and a feature flag, not the trader's name), and `instruments.enabled_real` was also
+left untouched (a distinct column for per-token real-trading enablement, out of the rename's stated
+scope). Verified end to end against the live server: DB rename applied cleanly (zero open bot
+positions at the time, bot trading state was `stopped`, `cmd/trader` container was not even
+running — the safest possible window), `go build`/`vet`/`test` all pass (973 tests before step 4's
+11 additions), `tsc -b`/`vite build` both pass, `paper-trader`/`api`/`panel` rebuilt and redeployed
+one at a time per the established procedure, `GET /api/health` now reports "Bot Trader" instead of
+"Real trader", `GET /api/positions?mode=bot` returns `bot_orders` data correctly, `?mode=real` now
+correctly 400s. `cmd/trader` itself was rebuilt (confirmed to compile and contain the renamed code)
+but deliberately NOT started — `okx-gateway` currently holds real, non-simulated credentials
+(`GET /health` -> `{"simulated":false}`), and starting the live trader is a separate, explicit
+go/no-go decision, never a side effect of a rename deploy.
 5. Panel `/trade` page skeleton: 3-column layout, chart (reusing existing internals), order ticket
    wired to the new endpoints, Home-page/`TokenChartModal` "Trade" button deep link. Ship this
    BEFORE the orderbook WS if useful — a manual trade page with a chart and no live orderbook ladder

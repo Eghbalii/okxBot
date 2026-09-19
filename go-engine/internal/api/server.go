@@ -59,6 +59,11 @@ type Server struct {
 	// ExecInstType is the instType those instruments live under ("FUTURES"), needed to read their
 	// price tick when rounding a manually-edited SL/TP.
 	ExecInstType string
+	// ManualTrading carries the TdMode/PosMode the manual/discretionary trading page's leverage
+	// endpoint needs (docs/MANUAL_TRADE_PLAN.md §3) — every actual order placement happens in
+	// cmd/trader's ManualTrader, which reads these from the same config; this process only needs
+	// them for the one call (SetLeverage) it's allowed to make directly.
+	ManualTrading ManualTradingConfig
 	// TraderBaseURL is cmd/trader's own restart-only HTTP surface (CLAUDE.md real-trading readiness
 	// plan, 2026-09-04) — used the same way PaperTraderBaseURL is: only the restart action needs to
 	// reach the running process, everything else (config reads/writes) hits Postgres directly.
@@ -141,6 +146,15 @@ func (s *Server) Routes() http.Handler {
 	// lookup for the token picker/order form, deliberately bypassing enabled_real (§8.3) and not
 	// limited to the pre-scanned roster.
 	mux.HandleFunc("GET /api/manual/instruments", s.handleManualInstrumentLookup)
+	mux.HandleFunc("POST /api/manual/leverage", s.handleManualSetLeverage)
+	mux.HandleFunc("POST /api/manual/orders", s.handleCreateManualOrder)
+	mux.HandleFunc("GET /api/manual/orders", s.handleListManualOrders)
+	mux.HandleFunc("GET /api/manual/order-intents/{id}", s.handleGetManualOrderIntent)
+	mux.HandleFunc("GET /api/manual/orders/{id}", s.handleGetManualOrder)
+	mux.HandleFunc("POST /api/manual/orders/{id}/close", s.handleCloseManualOrder)
+	mux.HandleFunc("POST /api/manual/orders/{id}/cancel", s.handleCancelManualOrder)
+	mux.HandleFunc("POST /api/manual/orders/{id}/adjust", s.handleAdjustManualOrder)
+	mux.HandleFunc("GET /api/manual/orders/{id}/adjustments", s.handleListManualOrderAdjustments)
 	// Service health + the real-trading halt, with the drift evidence that gates its reset
 	// (CLAUDE.md §47/§48 — two outages that looked identical from the panel and were not).
 	mux.HandleFunc("GET /api/health", s.handleHealth)

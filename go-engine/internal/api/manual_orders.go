@@ -21,6 +21,10 @@ type manualTradeClient interface {
 	GetOrder(instID, ordID string) (domain.OrderStatus, error)
 	PlaceAlgoOrder(req domain.AlgoOrderRequest) (string, error)
 	CancelAlgoOrder(instID, algoID string) error
+	// GetTicker supplies a reference price for converting an order-ticket SL/TP PERCENT into a
+	// price before the open-order intent is written (handleCreateManualOrder) — a market order has
+	// no price of its own yet, so the live last-traded price stands in for it.
+	GetTicker(instID string) (domain.Ticker, error)
 }
 
 type manualInstrumentView struct {

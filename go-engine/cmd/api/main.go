@@ -138,7 +138,10 @@ func main() {
 		Positions: gatewayclient.New(cfg.Gateway.URL, "api"),
 		// ManualTrade backs the manual/discretionary trading page (docs/MANUAL_TRADE_PLAN.md) —
 		// same gateway/consumer identity as every other cmd/api exchange call above.
-		ManualTrade:   gatewayclient.New(cfg.Gateway.URL, "api"),
+		ManualTrade: gatewayclient.New(cfg.Gateway.URL, "api"),
+		// TdMode/PosMode for the manual leverage-setting endpoint (docs/MANUAL_TRADE_PLAN.md §3) —
+		// the same values cmd/trader's ManualTrader uses for every order it actually places.
+		ManualTrading: api.ManualTradingConfig{TdMode: cfg.Trading.TdMode, PosMode: cfg.Trading.PosMode},
 		ExecInstIDFor: okx.SymbolMap(cfg.Trading.SymbolMap).Resolve,
 		ExecInstType:  cfg.Trading.ExecInstType,
 		ProcessMgr:    cfg.API.ProcessMgr,
