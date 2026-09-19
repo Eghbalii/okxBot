@@ -80,7 +80,7 @@ var trackedServices = []struct {
 	Container string
 	Critical  bool
 }{
-	{"Real trader", "okxbot-trader-1", true},
+	{"Bot Trader", "okxbot-trader-1", true},
 	{"Paper trader", "okxbot-paper-trader-1", true},
 	{"Ingestor", "okxbot-ingestor-1", true},
 	{"OKX gateway", "okxbot-okx-gateway-1", true},
