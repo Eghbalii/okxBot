@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api } from '../api/client'
-import type { ManualOrder, Position } from '../api/types'
+import type { ManualOrder, MarketToken, Position } from '../api/types'
 import { useCachedResource } from '../hooks/useCachedResource'
 import { useLiveCandles } from '../hooks/useLiveCandles'
 import { usePriceStream } from '../hooks/usePriceStream'
@@ -9,17 +9,33 @@ import { useOrderbook } from '../hooks/useOrderbook'
 import { usePolling } from '../hooks/usePolling'
 import { CandleChart } from '../components/CandleChart'
 import OrderbookLadder from '../components/OrderbookLadder'
+import TokenIcon from '../components/TokenIcon'
 import { fmtPctLabel } from '../components/ChartAdjustPanel'
 import { pctOnMargin } from '../components/PositionZones'
 import { tokenSymbol, trimPrice } from '../utils/format'
 
-// The manual/discretionary trading page ("Trade" tab, docs/MANUAL_TRADE_PLAN.md). §9's suggested
-// build order ships this BEFORE the orderbook WebSocket (§7) deliberately: a page with a chart and
-// order ticket but no live orderbook ladder is still a functioning trading page, and the orderbook
-// is the single largest/riskiest remaining piece. The middle column is a placeholder until it lands.
+// The manual/discretionary trading page ("Trade" tab, docs/MANUAL_TRADE_PLAN.md), laid out to
+// match a real exchange's own trading screen (explicit operator reference, 2026-09-19 redesign):
+// a full-width symbol/stats header, a chart panel that owns its own timeframe toolbar (not a
+// page-level control sitting outside the chart), a single STACKED order book (asks above the
+// spread, bids below — not the side-by-side split ladder an earlier pass tried), and an order
+// ticket styled like an exchange's own leverage/margin-mode pills + order-type tabs.
 
-const BARS = ['5m', '15m', '1H'] as const
+const BARS = ['1m', '5m', '15m', '1H', '4H', '1D'] as const
 const DEFAULT_SYMBOL = 'BTC'
+
+function fmtUsdCompact(n: number): string {
+  if (!Number.isFinite(n)) return '—'
+  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}K`
+  return `$${n.toFixed(0)}`
+}
+
+function fmtPctSigned(n: number): string {
+  if (!Number.isFinite(n)) return '—'
+  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
+}
 
 // manualOrderToPosition adapts a ManualOrder onto the minimal shape CandleChart/PositionZones
 // actually read (ID/Side/EntryPx/SLPx/TPPx/OpenedAt/ClosedAt/Leverage) — safe because neither
@@ -82,10 +98,27 @@ export default function TradePage() {
   const symbol = (routeSymbol ?? DEFAULT_SYMBOL).toUpperCase()
   const [bar, setBar] = useState<string>('5m')
   const [search, setSearch] = useState('')
+  const [searchFocused, setSearchFocused] = useState(false)
 
   const livePrices = usePriceStream(true)
   const lastPrice = livePrices[symbol]
   const book = useOrderbook(symbol)
+
+  // 24h stats for the header row (high/low/volume/change) — the same market-scan data the Home
+  // page's table already reads, just filtered to this one symbol.
+  const { data: marketResp } = useCachedResource(
+    'market-tokens:all',
+    () => api.marketTokens({}),
+    { maxAgeMs: 30_000, refetchMs: 30_000 },
+  )
+  const marketToken = useMemo<MarketToken | undefined>(
+    () => marketResp?.find((t) => t.symbol === symbol),
+    [marketResp, symbol],
+  )
+  const changePct = marketToken ? Number(marketToken.change24hPct) : NaN
+  const high24h = marketToken ? Number(marketToken.high24h) : NaN
+  const low24h = marketToken ? Number(marketToken.low24h) : NaN
+  const vol24hUsd = marketToken ? Number(marketToken.vol24hUsd) : NaN
 
   // Candles cached the same way TokenChartModal does (CLAUDE.md §50), so switching here from a
   // Home-page chart modal for the same token shares one cache entry.
@@ -146,49 +179,92 @@ export default function TradePage() {
 
   return (
     <div className="trade-page">
-      <div className="trade-header">
+      {/* Full-width symbol/stats header, above the 3-column workspace — the token picker, current
+          price and 24h stats belong to the WHOLE page, not to any one column beneath it. */}
+      <div className="trade-topbar">
         <div className="trade-token-picker">
-          <input
-            className="trade-search"
-            placeholder="Search token…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
-          {searchResults.length > 0 && (
-            <ul className="trade-search-results">
-              {searchResults.map((sym) => (
-                <li key={sym}>
-                  <button type="button" onClick={() => selectSymbol(sym)}>
-                    {sym}
-                  </button>
-                </li>
-              ))}
-            </ul>
+          <button type="button" className="trade-symbol-btn" onClick={() => setSearchFocused(true)}>
+            <TokenIcon symbol={symbol} size={22} />
+            <span className="trade-symbol">{tokenSymbol(symbol)}</span>
+            <span className="trade-symbol-suffix">Perp</span>
+            <span className="trade-symbol-caret">▾</span>
+          </button>
+          {searchFocused && (
+            <div className="trade-search-popover">
+              <input
+                autoFocus
+                className="trade-search"
+                placeholder="Search token…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                onBlur={() => window.setTimeout(() => setSearchFocused(false), 150)}
+              />
+              {searchResults.length > 0 && (
+                <ul className="trade-search-results">
+                  {searchResults.map((sym) => (
+                    <li key={sym}>
+                      <button type="button" onClick={() => selectSymbol(sym)}>
+                        {sym}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           )}
         </div>
-        <span className="trade-symbol">{tokenSymbol(symbol)}</span>
-        {lastPrice && <span className="trade-price mono">{trimPrice(lastPrice)}</span>}
-        <div className="trade-bars">
-          {BARS.map((b) => (
-            <button
-              key={b}
-              className={'trade-bar-btn' + (bar === b ? ' active' : '')}
-              onClick={() => setBar(b)}
-              type="button"
-            >
-              {b}
-            </button>
-          ))}
+
+        <div className="trade-topbar-stats">
+          <div className="trade-stat trade-stat-price">
+            <span className={'mono trade-price ' + (changePct >= 0 ? 'text-green' : 'text-red')}>
+              {trimPrice(lastPrice)}
+            </span>
+            {Number.isFinite(changePct) && (
+              <span className={'trade-stat-sub ' + (changePct >= 0 ? 'text-green' : 'text-red')}>
+                {fmtPctSigned(changePct)}
+              </span>
+            )}
+          </div>
+          <div className="trade-stat">
+            <span className="trade-stat-label">24h High</span>
+            <span className="mono">{Number.isFinite(high24h) ? trimPrice(high24h) : '—'}</span>
+          </div>
+          <div className="trade-stat">
+            <span className="trade-stat-label">24h Low</span>
+            <span className="mono">{Number.isFinite(low24h) ? trimPrice(low24h) : '—'}</span>
+          </div>
+          <div className="trade-stat">
+            <span className="trade-stat-label">24h Volume</span>
+            <span className="mono">{Number.isFinite(vol24hUsd) ? fmtUsdCompact(vol24hUsd) : '—'}</span>
+          </div>
         </div>
       </div>
 
       <div className="trade-columns">
         <div className="trade-col trade-col-chart">
-          {candlesLoading && !candles ? (
-            <p className="text-dim">Loading candles…</p>
-          ) : (
-            <CandleChart candles={candles ?? []} positions={chartPositions} frameKey={`${symbol}:${bar}`} height={520} />
-          )}
+          {/* The chart panel's OWN toolbar — timeframe buttons live here, inside the chart card,
+              never as a page-level control floating above it (explicit operator correction). */}
+          <div className="trade-chart-toolbar">
+            <div className="trade-bars" role="group">
+              {BARS.map((b) => (
+                <button
+                  key={b}
+                  className={'trade-bar-btn' + (bar === b ? ' active' : '')}
+                  onClick={() => setBar(b)}
+                  type="button"
+                >
+                  {b}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="trade-chart-body">
+            {candlesLoading && !candles ? (
+              <p className="text-dim">Loading candles…</p>
+            ) : (
+              <CandleChart candles={candles ?? []} positions={chartPositions} frameKey={`${symbol}:${bar}`} height={560} />
+            )}
+          </div>
         </div>
 
         <div className="trade-col trade-col-book">
@@ -318,6 +394,27 @@ function NewOrderTicket({
 
   return (
     <div className="order-ticket">
+      {/* Margin-mode / leverage pills, matching an exchange's own ticket header (explicit
+          reference) — this account is always cross-margin/manual leverage, so these are read-only
+          badges rather than switches; leverage itself is the actual input further down. */}
+      <div className="ot-pills">
+        <span className="ot-pill">Cross</span>
+        <span className="ot-pill">{leverage || '10'}x</span>
+      </div>
+
+      <div className="ot-type" role="group">
+        {(['limit', 'market'] as const).map((t) => (
+          <button
+            key={t}
+            type="button"
+            className={'ot-type-tab' + (orderType === t ? ' active' : '')}
+            onClick={() => setOrderType(t)}
+          >
+            {t === 'market' ? 'Market' : 'Limit'}
+          </button>
+        ))}
+      </div>
+
       <div className="order-ticket-side" role="group">
         <button
           type="button"
@@ -338,19 +435,6 @@ function NewOrderTicket({
       {hasStrategyPosition && (
         <p className="ot-warning">This token has an open position from a strategy.</p>
       )}
-
-      <div className="ot-type" role="group">
-        {(['market', 'limit'] as const).map((t) => (
-          <button
-            key={t}
-            type="button"
-            className={'ot-type-btn' + (orderType === t ? ' active' : '')}
-            onClick={() => setOrderType(t)}
-          >
-            {t === 'market' ? 'Market' : 'Limit'}
-          </button>
-        ))}
-      </div>
 
       {orderType === 'limit' && (
         <label className="ot-field">

@@ -2008,33 +2008,58 @@ input[type='number'] {
 .btn-trade-link:hover { background: rgba(31, 111, 235, 0.12); }
 .chart-trade-link { margin-right: 8px; }
 
-.trade-page { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
+.trade-page { display: flex; flex-direction: column; gap: 1px; background: var(--border); }
 
-.trade-header {
+/* --- Full-width top bar: symbol picker + 24h stats, above the 3-column workspace --- */
+.trade-topbar {
   display: flex;
   align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
-}
-.trade-token-picker { position: relative; }
-.trade-search {
+  gap: 28px;
+  padding: 10px 16px;
   background: var(--bg-panel);
+}
+.trade-token-picker { position: relative; flex: none; }
+.trade-symbol-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--text);
+}
+.trade-symbol-btn:hover { border-color: var(--border); background: var(--bg); }
+.trade-symbol { font-size: 1.05rem; font-weight: 700; }
+.trade-symbol-suffix {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--border);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.trade-symbol-caret { color: var(--text-dim); font-size: 10px; }
+
+.trade-search-popover {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 30;
+  margin-top: 4px;
+}
+.trade-search {
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--text);
   padding: 6px 10px;
-  width: 180px;
+  width: 200px;
 }
 .trade-search-results {
-  position: absolute;
-  top: 100%;
-  left: 0;
-  z-index: 20;
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: 4px;
-  margin-top: 2px;
-  min-width: 180px;
+  margin: 4px 0 0;
   max-height: 240px;
   overflow-y: auto;
   list-style: none;
@@ -2052,47 +2077,57 @@ input[type='number'] {
 }
 .trade-search-results li button:hover { background: var(--border); }
 
-.trade-symbol { font-size: 1.3rem; font-weight: 700; }
-.trade-price { font-size: 1.1rem; color: var(--text-dim); }
+.trade-topbar-stats { display: flex; align-items: center; gap: 32px; overflow-x: auto; }
+.trade-stat { display: flex; flex-direction: column; gap: 2px; font-size: 12px; white-space: nowrap; }
+.trade-stat-label { color: var(--text-dim); }
+.trade-stat-price { gap: 0; }
+.trade-price { font-size: 1.15rem; font-weight: 700; }
+.trade-stat-sub { font-size: 12px; font-weight: 600; }
 
-.trade-bars { display: flex; gap: 4px; margin-left: auto; }
-.trade-bar-btn {
-  padding: 4px 10px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--bg-panel);
-  color: var(--text-dim);
-}
-.trade-bar-btn.active { border-color: var(--accent); color: var(--text); }
-
+/* --- 3-column workspace --- */
 .trade-columns {
   display: grid;
-  grid-template-columns: minmax(0, 2.4fr) minmax(220px, 0.9fr) minmax(280px, 1fr);
-  gap: 12px;
-  align-items: start;
+  grid-template-columns: minmax(0, 1fr) 300px 300px;
+  gap: 1px;
+  align-items: stretch;
 }
-@media (max-width: 1100px) {
+@media (max-width: 1200px) {
   .trade-columns { grid-template-columns: 1fr; }
 }
 
-.trade-col {
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 12px;
-}
+.trade-col { background: var(--bg-panel); display: flex; flex-direction: column; min-width: 0; }
+.trade-col-chart { padding: 0; }
+.trade-col-book,
+.trade-col-ticket { padding: 12px; }
 
-.orderbook-ladder { min-height: 200px; display: flex; flex-direction: column; gap: 8px; }
-.ob-head { display: flex; align-items: center; justify-content: space-between; }
-.ob-head-title {
-  font-size: 0.75rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-dim);
+/* Chart panel owns its own toolbar (timeframes live INSIDE the chart card, never as a page-level
+   control floating above it — explicit correction after an earlier pass got this wrong). */
+.trade-chart-toolbar {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
 }
+.trade-chart-body { padding: 8px 4px 4px; }
+.trade-bars { display: flex; gap: 2px; }
+.trade-bar-btn {
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.trade-bar-btn:hover { background: var(--border); }
+.trade-bar-btn.active { background: var(--border); color: var(--text); font-weight: 600; }
+
+/* --- Order book: single STACKED ladder (asks above the spread, bids below) --- */
+.orderbook-ladder { display: flex; flex-direction: column; gap: 6px; min-height: 0; flex: 1; }
+.ob-head { display: flex; align-items: center; justify-content: space-between; }
+.ob-head-title { font-size: 13px; font-weight: 600; }
 .ob-grouping { display: flex; gap: 2px; }
 .ob-group-btn {
-  padding: 2px 6px;
+  padding: 2px 7px;
   font-size: 11px;
   border: 1px solid var(--border);
   border-radius: 3px;
@@ -2101,44 +2136,78 @@ input[type='number'] {
 }
 .ob-group-btn.active { border-color: var(--accent); color: var(--text); }
 
-.ob-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-.ob-col { display: flex; flex-direction: column; }
-/* Bids grow toward the spread from the top; asks the mirror, so both sides read best-price-first
-   nearest the middle of the ladder, matching how every exchange lays this out. */
-.ob-col-bids { flex-direction: column-reverse; }
+.ob-col-head {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 0 4px;
+}
+.ob-col-head span:nth-child(2) { text-align: right; }
+.ob-col-head span:nth-child(3) { text-align: right; }
+
+.ob-waiting { padding: 24px 0; text-align: center; }
+
+.ob-asks { display: flex; flex-direction: column; }
+.ob-bids { display: flex; flex-direction: column; }
 
 .ob-row {
   position: relative;
-  display: flex;
-  justify-content: space-between;
-  padding: 2px 6px;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  padding: 1.5px 4px;
   font-size: 12px;
+  line-height: 1.5;
   overflow: hidden;
   border-radius: 2px;
 }
 .ob-row-bar {
   position: absolute;
   top: 0;
+  right: 0;
   bottom: 0;
   z-index: 0;
 }
-.ob-row-ask .ob-row-bar { right: 0; background: rgba(248, 81, 73, 0.12); }
-.ob-row-bid .ob-row-bar { left: 0; background: rgba(63, 185, 80, 0.12); }
-.ob-px, .ob-sz { position: relative; z-index: 1; }
-.ob-sz { color: var(--text-dim); }
+.ob-row-bar-ask { background: rgba(248, 81, 73, 0.14); }
+.ob-row-bar-bid { background: rgba(63, 185, 80, 0.14); }
+.ob-px, .ob-sz, .ob-cum { position: relative; z-index: 1; }
+.ob-sz, .ob-cum { text-align: right; color: var(--text-dim); }
 
-.ob-spread {
+.ob-spread-row {
   display: flex;
-  justify-content: center;
+  align-items: baseline;
   gap: 8px;
-  padding: 6px 0;
+  padding: 6px 4px;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
-  font-size: 13px;
 }
+.ob-spread-px { font-size: 15px; font-weight: 700; }
 .ob-spread-val { font-size: 11px; }
 
+/* --- Order ticket --- */
 .order-ticket { display: flex; flex-direction: column; gap: 10px; }
+
+.ot-pills { display: flex; gap: 6px; }
+.ot-pill {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ot-type { display: flex; gap: 16px; border-bottom: 1px solid var(--border); }
+.ot-type-tab {
+  padding: 6px 0;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.ot-type-tab.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+
 .order-ticket-side { display: flex; gap: 6px; }
 .ot-side-btn {
   flex: 1;
@@ -2152,8 +2221,8 @@ input[type='number'] {
 .ot-side-btn.ot-long.active { border-color: var(--green); color: var(--green); background: rgba(63, 185, 80, 0.1); }
 .ot-side-btn.ot-short.active { border-color: var(--red); color: var(--red); background: rgba(248, 81, 73, 0.1); }
 
-.ot-type, .ot-mode { display: flex; gap: 4px; }
-.ot-type-btn, .ot-mode-btn {
+.ot-mode { display: flex; gap: 4px; }
+.ot-mode-btn {
   flex: 1;
   padding: 4px 8px;
   border: 1px solid var(--border);
@@ -2162,7 +2231,7 @@ input[type='number'] {
   color: var(--text-dim);
   font-size: 12px;
 }
-.ot-type-btn.active, .ot-mode-btn.active { border-color: var(--accent); color: var(--text); }
+.ot-mode-btn.active { border-color: var(--accent); color: var(--text); }
 
 .ot-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-dim); }
 .ot-field input {

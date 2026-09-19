@@ -40,29 +40,29 @@ function withCumulative(levels: OrderbookLevel[]): (OrderbookLevel & { cum: numb
   })
 }
 
-function Row({
-  level,
-  maxCum,
-  side,
-}: {
-  level: OrderbookLevel & { cum: number }
-  maxCum: number
-  side: 'ask' | 'bid'
-}) {
+/**
+ * One ladder row: price / size / cumulative-sum, with a depth bar filling from the right edge
+ * behind the sum column — the single-stacked-book convention (asks above the spread, bids below,
+ * both reading best-price-nearest-the-middle) used by Binance/most exchanges' own default layout,
+ * explicit operator preference over a side-by-side split ladder.
+ */
+function Row({ level, maxCum, side }: { level: OrderbookLevel & { cum: number }; maxCum: number; side: 'ask' | 'bid' }) {
   const barPct = maxCum > 0 ? (level.cum / maxCum) * 100 : 0
   return (
-    <div className={'ob-row ob-row-' + side}>
-      <div className="ob-row-bar" style={{ width: `${barPct}%` }} />
+    <div className="ob-row">
+      <div className={'ob-row-bar ob-row-bar-' + side} style={{ width: `${barPct}%` }} />
       <span className={'ob-px mono ' + (side === 'ask' ? 'text-red' : 'text-green')}>{trimPrice(level.px)}</span>
       <span className="ob-sz mono">{level.sz.toFixed(3)}</span>
+      <span className="ob-cum mono">{level.cum.toFixed(3)}</span>
     </div>
   )
 }
 
 /**
- * Split two-column order book ladder (asks right, bids left) — matches the layout used by most
- * exchanges' desktop UIs (docs/MANUAL_TRADE_PLAN.md §7, explicit operator preference over the
- * single-stacked-ladder alternative).
+ * Single stacked order-book ladder — asks above the spread (best ask nearest the middle,
+ * descending upward), the live price in the middle, bids below (best bid nearest the middle,
+ * descending downward). Matches the reference layout the operator asked for directly (Binance's
+ * own order-book panel), replacing an earlier side-by-side two-column attempt.
  */
 export default function OrderbookLadder({ book, lastPrice }: { book: Orderbook | null; lastPrice?: string }) {
   const [grouping, setGrouping] = useState<Grouping>(1)
@@ -78,12 +78,16 @@ export default function OrderbookLadder({ book, lastPrice }: { book: Orderbook |
     return { asks: groupedAsks, bids: groupedBids, maxCum: max }
   }, [book, grouping])
 
+  // Asks render top-to-bottom as farthest-from-spread-first, so the best ask sits directly above
+  // the spread row — the array itself is already best-first, so this is a simple reverse.
+  const asksTopDown = useMemo(() => [...asks].reverse(), [asks])
+
   const spread = asks.length > 0 && bids.length > 0 ? asks[0].px - bids[0].px : null
 
   return (
     <div className="orderbook-ladder">
       <div className="ob-head">
-        <span className="ob-head-title">Order book</span>
+        <span className="ob-head-title">Order Book</span>
         <div className="ob-grouping" role="group">
           {GROUPINGS.map((g) => (
             <button
@@ -98,29 +102,33 @@ export default function OrderbookLadder({ book, lastPrice }: { book: Orderbook |
         </div>
       </div>
 
+      <div className="ob-col-head">
+        <span>Price</span>
+        <span>Size</span>
+        <span>Sum</span>
+      </div>
+
       {!book ? (
-        <p className="text-dim">Waiting for order book data…</p>
+        <p className="text-dim ob-waiting">Waiting for order book data…</p>
       ) : (
         <>
-          <div className="ob-columns">
-            <div className="ob-col ob-col-bids">
-              {/* Bids read top-to-bottom as best-first, same direction as asks, so the two columns'
-                  rows sit at matching heights either side of the spread. */}
-              {bids.map((l) => (
-                <Row key={l.px} level={l} maxCum={maxCum} side="bid" />
-              ))}
-            </div>
-            <div className="ob-col ob-col-asks">
-              {asks.map((l) => (
-                <Row key={l.px} level={l} maxCum={maxCum} side="ask" />
-              ))}
-            </div>
+          <div className="ob-asks">
+            {asksTopDown.map((l) => (
+              <Row key={l.px} level={l} maxCum={maxCum} side="ask" />
+            ))}
           </div>
-          <div className="ob-spread">
-            {lastPrice && <span className="mono">{trimPrice(lastPrice)}</span>}
-            {spread !== null && (
-              <span className="text-dim ob-spread-val">spread {trimPrice(spread)}</span>
-            )}
+
+          <div className="ob-spread-row">
+            <span className={'mono ob-spread-px ' + (spread !== null && spread >= 0 ? 'text-green' : 'text-red')}>
+              {trimPrice(lastPrice)}
+            </span>
+            {spread !== null && <span className="text-dim ob-spread-val">spread {trimPrice(spread)}</span>}
+          </div>
+
+          <div className="ob-bids">
+            {bids.map((l) => (
+              <Row key={l.px} level={l} maxCum={maxCum} side="bid" />
+            ))}
           </div>
         </>
       )}
