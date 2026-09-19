@@ -15,24 +15,24 @@ import (
 )
 
 // ManualTrader is the discretionary/operator-placed order lifecycle (docs/MANUAL_TRADE_PLAN.md),
-// deliberately a SEPARATE type from RealTrader rather than a mode on it — a manual order has no
+// deliberately a SEPARATE type from BotTrader rather than a mode on it — a manual order has no
 // strategy signal, no conductor category, no RL model call, and no observation vector, so bolting
-// it onto RealTrader's own open/update/close methods would mean threading a "this call has none of
+// it onto BotTrader's own open/update/close methods would mean threading a "this call has none of
 // the things I normally require" flag through code that is not written to expect that.
 //
-// It reuses RealTrader's PROVEN safety mechanics rather than reinventing them: the same
+// It reuses BotTrader's PROVEN safety mechanics rather than reinventing them: the same
 // place-then-confirm-fill sequence (waitForFill), the same size->contracts conversion
 // (sizeToContracts), and the same exchange-side-protection-or-close-immediately posture
 // (placeProtection's reasoning, reproduced here as placeManualProtection). Where it genuinely
 // differs is §8.4's settled behavior: a manual order and a strategy position can share ONE net
 // exchange position, and OKX's conditional orders for a position do not stack cleanly — so before
-// placing its own protective order, ManualTrader checks whether RealTrader already protects this
+// placing its own protective order, ManualTrader checks whether BotTrader already protects this
 // token and, if so, deliberately does not place a second one.
 //
-// One ManualTrader instance is account-wide (unlike RealTrader, which is one-per-configured-
+// One ManualTrader instance is account-wide (unlike BotTrader, which is one-per-configured-
 // instrument) — a manual order can be placed on ANY token the operator picks, not just the
 // pre-configured roster (docs/MANUAL_TRADE_PLAN.md §1's rejected alternative explains why this
-// could not simply spin up a RealTrader per manual token instead).
+// could not simply spin up a BotTrader per manual token instead).
 type ManualTrader struct {
 	Repo     port.Repository
 	Exchange port.ExchangeClient
@@ -45,14 +45,14 @@ type ManualTrader struct {
 
 	// ExecInstIDFor resolves a short symbol ("BTC") to the instrument orders actually execute
 	// against (CLAUDE.md §33.4) — required since a manual order's token is chosen live, not fixed
-	// at construction the way RealTrader.ExecInstID is.
+	// at construction the way BotTrader.ExecInstID is.
 	ExecInstIDFor func(symbol string) (string, error)
 
-	// RealTraderProtects reports whether RealTrader already holds a live protective algo order on
+	// BotTraderProtects reports whether BotTrader already holds a live protective algo order on
 	// instID (§8.4). Wired by cmd/trader to a closure reading the shared engines map — kept as a
-	// function rather than a direct dependency on *RealTrader/map[string]*RealTrader so this type
+	// function rather than a direct dependency on *BotTrader/map[string]*BotTrader so this type
 	// does not need to know cmd/trader's own wiring shape, only the one fact it needs from it.
-	RealTraderProtects func(instID string) bool
+	BotTraderProtects func(instID string) bool
 
 	FillTimeout time.Duration
 
@@ -118,7 +118,7 @@ func (m *ManualTrader) execInstID(symbol string) (string, error) {
 }
 
 // instrumentMeta fetches and caches execInstID's contract-shape metadata, mirroring
-// RealTrader.instrumentMeta but keyed per-instrument since one ManualTrader serves every token
+// BotTrader.instrumentMeta but keyed per-instrument since one ManualTrader serves every token
 // rather than one fixed instrument.
 func (m *ManualTrader) instrumentMeta(execInstID string) (domain.Instrument, error) {
 	if m.instrumentCache == nil {
@@ -188,7 +188,7 @@ func (m *ManualTrader) processIntent(ctx context.Context, in port.ManualOrderInt
 
 // openFromIntent runs the full open sequence for one claimed intent: resolve the execution
 // instrument, set leverage, size, place the order, confirm its fill (or accept it resting if it's
-// a limit order that hasn't filled yet), then protect it — mirroring RealTrader.openReal's proven
+// a limit order that hasn't filled yet), then protect it — mirroring BotTrader.openBot's proven
 // sequence (docs/MANUAL_TRADE_PLAN.md §4).
 func (m *ManualTrader) openFromIntent(ctx context.Context, in port.ManualOrderIntent, logger *slog.Logger) (*int64, error) {
 	execInstID, err := m.execInstID(in.InstID)
@@ -271,7 +271,7 @@ func (m *ManualTrader) openFromIntent(ctx context.Context, in port.ManualOrderIn
 	}
 
 	// Persist the row IMMEDIATELY after the exchange accepts the order, before waiting for its
-	// fill (mirrors RealTrader.openReal's own reasoning, CLAUDE.md real-trading readiness plan):
+	// fill (mirrors BotTrader.openBot's own reasoning, CLAUDE.md real-trading readiness plan):
 	// the order is visible on the panel for the whole in-flight window, and — just as importantly
 	// for the reconcile-halt problem this whole design exists to avoid (docs/MANUAL_TRADE_PLAN.md
 	// §1/§4) — this system knows about the position from the moment it exists, before the next
@@ -284,7 +284,7 @@ func (m *ManualTrader) openFromIntent(ctx context.Context, in port.ManualOrderIn
 
 	if order.ExchangeOrderID == nil {
 		// No exchange order id at all — nothing to wait on. Treat as filled immediately, the same
-		// edge case RealTrader.openReal handles the same way.
+		// edge case BotTrader.openBot handles the same way.
 		return m.finishOpen(ctx, order, "filled", nil, nil, domain.Instrument{}, logger)
 	}
 
@@ -339,10 +339,10 @@ func (m *ManualTrader) openFromIntent(ctx context.Context, in port.ManualOrderIn
 }
 
 // waitForFill polls Exchange.GetOrder until ordID reaches a terminal state or fillTimeout()
-// elapses, mirroring RealTrader.waitForFill exactly (same poll interval, same cancel-on-timeout
+// elapses, mirroring BotTrader.waitForFill exactly (same poll interval, same cancel-on-timeout
 // behavior, same "timeout is not an error" contract) — kept as its own copy rather than an
-// extraction shared with RealTrader, since RealTrader's version reads e.execInstID()/e.Exchange
-// off *RealTrader and this type has no *RealTrader to borrow the method from; the logic itself
+// extraction shared with BotTrader, since BotTrader's version reads e.execInstID()/e.Exchange
+// off *BotTrader and this type has no *BotTrader to borrow the method from; the logic itself
 // must stay identical, which is why every constant/branch below matches realtrader.go's version
 // line for line.
 //
@@ -422,7 +422,7 @@ func (m *ManualTrader) probeLimitFill(ctx context.Context, execInstID, ordID str
 }
 
 // finishOpen records a fill outcome (filled/partial), places exchange-side protection (or defers
-// to RealTrader's if it already protects this token, §8.4), and returns the local order id.
+// to BotTrader's if it already protects this token, §8.4), and returns the local order id.
 func (m *ManualTrader) finishOpen(ctx context.Context, order port.ManualOrder, finalStatus string, status *domain.OrderStatus, refPx *decimal.Decimal, inst domain.Instrument, logger *slog.Logger) (*int64, error) {
 	var entryPx, size, contracts *decimal.Decimal
 	if status != nil {
@@ -456,10 +456,10 @@ func (m *ManualTrader) finishOpen(ctx context.Context, order port.ManualOrder, f
 		order.Contracts = contracts
 	}
 
-	// §8.4: if RealTrader already holds a live protective order on this token, this manual order
+	// §8.4: if BotTrader already holds a live protective order on this token, this manual order
 	// deliberately does NOT place a second one — OKX's conditional orders for a position don't
 	// stack cleanly, and the two would otherwise contend over one net exchange position.
-	if m.RealTraderProtects != nil && m.RealTraderProtects(order.InstID) {
+	if m.BotTraderProtects != nil && m.BotTraderProtects(order.InstID) {
 		if err := m.Repo.SetManualOrderProtection(ctx, order.ID, nil, true); err != nil {
 			logger.Warn("manual trader: failed to record shared-protection flag", "id", order.ID, "error", err)
 		}
@@ -473,7 +473,7 @@ func (m *ManualTrader) finishOpen(ctx context.Context, order port.ManualOrder, f
 
 	algoID, protErr := m.placeManualProtection(ctx, order, logger)
 	if protErr != nil {
-		metrics.RealUnprotectedClosedTotal.WithLabelValues(order.InstID).Inc()
+		metrics.BotUnprotectedClosedTotal.WithLabelValues(order.InstID).Inc()
 		logger.Error("could not rest sl/tp on the exchange for a just-opened manual position; closing it immediately",
 			"id", order.ID, "instId", order.InstID, "error", protErr)
 		if closeErr := m.closeManual(ctx, order, "manual", logger); closeErr != nil {
@@ -495,7 +495,7 @@ func (m *ManualTrader) finishOpen(ctx context.Context, order port.ManualOrder, f
 	return &id, nil
 }
 
-// placeManualProtection mirrors RealTrader.placeProtection: both trigger prices ride on one OCO
+// placeManualProtection mirrors BotTrader.placeProtection: both trigger prices ride on one OCO
 // algo order, rounded to the instrument's own tick, retried once before giving up.
 func (m *ManualTrader) placeManualProtection(ctx context.Context, o port.ManualOrder, logger *slog.Logger) (string, error) {
 	if o.Contracts == nil || !o.Contracts.IsPositive() {
@@ -528,7 +528,7 @@ func (m *ManualTrader) placeManualProtection(ctx context.Context, o port.ManualO
 	for attempt := 1; attempt <= 2; attempt++ {
 		algoID, err := m.Exchange.PlaceAlgoOrder(req)
 		if err == nil {
-			metrics.RealProtectionPlacedTotal.WithLabelValues(o.InstID).Inc()
+			metrics.BotProtectionPlacedTotal.WithLabelValues(o.InstID).Inc()
 			logger.Info("rested sl/tp on the exchange for a manual order", "id", o.ID, "instId", o.InstID,
 				"algoId", algoID, "sl", req.SLTriggerPx, "tp", req.TPTriggerPx)
 			return algoID, nil
@@ -536,11 +536,11 @@ func (m *ManualTrader) placeManualProtection(ctx context.Context, o port.ManualO
 		lastErr = err
 		logger.Warn("failed to rest sl/tp on the exchange for a manual order", "id", o.ID, "instId", o.InstID, "attempt", attempt, "error", err)
 	}
-	metrics.RealProtectionFailedTotal.WithLabelValues(o.InstID).Inc()
+	metrics.BotProtectionFailedTotal.WithLabelValues(o.InstID).Inc()
 	return "", fmt.Errorf("place protective order: %w", lastErr)
 }
 
-// closeManual flattens an open manual order at market, mirroring RealTrader.closeRealWith's
+// closeManual flattens an open manual order at market, mirroring BotTrader.closeBotWith's
 // exchange-first-then-database sequence (fill confirmation before the row is marked closed) and
 // its idempotency guard (a second racing close path finds nothing to do rather than double-closing).
 func (m *ManualTrader) closeManual(ctx context.Context, o port.ManualOrder, reason string, logger *slog.Logger) error {
@@ -606,7 +606,7 @@ func (m *ManualTrader) closeManual(ctx context.Context, o port.ManualOrder, reas
 		}
 		return err
 	}
-	// Cancel any resting protective order this manual order owns — never RealTrader's, if this
+	// Cancel any resting protective order this manual order owns — never BotTrader's, if this
 	// order was flagged protected-by-strategy (§8.4), since that order still protects the
 	// strategy's own slice of the shared position.
 	if !o.ProtectedByStrategy && o.ExchangeAlgoOrderID != nil && *o.ExchangeAlgoOrderID != "" {
@@ -632,7 +632,7 @@ func (m *ManualTrader) recordCloseError(ctx context.Context, id int64, cause err
 }
 
 // ProcessCloseRequests ends every manual order flagged manual_close_requested, ACROSS EVERY
-// INSTRUMENT — this type is account-wide (unlike RealTrader, which is one-per-instrument), so
+// INSTRUMENT — this type is account-wide (unlike BotTrader, which is one-per-instrument), so
 // unlike processPendingIntents' polling loop there is no per-instrument caller to drive this from;
 // it must sweep the whole account itself.
 //

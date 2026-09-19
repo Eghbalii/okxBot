@@ -152,12 +152,12 @@ func (s *Server) haltStatus(ctx context.Context) *haltStatus {
 	}
 	out.ExchangePositions = open
 
-	// ListRealPositions, not ListPositions: real orders live in their own table since §34, and
+	// ListBotPositions, not ListPositions: real orders live in their own table since §34, and
 	// ListPositions reads paper_orders. Using it here reported every real position as untracked —
 	// caught against live data on first deploy, where it claimed 2 exchange positions and 0 local
 	// rows while the database held both.
 	openOnly := true
-	local, err := s.Repo.ListRealPositions(ctx, port.PositionFilter{Mode: "real", Open: &openOnly})
+	local, err := s.Repo.ListBotPositions(ctx, port.PositionFilter{Mode: "bot", Open: &openOnly})
 	if err != nil {
 		out.Blockers = append(out.Blockers, fmt.Sprintf("cannot verify: database unreadable (%v)", err))
 		return out

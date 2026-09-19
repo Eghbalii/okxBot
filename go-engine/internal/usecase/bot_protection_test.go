@@ -11,16 +11,16 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
-// openOneRealPosition drives the real open path once and returns the resulting position, so the
+// openOneBotPosition drives the real open path once and returns the resulting position, so the
 // tests below assert against a position produced by the ACTUAL open flow rather than a
 // hand-constructed row — the point being that protection is placed by that flow, not bolted on.
-func openOneRealPosition(t *testing.T, repo *fakeRepository, exchange *fakeExchangeClient) []port.RealOrder {
+func openOneBotPosition(t *testing.T, repo *fakeRepository, exchange *fakeExchangeClient) []port.BotOrder {
 	t.Helper()
 	model := &fakeModelClient{action: domain.Action{
 		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
@@ -37,11 +37,11 @@ func openOneRealPosition(t *testing.T, repo *fakeRepository, exchange *fakeExcha
 // The whole point of this feature: opening a real position must rest its stop on the EXCHANGE, not
 // merely store it in a column this process watches. Real order 33 opened with a stop that existed
 // only in the database, which is what this asserts can no longer happen.
-func TestOpenReal_RestsStopLossOnTheExchange(t *testing.T) {
+func TestOpenBot_RestsStopLossOnTheExchange(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
 
-	open := openOneRealPosition(t, repo, exchange)
+	open := openOneBotPosition(t, repo, exchange)
 	if len(open) != 1 {
 		t.Fatalf("expected 1 open position, got %d", len(open))
 	}
@@ -78,11 +78,11 @@ func TestOpenReal_RestsStopLossOnTheExchange(t *testing.T) {
 // is the deliberate answer to "what if the SL never makes it onto the exchange" — the alternative,
 // holding an unprotected leveraged position and hoping a retry succeeds, is the exposure this
 // whole change removes.
-func TestOpenReal_ClosesThePositionWhenProtectionCannotBePlaced(t *testing.T) {
+func TestOpenBot_ClosesThePositionWhenProtectionCannotBePlaced(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{placeAlgoErr: errors.New("exchange rejected the algo order")}
 
-	open := openOneRealPosition(t, repo, exchange)
+	open := openOneBotPosition(t, repo, exchange)
 	if len(open) != 0 {
 		t.Fatalf("an unprotectable position must not be left open, got %d open", len(open))
 	}
@@ -103,17 +103,17 @@ func TestEnsureProtection_ReplacesAMissingProtectiveOrder(t *testing.T) {
 	exchange := &fakeExchangeClient{
 		algoStatus: &domain.AlgoOrderStatus{State: "canceled"},
 	}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, tp, contracts, algo := dec("95"), dec("110"), dec("3"), "algo-gone"
-	order := port.RealOrder{
+	order := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
 		SLPx: &sl, TPPx: &tp, Size: dec("10"), Leverage: dec("1"),
 		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
 	}
 	repo.realOrders[1] = order
 
-	rt.ensureProtection(context.Background(), []port.RealOrder{order}, testLogger())
+	rt.ensureProtection(context.Background(), []port.BotOrder{order}, testLogger())
 
 	if len(exchange.placedAlgoOrders) != 1 {
 		t.Fatalf("a vanished protective order must be re-placed, got %d placements", len(exchange.placedAlgoOrders))
@@ -129,16 +129,16 @@ func TestEnsureProtection_ReplacesAMissingProtectiveOrder(t *testing.T) {
 func TestEnsureProtection_LeavesALiveProtectiveOrderAlone(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{algoStatus: &domain.AlgoOrderStatus{State: "live"}}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, contracts, algo := dec("95"), dec("3"), "algo-live"
-	order := port.RealOrder{
+	order := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
 		SLPx: &sl, Size: dec("10"), Leverage: dec("1"),
 		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
 	}
 
-	rt.ensureProtection(context.Background(), []port.RealOrder{order}, testLogger())
+	rt.ensureProtection(context.Background(), []port.BotOrder{order}, testLogger())
 
 	if len(exchange.placedAlgoOrders) != 0 {
 		t.Errorf("a live protective order must not be duplicated, got %d new placements", len(exchange.placedAlgoOrders))
@@ -150,16 +150,16 @@ func TestEnsureProtection_LeavesALiveProtectiveOrderAlone(t *testing.T) {
 func TestEnsureProtection_DoesNotReplaceWhenTheCheckItselfFails(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{getAlgoErr: errors.New("timeout")}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, contracts, algo := dec("95"), dec("3"), "algo-unknown"
-	order := port.RealOrder{
+	order := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
 		SLPx: &sl, Size: dec("10"), Leverage: dec("1"),
 		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
 	}
 
-	rt.ensureProtection(context.Background(), []port.RealOrder{order}, testLogger())
+	rt.ensureProtection(context.Background(), []port.BotOrder{order}, testLogger())
 
 	if len(exchange.placedAlgoOrders) != 0 {
 		t.Errorf("an unreadable status must not trigger a replacement, got %d placements", len(exchange.placedAlgoOrders))
@@ -169,21 +169,21 @@ func TestEnsureProtection_DoesNotReplaceWhenTheCheckItselfFails(t *testing.T) {
 // Closing a position cancels its resting protective order. A live conditional order left behind on
 // a flat account can trigger and OPEN a brand-new position — the failure mode worth an explicit
 // cancel rather than relying on the exchange's own cleanup.
-func TestCloseReal_CancelsTheRestingProtectiveOrder(t *testing.T) {
+func TestCloseBot_CancelsTheRestingProtectiveOrder(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, contracts, algo := dec("95"), dec("3"), "algo-9"
-	order := port.RealOrder{
+	order := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
 		SLPx: &sl, Size: dec("10"), Leverage: dec("1"),
 		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
 	}
 	repo.realOrders[1] = order
 
-	if err := rt.closeReal(context.Background(), order, dec("110"), "tp", testLogger()); err != nil {
-		t.Fatalf("closeReal: %v", err)
+	if err := rt.closeBot(context.Background(), order, dec("110"), "tp", testLogger()); err != nil {
+		t.Fatalf("closeBot: %v", err)
 	}
 
 	if len(exchange.canceledAlgoIDs) != 1 || exchange.canceledAlgoIDs[0] != algo {
@@ -193,20 +193,20 @@ func TestCloseReal_CancelsTheRestingProtectiveOrder(t *testing.T) {
 
 // A failed cancel must not make a completed close look failed. The position IS flat; a leftover
 // conditional order is a smaller problem than a row that wrongly reports the close as unsuccessful.
-func TestCloseReal_SucceedsEvenIfCancellingProtectionFails(t *testing.T) {
+func TestCloseBot_SucceedsEvenIfCancellingProtectionFails(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{cancelAlgoErr: errors.New("cancel failed")}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, contracts, algo := dec("95"), dec("3"), "algo-9"
-	order := port.RealOrder{
+	order := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
 		SLPx: &sl, Size: dec("10"), Leverage: dec("1"),
 		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
 	}
 	repo.realOrders[1] = order
 
-	if err := rt.closeReal(context.Background(), order, dec("110"), "tp", testLogger()); err != nil {
+	if err := rt.closeBot(context.Background(), order, dec("110"), "tp", testLogger()); err != nil {
 		t.Fatalf("a failed protective-order cancel must not fail the close: %v", err)
 	}
 	if repo.realOrders[1].ClosedAt == nil {
@@ -217,10 +217,10 @@ func TestCloseReal_SucceedsEvenIfCancellingProtectionFails(t *testing.T) {
 // Both levels ride on ONE order, so OKX's own OCO handling cancels the loser when the winner fires.
 // Two separate orders would leave the losing side resting after the position closed.
 func TestProtectionRequest_CarriesBothLevelsOnOneOrder(t *testing.T) {
-	rt := newTestRealTrader(newFakeRepository(), &fakeExchangeClient{}, nil, nil)
+	rt := newTestBotTrader(newFakeRepository(), &fakeExchangeClient{}, nil, nil)
 
 	sl, tp, contracts := dec("95"), dec("110"), dec("3")
-	order := port.RealOrder{
+	order := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"),
 		SLPx: &sl, TPPx: &tp, Contracts: &contracts,
 	}
@@ -244,10 +244,10 @@ func TestReconcile_ConcurrentPassesCloseAStalePositionOnlyOnce(t *testing.T) {
 	repo := newFakeRepository()
 	// The exchange reports flat while the local row is still open — the stale-position case.
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, contracts, algo := dec("95"), dec("3"), "algo-1"
-	repo.realOrders[1] = port.RealOrder{
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
 		SLPx: &sl, Size: dec("10"), Leverage: dec("1"),
 		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
@@ -284,17 +284,17 @@ func TestReconcile_ConcurrentPassesCloseAStalePositionOnlyOnce(t *testing.T) {
 // the flatten fills. Asking the model to move its levels then is pointless work on a position
 // already on its way out, and would amend an order about to be cancelled.
 //
-// 'closing' rather than 'opening' here is deliberate: ListRealPositions filters 'opening' out on
+// 'closing' rather than 'opening' here is deliberate: ListBotPositions filters 'opening' out on
 // its own, so a test using it would pass with or without the guard and prove nothing.
 func TestRunUpdates_SkipsPositionsThatAreNotHoldingExposure(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionUpdate, SLPx: dec("98")}}
-	rt := newTestRealTrader(repo, exchange, model, nil)
+	rt := newTestBotTrader(repo, exchange, model, nil)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	sl := dec("95")
-	repo.realOrders[1] = port.RealOrder{
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", Status: "closing", EntryPx: dec("100"),
 		SLPx: &sl, Size: dec("10"), Leverage: dec("1"), ExchangeAlgoOrderID: algoIDPtr("a1"),
 	}
@@ -343,10 +343,10 @@ func TestReconcile_RecordsAnExchangeStopLossAsSLWithItsRealNumbers(t *testing.T)
 			Pnl: dec("-0.265"), Fee: dec("-0.0088"),
 		},
 	}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, contracts, algo := dec("0.000003527"), dec("5"), "algo-1"
-	repo.realOrders[1] = port.RealOrder{
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("0.00000358"),
 		SLPx: &sl, Size: dec("1.81"), Leverage: dec("9.88"),
 		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
@@ -381,10 +381,10 @@ func TestReconcile_KeepsManualWhenTheProtectiveOrderDidNotFire(t *testing.T) {
 	exchange := &fakeExchangeClient{
 		algoStatus: &domain.AlgoOrderStatus{State: "canceled", AlgoID: "algo-1"},
 	}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, contracts, algo := dec("95"), dec("5"), "algo-1"
-	repo.realOrders[1] = port.RealOrder{
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
 		SLPx: &sl, Size: dec("10"), Leverage: dec("1"),
 		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
@@ -401,26 +401,26 @@ func TestReconcile_KeepsManualWhenTheProtectiveOrderDidNotFire(t *testing.T) {
 // apart, and the second write replaced a -0.014 loss with a +0.472 gain — both wrong, but the
 // second should never have landed. The guard is in the database, so it holds across engines and
 // across processes, which an in-process mutex cannot.
-func TestCloseReal_SecondCloseDoesNotOverwriteTheFirst(t *testing.T) {
+func TestCloseBot_SecondCloseDoesNotOverwriteTheFirst(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	contracts := dec("5")
-	order := port.RealOrder{
+	order := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
 		Size: dec("10"), Leverage: dec("1"), Contracts: &contracts,
 	}
 	repo.realOrders[1] = order
 
-	if err := rt.closeReal(context.Background(), order, dec("110"), "tp", testLogger()); err != nil {
+	if err := rt.closeBot(context.Background(), order, dec("110"), "tp", testLogger()); err != nil {
 		t.Fatalf("first close: %v", err)
 	}
 	first := repo.realOrders[1]
 
 	// A second close of the SAME order, as a racing pass would attempt. It must not error (the
 	// position is closed, which is what the caller wanted) and must not change the outcome.
-	if err := rt.closeReal(context.Background(), order, dec("90"), "sl", testLogger()); err != nil {
+	if err := rt.closeBot(context.Background(), order, dec("90"), "sl", testLogger()); err != nil {
 		t.Fatalf("a second close must be a no-op, not an error: %v", err)
 	}
 	second := repo.realOrders[1]
@@ -451,10 +451,10 @@ func TestCloseFacts_RetriesUntilTheExchangeReportsWhichSideFired(t *testing.T) {
 			Pnl: dec("-0.31"), Fee: dec("-0.004"),
 		},
 	}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, contracts, algo := dec("2443.14"), dec("1"), "algo-1"
-	order := port.RealOrder{
+	order := port.BotOrder{
 		ID: 43, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("2456.11"),
 		SLPx: &sl, Size: dec("10"), Leverage: dec("9.46"),
 		Contracts: &contracts, ExchangeAlgoOrderID: &algo,

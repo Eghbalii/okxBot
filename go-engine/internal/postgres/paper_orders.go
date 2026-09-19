@@ -56,7 +56,7 @@ func (r *Repository) GetPaperOrder(ctx context.Context, id int64) (port.PaperOrd
 }
 
 // SetExchangeAlgoOrderID records the resting SL/TP algo order's OKX-assigned ID on an already-open
-// real order (CLAUDE.md §27.3) — a separate call from OpenPaperOrder because the algo order isn't
+// bot order (CLAUDE.md §27.3) — a separate call from OpenPaperOrder because the algo order isn't
 // placed until after the entry order's row already exists.
 func (r *Repository) SetExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error {
 	_, err := r.pool.Exec(ctx, `
@@ -249,20 +249,20 @@ func (r *Repository) CountPositions(ctx context.Context, f port.PositionFilter) 
 	return count, nil
 }
 
-// TokenStats24h computes each token's last-24h activity for mode ("paper" or "real") — CLAUDE.md,
+// TokenStats24h computes each token's last-24h activity for mode ("paper" or "bot") — CLAUDE.md,
 // "Manage tokens" panel, 2026-09-04 request, extended to real trading by the real-trading
 // readiness plan (2026-09-04) — position count and PnL$/PnL% for trades CLOSED in the last 24
 // hours, sourced from paper_orders (filtered to variant='baseline', excluding shadow forks —
-// CLAUDE.md §16.9) or real_orders (no variant column, every row counts) depending on mode. PnL% is
+// CLAUDE.md §16.9) or bot_orders (no variant column, every row counts) depending on mode. PnL% is
 // expressed against the token's own summed entry notional in the window (return on capital
 // deployed for that token), not the shared account's equity — a token has no "starting equity" of
 // its own the way the whole account does (CLAUDE.md §15.6's shared pool).
 func (r *Repository) TokenStats24h(ctx context.Context, mode string) ([]port.TokenStats, error) {
 	var query string
-	if mode == "real" {
+	if mode == "bot" {
 		query = `
 			SELECT inst_id, count(*), coalesce(sum(realized_pnl), 0), coalesce(sum(size), 0)
-			FROM real_orders
+			FROM bot_orders
 			WHERE closed_at IS NOT NULL AND closed_at >= now() - interval '24 hours'
 			GROUP BY inst_id
 		`

@@ -120,7 +120,7 @@ func (s *IchimokuTKCross) Evaluate(candles []Candle) (Signal, error) {
 		return Signal{Side: Buy, Confidence: decimal.NewFromFloat(0.6), SLPct: s.SLPct, TPPct: s.TPPct}, nil
 	case !aboveBase && hasPrev && wasAbove:
 		// The source flattens (strategy.close) rather than reversing into a short — modeled as a
-		// Sell signal here since this interface has no bare "close" side; PaperTrader/RealTrader
+		// Sell signal here since this interface has no bare "close" side; PaperTrader/BotTrader
 		// treat an opposite-side signal on an open position as an update/close request, not an
 		// automatic reversal into a new short (CLAUDE.md §27.3), so this stays faithful to
 		// "long-only, exit on cross-down" in practice.

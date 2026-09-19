@@ -179,7 +179,7 @@ func TestRosterFor_RespectsEachConsumerIndependently(t *testing.T) {
 	for _, tc := range []struct {
 		consumer string
 		want     int
-	}{{"ingest", 1}, {"paper", 1}, {"real", 0}} {
+	}{{"ingest", 1}, {"paper", 1}, {"bot", 0}} {
 		got, err := RosterFor(ctx, repo, "okx", tc.consumer, nil, nil, "", nil)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.consumer, err)

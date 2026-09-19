@@ -20,7 +20,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
-// RealTrader brings cmd/trader onto the same strategy-signal + conductor lifecycle
+// BotTrader brings cmd/trader onto the same strategy-signal + conductor lifecycle
 // usecase.PaperTrader already runs (CLAUDE.md §27.3), replacing the old flat delta-notional
 // rebalance loop (trade.go's Trader) — but placing real orders on the exchange instead of
 // bookkeeping-only virtual ones. Deliberately NOT PaperTrader-with-a-flag: the two engines share
@@ -31,7 +31,7 @@ import (
 //
 // The "no fork" mechanic (CLAUDE.md §15.4's shadow-fork A/B comparison is paper-trading-only):
 // real trading holds at most one open position per token per side, and the model edits its SL/TP
-// in place. Corrected 2026-09-03 (see the plan doc's §3a): that edit is watched by RealTrader's
+// in place. Corrected 2026-09-03 (see the plan doc's §3a): that edit is watched by BotTrader's
 // own in-process tick monitor, the SAME mechanism PaperTrader already uses — never a resting
 // conditional/algo order on OKX. A periodic reconciliation poll (reconcile, see below) checks
 // GetPositions/GetBalance against this process's own bookkeeping to catch drift (a manual close on
@@ -39,7 +39,7 @@ import (
 //
 // Futures/perpetual-swap ("SWAP") endpoints only, matching every other exchange call in this
 // codebase — this type introduces no new instrument type or exchange endpoint category.
-type RealTrader struct {
+type BotTrader struct {
 	InstID          string
 	Bars            []string
 	CandleWindow    int
@@ -70,7 +70,7 @@ type RealTrader struct {
 	ExecInstType string // e.g. "SWAP" or "FUTURES"; defaults to "SWAP" when empty
 	SettleCcy    string // e.g. "USDT" or "USDC"; defaults to "USDT" when empty
 
-	// Mode is "demo" or "real" (CLAUDE.md §15.6) — never "paper". Selects which account_equity row
+	// Mode is "demo" or "bot" (CLAUDE.md §15.6) — never "paper". Selects which account_equity row
 	// this engine's equity timeline is recorded under and which mode's rows ListPositions/
 	// ListOpenPaperOrders-equivalent queries are scoped to (see openPositions/allOpenPositions
 	// below) — critical, since paper trading may be running concurrently against the SAME InstID
@@ -193,8 +193,8 @@ type RealTrader struct {
 
 	// rlAdjustMu/lastRLAdjustAt throttle runUpdates to RLAdjustInterval cadence, mirroring
 	// PaperTrader's identical throttle exactly (CLAUDE.md §15.9's MidPrice-freshness fix) — found
-	// missing 2026-09-05 during the first real-trading activation: RealTrader.handleTick called
-	// runUpdates (which queries real_orders via openPositions()) on EVERY tick with no throttle at
+	// missing 2026-09-05 during the first real-trading activation: BotTrader.handleTick called
+	// runUpdates (which queries bot_orders via openPositions()) on EVERY tick with no throttle at
 	// all, unlike PaperTrader's shouldRunRLAdjust gate. At OKX's live tick rate across 10
 	// instruments this measured as a genuinely elevated, continuous Postgres query load (~65% CPU
 	// on the timescaledb container) — not a slow query (0.14ms execution, correctly indexed), a
@@ -213,7 +213,7 @@ type RealTrader struct {
 // shouldRunRLAdjust mirrors PaperTrader.shouldRunRLAdjust exactly: reports whether RLAdjustInterval
 // has elapsed since the last update pass, and if so atomically claims the slot so concurrent ticks
 // can't both pass the check and double-fire.
-func (e *RealTrader) shouldRunRLAdjust() bool {
+func (e *BotTrader) shouldRunRLAdjust() bool {
 	e.rlAdjustMu.Lock()
 	defer e.rlAdjustMu.Unlock()
 	if time.Since(e.lastRLAdjustAt) < RLAdjustInterval {
@@ -223,16 +223,16 @@ func (e *RealTrader) shouldRunRLAdjust() bool {
 	return true
 }
 
-// asPaperOrderView converts a RealOrder into the port.PaperOrder shape the shared pure math
+// asPaperOrderView converts a BotOrder into the port.PaperOrder shape the shared pure math
 // functions (closeReason/realizedPnL/computeAdjustedLevels/positionStateOf/unrealizedPnLPct/
 // RatchetSLTP, all in papertrade.go/rl_sltp_adjust.go/sltp_ratchet.go) are typed against —
-// CLAUDE.md real-trading readiness plan, 2026-09-04's real_orders table split. Every field those
+// CLAUDE.md real-trading readiness plan, 2026-09-04's bot_orders table split. Every field those
 // functions actually read (Side/EntryPx/SLPx/TPPx/Size/Leverage/OpenedAt/PnLMaxPct/PnLMinPct) has
-// an identical counterpart on RealOrder; Variant is fixed to "baseline" (a real order is never a
+// an identical counterpart on BotOrder; Variant is fixed to "baseline" (a bot order is never a
 // shadow fork, §27.3) so positionStateOf's IsFork always reads false, matching reality. This is
 // purely an in-memory adapter for reusing already-proven math — it is never itself persisted, and
 // paper-trading's own code path is untouched by its existence.
-func asPaperOrderView(o port.RealOrder) port.PaperOrder {
+func asPaperOrderView(o port.BotOrder) port.PaperOrder {
 	return port.PaperOrder{
 		ID:         o.ID,
 		InstID:     o.InstID,
@@ -254,7 +254,7 @@ func asPaperOrderView(o port.RealOrder) port.PaperOrder {
 // execInstID is the instId actually sent to the exchange — ExecInstID when set, else InstID
 // (CLAUDE.md §27's real-account finding: an account may only have usable margin on a different
 // OKX product than the one this engine's market data/observation identity uses).
-func (e *RealTrader) execInstID() string {
+func (e *BotTrader) execInstID() string {
 	if e.ExecInstID != "" {
 		return e.ExecInstID
 	}
@@ -264,7 +264,7 @@ func (e *RealTrader) execInstID() string {
 // execInstType is the instType used for GetPositions/GetInstrument calls — "SWAP" when
 // ExecInstType is unset, matching this codebase's pre-2026-09-04 assumption for every deployment
 // whose account trades the classic SWAP product directly.
-func (e *RealTrader) execInstType() string {
+func (e *BotTrader) execInstType() string {
 	if e.ExecInstType != "" {
 		return e.ExecInstType
 	}
@@ -273,7 +273,7 @@ func (e *RealTrader) execInstType() string {
 
 // settleCcy is the currency used for GetBalance calls — "USDT" when SettleCcy is unset, matching
 // this codebase's pre-2026-09-04 assumption.
-func (e *RealTrader) settleCcy() string {
+func (e *BotTrader) settleCcy() string {
 	if e.SettleCcy != "" {
 		return e.SettleCcy
 	}
@@ -284,9 +284,9 @@ func (e *RealTrader) settleCcy() string {
 // first use — a real network call only once per process lifetime, not once per order, since an
 // instrument's contract shape does not change while the process runs. A fetch failure is cached
 // too (instrumentOnce fires exactly once regardless of outcome) rather than retried on every
-// order: a real order must not silently fall back to an unconverted size if this call is broken,
+// order: a bot order must not silently fall back to an unconverted size if this call is broken,
 // so callers treat a returned error as fatal to that order rather than proceeding with a guess.
-func (e *RealTrader) instrumentMeta() (domain.Instrument, error) {
+func (e *BotTrader) instrumentMeta() (domain.Instrument, error) {
 	e.instrumentOnce.Do(func() {
 		e.instrument, e.instrumentErr = e.Exchange.GetInstrument(e.execInstType(), e.execInstID())
 	})
@@ -296,7 +296,7 @@ func (e *RealTrader) instrumentMeta() (domain.Instrument, error) {
 // sizeToContracts converts a desired notional (USD) at the given price into a valid contract
 // count for execInstID: notional/price gives the base-unit size (e.g. BTC), divided by CtVal to
 // get contracts, then rounded down to the nearest LotSz multiple — OKX rejects a size that isn't
-// an exact multiple (51121, found live 2026-09-04). Rounding DOWN, never up, so a real order can
+// an exact multiple (51121, found live 2026-09-04). Rounding DOWN, never up, so a bot order can
 // never request more notional than what was actually sized/approved by the risk manager upstream.
 // A CtVal of zero (unset/misconfigured instrument metadata) is treated as 1 — the pre-2026-09-04
 // implicit assumption — rather than dividing by zero.
@@ -346,7 +346,7 @@ type rawOrderFetcher interface {
 // Entirely best-effort: every failure path here logs and returns. An order's record is an audit
 // nicety, and losing it must never affect the position it describes — which is also why this runs
 // AFTER the close is durably recorded, never before.
-func (e *RealTrader) captureExchangeRecord(ctx context.Context, orderID int64, leg, exchangeOrdID string, logger *slog.Logger) {
+func (e *BotTrader) captureExchangeRecord(ctx context.Context, orderID int64, leg, exchangeOrdID string, logger *slog.Logger) {
 	if e.Repo == nil || orderID == 0 || exchangeOrdID == "" {
 		return
 	}
@@ -359,7 +359,7 @@ func (e *RealTrader) captureExchangeRecord(ctx context.Context, orderID int64, l
 		logger.Warn("could not capture exchange order record", "id", orderID, "leg", leg, "ordId", exchangeOrdID, "error", err)
 		return
 	}
-	if err := e.Repo.SetRealOrderExchangeRaw(ctx, orderID, leg, raw); err != nil {
+	if err := e.Repo.SetBotOrderExchangeRaw(ctx, orderID, leg, raw); err != nil {
 		logger.Warn("could not store exchange order record", "id", orderID, "leg", leg, "error", err)
 	}
 }
@@ -392,7 +392,7 @@ func marginFromFill(status domain.OrderStatus, fillPx, leverage decimal.Decimal,
 // Unlike instrumentMeta this never errors: its callers are correcting a stored figure after an
 // order is already live, where a metadata failure should leave the existing value alone rather
 // than abort anything.
-func (e *RealTrader) instrumentOrZero() domain.Instrument {
+func (e *BotTrader) instrumentOrZero() domain.Instrument {
 	inst, err := e.instrumentMeta()
 	if err != nil {
 		return domain.Instrument{}
@@ -400,7 +400,7 @@ func (e *RealTrader) instrumentOrZero() domain.Instrument {
 	return inst
 }
 
-// DefaultReconcileInterval is the reconciliation poll's cadence when RealTrader.ReconcileInterval
+// DefaultReconcileInterval is the reconciliation poll's cadence when BotTrader.ReconcileInterval
 // is unset.
 //
 // 20 seconds. It was set to 5 on 2026-09-09 (operator request) and raised on 2026-09-10 after that
@@ -410,7 +410,7 @@ func (e *RealTrader) instrumentOrZero() domain.Instrument {
 //
 // The rate limiting was not harmless. A reconciliation pass that cannot read positions cannot
 // detect drift, and one that cannot read the protective order falls back to recording a close as
-// manual — which is how real order 43 was mis-recorded minutes after the code to prevent exactly
+// manual — which is how bot order 43 was mis-recorded minutes after the code to prevent exactly
 // that had shipped.
 //
 // 20s is the compromise, not the ideal. The right fix is one account-wide poll shared across
@@ -429,14 +429,14 @@ func (e *RealTrader) instrumentOrZero() domain.Instrument {
 // wired separately; this poll remains as the backup that does not depend on a socket staying up.
 const DefaultReconcileInterval = 20 * time.Second
 
-func (e *RealTrader) reconcileInterval() time.Duration {
+func (e *BotTrader) reconcileInterval() time.Duration {
 	if e.ReconcileInterval > 0 {
 		return e.ReconcileInterval
 	}
 	return DefaultReconcileInterval
 }
 
-// DefaultFillTimeout is RealTrader.FillTimeout's fallback when unset — 60s, matching
+// DefaultFillTimeout is BotTrader.FillTimeout's fallback when unset — 60s, matching
 // config.FillTimeout.OrderFillTimeoutSec's own default (CLAUDE.md §27.5).
 const DefaultFillTimeout = 60 * time.Second
 
@@ -446,7 +446,7 @@ const DefaultFillTimeout = 60 * time.Second
 // short, bounded wait for a single order's own outcome.
 const fillPollInterval = 500 * time.Millisecond
 
-func (e *RealTrader) fillTimeout() time.Duration {
+func (e *BotTrader) fillTimeout() time.Duration {
 	if e.FillTimeout > 0 {
 		return e.FillTimeout
 	}
@@ -456,20 +456,20 @@ func (e *RealTrader) fillTimeout() time.Duration {
 // waitForFill polls Exchange.GetOrder for ordID until it reaches a terminal state (filled or
 // canceled) or fillTimeout() elapses, whichever comes first (CLAUDE.md §27.5). On timeout it
 // CANCELS the order and returns the status as last observed — deliberately no retry or re-price;
-// the caller (openReal/closeRealWith) is responsible for deciding what an unfilled/partially-
+// the caller (openBot/closeBotWith) is responsible for deciding what an unfilled/partially-
 // filled result means for its own path. A GetOrder error mid-poll is logged and treated as "not
 // yet terminal" rather than aborting the wait outright — a single flaky status read must not
 // abandon an order that may still be filling normally.
 // WaitForFillForTesting exports waitForFill for cmd/okx-apitest (CLAUDE.md's 2026-09-04 API-key
 // diagnostic) to call the real production fill-timeout/cancel path directly, without pulling in
-// the rest of RealTrader's strategy/conductor/Kafka machinery — the diagnostic must never risk
+// the rest of BotTrader's strategy/conductor/Kafka machinery — the diagnostic must never risk
 // opening a position on its own initiative. Behavior is identical to waitForFill; this is purely
 // a visibility export, not a separate implementation.
-func (e *RealTrader) WaitForFillForTesting(ctx context.Context, ordID string, logger *slog.Logger) (domain.OrderStatus, error) {
+func (e *BotTrader) WaitForFillForTesting(ctx context.Context, ordID string, logger *slog.Logger) (domain.OrderStatus, error) {
 	return e.waitForFill(ctx, ordID, logger)
 }
 
-func (e *RealTrader) waitForFill(ctx context.Context, ordID string, logger *slog.Logger) (domain.OrderStatus, error) {
+func (e *BotTrader) waitForFill(ctx context.Context, ordID string, logger *slog.Logger) (domain.OrderStatus, error) {
 	deadline := time.Now().Add(e.fillTimeout())
 	var last domain.OrderStatus
 	for {
@@ -513,7 +513,7 @@ func (e *RealTrader) waitForFill(ctx context.Context, ordID string, logger *slog
 // sizing uses and the number the panel shows as Total Equity cannot disagree. A read failure falls
 // back to the SafeMoneyUSD path rather than to the full balance: degrading toward the more
 // conservative of the two is the only safe direction when the intended limit is unknown.
-func (e *RealTrader) tradableEquityFor(ctx context.Context, rawBalance decimal.Decimal) decimal.Decimal {
+func (e *BotTrader) tradableEquityFor(ctx context.Context, rawBalance decimal.Decimal) decimal.Decimal {
 	if e.Repo != nil {
 		if ae, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), rawBalance); err == nil && ae.TradingCapUSD != nil {
 			// The reserve, not the cap itself: realized PnL accrues to the tradable slice, so a
@@ -534,7 +534,7 @@ func (e *RealTrader) tradableEquityFor(ctx context.Context, rawBalance decimal.D
 // account with no explicit trading cap set. Floored at zero: a balance the reserve exceeds must
 // never report as negative equity (which would read as the account being drained, not merely
 // under the reserve).
-func (e *RealTrader) tradableEquity(rawBalance decimal.Decimal) decimal.Decimal {
+func (e *BotTrader) tradableEquity(rawBalance decimal.Decimal) decimal.Decimal {
 	if !e.SafeMoneyUSD.IsPositive() {
 		return rawBalance
 	}
@@ -549,7 +549,7 @@ func (e *RealTrader) tradableEquity(rawBalance decimal.Decimal) decimal.Decimal 
 // is expected to take when equity is split evenly across the active roster, fed to the model as
 // MaxPositionPct (observation schema v7). Derived from the live roster length rather than a config
 // constant so enabling or disabling a token reshapes the budget on its own.
-func (e *RealTrader) evenShareOfAccount() decimal.Decimal {
+func (e *BotTrader) evenShareOfAccount() decimal.Decimal {
 	count := len(e.ActiveTokens)
 	if count <= 0 {
 		count = 1
@@ -576,7 +576,7 @@ func tighterPct(a, b decimal.Decimal) decimal.Decimal {
 
 // opensDisabled reports whether this token is currently excluded from opening new positions.
 // Existing positions are unaffected either way — monitorOpenPositions keeps watching them.
-func (e *RealTrader) opensDisabled() bool {
+func (e *BotTrader) opensDisabled() bool {
 	e.opensMu.RLock()
 	defer e.opensMu.RUnlock()
 	return e.OpensDisabled
@@ -590,32 +590,32 @@ func (e *RealTrader) opensDisabled() bool {
 // after startup kept opening positions until someone restarted the process — observed live with
 // PUMP and PEPE, which were auto-disabled 1.5s after trader came up and went on generating open
 // attempts for the next 20 minutes.
-func (e *RealTrader) SetOpensDisabled(disabled bool) {
+func (e *BotTrader) SetOpensDisabled(disabled bool) {
 	e.opensMu.Lock()
 	defer e.opensMu.Unlock()
 	e.OpensDisabled = disabled
 }
 
-func (e *RealTrader) accountMode() string {
+func (e *BotTrader) accountMode() string {
 	if e.Mode == "" {
-		return "real"
+		return "bot"
 	}
 	return e.Mode
 }
 
-func (e *RealTrader) decisionBar() string {
+func (e *BotTrader) decisionBar() string {
 	return decisionBarFor("", e.Bars)
 }
 
-func (e *RealTrader) marketView(bar string) strategy.MarketView {
+func (e *BotTrader) marketView(bar string) strategy.MarketView {
 	return snapshotCandles(&e.candlesMu, e.candles, bar)
 }
 
-func (e *RealTrader) seedCandlesFromRepo(ctx context.Context, logger *slog.Logger) {
+func (e *BotTrader) seedCandlesFromRepo(ctx context.Context, logger *slog.Logger) {
 	seedCandlesFromRepo(ctx, &e.candlesMu, e.candles, e.Repo, e.InstID, e.Bars, e.CandleWindow, logger)
 }
 
-func (e *RealTrader) conductor() *conductor.Conductor {
+func (e *BotTrader) conductor() *conductor.Conductor {
 	e.conductorOnce.Do(func() {
 		e.lifecycle = conductor.New(conductor.Config{
 			UpdatePnLThresholdPct: e.RLUpdatePnLThresholdPct,
@@ -628,13 +628,13 @@ func (e *RealTrader) conductor() *conductor.Conductor {
 	return e.lifecycle
 }
 
-func (e *RealTrader) conductorClamps() conductor.Clamps {
+func (e *BotTrader) conductorClamps() conductor.Clamps {
 	return e.RLClamps
 }
 
 // Run consumes ticks/candles from the event bus and drives the reconciliation poll, until ctx is
 // cancelled. Mirrors PaperTrader.Run's shape (CLAUDE.md §27's plan, tickfeed.go).
-func (e *RealTrader) Run(ctx context.Context) error {
+func (e *BotTrader) Run(ctx context.Context) error {
 	logger := e.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -662,7 +662,7 @@ func (e *RealTrader) Run(ctx context.Context) error {
 	}
 	// Skipped when a ReconcileDriver owns this engine's reconciliation (2026-09-10): the driver
 	// runs ONE account-wide pass for the whole roster rather than each engine polling the same
-	// account-scoped endpoints independently. Left in place otherwise so a RealTrader run on its
+	// account-scoped endpoints independently. Left in place otherwise so a BotTrader run on its
 	// own is still reconciled — dropping the loop outright would make an engine's safety depend on
 	// a caller remembering to wire a driver.
 	if !e.ReconciledExternally {
@@ -679,7 +679,7 @@ func (e *RealTrader) Run(ctx context.Context) error {
 	}
 }
 
-func (e *RealTrader) handleTick(ctx context.Context, data []byte, logger *slog.Logger) error {
+func (e *BotTrader) handleTick(ctx context.Context, data []byte, logger *slog.Logger) error {
 	price, ok, err := decodeTick(data, e.InstID)
 	if err != nil {
 		return err
@@ -691,7 +691,7 @@ func (e *RealTrader) handleTick(ctx context.Context, data []byte, logger *slog.L
 		return err
 	}
 	// Throttled to RLAdjustInterval (CLAUDE.md §15.9's freshness fix, mirrored from PaperTrader) —
-	// runUpdates queries real_orders and, when a position is actually due for a decision, calls the
+	// runUpdates queries bot_orders and, when a position is actually due for a decision, calls the
 	// model; running it on every single tick against 10 live instruments produced a continuous,
 	// unnecessary Postgres query load with no benefit (found 2026-09-05 during first activation).
 	if e.shouldRunRLAdjust() {
@@ -700,7 +700,7 @@ func (e *RealTrader) handleTick(ctx context.Context, data []byte, logger *slog.L
 	return nil
 }
 
-func (e *RealTrader) handleCandle(ctx context.Context, bar string, data []byte, logger *slog.Logger) error {
+func (e *BotTrader) handleCandle(ctx context.Context, bar string, data []byte, logger *slog.Logger) error {
 	dc, ok, err := decodeCandle(data, e.InstID)
 	if err != nil {
 		return err
@@ -713,31 +713,31 @@ func (e *RealTrader) handleCandle(ctx context.Context, bar string, data []byte, 
 	if !dc.Confirmed {
 		return nil
 	}
-	// Unlike PaperTrader, RealTrader is never the only writer of a bar's candles — cmd/paper-trader
-	// (or another RealTrader instance sharing this instrument) already persists them. Re-saving here
+	// Unlike PaperTrader, BotTrader is never the only writer of a bar's candles — cmd/paper-trader
+	// (or another BotTrader instance sharing this instrument) already persists them. Re-saving here
 	// would just be a redundant upsert on the same (inst_id, bar, ts) key, so this deliberately does
 	// NOT call Repo.SaveCandle.
 	return e.evaluateStrategies(ctx, bar, c.Close, logger)
 }
 
-// openPositions returns this instrument's currently-open real positions from real_orders — its
+// openPositions returns this instrument's currently-open real positions from bot_orders — its
 // own table (CLAUDE.md real-trading readiness plan, 2026-09-04), never paper_orders/ListPositions,
 // so paper trading running concurrently on the same instrument can never be mistaken for a real
-// position. ListRealPositions' f.Open=true filter already excludes still-pending orders (an
-// in-flight fill is not yet a position, per port.RealOrder.Status's doc comment).
-func (e *RealTrader) openPositions(ctx context.Context) ([]port.RealOrder, error) {
+// position. ListBotPositions' f.Open=true filter already excludes still-pending orders (an
+// in-flight fill is not yet a position, per port.BotOrder.Status's doc comment).
+func (e *BotTrader) openPositions(ctx context.Context) ([]port.BotOrder, error) {
 	open := true
-	return e.Repo.ListRealPositions(ctx, port.PositionFilter{InstID: e.InstID, Open: &open})
+	return e.Repo.ListBotPositions(ctx, port.PositionFilter{InstID: e.InstID, Open: &open})
 }
 
 // hasOpenPosition reports whether any of open is a real position — always true for a non-empty
-// ListRealPositions(Open:true) result, but kept as a named check (mirroring PaperTrader's
+// ListBotPositions(Open:true) result, but kept as a named check (mirroring PaperTrader's
 // hasOpenBaseline) so the "is this token occupied" question reads the same way at both call sites.
-func hasOpenPosition(open []port.RealOrder) bool {
+func hasOpenPosition(open []port.BotOrder) bool {
 	return len(open) > 0
 }
 
-func (e *RealTrader) evaluateStrategies(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) error {
+func (e *BotTrader) evaluateStrategies(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) error {
 	if halted, reason := e.RiskManager.Halted(); halted {
 		logger.Warn("real trading halted, skipping new opens", "instId", e.InstID, "reason", reason)
 		return nil
@@ -765,7 +765,7 @@ func (e *RealTrader) evaluateStrategies(ctx context.Context, bar string, price d
 
 	open, err := e.openPositions(ctx)
 	if err != nil {
-		return fmt.Errorf("list open real positions: %w", err)
+		return fmt.Errorf("list open bot positions: %w", err)
 	}
 
 	view := e.marketView(bar)
@@ -819,13 +819,13 @@ func (e *RealTrader) evaluateStrategies(ctx context.Context, bar string, price d
 		obs.Category = conductor.OpenCategory(string(signal.Side))
 		obs.Signal = e.carriedSignalFor(bar)
 
-		// resolved, not the raw signal: buildPaperOrder inside openReal derives levels from
+		// resolved, not the raw signal: buildPaperOrder inside openBot derives levels from
 		// SLPct/TPPct only, so a strategy reporting a STRUCTURAL price instead (7 of the 14 do —
 		// CLAUDE.md §16.8: a stop below a swing low, a target at a fair-value gap) had its level
 		// silently discarded on every real order. ResolveLevels carries both forms, filling in
 		// whichever was not set, so passing it preserves a structural level all the way to the
 		// order while leaving percentage-based strategies unchanged.
-		opened, err := e.openReal(ctx, obs, resolved, open, price, a, bar, logger)
+		opened, err := e.openBot(ctx, obs, resolved, open, price, a, bar, logger)
 		if err != nil {
 			logger.Error("failed to open real order", "strategy", s.Name(), "instId", e.InstID, "error", err)
 			continue
@@ -838,19 +838,19 @@ func (e *RealTrader) evaluateStrategies(ctx context.Context, bar string, price d
 	return nil
 }
 
-// openReal asks the model whether to take signal, sizes/clamps the result, places the real order,
+// openBot asks the model whether to take signal, sizes/clamps the result, places the real order,
 // and persists the row. Returns nil, nil when the signal was declined (model skip, or no usable
 // stop) rather than an error — declining is a normal outcome, not a failure.
-func (e *RealTrader) openReal(
+func (e *BotTrader) openBot(
 	ctx context.Context,
 	obs domain.Observation,
 	signal strategy.Signal,
-	openOrders []port.RealOrder,
+	openOrders []port.BotOrder,
 	price decimal.Decimal,
 	a StrategyAssignment,
 	bar string,
 	logger *slog.Logger,
-) (*port.RealOrder, error) {
+) (*port.BotOrder, error) {
 	category := conductor.OpenCategory(string(signal.Side))
 	if category == "" || e.Model == nil {
 		return nil, nil
@@ -901,7 +901,7 @@ func (e *RealTrader) openReal(
 	}
 
 	paperShaped := buildPaperOrder(e.InstID, price, signal, notional, a.StrategyID, bar)
-	order := port.RealOrder{
+	order := port.BotOrder{
 		InstID:     paperShaped.InstID,
 		StrategyID: paperShaped.StrategyID,
 		Bar:        paperShaped.Bar,
@@ -949,7 +949,7 @@ func (e *RealTrader) openReal(
 		logger.Error("refusing to open a real position with no stop-loss", "instId", e.InstID, "side", order.Side)
 		return nil, nil
 	}
-	// A position with no target never takes profit on its own: RealTrader watches SL/TP in-process
+	// A position with no target never takes profit on its own: BotTrader watches SL/TP in-process
 	// (§3a) and simply has nothing to watch for on the winning side, so the trade can only ever end
 	// at its stop, at the 6h timeout, or by hand. That is strictly worse than a wrong-but-present
 	// target, so a missing one is derived from the stop's own distance via MinTPSLRatio — the same
@@ -1016,7 +1016,7 @@ func (e *RealTrader) openReal(
 	// still catch a truly untracked position).
 	var localID int64
 	persisted := false
-	id, err := e.Repo.OpenRealOrder(ctx, order)
+	id, err := e.Repo.OpenBotOrder(ctx, order)
 	if err != nil {
 		logger.Error("failed to persist pending real order; continuing since the exchange order is already live",
 			"instId", e.InstID, "exchangeOrderId", order.ExchangeOrderID, "error", err)
@@ -1036,8 +1036,8 @@ func (e *RealTrader) openReal(
 		// resolves seconds later (2026-09-08 request). Best-effort: this is visibility, and losing
 		// it must not abort an open the exchange has already accepted.
 		if persisted {
-			if err := e.Repo.UpdateRealOrderStatus(ctx, localID, "opening", nil, nil, nil); err != nil {
-				logger.Warn("failed to mark real order opening", "id", localID, "error", err)
+			if err := e.Repo.UpdateBotOrderStatus(ctx, localID, "opening", nil, nil, nil); err != nil {
+				logger.Warn("failed to mark bot order opening", "id", localID, "error", err)
 			}
 		}
 		status, err := e.waitForFill(ctx, *order.ExchangeOrderID, logger)
@@ -1046,7 +1046,7 @@ func (e *RealTrader) openReal(
 			// exchange and its fill is simply unconfirmed, which is exactly the state someone needs
 			// to look at rather than find in a log later.
 			if persisted {
-				if setErr := e.Repo.SetRealOrderError(ctx, localID, fmt.Sprintf("wait for fill: %v", err)); setErr != nil {
+				if setErr := e.Repo.SetBotOrderError(ctx, localID, fmt.Sprintf("wait for fill: %v", err)); setErr != nil {
 					logger.Warn("failed to record open error", "id", localID, "error", setErr)
 				}
 			}
@@ -1124,11 +1124,11 @@ func (e *RealTrader) openReal(
 			entryPxPtr, sizePtr = &order.EntryPx, &order.Size
 			contractsPtr = order.Contracts
 		}
-		if err := e.Repo.UpdateRealOrderStatus(ctx, localID, finalStatus, entryPxPtr, sizePtr, contractsPtr); err != nil {
-			logger.Warn("failed to update real order status", "id", localID, "instId", e.InstID, "status", finalStatus, "error", err)
+		if err := e.Repo.UpdateBotOrderStatus(ctx, localID, finalStatus, entryPxPtr, sizePtr, contractsPtr); err != nil {
+			logger.Warn("failed to update bot order status", "id", localID, "instId", e.InstID, "status", finalStatus, "error", err)
 		}
-		if err := e.Repo.SetRealOrderFeatures(ctx, localID, order.FeaturesJSON); err != nil {
-			logger.Warn("failed to set real order features", "id", localID, "instId", e.InstID, "error", err)
+		if err := e.Repo.SetBotOrderFeatures(ctx, localID, order.FeaturesJSON); err != nil {
+			logger.Warn("failed to set bot order features", "id", localID, "instId", e.InstID, "error", err)
 		}
 		// The open order has reached a terminal state here, so its exchange record is final —
 		// capture it once now rather than re-fetching it on every later view (2026-09-09).
@@ -1144,8 +1144,8 @@ func (e *RealTrader) openReal(
 
 	// Rest the stop and target on the EXCHANGE before treating this position as open (2026-09-09
 	// request: "we should set sl/tp on exchange always"). Until this existed the levels lived only
-	// in real_orders, watched by this process's own tick monitor — so any interruption of this
-	// service left real capital running unprotected, which is what real order 33 exposed.
+	// in bot_orders, watched by this process's own tick monitor — so any interruption of this
+	// service left real capital running unprotected, which is what bot order 33 exposed.
 	//
 	// A position that cannot be protected is CLOSED again immediately rather than kept. That costs
 	// a round-trip fee on a rare failure; holding an unprotected real position costs an unbounded
@@ -1153,15 +1153,15 @@ func (e *RealTrader) openReal(
 	// Note this runs even when the DB insert failed (persisted == false). The position is LIVE on
 	// the exchange either way, and a live position is exactly what must not go unprotected — losing
 	// our own record of it is a bookkeeping problem, running it without a stop is a capital one.
-	// placeProtection skips only the algoId write in that case, which openReal has nowhere to store
+	// placeProtection skips only the algoId write in that case, which openBot has nowhere to store
 	// anyway.
 	{
 		algoID, protErr := e.placeProtection(ctx, order, logger)
 		if protErr != nil {
-			metrics.RealUnprotectedClosedTotal.WithLabelValues(e.InstID).Inc()
+			metrics.BotUnprotectedClosedTotal.WithLabelValues(e.InstID).Inc()
 			logger.Error("could not rest sl/tp on the exchange for a just-opened real position; closing it immediately",
 				"id", order.ID, "instId", e.InstID, "error", protErr)
-			if closeErr := e.closeReal(ctx, order, price, conductor.CloseReasonManual, logger); closeErr != nil {
+			if closeErr := e.closeBot(ctx, order, price, conductor.CloseReasonManual, logger); closeErr != nil {
 				// Now genuinely dangerous: an unprotected position that also would not flatten.
 				// Halt so nothing new is opened alongside it and a human is drawn to it — the same
 				// escalation reconcile uses for an untracked position.
@@ -1184,12 +1184,12 @@ func (e *RealTrader) openReal(
 	return &order, nil
 }
 
-// setLeverageIfNeeded calls SetLeverage unconditionally on open — RealTrader has no cheap prior
+// setLeverageIfNeeded calls SetLeverage unconditionally on open — BotTrader has no cheap prior
 // leverage to compare against the way trade.go's Trader does (it reads the exchange's current
-// position leverage every poll; RealTrader only calls GetPositions from the reconciliation poll,
+// position leverage every poll; BotTrader only calls GetPositions from the reconciliation poll,
 // not on every open) — an extra SetLeverage call when the value happens to already match is a
 // harmless no-op on OKX's side, not worth threading additional state to avoid.
-func (e *RealTrader) setLeverageIfNeeded(leverage decimal.Decimal, side string, logger *slog.Logger) error {
+func (e *BotTrader) setLeverageIfNeeded(leverage decimal.Decimal, side string, logger *slog.Logger) error {
 	if !leverage.IsPositive() {
 		return nil
 	}
@@ -1216,7 +1216,7 @@ func signedNotionalForSide(side string) decimal.Decimal {
 
 // liquidationBufferEstimate mirrors trade.go's execute() conservative 100/leverage approximation
 // (CLAUDE.md §27.2) — ignores maintenance margin, same accepted simplification as the existing live
-// path. RealTrader has no prior position's LiqPx/MarkPx to cross-check against at OPEN time (that
+// path. BotTrader has no prior position's LiqPx/MarkPx to cross-check against at OPEN time (that
 // cross-check only makes sense once a position exists, per §27.2's own note) — the reconciliation
 // poll (reconcile) is where an already-open position's real liquidation distance gets checked
 // against what OKX reports.
@@ -1231,10 +1231,10 @@ func nonZeroLevels(slPx, tpPx decimal.Decimal) conductor.Levels {
 	return conductor.Levels{SLPx: nonZeroPx(slPx), TPPx: nonZeroPx(tpPx)}
 }
 
-// runUpdates is RealTrader's in-trade half of the lifecycle (CLAUDE.md §15.12), mirroring
+// runUpdates is BotTrader's in-trade half of the lifecycle (CLAUDE.md §15.12), mirroring
 // PaperTrader.runUpdates. Purely local per §3a's correction: no exchange call for an SL/TP move,
-// since RealTrader watches SL/TP itself rather than resting a conditional order on OKX.
-func (e *RealTrader) runUpdates(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) {
+// since BotTrader watches SL/TP itself rather than resting a conditional order on OKX.
+func (e *BotTrader) runUpdates(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) {
 	open, err := e.openPositions(ctx)
 	if err != nil {
 		logger.Warn("real updates: list open positions failed", "instId", e.InstID, "error", err)
@@ -1265,7 +1265,7 @@ func (e *RealTrader) runUpdates(ctx context.Context, bar string, price decimal.D
 			continue
 		}
 		// A position still being opened has no resting protective order yet, so any level the model
-		// proposed could not be pushed to the exchange and applyRealAdjustment would refuse it
+		// proposed could not be pushed to the exchange and applyBotAdjustment would refuse it
 		// anyway (2026-09-09). Skipping here avoids spending a model call on a decision that cannot
 		// be carried out, and avoids logging an alarming "no resting order to amend" for what is
 		// just an order that has not finished filling.
@@ -1292,17 +1292,17 @@ func (e *RealTrader) runUpdates(ctx context.Context, bar string, price decimal.D
 		case domain.ActionClose:
 			e.closeEarly(ctx, o, price, logger)
 		case domain.ActionUpdate:
-			e.applyRealAdjustment(ctx, o, action, price, logger)
+			e.applyBotAdjustment(ctx, o, action, price, logger)
 		}
 	}
 }
 
-// applyRealAdjustment is RealTrader's no-fork SL/TP edit: computeAdjustedLevels (the shared free
+// applyBotAdjustment is BotTrader's no-fork SL/TP edit: computeAdjustedLevels (the shared free
 // function, plan commit 2) is the SAME ratchet-checked computation PaperTrader.applyAdjustment
-// uses, but the IO here writes to real_orders/real_order_adjustments (CLAUDE.md real-trading
+// uses, but the IO here writes to bot_orders/bot_order_adjustments (CLAUDE.md real-trading
 // readiness plan, 2026-09-04's table split). No exchange call: the new levels take effect on this
 // engine's own next tick via monitorOpenPositions.
-func (e *RealTrader) applyRealAdjustment(ctx context.Context, o port.RealOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
+func (e *BotTrader) applyBotAdjustment(ctx context.Context, o port.BotOrder, action *domain.Action, price decimal.Decimal, logger *slog.Logger) {
 	newSL, newTP, changed := computeAdjustedLevels(asPaperOrderView(o), action, price, e.RLClamps.MinSLDistPct)
 	if !changed {
 		return
@@ -1318,17 +1318,17 @@ func (e *RealTrader) applyRealAdjustment(ctx context.Context, o port.RealOrder, 
 			"instId", e.InstID, "orderId", o.ID, "error", err)
 		return
 	}
-	if err := e.Repo.UpdateRealOrderSLTP(ctx, o.ID, newSL, newTP, false); err != nil {
+	if err := e.Repo.UpdateBotOrderSLTP(ctx, o.ID, newSL, newTP, false); err != nil {
 		logger.Warn("real updates: sl/tp update failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 		return
 	}
 	if !samePriceOrNil(newSL, o.SLPx) {
-		if err := e.Repo.RecordRealOrderAdjustment(ctx, o.ID, "sl", o.SLPx, newSL, "model"); err != nil {
+		if err := e.Repo.RecordBotOrderAdjustment(ctx, o.ID, "sl", o.SLPx, newSL, "model"); err != nil {
 			logger.Warn("real updates: record sl adjustment failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 		}
 	}
 	if !samePriceOrNil(newTP, o.TPPx) {
-		if err := e.Repo.RecordRealOrderAdjustment(ctx, o.ID, "tp", o.TPPx, newTP, "model"); err != nil {
+		if err := e.Repo.RecordBotOrderAdjustment(ctx, o.ID, "tp", o.TPPx, newTP, "model"); err != nil {
 			logger.Warn("real updates: record tp adjustment failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 		}
 	}
@@ -1347,43 +1347,43 @@ func (e *RealTrader) applyRealAdjustment(ctx context.Context, o port.RealOrder, 
 // the decision, and "how often does it want out early, and was it right?" is exactly the evidence
 // needed to decide whether to ever turn this on. The position simply runs to its own SL/TP or
 // timeout instead.
-func (e *RealTrader) closeEarly(ctx context.Context, o port.RealOrder, price decimal.Decimal, logger *slog.Logger) {
+func (e *BotTrader) closeEarly(ctx context.Context, o port.BotOrder, price decimal.Decimal, logger *slog.Logger) {
 	if !e.RLEarlyClose {
-		metrics.RealEarlyCloseIgnoredTotal.WithLabelValues(e.InstID).Inc()
+		metrics.BotEarlyCloseIgnoredTotal.WithLabelValues(e.InstID).Inc()
 		logger.Info("real updates: model asked to close early, ignored (trading.allow_rl_early_close is off)",
 			"instId", e.InstID, "orderId", o.ID, "price", price)
 		return
 	}
-	if err := e.closeReal(ctx, o, price, conductor.CloseReasonRLEarly, logger); err != nil {
+	if err := e.closeBot(ctx, o, price, conductor.CloseReasonRLEarly, logger); err != nil {
 		logger.Error("real updates: early close failed", "instId", e.InstID, "orderId", o.ID, "error", err)
 	}
 }
 
-// monitorOpenPositions is RealTrader's SL/TP-touch and timeout check — the SAME in-process
+// monitorOpenPositions is BotTrader's SL/TP-touch and timeout check — the SAME in-process
 // tick-driven mechanism PaperTrader.monitorOpenOrders already uses (CLAUDE.md §27.3's correction:
 // no OKX conditional/algo order, this process watches its own open positions on every tick).
 // trackPnLExtremes advances an open real position's peak/trough unrealized PnL, mirroring
-// PaperTrader.trackPnLExtremes exactly (CLAUDE.md §15.11) against real_orders instead of
+// PaperTrader.trackPnLExtremes exactly (CLAUDE.md §15.11) against bot_orders instead of
 // paper_orders. Only writes when a new extreme is actually reached, so a position sitting still
 // does not generate a database write on every tick.
 //
 // The distinction these columns carry is real training signal as well as display: a trade that
 // reached 90% of its target and gave it all back is a completely different lesson from one that
 // drifted sideways, and current PnL alone cannot tell them apart.
-func (e *RealTrader) trackPnLExtremes(ctx context.Context, o port.RealOrder, price decimal.Decimal, logger *slog.Logger) {
+func (e *BotTrader) trackPnLExtremes(ctx context.Context, o port.BotOrder, price decimal.Decimal, logger *slog.Logger) {
 	upl := unrealizedPnLPct(asPaperOrderView(o), price)
 	if !upl.GreaterThan(o.PnLMaxPct) && !upl.LessThan(o.PnLMinPct) {
 		return
 	}
-	if err := e.Repo.UpdateRealOrderPnLExtremes(ctx, o.ID, upl, upl); err != nil {
+	if err := e.Repo.UpdateBotOrderPnLExtremes(ctx, o.ID, upl, upl); err != nil {
 		logger.Warn("failed to update real pnl extremes", "instId", e.InstID, "orderId", o.ID, "error", err)
 	}
 }
 
-func (e *RealTrader) monitorOpenPositions(ctx context.Context, price decimal.Decimal, logger *slog.Logger) error {
+func (e *BotTrader) monitorOpenPositions(ctx context.Context, price decimal.Decimal, logger *slog.Logger) error {
 	open, err := e.openPositions(ctx)
 	if err != nil {
-		return fmt.Errorf("list open real positions: %w", err)
+		return fmt.Errorf("list open bot positions: %w", err)
 	}
 
 	now := time.Now()
@@ -1393,7 +1393,7 @@ func (e *RealTrader) monitorOpenPositions(ctx context.Context, price decimal.Dec
 		// profit and round-tripped must still show that peak even on the tick that closes it.
 		// Best-effort — this is model input and panel display, never a reason to block a close.
 		//
-		// Missing entirely until 2026-09-08: UpdateRealOrderPnLExtremes was implemented in
+		// Missing entirely until 2026-09-08: UpdateBotOrderPnLExtremes was implemented in
 		// internal/postgres and declared on the port, but nothing ever called it, so the panel's
 		// Max/Min columns sat at 0 for every real position no matter how far it moved.
 		e.trackPnLExtremes(ctx, o, price, logger)
@@ -1439,41 +1439,41 @@ func (e *RealTrader) monitorOpenPositions(ctx context.Context, price decimal.Dec
 				}
 				facts := &exchangeCloseFacts{PnL: exPnL, Fee: exFee}
 				// skipExchange: there is nothing left to flatten.
-				if err := e.closeRealWith(ctx, o, closePx, reason, true, facts, logger); err != nil {
+				if err := e.closeBotWith(ctx, o, closePx, reason, true, facts, logger); err != nil {
 					logger.Error("failed to record an exchange-closed position", "id", o.ID, "instId", e.InstID, "error", err)
 				}
 				continue
 			}
 		}
-		if err := e.closeReal(ctx, o, price, reason, logger); err != nil {
+		if err := e.closeBot(ctx, o, price, reason, logger); err != nil {
 			logger.Error("failed to close real order", "id", o.ID, "instId", e.InstID, "error", err)
 		}
 	}
 	return nil
 }
 
-// closeReal is RealTrader's single close path (mirrors PaperTrader.closeOrder — every close, SL/TP
+// closeBot is BotTrader's single close path (mirrors PaperTrader.closeOrder — every close, SL/TP
 // touch, timeout, or model-driven early close, goes through here so nothing can skip the terminal
 // model call). Exchange-first: the flattening market order is placed BEFORE the DB is marked
 // closed, so a DB failure never leaves the system believing a still-open real position is closed
 // (CLAUDE.md §27.3). If the exchange already reports the position flat (a reconciliation-poll-
 // detected close, see reconcile), skipExchange lets the flattening order be skipped since there is
 // nothing left to close on OKX's side — the DB/reward/audit consequences are identical either way.
-func (e *RealTrader) closeReal(ctx context.Context, o port.RealOrder, price decimal.Decimal, reason string, logger *slog.Logger) error {
-	return e.closeRealWith(ctx, o, price, reason, false, nil, logger)
+func (e *BotTrader) closeBot(ctx context.Context, o port.BotOrder, price decimal.Decimal, reason string, logger *slog.Logger) error {
+	return e.closeBotWith(ctx, o, price, reason, false, nil, logger)
 }
 
 // recordCloseError persists a failed close's reason on the order and returns the error unchanged,
-// so every failure path in closeRealWith both surfaces to the panel and still propagates to its
+// so every failure path in closeBotWith both surfaces to the panel and still propagates to its
 // caller. Persisting is best-effort: losing the record must not swallow the underlying error.
 //
 // The order's status is deliberately NOT reverted here. A failed close leaves the row in
 // 'closing', which is what makes it visibly stuck and gets a human to look at it — quietly
 // restoring 'filled' would make a position that may or may not still exist on the exchange look
 // perfectly normal, which is precisely the failure mode this whole confirmation flow exists for.
-func (e *RealTrader) recordCloseError(ctx context.Context, id int64, cause error, logger *slog.Logger) error {
+func (e *BotTrader) recordCloseError(ctx context.Context, id int64, cause error, logger *slog.Logger) error {
 	if e.Repo != nil {
-		if err := e.Repo.SetRealOrderError(ctx, id, cause.Error()); err != nil {
+		if err := e.Repo.SetBotOrderError(ctx, id, cause.Error()); err != nil {
 			logger.Warn("failed to record close error on real order", "id", id, "error", err)
 		}
 	}
@@ -1510,7 +1510,7 @@ func exchangeCloseNumbers(status domain.OrderStatus) (pnl, fee *decimal.Decimal)
 // Storing one in the column and the other alongside it made them look like a cross-check that
 // disagreed, when in fact neither was the net figure the panel and the model's reward both need.
 //
-// Verified against every closed real order on 2026-09-10: OKX's gross pnl equals the pure price
+// Verified against every closed bot order on 2026-09-10: OKX's gross pnl equals the pure price
 // math (close - entry)/entry * size * leverage to the last digit on all of them, so the exchange
 // and this codebase agree completely about the price move. Every discrepancy came from the fee: the
 // live-closed rows carried a locally ESTIMATED fee instead of the real one, and the rows backfilled
@@ -1535,7 +1535,7 @@ func netRealizedPnL(o port.PaperOrder, closePx decimal.Decimal, exchangePnL, exc
 	return net
 }
 
-func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price decimal.Decimal, reason string, skipExchange bool, facts *exchangeCloseFacts, logger *slog.Logger) error {
+func (e *BotTrader) closeBotWith(ctx context.Context, o port.BotOrder, price decimal.Decimal, reason string, skipExchange bool, facts *exchangeCloseFacts, logger *slog.Logger) error {
 	// exchangeClosePx/exchangeFee/exchangePnL are the EXCHANGE's own numbers, left nil when it did
 	// not report them (a skipExchange close, or a status response missing the field). nil is
 	// deliberately distinct from zero: it means "OKX did not tell us", and the panel falls back to
@@ -1602,11 +1602,11 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 		// Mark the close IN FLIGHT before waiting on it. This is what makes an in-progress or a
 		// stuck close visible to a trader watching the panel rather than a row that looks idle —
 		// and it records the flattening order's id, without which a close cannot be audited
-		// against OKX afterwards at all (real order 3 had no such record).
+		// against OKX afterwards at all (bot order 3 had no such record).
 		if result != nil {
 			closeOrdID = result.OrdID
-			if err := e.Repo.SetRealOrderClosing(ctx, o.ID, result.OrdID); err != nil {
-				logger.Warn("failed to mark real order closing", "id", o.ID, "error", err)
+			if err := e.Repo.SetBotOrderClosing(ctx, o.ID, result.OrdID); err != nil {
+				logger.Warn("failed to mark bot order closing", "id", o.ID, "error", err)
 			}
 		}
 
@@ -1644,14 +1644,14 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 	}
 
 	pnl := netRealizedPnL(asPaperOrderView(o), price, exchangePnL, exchangeFee)
-	if err := e.Repo.CloseRealOrderConfirmed(ctx, o.ID, price, reason, pnl, exchangePnL, exchangeFee, exchangeClosePx); err != nil {
+	if err := e.Repo.CloseBotOrderConfirmed(ctx, o.ID, price, reason, pnl, exchangePnL, exchangeFee, exchangeClosePx); err != nil {
 		// Another path closed it first (a second reconciliation pass, the tick monitor racing
 		// reconcile, a second process after a restart). The position IS closed and this caller
 		// simply was not the one that closed it, so it stops here rather than going on to deliver
 		// a duplicate reward to the model or publish a duplicate close event — both of which
-		// really happened on real order 38, closed twice 3 seconds apart.
+		// really happened on bot order 38, closed twice 3 seconds apart.
 		if errors.Is(err, port.ErrOrderAlreadyClosed) {
-			logger.Info("real order was already closed by another path; nothing to do",
+			logger.Info("bot order was already closed by another path; nothing to do",
 				"id", o.ID, "instId", e.InstID, "reason", reason)
 			return nil
 		}
@@ -1677,7 +1677,7 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 	e.publishOrderEvent(ctx, "closed", o.ID, logger)
 
 	e.conductor().Forget(o.ID)
-	e.reportTerminalReal(ctx, o, price, pnl, reason, logger)
+	e.reportTerminalBot(ctx, o, price, pnl, reason, logger)
 
 	// NOTE: no ApplyRealizedPnL here, deliberately (2026-09-08). In real mode the exchange's own
 	// reported balance is ground truth and already reflects this trade's PnL the moment it closes;
@@ -1686,7 +1686,7 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 	// same profit or loss TWICE against a real account.
 	//
 	// This call used to exist and always failed, on a foreign key from account_equity_history
-	// .order_id to paper_orders(id) that real order ids can never satisfy (migration 000019 moved
+	// .order_id to paper_orders(id) that bot order ids can never satisfy (migration 000019 moved
 	// real orders to their own table). The failure was logged and swallowed, so the double-count it
 	// would otherwise have produced never actually happened — the constraint was accidentally
 	// holding the account correct. Removing the call is what makes that correctness intentional
@@ -1695,9 +1695,9 @@ func (e *RealTrader) closeRealWith(ctx context.Context, o port.RealOrder, price 
 	return nil
 }
 
-// reportTerminalReal delivers a closed real trade's outcome to the model — same terminal-call
+// reportTerminalBot delivers a closed real trade's outcome to the model — same terminal-call
 // contract as PaperTrader.reportTerminal (CLAUDE.md §15.10: the close event IS the reward).
-func (e *RealTrader) reportTerminalReal(ctx context.Context, o port.RealOrder, closePx, pnl decimal.Decimal, closeReason string, logger *slog.Logger) {
+func (e *BotTrader) reportTerminalBot(ctx context.Context, o port.BotOrder, closePx, pnl decimal.Decimal, closeReason string, logger *slog.Logger) {
 	if e.Model == nil {
 		return
 	}
@@ -1727,7 +1727,7 @@ func (e *RealTrader) reportTerminalReal(ctx context.Context, o port.RealOrder, c
 	}
 }
 
-func (e *RealTrader) carriedSignalFor(bar string) *domain.StrategySignal {
+func (e *BotTrader) carriedSignalFor(bar string) *domain.StrategySignal {
 	sig, ok := e.conductor().CarriedSignal(e.InstID, bar)
 	if !ok {
 		return nil
@@ -1735,13 +1735,13 @@ func (e *RealTrader) carriedSignalFor(bar string) *domain.StrategySignal {
 	return &sig
 }
 
-func (e *RealTrader) publishOrderEvent(ctx context.Context, eventType string, orderID int64, logger *slog.Logger) {
+func (e *BotTrader) publishOrderEvent(ctx context.Context, eventType string, orderID int64, logger *slog.Logger) {
 	if e.OrderEvents == nil {
 		return
 	}
 	event := PaperOrderEvent{Type: eventType, OrderID: orderID, InstID: e.InstID}
 	if err := e.OrderEvents.Publish(ctx, e.InstID, event); err != nil {
-		logger.Warn("failed to publish real order event", "type", eventType, "orderId", orderID, "instId", e.InstID, "error", err)
+		logger.Warn("failed to publish bot order event", "type", eventType, "orderId", orderID, "instId", e.InstID, "error", err)
 	}
 }
 
@@ -1755,7 +1755,7 @@ func (e *RealTrader) publishOrderEvent(ctx context.Context, eventType string, or
 // Returns an error rather than a partly-filled observation, for the same reason PaperTrader's does:
 // a caller must SKIP the model call rather than send a short observation and have rl_service reject
 // it, which would leave a pending decision in the learner that never receives its reward.
-func (e *RealTrader) buildObservation(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) (domain.Observation, error) {
+func (e *BotTrader) buildObservation(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) (domain.Observation, error) {
 	view := e.marketView(bar)
 	window := view.Candles
 
@@ -1782,7 +1782,7 @@ func (e *RealTrader) buildObservation(ctx context.Context, bar string, price dec
 	}
 	equity := e.tradableEquityFor(ctx, balances[0].Eq)
 
-	margin, leveraged, count, err := e.exposureSnapshotReal(ctx)
+	margin, leveraged, count, err := e.exposureSnapshotBot(ctx)
 	if err != nil {
 		return domain.Observation{}, fmt.Errorf("open exposure: %w", err)
 	}
@@ -1812,7 +1812,7 @@ func (e *RealTrader) buildObservation(ctx context.Context, bar string, price dec
 // btcContext builds the market-wide reference block from BTC's own candle window on the same bar.
 // See PaperTrader.btcContext — a zeroed block would read as "BTC is flat and uncorrelated", a
 // specific false claim rather than an absence of information.
-func (e *RealTrader) btcContext(bar string, tokenReturns []decimal.Decimal) (domain.BTCContext, error) {
+func (e *BotTrader) btcContext(bar string, tokenReturns []decimal.Decimal) (domain.BTCContext, error) {
 	if e.BTCCandles == nil {
 		return domain.BTCContext{}, fmt.Errorf("btc context: no reference feed wired")
 	}
@@ -1825,7 +1825,7 @@ func (e *RealTrader) btcContext(bar string, tokenReturns []decimal.Decimal) (dom
 
 // tokenProfile describes what this instrument IS, replacing v7's identity one-hot. See
 // PaperTrader.tokenProfile.
-func (e *RealTrader) tokenProfile(window []domain.Candle) domain.TokenProfile {
+func (e *BotTrader) tokenProfile(window []domain.Candle) domain.TokenProfile {
 	p := domain.TokenProfile{}
 	if len(window) == 0 {
 		return p
@@ -1853,7 +1853,7 @@ func (e *RealTrader) tokenProfile(window []domain.Candle) domain.TokenProfile {
 
 // peakEquity tracks the high-water mark this process has observed, so drawdown reaches the model
 // measured from the peak rather than from a configured starting balance. See PaperTrader.peakEquity.
-func (e *RealTrader) peakEquity(equity decimal.Decimal) decimal.Decimal {
+func (e *BotTrader) peakEquity(equity decimal.Decimal) decimal.Decimal {
 	e.peakMu.Lock()
 	defer e.peakMu.Unlock()
 	if equity.GreaterThan(e.peak) {
@@ -1862,12 +1862,12 @@ func (e *RealTrader) peakEquity(equity decimal.Decimal) decimal.Decimal {
 	return e.peak
 }
 
-// exposureSnapshotReal reports margin committed, leveraged exposure and open position count across
-// every real position. Mirrors PaperTrader.exposureSnapshot but reads real_orders — real trading
+// exposureSnapshotBot reports margin committed, leveraged exposure and open position count across
+// every real position. Mirrors PaperTrader.exposureSnapshot but reads bot_orders — real trading
 // needs no mode filter, since every row there belongs to it by construction.
-func (e *RealTrader) exposureSnapshotReal(ctx context.Context) (margin, leveraged decimal.Decimal, count int, err error) {
+func (e *BotTrader) exposureSnapshotBot(ctx context.Context) (margin, leveraged decimal.Decimal, count int, err error) {
 	openOnly := true
-	positions, err := e.Repo.ListRealPositions(ctx, port.PositionFilter{Open: &openOnly})
+	positions, err := e.Repo.ListBotPositions(ctx, port.PositionFilter{Open: &openOnly})
 	if err != nil {
 		return decimal.Zero, decimal.Zero, 0, err
 	}
@@ -1887,7 +1887,7 @@ func (e *RealTrader) exposureSnapshotReal(ctx context.Context) (margin, leverage
 // authoritative GetPositions/GetBalance response (CLAUDE.md §27.3/§27.6), on a fixed 1-minute
 // cadence (reconcileInterval) — separate from and much slower than the tick-driven SL/TP monitor,
 // since this poll exists only to catch drift, not to drive trading.
-func (e *RealTrader) runReconcileLoop(ctx context.Context, logger *slog.Logger) error {
+func (e *BotTrader) runReconcileLoop(ctx context.Context, logger *slog.Logger) error {
 	ticker := time.NewTicker(e.reconcileInterval())
 	defer ticker.Stop()
 	for {
@@ -1913,7 +1913,7 @@ func (e *RealTrader) runReconcileLoop(ctx context.Context, logger *slog.Logger) 
 // Kept for an engine running without a driver, and used directly by tests. Safe to call
 // concurrently with the periodic loop: reconcile re-reads both sides before acting, so a redundant
 // pass is a no-op rather than a double-close.
-func (e *RealTrader) ReconcileNow(ctx context.Context, logger *slog.Logger) {
+func (e *BotTrader) ReconcileNow(ctx context.Context, logger *slog.Logger) {
 	if logger == nil {
 		logger = e.Logger
 	}
@@ -1928,7 +1928,7 @@ func (e *RealTrader) ReconcileNow(ctx context.Context, logger *slog.Logger) {
 // Prefer ReconcileWith when a snapshot is already in hand: GetPositions/GetBalance are ACCOUNT-wide
 // (they take no instrument and return the same response to every engine), so a per-engine fetch
 // multiplies one call by the size of the roster. See AccountSnapshot.
-func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
+func (e *BotTrader) reconcile(ctx context.Context, logger *slog.Logger) {
 	snap, err := FetchAccountSnapshot(e.Exchange, e.execInstType(), e.settleCcy())
 	if err != nil {
 		logger.Warn("reconcile: account snapshot failed", "instId", e.InstID, "error", err)
@@ -1944,8 +1944,8 @@ func (e *RealTrader) reconcile(ctx context.Context, logger *slog.Logger) {
 // issue did not.
 //
 // Equity recording is deliberately NOT done here — it writes one shared account row, so the caller
-// does it once per snapshot rather than once per engine. See recordEquityReal.
-func (e *RealTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, logger *slog.Logger) {
+// does it once per snapshot rather than once per engine. See recordEquityBot.
+func (e *BotTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, logger *slog.Logger) {
 	if logger == nil {
 		logger = e.Logger
 	}
@@ -2009,7 +2009,7 @@ func (e *RealTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, lo
 			// manual close at the entry price (2026-09-09) — see closeFactsFromExchange.
 			reason, closePx, exPnL, exFee := e.closeFactsFromExchange(o, logger)
 			facts := &exchangeCloseFacts{PnL: exPnL, Fee: exFee}
-			if err := e.closeRealWith(ctx, o, closePx, reason, true, facts, logger); err != nil {
+			if err := e.closeBotWith(ctx, o, closePx, reason, true, facts, logger); err != nil {
 				logger.Error("reconcile: failed to close locally-stale position", "id", o.ID, "error", err)
 			}
 		}
@@ -2067,7 +2067,7 @@ func (e *RealTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, lo
 			if reason, hit := closeReason(asPaperOrderView(local[0]), remote.MarkPx); hit {
 				logger.Warn("reconcile: position is past its own SL/TP but was never closed; closing now",
 					"instId", e.InstID, "id", local[0].ID, "reason", reason, "markPx", remote.MarkPx)
-				if err := e.closeReal(ctx, local[0], remote.MarkPx, reason, logger); err != nil {
+				if err := e.closeBot(ctx, local[0], remote.MarkPx, reason, logger); err != nil {
 					logger.Error("reconcile: failed to close a position past its level", "id", local[0].ID, "error", err)
 				}
 			}
@@ -2076,7 +2076,7 @@ func (e *RealTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, lo
 
 }
 
-// recordEquityReal mirrors trade.go's Trader.recordEquity: the exchange's reported balance is
+// recordEquityBot mirrors trade.go's Trader.recordEquity: the exchange's reported balance is
 // ground truth, so this only observes it and records the delta from what was last stored, never
 // applying a top-up/reset the way paper mode's balance does. Best-effort.
 //
@@ -2086,7 +2086,7 @@ func (e *RealTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, lo
 // feeding that into a plain delta-from-EquityUSD comparison meant the reserve itself was read as
 // a realized trade loss the first time SafeMoneyUSD went from 0 to nonzero, corrupting the real
 // AccountBalanceUSD by the reserve amount.
-func (e *RealTrader) recordEquityReal(ctx context.Context, rawBalance decimal.Decimal, logger *slog.Logger) {
+func (e *BotTrader) recordEquityBot(ctx context.Context, rawBalance decimal.Decimal, logger *slog.Logger) {
 	if e.Repo == nil {
 		return
 	}
@@ -2108,7 +2108,7 @@ func (e *RealTrader) recordEquityReal(ctx context.Context, rawBalance decimal.De
 //
 // Guarded by openMu, which evaluateStrategies already holds across the whole open sequence. Taking
 // it here too would deadlock; reconcile reads the flag under the same lock via isOpenInFlight.
-func (e *RealTrader) setOpenInFlight(v bool) {
+func (e *BotTrader) setOpenInFlight(v bool) {
 	e.openInFlight = v
 }
 
@@ -2119,7 +2119,7 @@ func (e *RealTrader) setOpenInFlight(v bool) {
 // could be arbitrarily stale. A blocked read here is also exactly the desired behaviour: if an open
 // currently holds openMu, reconcile waits for it to finish and then sees the committed row rather
 // than the in-flight gap.
-func (e *RealTrader) isOpenInFlight() bool {
+func (e *BotTrader) isOpenInFlight() bool {
 	e.openMu.Lock()
 	defer e.openMu.Unlock()
 	return e.openInFlight
@@ -2132,7 +2132,7 @@ func (e *RealTrader) isOpenInFlight() bool {
 // exchange — the surrounding ReconcileWith needs both. That matters here because this exact
 // decision, made wrongly, halted all real trading for two hours (CLAUDE.md §48), and a regression
 // test should be able to reproduce it directly rather than approximate it.
-func (e *RealTrader) shouldDeferUntrackedHalt(logger *slog.Logger, remote *domain.Position) bool {
+func (e *BotTrader) shouldDeferUntrackedHalt(logger *slog.Logger, remote *domain.Position) bool {
 	if !e.isOpenInFlight() {
 		return false
 	}

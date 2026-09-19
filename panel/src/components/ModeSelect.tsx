@@ -4,20 +4,20 @@ import type { PositionMode } from '../api/types'
 
 const MODES: { value: PositionMode; label: string; hint: string }[] = [
   { value: 'paper', label: 'Paper', hint: 'Simulated — no orders reach the exchange' },
-  { value: 'real', label: 'Real', hint: 'Live money — orders execute on OKX' },
+  { value: 'bot', label: 'Bot Trader', hint: 'Live money — orders execute on OKX' },
 ]
 
 /**
- * Paper/Real selector for the header.
+ * Paper/Bot Trader selector for the header.
  *
  * A hand-rolled menu rather than a native <select> (2026-09-12): a select's OPEN list is drawn by
  * the operating system, so no amount of CSS on the closed control reaches it — it rendered as a
  * grey system list against this dark UI, which is what read as dated. The trigger is a button and
  * the list is ordinary markup, so both halves can be styled as one piece.
  *
- * The colour treatment is carried by a small dot rather than by tinting the whole control. Real
- * money does need a standing marker, but a red-on-red button reads as an error state, and it sat
- * in the header on every page — a persistent alarm for something that is simply a mode.
+ * The colour treatment is carried by a small dot rather than by tinting the whole control. Bot
+ * Trader money does need a standing marker, but a red-on-red button reads as an error state, and it
+ * sat in the header on every page — a persistent alarm for something that is simply a mode.
  */
 export default function ModeSelect({ mode }: { mode: PositionMode }) {
   const navigate = useNavigate()

@@ -10,17 +10,17 @@ import (
 )
 
 // tenEngineDriver builds a driver over a roster of engines sharing one exchange and repository,
-// mirroring cmd/trader's own construction (one RealTrader per instrument, one exchange client).
+// mirroring cmd/trader's own construction (one BotTrader per instrument, one exchange client).
 func tenEngineDriver(t *testing.T, symbols []string, exchange *fakeExchangeClient) (*ReconcileDriver, *fakeRepository) {
 	t.Helper()
 	repo := newFakeRepository()
-	repo.accounts["real"] = port.AccountEquity{
-		Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000"), AccountBalanceUSD: dec("1000"),
+	repo.accounts["bot"] = port.AccountEquity{
+		Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000"), AccountBalanceUSD: dec("1000"),
 	}
 
-	engines := make(map[string]*RealTrader, len(symbols))
+	engines := make(map[string]*BotTrader, len(symbols))
 	for _, sym := range symbols {
-		rt := newTestRealTrader(repo, exchange, nil, nil)
+		rt := newTestBotTrader(repo, exchange, nil, nil)
 		rt.InstID = sym
 		rt.ExecInstID = sym
 		engines[sym] = rt
@@ -68,7 +68,7 @@ func TestReconcileAll_StillReconcilesEveryEngine(t *testing.T) {
 	// reconciled engine closes its row and a skipped one leaves it open.
 	for i, sym := range symbols {
 		id := int64(i + 1)
-		repo.realOrders[id] = port.RealOrder{
+		repo.realOrders[id] = port.BotOrder{
 			ID: id, InstID: sym, Status: "filled", Side: "buy",
 			EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1"),
 		}
@@ -84,7 +84,7 @@ func TestReconcileAll_StillReconcilesEveryEngine(t *testing.T) {
 	}
 }
 
-// TestReconcileAll_RecordsEquityOncePerPass covers the second half of the waste: recordEquityReal
+// TestReconcileAll_RecordsEquityOncePerPass covers the second half of the waste: recordEquityBot
 // writes ONE shared account row, so ten engines calling it made ten transactions for one row's work
 // — and when the delta was nonzero, whichever engine ran first stamped its own instID on the
 // history row, attributing an account-wide balance change to one arbitrary token.
@@ -118,7 +118,7 @@ func TestReconcileAll_SkipsThePassWhenPositionsCannotBeRead(t *testing.T) {
 		balances:        []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
 	}
 	driver, repo := tenEngineDriver(t, tenSymbols(), exchange)
-	repo.realOrders[1] = port.RealOrder{
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: "BTC", Status: "filled", Side: "buy",
 		EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1"),
 	}
@@ -137,11 +137,11 @@ func TestReconcileAll_SkipsThePassWhenPositionsCannotBeRead(t *testing.T) {
 func TestReconcileInstrument_FetchesFreshDataForOneEngine(t *testing.T) {
 	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}}
 	driver, repo := tenEngineDriver(t, tenSymbols(), exchange)
-	repo.realOrders[1] = port.RealOrder{
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: "ETH", Status: "filled", Side: "buy",
 		EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1"),
 	}
-	repo.realOrders[2] = port.RealOrder{
+	repo.realOrders[2] = port.BotOrder{
 		ID: 2, InstID: "SOL", Status: "filled", Side: "buy",
 		EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1"),
 	}

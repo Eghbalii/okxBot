@@ -1656,7 +1656,7 @@ input[type='number'] {
   box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.15);
 }
 
-.mode-dot-real {
+.mode-dot-bot {
   background: #f6465d;
   box-shadow: 0 0 0 3px rgba(246, 70, 93, 0.18);
 }
@@ -1896,7 +1896,7 @@ input[type='number'] {
 /* A left edge in each mode's own color, so paper and real are never mistaken for each other at a
    glance — the one distinction on this page where a misread has real consequences. */
 .service-card-paper { border-left: 3px solid var(--accent); }
-.service-card-real { border-left: 3px solid var(--yellow); }
+.service-card-bot { border-left: 3px solid var(--yellow); }
 .service-card-head {
   display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;
 }

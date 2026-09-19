@@ -46,10 +46,10 @@ func (s *Server) proxyTraderRequest(w http.ResponseWriter, r *http.Request, meth
 func (s *Server) handleRestartTrading(w http.ResponseWriter, r *http.Request) {
 	mode, ok := statsMode(r.URL.Query().Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
-	if mode == "real" {
+	if mode == "bot" {
 		s.proxyTraderRequest(w, r, r.Method, "/restart")
 		return
 	}

@@ -16,8 +16,8 @@ import (
 
 // Exchange-side stop-loss / take-profit for real positions (2026-09-09 request).
 //
-// WHY THIS EXISTS. Until this file, a real position's SL and TP were columns in real_orders that
-// RealTrader's own tick monitor compared against the live price each tick. That works only while
+// WHY THIS EXISTS. Until this file, a real position's SL and TP were columns in bot_orders that
+// BotTrader's own tick monitor compared against the live price each tick. That works only while
 // this process is alive, connected, and receiving ticks — so a crash, a deploy, an OOM, a stalled
 // Kafka feed, or a network partition left real capital running with no protection at all, and
 // nothing anywhere would have reported the position as unprotected. Real order 33 is what surfaced
@@ -33,7 +33,7 @@ import (
 //     vanished is re-placed.
 //   - The in-process tick monitor stays as a BACKUP, not the primary. Its close path is unchanged.
 //
-// A position that cannot be protected is not kept: openReal flattens it. An unprotected real
+// A position that cannot be protected is not kept: openBot flattens it. An unprotected real
 // position is a worse outcome than a wasted round-trip fee, and the alternative — keeping it and
 // hoping — is what this whole change exists to eliminate.
 
@@ -47,14 +47,14 @@ func closingSide(entrySide string) string {
 }
 
 // protectionRequest builds the exchange-side SL/TP order for an open position, or reports ok=false
-// when the position carries no levels worth resting (which openReal already refuses to allow, but
+// when the position carries no levels worth resting (which openBot already refuses to allow, but
 // ensureProtection can encounter on a legacy row opened before this mechanism existed).
 //
 // Both levels ride on ONE order deliberately: OKX treats a conditional order carrying both trigger
 // prices as OCO, so whichever fires cancels the other. Two separate orders would leave the losing
 // side resting after the winning one filled — a stale order that could later open a brand-new
 // position in the opposite direction, on an account that believes it is flat.
-func (e *RealTrader) protectionRequest(o port.RealOrder) (domain.AlgoOrderRequest, bool) {
+func (e *BotTrader) protectionRequest(o port.BotOrder) (domain.AlgoOrderRequest, bool) {
 	sz := o.Contracts
 	if sz == nil || !sz.IsPositive() {
 		return domain.AlgoOrderRequest{}, false
@@ -93,7 +93,7 @@ func (e *RealTrader) protectionRequest(o port.RealOrder) (domain.AlgoOrderReques
 // Retries once on failure before giving up. A single transient error (a rate-limit blip, a dropped
 // connection) is not evidence that protection is impossible, and the caller's response to failure
 // is to flatten a position that just opened — an expensive answer to give to a hiccup.
-func (e *RealTrader) placeProtection(ctx context.Context, o port.RealOrder, logger *slog.Logger) (string, error) {
+func (e *BotTrader) placeProtection(ctx context.Context, o port.BotOrder, logger *slog.Logger) (string, error) {
 	req, ok := e.protectionRequest(o)
 	if !ok {
 		return "", fmt.Errorf("order %d has no stop or target to rest on the exchange", o.ID)
@@ -108,7 +108,7 @@ func (e *RealTrader) placeProtection(ctx context.Context, o port.RealOrder, logg
 			// only our ability to amend or cancel it later is lost, which the reconciliation
 			// poll's untracked-position halt is what surfaces.
 			if e.Repo != nil && o.ID != 0 {
-				if setErr := e.Repo.SetRealOrderExchangeAlgoOrderID(ctx, o.ID, algoID); setErr != nil {
+				if setErr := e.Repo.SetBotOrderExchangeAlgoOrderID(ctx, o.ID, algoID); setErr != nil {
 					// The order IS resting on the exchange; only our record of its id is missing.
 					// Losing that id means a later adjustment cannot amend it and a close cannot
 					// cancel it, so it is reported loudly — but the position is protected, which is
@@ -118,7 +118,7 @@ func (e *RealTrader) placeProtection(ctx context.Context, o port.RealOrder, logg
 						"id", o.ID, "instId", e.InstID, "algoId", algoID, "error", setErr)
 				}
 			}
-			metrics.RealProtectionPlacedTotal.WithLabelValues(e.InstID).Inc()
+			metrics.BotProtectionPlacedTotal.WithLabelValues(e.InstID).Inc()
 			logger.Info("rested sl/tp on the exchange", "id", o.ID, "instId", e.InstID,
 				"algoId", algoID, "sl", req.SLTriggerPx, "tp", req.TPTriggerPx)
 			return algoID, nil
@@ -127,7 +127,7 @@ func (e *RealTrader) placeProtection(ctx context.Context, o port.RealOrder, logg
 		logger.Warn("failed to rest sl/tp on the exchange", "id", o.ID, "instId", e.InstID,
 			"attempt", attempt, "error", err)
 	}
-	metrics.RealProtectionFailedTotal.WithLabelValues(e.InstID).Inc()
+	metrics.BotProtectionFailedTotal.WithLabelValues(e.InstID).Inc()
 	return "", fmt.Errorf("place protective order: %w", lastErr)
 }
 
@@ -143,7 +143,7 @@ func (e *RealTrader) placeProtection(ctx context.Context, o port.RealOrder, logg
 //
 // A missing algoId is a real, reportable condition rather than a silent skip: it means this
 // position's protection is not on the exchange, which is exactly what must never pass unnoticed.
-func (e *RealTrader) amendProtection(ctx context.Context, o port.RealOrder, newSL, newTP *decimal.Decimal, logger *slog.Logger) error {
+func (e *BotTrader) amendProtection(ctx context.Context, o port.BotOrder, newSL, newTP *decimal.Decimal, logger *slog.Logger) error {
 	if o.ExchangeAlgoOrderID == nil || *o.ExchangeAlgoOrderID == "" {
 		return fmt.Errorf("order %d has no resting protective order to amend", o.ID)
 	}
@@ -163,10 +163,10 @@ func (e *RealTrader) amendProtection(ctx context.Context, o port.RealOrder, newS
 		return fmt.Errorf("order %d: refusing to amend a protective order to no levels at all", o.ID)
 	}
 	if err := e.Exchange.AmendAlgoOrder(req); err != nil {
-		metrics.RealProtectionAmendFailedTotal.WithLabelValues(e.InstID).Inc()
+		metrics.BotProtectionAmendFailedTotal.WithLabelValues(e.InstID).Inc()
 		return fmt.Errorf("amend protective order: %w", err)
 	}
-	metrics.RealProtectionAmendedTotal.WithLabelValues(e.InstID).Inc()
+	metrics.BotProtectionAmendedTotal.WithLabelValues(e.InstID).Inc()
 	logger.Info("moved the exchange's resting sl/tp", "id", o.ID, "instId", e.InstID,
 		"algoId", *o.ExchangeAlgoOrderID, "sl", req.SLTriggerPx, "tp", req.TPTriggerPx)
 	return nil
@@ -181,7 +181,7 @@ func (e *RealTrader) amendProtection(ctx context.Context, o port.RealOrder, newS
 // a conditional order whose position no longer exists — but it is still cancelled explicitly
 // rather than relied on, because "the exchange will probably clean it up" is not something to
 // build on when the failure mode is opening an unwanted position.
-func (e *RealTrader) cancelProtection(ctx context.Context, o port.RealOrder, logger *slog.Logger) {
+func (e *BotTrader) cancelProtection(ctx context.Context, o port.BotOrder, logger *slog.Logger) {
 	if o.ExchangeAlgoOrderID == nil || *o.ExchangeAlgoOrderID == "" {
 		return
 	}
@@ -206,7 +206,7 @@ func (e *RealTrader) cancelProtection(ctx context.Context, o port.RealOrder, log
 // A position whose protective order has TRIGGERED is deliberately left alone: it is on its way to
 // being flat, and the reconciliation poll's own position comparison is what closes the local row.
 // Re-placing a stop for a position that is closing would rest an order against nothing.
-func (e *RealTrader) ensureProtection(ctx context.Context, open []port.RealOrder, logger *slog.Logger) {
+func (e *BotTrader) ensureProtection(ctx context.Context, open []port.BotOrder, logger *slog.Logger) {
 	for _, o := range open {
 		// Only positions that actually hold exposure need protecting. A row still opening, or one
 		// already closing, has either nothing to protect yet or nothing left to protect.
@@ -234,11 +234,11 @@ func (e *RealTrader) ensureProtection(ctx context.Context, open []port.RealOrder
 			}
 			logger.Error("a real position's protective order is no longer on the exchange; re-placing it",
 				"id", o.ID, "instId", e.InstID, "algoId", *o.ExchangeAlgoOrderID, "state", status.State)
-			metrics.RealProtectionMissingTotal.WithLabelValues(e.InstID).Inc()
+			metrics.BotProtectionMissingTotal.WithLabelValues(e.InstID).Inc()
 		} else {
 			logger.Error("a real position has no protective order on the exchange; placing one",
 				"id", o.ID, "instId", e.InstID)
-			metrics.RealProtectionMissingTotal.WithLabelValues(e.InstID).Inc()
+			metrics.BotProtectionMissingTotal.WithLabelValues(e.InstID).Inc()
 		}
 
 		if _, err := e.placeProtection(ctx, o, logger); err != nil {
@@ -270,7 +270,7 @@ func (e *RealTrader) ensureProtection(ctx context.Context, open []port.RealOrder
 // Falls back to the old behavior (manual, at entry price) only when the exchange cannot tell us
 // otherwise: an order with no protective order recorded, an unreadable algo order, or one that did
 // not fire. A guess is never substituted for an answer.
-func (e *RealTrader) closeFactsFromExchange(o port.RealOrder, logger *slog.Logger) (
+func (e *BotTrader) closeFactsFromExchange(o port.BotOrder, logger *slog.Logger) (
 	reason string, closePx decimal.Decimal, exchangePnL, exchangeFee *decimal.Decimal,
 ) {
 	reason, closePx = conductor.CloseReasonManual, o.EntryPx
@@ -359,7 +359,7 @@ type exchangeCloseFacts struct {
 // race: the exchange's stop fires, then this process's tick monitor sees the same touch a moment
 // later and asks OKX to close a position that is already gone (sCode=51169). The close was never
 // at risk; the noise was, and it landed in the one channel that has to stay trustworthy.
-func (e *RealTrader) protectionAlreadyFired(o port.RealOrder, logger *slog.Logger) (bool, bool) {
+func (e *BotTrader) protectionAlreadyFired(o port.BotOrder, logger *slog.Logger) (bool, bool) {
 	if o.ExchangeAlgoOrderID == nil || *o.ExchangeAlgoOrderID == "" {
 		return false, false
 	}

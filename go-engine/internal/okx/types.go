@@ -15,7 +15,7 @@ import (
 // that a blank string ("") or JSON null decodes as zero instead of erroring. Found live
 // 2026-09-04 (cmd/okx-apitest's diagnostic): GET /api/v5/trade/order returns avgPx/accFillSz as
 // "" — not "0" — for an order that hasn't started filling yet, which decimal.Decimal's own
-// UnmarshalJSON rejects outright. RealTrader.waitForFill's polling loop already tolerates a
+// UnmarshalJSON rejects outright. BotTrader.waitForFill's polling loop already tolerates a
 // GetOrder error by retrying (it never surfaced as a user-visible bug), but every retry logged a
 // spurious warning and wasted a poll cycle for the entirely normal case of an order still being
 // registered.

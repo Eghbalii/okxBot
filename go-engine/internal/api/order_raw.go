@@ -45,7 +45,7 @@ func (s *Server) handleOrderExchangeRaw(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	order, err := s.Repo.GetRealOrder(r.Context(), id)
+	order, err := s.Repo.GetBotOrder(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return

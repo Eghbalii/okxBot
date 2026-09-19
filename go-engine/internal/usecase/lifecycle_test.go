@@ -440,7 +440,7 @@ func TestUpdate_CarriesSignalForward(t *testing.T) {
 }
 
 // TestCloseEarly_IgnoredRequestIsRecorded covers the observability gap found on 2026-09-10: paper
-// trading's closeEarly returned on the disabled flag with no log and no metric, while RealTrader's
+// trading's closeEarly returned on the disabled flag with no log and no metric, while BotTrader's
 // equivalent had recorded both since 2026-09-08.
 //
 // The silence is what made a real symptom unexplainable. SL/TP adjustments looked broken (690/day

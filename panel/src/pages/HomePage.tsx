@@ -156,7 +156,7 @@ function BalanceRow() {
   )
 }
 
-function ServiceCard({ mode }: { mode: 'paper' | 'real' }) {
+function ServiceCard({ mode }: { mode: 'paper' | 'bot' }) {
   const { data, loading, error } = useCachedResource<PaperTradingStats>(
     `pt-stats:${mode}`,
     () => api.paperTradingStats(mode),
@@ -167,7 +167,7 @@ function ServiceCard({ mode }: { mode: 'paper' | 'real' }) {
   return (
     <div className={`service-card service-card-${mode}`}>
       <div className="service-card-head">
-        <span className="service-card-title">{mode === 'paper' ? 'Paper Trading' : 'Real Trading'}</span>
+        <span className="service-card-title">{mode === 'paper' ? 'Paper Trading' : 'Bot Trader'}</span>
         {/* Link, not a bare href: this app uses BrowserRouter, so a hash URL would not route at
             all and a plain href would full-page-reload the SPA. */}
         <Link className="service-card-link" to={`/positions/${mode}`}>
@@ -297,7 +297,7 @@ export default function HomePage() {
 
       <div className="home-services">
         <ServiceCard mode="paper" />
-        <ServiceCard mode="real" />
+        <ServiceCard mode="bot" />
       </div>
 
       <div className="home-market">
@@ -442,11 +442,11 @@ export default function HomePage() {
                               not a label for whether real capital is at risk. */}
                           {r.enabledReal ? (
                             <span className="flag flag-on" title="enabled for real money">
-                              real ✓
+                              bot ✓
                             </span>
                           ) : (
                             <span className="flag flag-off" title="not enabled for real money">
-                              real off
+                              bot off
                             </span>
                           )}
                         </>

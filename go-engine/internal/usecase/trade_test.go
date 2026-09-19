@@ -455,7 +455,7 @@ func testLimits() risk.Limits {
 // mostly-empty observation that rl_service padded into a full-width vector and answered
 // confidently, which is exactly the silent degradation this schema exists to end.
 //
-// RealTrader supersedes this loop (§27.3). Until it is retired, running without the model is the
+// BotTrader supersedes this loop (§27.3). Until it is retired, running without the model is the
 // only honest option: the alternative is asking for a decision on data that does not exist.
 func TestStep_LegacyLoopDoesNotConsultTheModel(t *testing.T) {
 	exchange := &fakeExchangeClient{

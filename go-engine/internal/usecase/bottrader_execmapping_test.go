@@ -61,52 +61,52 @@ func TestSizeToContracts_ZeroCtValTreatedAsOne(t *testing.T) {
 }
 
 func TestExecInstID_FallsBackToInstIDWhenUnset(t *testing.T) {
-	rt := &RealTrader{InstID: "BTC-USDT-SWAP"}
+	rt := &BotTrader{InstID: "BTC-USDT-SWAP"}
 	if got := rt.execInstID(); got != "BTC-USDT-SWAP" {
 		t.Errorf("execInstID() = %q, want BTC-USDT-SWAP", got)
 	}
 }
 
 func TestExecInstID_UsesExecInstIDWhenSet(t *testing.T) {
-	rt := &RealTrader{InstID: "BTC-USDT-SWAP", ExecInstID: "BTC-USD_UM_XPERP-310404"}
+	rt := &BotTrader{InstID: "BTC-USDT-SWAP", ExecInstID: "BTC-USD_UM_XPERP-310404"}
 	if got := rt.execInstID(); got != "BTC-USD_UM_XPERP-310404" {
 		t.Errorf("execInstID() = %q, want BTC-USD_UM_XPERP-310404", got)
 	}
 }
 
 func TestExecInstType_DefaultsToSwap(t *testing.T) {
-	rt := &RealTrader{}
+	rt := &BotTrader{}
 	if got := rt.execInstType(); got != "SWAP" {
 		t.Errorf("execInstType() = %q, want SWAP", got)
 	}
 }
 
 func TestExecInstType_UsesConfiguredValue(t *testing.T) {
-	rt := &RealTrader{ExecInstType: "FUTURES"}
+	rt := &BotTrader{ExecInstType: "FUTURES"}
 	if got := rt.execInstType(); got != "FUTURES" {
 		t.Errorf("execInstType() = %q, want FUTURES", got)
 	}
 }
 
 func TestSettleCcy_DefaultsToUSDT(t *testing.T) {
-	rt := &RealTrader{}
+	rt := &BotTrader{}
 	if got := rt.settleCcy(); got != "USDT" {
 		t.Errorf("settleCcy() = %q, want USDT", got)
 	}
 }
 
 func TestSettleCcy_UsesConfiguredValue(t *testing.T) {
-	rt := &RealTrader{SettleCcy: "USDC"}
+	rt := &BotTrader{SettleCcy: "USDC"}
 	if got := rt.settleCcy(); got != "USDC" {
 		t.Errorf("settleCcy() = %q, want USDC", got)
 	}
 }
 
-// TestOpenReal_UsesExecInstIDNotMarketDataInstID confirms the actual PlaceOrder call targets
+// TestOpenBot_UsesExecInstIDNotMarketDataInstID confirms the actual PlaceOrder call targets
 // ExecInstID, not InstID, when the two differ — the concrete bug found live: an order attempted
 // against BTC-USDT-SWAP would have been rejected outright (50124) for an account only eligible to
 // trade BTC-USD_UM_XPERP-310404.
-func TestOpenReal_UsesExecInstIDNotMarketDataInstID(t *testing.T) {
+func TestOpenBot_UsesExecInstIDNotMarketDataInstID(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{
 		instrument: &domain.Instrument{CtVal: dec("0.0001"), LotSz: dec("1")},
@@ -115,7 +115,7 @@ func TestOpenReal_UsesExecInstIDNotMarketDataInstID(t *testing.T) {
 		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.ExecInstID = "BTC-USD_UM_XPERP-310404"
 	rt.ExecInstType = "FUTURES"
 	rt.SettleCcy = "USDC"
@@ -127,7 +127,7 @@ func TestOpenReal_UsesExecInstIDNotMarketDataInstID(t *testing.T) {
 	}
 
 	if len(exchange.placedOrders) != 1 {
-		t.Fatalf("expected exactly 1 real order placed, got %d", len(exchange.placedOrders))
+		t.Fatalf("expected exactly 1 bot order placed, got %d", len(exchange.placedOrders))
 	}
 	if exchange.placedOrders[0].InstID != "BTC-USD_UM_XPERP-310404" {
 		t.Errorf("PlaceOrder InstID = %q, want BTC-USD_UM_XPERP-310404 (the execution instrument, not the market-data one)",
@@ -135,10 +135,10 @@ func TestOpenReal_UsesExecInstIDNotMarketDataInstID(t *testing.T) {
 	}
 }
 
-// TestOpenReal_ConvertsSizeThroughInstrumentMetadata confirms the placed order's Sz field is a
+// TestOpenBot_ConvertsSizeThroughInstrumentMetadata confirms the placed order's Sz field is a
 // real contract count (via CtVal/LotSz), not a raw notional/price division — the bug that would
 // have sized an order roughly 10,000x too large against BTC-USD_UM_XPERP-310404's real CtVal.
-func TestOpenReal_ConvertsSizeThroughInstrumentMetadata(t *testing.T) {
+func TestOpenBot_ConvertsSizeThroughInstrumentMetadata(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{
 		instrument: &domain.Instrument{CtVal: dec("0.0001"), LotSz: dec("1")},
@@ -148,7 +148,7 @@ func TestOpenReal_ConvertsSizeThroughInstrumentMetadata(t *testing.T) {
 		Action: domain.ActionOpen, SizePct: dec("1"), LeverageFrac: dec("0.5"),
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.ExecInstID = "BTC-USD_UM_XPERP-310404"
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("80000")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
@@ -158,7 +158,7 @@ func TestOpenReal_ConvertsSizeThroughInstrumentMetadata(t *testing.T) {
 	}
 
 	if len(exchange.placedOrders) != 1 {
-		t.Fatalf("expected exactly 1 real order placed, got %d", len(exchange.placedOrders))
+		t.Fatalf("expected exactly 1 bot order placed, got %d", len(exchange.placedOrders))
 	}
 	sz := exchange.placedOrders[0].Sz
 	// Whatever the approved notional was, the resulting contract count must be a whole multiple

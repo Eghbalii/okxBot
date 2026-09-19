@@ -134,7 +134,7 @@ func (c *Consumer) isStale(msgTime time.Time) bool {
 // session low was 103.86). Stale market data driving a live trading decision is the failure this
 // prevents; a fresh consumer wants the CURRENT state of the world, never a recording of a past one.
 //
-// Candle topics get the same treatment, which is safe for the same reason: PaperTrader/RealTrader
+// Candle topics get the same treatment, which is safe for the same reason: PaperTrader/BotTrader
 // seed their candle windows from Postgres at startup (CLAUDE.md §14), so history comes from the
 // database rather than from replaying the bus.
 func NewConsumer(brokers []string, topic, group string) *Consumer {

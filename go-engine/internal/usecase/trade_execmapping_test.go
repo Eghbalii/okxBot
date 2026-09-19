@@ -9,7 +9,7 @@ import (
 
 // Mirrors realtrader_execmapping_test.go's coverage for the same gap in the older, legacy Trader
 // path (CLAUDE.md §27, 2026-09-04: fixed for consistency even though this path is being phased
-// out in favor of RealTrader, per explicit operator instruction).
+// out in favor of BotTrader, per explicit operator instruction).
 
 func TestTraderExecInstID_FallsBackToInstIDWhenUnset(t *testing.T) {
 	tr := &Trader{InstID: "BTC-USDT-SWAP"}

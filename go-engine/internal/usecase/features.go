@@ -324,12 +324,12 @@ func (e *PaperTrader) skipModelCall(stage string, err error, logger *slog.Logger
 		"stage", stage, "reason", reason, "error", err)
 }
 
-// skipModelCall is RealTrader's own copy, deliberately not shared with PaperTrader's.
+// skipModelCall is BotTrader's own copy, deliberately not shared with PaperTrader's.
 //
 // The two engines keep separate implementations of their lifecycle throughout (§27.3), and a shared
 // method would need an interface for one logging call. The duplication §23 warns about is a field
 // dropped from a struct literal; this is four lines with no state.
-func (e *RealTrader) skipModelCall(stage string, err error, logger *slog.Logger) {
+func (e *BotTrader) skipModelCall(stage string, err error, logger *slog.Logger) {
 	reason := domain.ValidationField(err)
 	if reason == "" {
 		reason = "build"

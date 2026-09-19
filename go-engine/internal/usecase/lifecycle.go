@@ -229,7 +229,7 @@ func (e *PaperTrader) applyAdjustment(ctx context.Context, o port.PaperOrder, ac
 // early-closed trade can never show what it would have done — so it stays opt-in.
 func (e *PaperTrader) closeEarly(ctx context.Context, o port.PaperOrder, price decimal.Decimal, logger *slog.Logger) {
 	if !e.RLEarlyClose {
-		// Counted and logged rather than dropped silently (2026-09-10), matching RealTrader's own
+		// Counted and logged rather than dropped silently (2026-09-10), matching BotTrader's own
 		// closeEarly. A suppressed decision is still a decision the model made, and leaving no trace
 		// of it is what made "SL/TP stopped adjusting" impossible to explain from the outside: the
 		// model was answering "close" almost every time, the answer was discarded here, and the

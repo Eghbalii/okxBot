@@ -33,7 +33,7 @@ import (
 // Entry: `price > c2 AND price[1] > c1` -> long. `price < c1 AND price[1] < c2` -> short. Close an
 // existing position whenever price crosses back through c2 (long) / c1 (short) the source's own way
 // — modeled here as the opposite-side Signal, per every other ported strategy's "close = opposite
-// signal" convention in this package (PaperTrader/RealTrader treat it as an update/close request,
+// signal" convention in this package (PaperTrader/BotTrader treat it as an update/close request,
 // not an automatic reversal, CLAUDE.md §27.3).
 type HMASwing struct {
 	Period       int

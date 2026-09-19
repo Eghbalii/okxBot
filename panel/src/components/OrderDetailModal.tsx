@@ -336,8 +336,8 @@ function RawLeg({
             )}
           </span>
         </div>
-        {/* Real orders only: paper trading has no exchange leg, so there is no record to show. */}
-        {position.Mode === 'real' && (
+        {/* Bot Trader orders only: paper trading has no exchange leg, so there is no record to show. */}
+        {position.Mode === 'bot' && (
           <>
             <h4 className="raw-json-heading">Full exchange record</h4>
             <ExchangeRawJSON orderId={position.ID} />

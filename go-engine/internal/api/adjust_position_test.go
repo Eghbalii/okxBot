@@ -21,7 +21,7 @@ import (
 // it surfaces immediately as "this test needs a stub for X" rather than silently doing nothing.
 type stubRepo struct {
 	port.Repository
-	order           port.RealOrder
+	order           port.BotOrder
 	getErr          error
 	updateSLTPCalls []struct {
 		id             int64
@@ -36,14 +36,14 @@ type stubRepo struct {
 	}
 }
 
-func (s *stubRepo) GetRealOrder(ctx context.Context, id int64) (port.RealOrder, error) {
+func (s *stubRepo) GetBotOrder(ctx context.Context, id int64) (port.BotOrder, error) {
 	if s.getErr != nil {
-		return port.RealOrder{}, s.getErr
+		return port.BotOrder{}, s.getErr
 	}
 	return s.order, nil
 }
 
-func (s *stubRepo) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal, manualOverride bool) error {
+func (s *stubRepo) UpdateBotOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal, manualOverride bool) error {
 	s.updateSLTPCalls = append(s.updateSLTPCalls, struct {
 		id             int64
 		sl, tp         *decimal.Decimal
@@ -52,7 +52,7 @@ func (s *stubRepo) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx
 	return nil
 }
 
-func (s *stubRepo) RecordRealOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error {
+func (s *stubRepo) RecordBotOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error {
 	s.adjustmentsRecorded = append(s.adjustmentsRecorded, struct {
 		id        int64
 		field     string
@@ -95,16 +95,16 @@ func newTestServer(repo *stubRepo) *Server {
 }
 
 // testAlgoID is the resting protective order every fixture position carries. A real open position
-// always has one (openReal closes any position it cannot protect), so a fixture without one would
+// always has one (openBot closes any position it cannot protect), so a fixture without one would
 // be testing a state production does not produce.
 const testAlgoID = "algo-test-1"
 
 func algoID() *string { id := testAlgoID; return &id }
 
-// doAdjust defaults to ?mode=real (every pre-existing test in this file exercises the real-mode
+// doAdjust defaults to ?mode=bot (every pre-existing test in this file exercises the real-mode
 // path); doAdjustMode lets a test override it (e.g. to exercise the paper-mode-rejected case).
 func doAdjust(srv *Server, id string, body adjustPositionRequest) *httptest.ResponseRecorder {
-	return doAdjustMode(srv, id, "real", body)
+	return doAdjustMode(srv, id, "bot", body)
 }
 
 func doAdjustMode(srv *Server, id, mode string, body adjustPositionRequest) *httptest.ResponseRecorder {
@@ -119,7 +119,7 @@ func doAdjustMode(srv *Server, id, mode string, body adjustPositionRequest) *htt
 func floatPtr(f float64) *float64 { return &f }
 
 func TestHandleAdjustPosition_MovesSLIntoLoss(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{
+	repo := &stubRepo{order: port.BotOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
@@ -130,7 +130,7 @@ func TestHandleAdjustPosition_MovesSLIntoLoss(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(repo.updateSLTPCalls) != 1 {
-		t.Fatalf("expected 1 UpdateRealOrderSLTP call, got %d", len(repo.updateSLTPCalls))
+		t.Fatalf("expected 1 UpdateBotOrderSLTP call, got %d", len(repo.updateSLTPCalls))
 	}
 	// -5% margin loss at 10x leverage = 0.5% price move from entry, below (loss side) for a long.
 	got := repo.updateSLTPCalls[0].sl
@@ -143,7 +143,7 @@ func TestHandleAdjustPosition_MovesSLIntoLoss(t *testing.T) {
 }
 
 func TestHandleAdjustPosition_BringsSLIntoProfit(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{
+	repo := &stubRepo{order: port.BotOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
@@ -162,7 +162,7 @@ func TestHandleAdjustPosition_BringsSLIntoProfit(t *testing.T) {
 }
 
 func TestHandleAdjustPosition_ShortSideDirectionIsMirrored(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{
+	repo := &stubRepo{order: port.BotOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "sell",
 		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
@@ -186,7 +186,7 @@ func TestHandleAdjustPosition_ShortSideDirectionIsMirrored(t *testing.T) {
 // A -50% "loss" at 10x leverage (a 5% price move, ten times CLAUDE.md §19.2's normal 15%-of-margin/
 // leverage cap) must still be written exactly as entered.
 func TestHandleAdjustPosition_IsDeliberatelyUnclamped(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{
+	repo := &stubRepo{order: port.BotOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
@@ -208,7 +208,7 @@ func TestHandleAdjustPosition_IsDeliberatelyUnclamped(t *testing.T) {
 // conductor.Clamps.Apply would reject outright, since it treats any long stop above entry as an
 // incoherent/"wrong side" level. The unclamped manual endpoint must allow it.
 func TestHandleAdjustPosition_BringsSLPastEntryIntoProfit(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{
+	repo := &stubRepo{order: port.BotOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("20"), ExchangeAlgoOrderID: algoID(),
 	}}
@@ -227,7 +227,7 @@ func TestHandleAdjustPosition_BringsSLPastEntryIntoProfit(t *testing.T) {
 
 func TestHandleAdjustPosition_RejectsClosedOrder(t *testing.T) {
 	now := time.Now()
-	repo := &stubRepo{order: port.RealOrder{
+	repo := &stubRepo{order: port.BotOrder{
 		ID: 1, Side: "buy", EntryPx: dec("100"), Leverage: dec("10"),
 		ClosedAt: &now,
 	}}
@@ -244,9 +244,9 @@ func TestHandleAdjustPosition_RejectsClosedOrder(t *testing.T) {
 
 // TestHandleAdjustPosition_RejectsPaperMode confirms ?mode=paper is rejected outright, before any
 // repository call — the table split (CLAUDE.md real-trading readiness plan, 2026-09-04) makes
-// mode="real" the only table this endpoint can ever address.
+// mode="bot" the only table this endpoint can ever address.
 func TestHandleAdjustPosition_RejectsPaperMode(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{ID: 1, Side: "buy", EntryPx: dec("100"), Leverage: dec("10")}}
+	repo := &stubRepo{order: port.BotOrder{ID: 1, Side: "buy", EntryPx: dec("100"), Leverage: dec("10")}}
 	srv := newTestServer(repo)
 
 	rec := doAdjustMode(srv, "1", "paper", adjustPositionRequest{SLPct: floatPtr(-5)})
@@ -261,7 +261,7 @@ func TestHandleAdjustPosition_RejectsPaperMode(t *testing.T) {
 // TestHandleAdjustPosition_RejectsMissingMode confirms the mode query param is required, not
 // defaulted — a missing mode must never silently target the wrong table.
 func TestHandleAdjustPosition_RejectsMissingMode(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{ID: 1, Side: "buy", EntryPx: dec("100"), Leverage: dec("10")}}
+	repo := &stubRepo{order: port.BotOrder{ID: 1, Side: "buy", EntryPx: dec("100"), Leverage: dec("10")}}
 	srv := newTestServer(repo)
 
 	rec := doAdjustMode(srv, "1", "", adjustPositionRequest{SLPct: floatPtr(-5)})
@@ -271,7 +271,7 @@ func TestHandleAdjustPosition_RejectsMissingMode(t *testing.T) {
 }
 
 func TestHandleAdjustPosition_RejectsEmptyBody(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{ID: 1, Side: "buy", EntryPx: dec("100"), Leverage: dec("10")}}
+	repo := &stubRepo{order: port.BotOrder{ID: 1, Side: "buy", EntryPx: dec("100"), Leverage: dec("10")}}
 	srv := newTestServer(repo)
 
 	rec := doAdjust(srv, "1", adjustPositionRequest{})
@@ -281,10 +281,10 @@ func TestHandleAdjustPosition_RejectsEmptyBody(t *testing.T) {
 }
 
 // A manual edit must lock the order out of the model's update loop (2026-09-06 request): the
-// handler passes manualOverride=true to UpdateRealOrderSLTP on every manual adjustment, regardless
+// handler passes manualOverride=true to UpdateBotOrderSLTP on every manual adjustment, regardless
 // of which field (SL or TP, or both) was actually touched.
 func TestHandleAdjustPosition_SetsManualOverride(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{
+	repo := &stubRepo{order: port.BotOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
@@ -295,7 +295,7 @@ func TestHandleAdjustPosition_SetsManualOverride(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(repo.updateSLTPCalls) != 1 || !repo.updateSLTPCalls[0].manualOverride {
-		t.Fatalf("expected UpdateRealOrderSLTP to be called with manualOverride=true, got %+v", repo.updateSLTPCalls)
+		t.Fatalf("expected UpdateBotOrderSLTP to be called with manualOverride=true, got %+v", repo.updateSLTPCalls)
 	}
 }
 
@@ -328,7 +328,7 @@ func TestPriceFromMarginPct_TableDriven(t *testing.T) {
 // Before this, the handler wrote the new level locally and OKX kept enforcing the old one — the
 // operator would believe they had moved their stop when they had not.
 func TestHandleAdjustPosition_AmendsTheExchangeOrder(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{
+	repo := &stubRepo{order: port.BotOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
@@ -355,7 +355,7 @@ func TestHandleAdjustPosition_AmendsTheExchangeOrder(t *testing.T) {
 // A rejected amend must leave the stored levels untouched. The dangerous state is the exchange
 // holding one stop while the panel displays another, so a failure changes nothing at all.
 func TestHandleAdjustPosition_ExchangeRejectionChangesNothing(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{
+	repo := &stubRepo{order: port.BotOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}
@@ -378,7 +378,7 @@ func TestHandleAdjustPosition_ExchangeRejectionChangesNothing(t *testing.T) {
 // edit is refused rather than written locally — the same "never record a level the exchange does
 // not have" rule as the rejection case above.
 func TestHandleAdjustPosition_RefusesWhenThereIsNoRestingOrder(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{
+	repo := &stubRepo{order: port.BotOrder{
 		ID: 1, InstID: "BTC-USDT-SWAP", Side: "buy",
 		EntryPx: dec("100"), Leverage: dec("10"),
 	}}
@@ -397,7 +397,7 @@ func TestHandleAdjustPosition_RefusesWhenThereIsNoRestingOrder(t *testing.T) {
 // level that is not a multiple of the instrument's tick — with a bare "code=1" naming nothing
 // (2026-09-10, the error the operator hit). The price must be snapped before it is sent.
 func TestHandleAdjustPosition_RoundsThePriceToTheInstrumentTick(t *testing.T) {
-	repo := &stubRepo{order: port.RealOrder{
+	repo := &stubRepo{order: port.BotOrder{
 		ID: 1, InstID: "SOL", Side: "buy",
 		EntryPx: dec("101.84"), Leverage: dec("10"), ExchangeAlgoOrderID: algoID(),
 	}}

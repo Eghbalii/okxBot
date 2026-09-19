@@ -27,7 +27,7 @@ import (
 //     which is what the domain stores and later passes back to amend/cancel/get. It is an opaque
 //     handle to every caller, so using a position id is honest rather than a fiction — and it is
 //     the only stable identifier MEXC offers for "the protection on this position".
-//   - Protection cannot be placed before a position exists. RealTrader already places protection
+//   - Protection cannot be placed before a position exists. BotTrader already places protection
 //     immediately AFTER the entry fills (§35.2), so this ordering is satisfied; but a caller that
 //     tried to pre-place would get a clear error rather than a silent no-op.
 //   - There is no separate OCO to cancel. Removing protection means clearing the trigger prices.

@@ -21,7 +21,7 @@ import (
 // WebSocket, since the fill itself pushes an event that triggers the pass.
 func TestReconcile_DoesNotHaltWhileAnOpenIsInFlight(t *testing.T) {
 	rm := risk.NewManager(risk.Limits{}, decimal.NewFromInt(100))
-	e := &RealTrader{InstID: "DOGE", Mode: "real", RiskManager: rm}
+	e := &BotTrader{InstID: "DOGE", Mode: "bot", RiskManager: rm}
 
 	// Simulate being mid-open, exactly as evaluateStrategies does while it holds openMu.
 	e.setOpenInFlight(true)
@@ -44,7 +44,7 @@ func TestReconcile_DoesNotHaltWhileAnOpenIsInFlight(t *testing.T) {
 // opened is real drift (a manual trade, a missed fill) and must still stop trading.
 func TestReconcile_StillHaltsOnAGenuinelyUntrackedPosition(t *testing.T) {
 	rm := risk.NewManager(risk.Limits{}, decimal.NewFromInt(100))
-	e := &RealTrader{InstID: "DOGE", Mode: "real", RiskManager: rm}
+	e := &BotTrader{InstID: "DOGE", Mode: "bot", RiskManager: rm}
 
 	// No open in flight — the default, and the genuine-drift case.
 	remote := &domain.Position{InstID: "DOGE", PosSide: "short", Pos: decimal.NewFromInt(-45)}
@@ -61,7 +61,7 @@ func TestReconcile_StillHaltsOnAGenuinelyUntrackedPosition(t *testing.T) {
 // mirroring production: the open path sets it on one goroutine while reconcile reads it on another
 // (the 5s poll and the WebSocket-pushed pass are both separate goroutines).
 func TestOpenInFlight_IsRaceFree(t *testing.T) {
-	e := &RealTrader{InstID: "DOGE"}
+	e := &BotTrader{InstID: "DOGE"}
 	var wg sync.WaitGroup
 
 	wg.Add(1)

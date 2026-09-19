@@ -168,7 +168,7 @@ func (s *Server) Routes() http.Handler {
 	// Manual SL/TP edit for real positions (CLAUDE.md §27's real-trading plan §3b, 2026-09-03):
 	// real-trading-only, unlike Close above which is paper-only today — paper positions have no
 	// exchange leg to reason about, real positions have no in-process manual-close-flag mechanism
-	// to reuse (they're watched by RealTrader's own tick monitor, not PaperTrader's).
+	// to reuse (they're watched by BotTrader's own tick monitor, not PaperTrader's).
 	mux.HandleFunc("POST /api/positions/{id}/adjust", s.handleAdjustPosition)
 
 	// CLAUDE.md §15.6/§15.7: the shared account's current balance and its timeline, backing the
@@ -438,7 +438,7 @@ func (s *Server) handleStrategyStats(w http.ResponseWriter, r *http.Request) {
 	}
 	mode, ok := statsMode(r.URL.Query().Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
 	stats, err := s.Repo.StrategyStatsFor(r.Context(), id, mode)
@@ -449,14 +449,14 @@ func (s *Server) handleStrategyStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
-// assignmentMode resolves the mode query param/body field to "paper" or "real" — CLAUDE.md
+// assignmentMode resolves the mode query param/body field to "paper" or "bot" — CLAUDE.md
 // real-trading readiness plan, 2026-09-04: strategy_assignments is now mode-scoped. Defaults to
 // "paper" (every caller before this change implicitly meant paper trading).
 func assignmentMode(raw string) (string, bool) {
 	switch raw {
 	case "":
 		return "paper", true
-	case "paper", "real":
+	case "paper", "bot":
 		return raw, true
 	default:
 		return "", false
@@ -468,7 +468,7 @@ func (s *Server) handleListAssignments(w http.ResponseWriter, r *http.Request) {
 	enabledOnly := r.URL.Query().Get("enabledOnly") == "true"
 	mode, ok := assignmentMode(r.URL.Query().Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
 	list, err := s.Repo.ListAssignments(r.Context(), instID, enabledOnly, mode)
@@ -487,7 +487,7 @@ func (s *Server) handleCreateAssignment(w http.ResponseWriter, r *http.Request) 
 	}
 	mode, ok := assignmentMode(req.Mode)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
 	req.Mode = mode
@@ -550,12 +550,12 @@ type positionsListResponse struct {
 	Total int               `json:"total"`
 }
 
-// realOrderToPosition maps a real_orders row onto the port.PaperOrder-shaped DTO the panel already
+// botOrderToPosition maps a bot_orders row onto the port.PaperOrder-shaped DTO the panel already
 // consumes for paper/demo positions (CLAUDE.md real-trading readiness plan, 2026-09-04) — keeps
 // /api/positions a single response shape regardless of which table backed the row. ParentOrderID/
 // Variant don't exist for real orders (no shadow-fork mechanic, §27.3) so they're left at their
 // paper-shaped defaults (nil/"baseline"); Status is the one field only real rows populate.
-func realOrderToPosition(o port.RealOrder) port.PaperOrder {
+func botOrderToPosition(o port.BotOrder) port.PaperOrder {
 	status := o.Status
 	return port.PaperOrder{
 		ID:                   o.ID,
@@ -574,7 +574,7 @@ func realOrderToPosition(o port.RealOrder) port.PaperOrder {
 		ClosePx:              o.ClosePx,
 		RealizedPnL:          o.RealizedPnL,
 		FeaturesJSON:         o.FeaturesJSON,
-		Mode:                 "real",
+		Mode:                 "bot",
 		PnLMaxPct:            o.PnLMaxPct,
 		PnLMinPct:            o.PnLMinPct,
 		Variant:              "baseline",
@@ -599,7 +599,7 @@ func realOrderToPosition(o port.RealOrder) port.PaperOrder {
 // real-trading readiness plan, 2026-09-04: closes the "typo'd mode silently returns 0 rows" gap.
 func positionsMode(raw string) (string, bool) {
 	switch raw {
-	case "", "paper", "demo", "real":
+	case "", "paper", "demo", "bot":
 		return raw, true
 	default:
 		return "", false
@@ -609,14 +609,14 @@ func positionsMode(raw string) (string, bool) {
 // handleListPositions serves the positions panel (CLAUDE.md §11.4): filterable by mode
 // (paper/demo/real), instrument, open/closed, sortable by opened_at/closed_at/pnl/inst_id, and
 // paged via page/pageSize (page is 0-indexed; pageSize defaults to defaultPositionsPageSize,
-// capped at maxPositionsPageSize). mode="real" routes to real_orders (its own table, CLAUDE.md
+// capped at maxPositionsPageSize). mode="bot" routes to bot_orders (its own table, CLAUDE.md
 // real-trading readiness plan, 2026-09-04) rather than paper_orders, mapped through
-// realOrderToPosition so the response shape stays identical either way.
+// botOrderToPosition so the response shape stays identical either way.
 func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	mode, ok := positionsMode(q.Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper, demo, or real)")
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper, demo, or bot)")
 		return
 	}
 	filter := port.PositionFilter{
@@ -648,20 +648,20 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 	filter.Limit = pageSize
 	filter.Offset = page * pageSize
 
-	if mode == "real" {
-		realList, err := s.Repo.ListRealPositions(r.Context(), filter)
+	if mode == "bot" {
+		realList, err := s.Repo.ListBotPositions(r.Context(), filter)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		total, err := s.Repo.CountRealPositions(r.Context(), filter)
+		total, err := s.Repo.CountBotPositions(r.Context(), filter)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		list := make([]port.PaperOrder, len(realList))
 		for i, o := range realList {
-			list[i] = realOrderToPosition(o)
+			list[i] = botOrderToPosition(o)
 		}
 		writeJSON(w, http.StatusOK, positionsListResponse{Items: list, Total: total})
 		return
@@ -681,14 +681,14 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 }
 
 // idMode resolves the required ?mode= query param on an ID-addressed positions endpoint
-// (close/adjust/adjustments) to "paper" or "real" — CLAUDE.md real-trading readiness plan,
-// 2026-09-04: paper_orders.id and real_orders.id are independent sequences post-table-split, so an
+// (close/adjust/adjustments) to "paper" or "bot" — CLAUDE.md real-trading readiness plan,
+// 2026-09-04: paper_orders.id and bot_orders.id are independent sequences post-table-split, so an
 // id is no longer globally unique and the caller must say which table it means. Required (no
 // default), unlike positionsMode/statsMode/assignmentMode — defaulting here would silently target
 // the wrong table for whichever mode isn't the default.
 func idMode(raw string) (string, bool) {
 	switch raw {
-	case "paper", "real":
+	case "paper", "bot":
 		return raw, true
 	default:
 		return "", false
@@ -696,9 +696,9 @@ func idMode(raw string) (string, bool) {
 }
 
 // handleClosePosition lets the panel close an open position by hand (2026-08-31 request, extended
-// to real positions 2026-09-04). cmd/api runs in a separate process from the PaperTrader/RealTrader
+// to real positions 2026-09-04). cmd/api runs in a separate process from the PaperTrader/BotTrader
 // that actually owns this order's instrument's tick stream, so it cannot close the order itself —
-// it only flags intent via RequestManualClose/RequestRealManualClose; the owning engine closes it
+// it only flags intent via RequestManualClose/RequestBotManualClose; the owning engine closes it
 // at the live price on its next tick, close_reason='manual', reported to the model as closed_early
 // (conductor.TerminalCategory).
 func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
@@ -709,15 +709,15 @@ func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
 	}
 	mode, ok := idMode(r.URL.Query().Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "mode query param is required (want paper or real)")
+		writeError(w, http.StatusBadRequest, "mode query param is required (want paper or bot)")
 		return
 	}
-	if mode == "real" {
-		if err := s.Repo.RequestRealManualClose(r.Context(), id); err != nil {
+	if mode == "bot" {
+		if err := s.Repo.RequestBotManualClose(r.Context(), id); err != nil {
 			// "not open" is overwhelmingly "it closed a moment ago", not "no such order" — most
 			// often the exchange's own stop-loss fired between the panel rendering the Close button
 			// and the operator clicking it (2026-09-09: exactly what happened with real orders 39
-			// and 40). The bare repository error said only "real order 39 is not open", which
+			// and 40). The bare repository error said only "bot order 39 is not open", which
 			// leaves the operator to guess whether their close failed or was unnecessary, and reads
 			// like a fault when nothing is wrong.
 			//
@@ -725,7 +725,7 @@ func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
 			// when the operator reported it there was no server-side record to look up at all.
 			msg := err.Error()
 			status := http.StatusConflict
-			if o, getErr := s.Repo.GetRealOrder(r.Context(), id); getErr == nil && o.ClosedAt != nil {
+			if o, getErr := s.Repo.GetBotOrder(r.Context(), id); getErr == nil && o.ClosedAt != nil {
 				reason := "manual"
 				if o.CloseReason != nil {
 					reason = *o.CloseReason
@@ -773,18 +773,18 @@ type adjustPositionRequest struct {
 // nothing else automated: the percentage the operator enters converts straight to a price via
 // priceFromMarginPct (entry price + leverage, no clamp), full stop.
 //
-// Amends the resting SL/TP order on the EXCHANGE first, then writes UpdateRealOrderSLTP +
-// RecordRealOrderAdjustment(source="manual") (2026-09-09 request). This handler used to be purely
+// Amends the resting SL/TP order on the EXCHANGE first, then writes UpdateBotOrderSLTP +
+// RecordBotOrderAdjustment(source="manual") (2026-09-09 request). This handler used to be purely
 // local, on the since-reversed assumption that there was no exchange-side order to amend — which
 // is exactly what left real positions protected only by this system's own tick monitor.
 //
 // Also sets manual_override (2026-09-06, explicit operator request): once an operator has edited a
-// position's SL/TP by hand, RealTrader.runUpdates skips it permanently — the model is never asked
+// position's SL/TP by hand, BotTrader.runUpdates skips it permanently — the model is never asked
 // about it again, so it can neither move the levels a second time nor close the position early
 // (rl_early_close). A manual correction has to stick.
-// handleAdjustPosition is real-trading-only by construction (mode="real" always routes to
-// real_orders, mode="paper" 404s since GetPaperOrder has no manual-unclamped-edit path) — the old
-// explicit o.Mode != "real" check is gone now that the table itself is the mode discriminator
+// handleAdjustPosition is real-trading-only by construction (mode="bot" always routes to
+// bot_orders, mode="paper" 404s since GetPaperOrder has no manual-unclamped-edit path) — the old
+// explicit o.Mode != "bot" check is gone now that the table itself is the mode discriminator
 // (CLAUDE.md real-trading readiness plan, 2026-09-04).
 func (s *Server) handleAdjustPosition(w http.ResponseWriter, r *http.Request) {
 	id, err := pathInt64(r, "id")
@@ -794,10 +794,10 @@ func (s *Server) handleAdjustPosition(w http.ResponseWriter, r *http.Request) {
 	}
 	mode, ok := idMode(r.URL.Query().Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "mode query param is required (want paper or real)")
+		writeError(w, http.StatusBadRequest, "mode query param is required (want paper or bot)")
 		return
 	}
-	if mode != "real" {
+	if mode != "bot" {
 		writeError(w, http.StatusBadRequest, "manual SL/TP adjustment is only supported for real positions")
 		return
 	}
@@ -812,7 +812,7 @@ func (s *Server) handleAdjustPosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	o, err := s.Repo.GetRealOrder(r.Context(), id)
+	o, err := s.Repo.GetBotOrder(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -883,17 +883,17 @@ func (s *Server) handleAdjustPosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.Repo.UpdateRealOrderSLTP(r.Context(), id, newSL, newTP, true); err != nil {
+	if err := s.Repo.UpdateBotOrderSLTP(r.Context(), id, newSL, newTP, true); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if req.SLPct != nil && !samePriceOrNil(newSL, o.SLPx) {
-		if err := s.Repo.RecordRealOrderAdjustment(r.Context(), id, "sl", o.SLPx, newSL, "manual"); err != nil {
+		if err := s.Repo.RecordBotOrderAdjustment(r.Context(), id, "sl", o.SLPx, newSL, "manual"); err != nil {
 			s.Logger.Warn("adjust position: record sl adjustment failed", "id", id, "error", err)
 		}
 	}
 	if req.TPPct != nil && !samePriceOrNil(newTP, o.TPPx) {
-		if err := s.Repo.RecordRealOrderAdjustment(r.Context(), id, "tp", o.TPPx, newTP, "manual"); err != nil {
+		if err := s.Repo.RecordBotOrderAdjustment(r.Context(), id, "tp", o.TPPx, newTP, "manual"); err != nil {
 			s.Logger.Warn("adjust position: record tp adjustment failed", "id", id, "error", err)
 		}
 	}
@@ -940,7 +940,7 @@ func priceFromMarginPct(entryPx, leverage decimal.Decimal, side string, pct deci
 // handleListPaperOrderAdjustments serves an order's in-trade SL/TP adjustment history (CLAUDE.md
 // §15.4/§15.12 revision, 2026-09-02) — the audit trail the order-detail modal shows on click,
 // replacing the old baseline-vs-rl_adjusted A/B comparison.
-// handleListPaperOrderAdjustments routes to real_order_adjustments when ?mode=real (CLAUDE.md
+// handleListPaperOrderAdjustments routes to bot_order_adjustments when ?mode=bot (CLAUDE.md
 // real-trading readiness plan, 2026-09-04) — defaults to "paper" when omitted (unlike
 // close/adjust, this is a read with no ambiguous side effect, so a missing mode is treated as the
 // pre-existing paper-only behavior rather than a 400, preserving every caller from before the
@@ -953,12 +953,12 @@ func (s *Server) handleListPaperOrderAdjustments(w http.ResponseWriter, r *http.
 	}
 	mode, ok := statsMode(r.URL.Query().Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
 	var adjustments []port.PaperOrderAdjustment
-	if mode == "real" {
-		adjustments, err = s.Repo.ListRealOrderAdjustments(r.Context(), id)
+	if mode == "bot" {
+		adjustments, err = s.Repo.ListBotOrderAdjustments(r.Context(), id)
 	} else {
 		adjustments, err = s.Repo.ListPaperOrderAdjustments(r.Context(), id)
 	}

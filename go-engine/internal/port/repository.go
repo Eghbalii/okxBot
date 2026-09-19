@@ -47,7 +47,7 @@ type StrategyAssignment struct {
 	InstID     string
 	Bar        string
 	Enabled    bool
-	// Mode scopes this assignment to "paper" or "real" trading (CLAUDE.md, real-trading readiness
+	// Mode scopes this assignment to "paper" or "bot" trading (CLAUDE.md, real-trading readiness
 	// plan, 2026-09-04) — paper and real trading each maintain independent strategy assignments,
 	// so a strategy tuned/enabled for paper trading has no effect on real trading and vice versa.
 	// Defaults to "paper" for every row created before this field existed.
@@ -89,7 +89,7 @@ type TokenStats struct {
 // payload once closed positions numbered in the hundreds (each row carries FeaturesJSON, the full
 // decision-time observation, averaging ~3.8KB). Now capped server-side to one page at a time.
 type PositionFilter struct {
-	Mode   string // "paper", "demo", "real", or "" for all
+	Mode   string // "paper", "demo", "bot", or "" for all
 	InstID string // "" for all
 	Open   *bool  // nil = both open and closed
 	// SortBy: "opened_at", "closed_at" (default), "pnl", "inst_id". SortDesc reverses order.
@@ -131,7 +131,7 @@ type PaperOrder struct {
 	FeesUSD      *decimal.Decimal
 	FundingUSD   *decimal.Decimal
 	FeaturesJSON json.RawMessage
-	Mode         string // "paper", "demo", or "real" (CLAUDE.md §11.4); defaults to "paper"
+	Mode         string // "paper", "demo", or "bot" (CLAUDE.md §11.4); defaults to "paper"
 
 	// PnLMaxPct/PnLMinPct are the peak and trough unrealized PnL this position has reached while
 	// open (CLAUDE.md §15.11) — model input, not reporting. A trade that ran to 90% of its target
@@ -170,18 +170,18 @@ type PaperOrder struct {
 	// nil for paper/demo rows). ExchangeOrderID identifies the entry market order; ExchangeAlgoOrderID
 	// identifies the resting SL/TP algo/conditional order placed immediately after — needed later
 	// to amend or cancel it, since real trading edits that order in place rather than forking
-	// (§27.3). Populated only by RealTrader's open path.
+	// (§27.3). Populated only by BotTrader's open path.
 	ExchangeOrderID     *string
 	ExchangeAlgoOrderID *string
 
 	// Status is nil for paper/demo rows (which have no fill lifecycle — a paper order is always
-	// instantly and fully filled) and set for rows sourced from real_orders (CLAUDE.md, real-
+	// instantly and fully filled) and set for rows sourced from bot_orders (CLAUDE.md, real-
 	// trading readiness plan, 2026-09-04): "pending", "partial", "filled", or "canceled". Lets
-	// handleListPositions present RealOrder rows through the same DTO shape the panel already
+	// handleListPositions present BotOrder rows through the same DTO shape the panel already
 	// consumes for paper/demo positions, without inventing a second response type.
 	Status *string
 	// ExchangeCloseOrderID/ExchangeRealizedPnL/ExchangeFee/ExchangeClosePx/LastError/LastErrorAt
-	// are real-trading pass-throughs, populated only by realOrderToPosition so the panel can show
+	// are real-trading pass-throughs, populated only by botOrderToPosition so the panel can show
 	// the EXCHANGE's own accounting for a close and raise a failed open/close to a human
 	// (2026-09-08). Always nil for a genuine paper order — paper has no exchange.
 	ExchangeCloseOrderID *string
@@ -192,17 +192,17 @@ type PaperOrder struct {
 	LastErrorAt          *time.Time
 }
 
-// RealOrder is a real-money trade placed against the exchange (CLAUDE.md, real-trading readiness
+// BotOrder is a real-money trade placed against the exchange (CLAUDE.md, real-trading readiness
 // plan, 2026-09-04) — stored in its own table, separate from PaperOrder/paper_orders. This is a
 // deliberate reversal of the earlier decision (§27.3/§27.7) to share paper_orders with mode='real':
-// a real order has a fill lifecycle (Status) with no paper-trading equivalent (a paper order is
+// a bot order has a fill lifecycle (Status) with no paper-trading equivalent (a paper order is
 // always instantly and fully filled), so it needs its own home rather than a column that would mean
-// nothing on every paper row. Every RealOrder IS mode="real" by construction — the table itself is
+// nothing on every paper row. Every BotOrder IS mode="bot" by construction — the table itself is
 // the mode discriminator, there is no Mode field here.
 //
 // Mirrors PaperOrder field-for-field except: no ParentOrderID/Variant (real trading has no
 // shadow-fork mechanic, §27.3) and no Mode (redundant by construction), plus the new Status field.
-type RealOrder struct {
+type BotOrder struct {
 	ID           int64
 	InstID       string
 	StrategyID   *int64
@@ -236,7 +236,7 @@ type RealOrder struct {
 	// "opening": the open order is accepted but its fill is still being confirmed.
 	// "closing": the flattening order has been sent, its fill not yet confirmed. Until it IS
 	// confirmed the position stays OPEN (ClosedAt nil) — a close is only recorded once the
-	// exchange agrees, which is the whole point (real order 3 was recorded closed with nothing
+	// exchange agrees, which is the whole point (bot order 3 was recorded closed with nothing
 	// having verified that).
 	Status string
 
@@ -280,15 +280,15 @@ type RealOrder struct {
 	PnLMaxPct decimal.Decimal
 	PnLMinPct decimal.Decimal
 
-	// StrategyName is joined in by ListRealPositions for display — not a stored column.
+	// StrategyName is joined in by ListBotPositions for display — not a stored column.
 	StrategyName string
 
 	// AdjustmentCount mirrors PaperOrder.AdjustmentCount: in-place SL/TP edits, counted by
-	// ListRealPositions only.
+	// ListBotPositions only.
 	AdjustmentCount int
 
 	// ManualOverride is set the moment an operator edits this order's SL/TP via the panel's Update
-	// button (handleAdjustPosition) and checked by RealTrader.runUpdates, which skips the order
+	// button (handleAdjustPosition) and checked by BotTrader.runUpdates, which skips the order
 	// entirely once it's true — the model is never even asked about it again, so it can neither
 	// move the levels a second time nor close the position early (rl_early_close). Explicit
 	// operator request, 2026-09-06: a manual correction must stick, not be overwritten or
@@ -303,25 +303,25 @@ type RealOrder struct {
 }
 
 // ManualOrder is a discretionary, operator-placed real-money order (docs/MANUAL_TRADE_PLAN.md),
-// stored in its own table fully independent of RealOrder/PaperOrder — a manual order has no
+// stored in its own table fully independent of BotOrder/PaperOrder — a manual order has no
 // strategy signal, no conductor category, and no observation vector, so it must never be picked up
-// by anything that iterates real_orders expecting those things (the RL reward pipeline,
+// by anything that iterates bot_orders expecting those things (the RL reward pipeline,
 // StrategyStatsFor, the SL/TP-adjustment A/B comparison). No Mode field: every row IS real by
-// construction, matching RealOrder's own "the table is the discriminator" precedent.
+// construction, matching BotOrder's own "the table is the discriminator" precedent.
 type ManualOrder struct {
 	ID         int64
 	InstID     string
 	ExecInstID string
-	Side       string // "buy" or "sell" — matches RealOrder.Side's convention, not PosSide's
+	Side       string // "buy" or "sell" — matches BotOrder.Side's convention, not PosSide's
 	// OrderType/LimitPx: both market and limit orders are supported from day one (§8.1) — unlike
 	// every automated order elsewhere in this codebase, which is market-only. LimitPx is nil for a
 	// market order.
 	OrderType string // "market" or "limit"
 	LimitPx   *decimal.Decimal
 
-	// Status tracks the fill lifecycle. "resting" is the one state RealOrder has never needed: a
+	// Status tracks the fill lifecycle. "resting" is the one state BotOrder has never needed: a
 	// limit order accepted by the exchange but not yet filled, distinct from "pending" (this
-	// process hasn't finished submitting it yet). See RealOrder.Status's own doc comment for the
+	// process hasn't finished submitting it yet). See BotOrder.Status's own doc comment for the
 	// other states' meaning, which this mirrors.
 	Status string
 
@@ -332,7 +332,7 @@ type ManualOrder struct {
 	Leverage    decimal.Decimal
 	Contracts   *decimal.Decimal
 
-	// ProtectedByStrategy is true when RealTrader already held a protective algo order on this
+	// ProtectedByStrategy is true when BotTrader already held a protective algo order on this
 	// token at open time, so ManualTrader deliberately did not place a second one (§8.4: a manual
 	// order and a strategy position can share one net exchange position in net mode, and OKX's
 	// conditional orders for a position don't stack cleanly). ExchangeAlgoOrderID stays nil in that
@@ -359,7 +359,7 @@ type ManualOrder struct {
 }
 
 // ManualOrderAdjustment is one in-place SL/TP edit on a manual order — exact mirror of
-// PaperOrderAdjustment/the real_order_adjustments shape, minus Source (every adjustment on a manual
+// PaperOrderAdjustment/the bot_order_adjustments shape, minus Source (every adjustment on a manual
 // order is manual by construction, so the column doesn't exist on manual_order_adjustments).
 type ManualOrderAdjustment struct {
 	ID        int64
@@ -374,7 +374,7 @@ type ManualOrderAdjustment struct {
 // writes one on POST /api/manual/orders; cmd/trader's ManualTrader is the ONLY thing that ever
 // claims one and calls PlaceOrder for it. This is what keeps "only one process holds credentials
 // and talks to the exchange" (CLAUDE.md §27.1) intact for manual trading, and is what avoids
-// RealTrader's reconcile loop halting real trading on what would otherwise look like an untracked
+// BotTrader's reconcile loop halting real trading on what would otherwise look like an untracked
 // exchange position (CLAUDE.md §48) — ManualTrader knows about its own order from the moment it
 // claims the intent, before it ever reaches the exchange.
 type ManualOrderIntent struct {
@@ -403,7 +403,7 @@ type ManualOrderIntent struct {
 // zero" is a fact the system can act on directly, and so reset events (ResetCount/LastResetAt) stay
 // visible for training-run analysis rather than looking like unlimited free money.
 type AccountEquity struct {
-	Mode       string          // "paper", "demo", or "real"
+	Mode       string          // "paper", "demo", or "bot"
 	InitialUSD decimal.Decimal // configured starting balance a reset returns to
 	EquityUSD  decimal.Decimal // "Total Equity": running balance SINCE the last reset/cap choice
 	// AccountBalanceUSD is "Account Balance": the real, continuous running total (CLAUDE.md
@@ -447,7 +447,7 @@ type EquityPoint struct {
 	CreatedAt time.Time
 }
 
-// ErrOrderAlreadyClosed is returned by CloseRealOrderConfirmed when the order was already closed
+// ErrOrderAlreadyClosed is returned by CloseBotOrderConfirmed when the order was already closed
 // by another path — a second reconciliation pass, the tick monitor racing reconcile, or a second
 // process after a restart. It is a normal outcome of concurrent close paths, not a failure: the
 // position IS closed, and the caller simply was not the one that closed it.
@@ -531,7 +531,7 @@ type Instrument struct {
 // InstrumentFilter narrows ListInstruments. A zero filter returns the whole roster.
 type InstrumentFilter struct {
 	Exchange string // "" = every exchange
-	// Enabled restricts to rows enabled for one consumer: "ingest", "paper", or "real". "" returns
+	// Enabled restricts to rows enabled for one consumer: "ingest", "paper", or "bot". "" returns
 	// rows regardless of their flags — which is what the panel's roster view wants, and what no
 	// trading service should ever ask for.
 	Enabled string
@@ -634,22 +634,22 @@ type Repository interface {
 	// exactly which variant was running where (CLAUDE.md §11.3) instead of relying on in-code
 	// wiring like cmd/paper-trader/main.go's current hardcoded []usecase.StrategyAssignment.
 	CreateAssignment(ctx context.Context, a StrategyAssignment) (int64, error)
-	// ListAssignments returns assignments for mode ("paper" or "real") — CLAUDE.md real-trading
+	// ListAssignments returns assignments for mode ("paper" or "bot") — CLAUDE.md real-trading
 	// readiness plan, 2026-09-04: paper and real trading each maintain independent assignments, so
 	// a strategy tuned/enabled for one has no effect on the other.
 	ListAssignments(ctx context.Context, instID string, enabledOnly bool, mode string) ([]StrategyAssignment, error)
 	SetAssignmentEnabled(ctx context.Context, id int64, enabled bool) error
 	DeleteAssignment(ctx context.Context, id int64) error
 
-	// StrategyStatsFor computes strategyID's track record for mode ("paper" or "real") — CLAUDE.md
+	// StrategyStatsFor computes strategyID's track record for mode ("paper" or "bot") — CLAUDE.md
 	// §11.3, extended to real trading by the real-trading readiness plan (2026-09-04): paper and
 	// real trading each have their own completely independent track record, sourced from
-	// paper_orders or real_orders respectively (real_orders has no "variant" column to filter by,
-	// unlike paper_orders' baseline/rl_adjusted split — every real_orders row already counts).
+	// paper_orders or bot_orders respectively (bot_orders has no "variant" column to filter by,
+	// unlike paper_orders' baseline/rl_adjusted split — every bot_orders row already counts).
 	StrategyStatsFor(ctx context.Context, strategyID int64, mode string) (StrategyStats, error)
 
 	// TokenStats24h computes each active token's last-24h activity (position count, PnL$, PnL%)
-	// for mode ("paper" or "real") — backs the panel's "Manage tokens" modal, one row per inst_id
+	// for mode ("paper" or "bot") — backs the panel's "Manage tokens" modal, one row per inst_id
 	// that has at least one trade closed in the window for that mode.
 	TokenStats24h(ctx context.Context, mode string) ([]TokenStats, error)
 
@@ -663,7 +663,7 @@ type Repository interface {
 	// ListPositions) are all the wrong shape for "fetch one order I already have the id of."
 	GetPaperOrder(ctx context.Context, id int64) (PaperOrder, error)
 	// SetExchangeAlgoOrderID records the resting SL/TP algo order's OKX-assigned ID on an already-
-	// open real order (CLAUDE.md §27.3), so it can be amended/cancelled later. Real trading only.
+	// open bot order (CLAUDE.md §27.3), so it can be amended/cancelled later. Real trading only.
 	SetExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error
 	// feesUSD (trading fee) and fundingUSD (accrued funding cost/credit, positive = cost) are
 	// already subtracted into realizedPnL (2026-09-06) — stored as their own columns, kept separate
@@ -675,7 +675,7 @@ type Repository interface {
 	// (usecase.RatchetSLTP) before calling this — the repository does not re-validate the ratchet
 	// constraint itself. This is now the ONLY path the RL SL/TP-adjust mechanic uses (2026-09-02
 	// revision): it used to fork the order instead of editing it, but fork volume grew large
-	// enough to distort per-strategy stats, so the mechanic now edits the one real order directly
+	// enough to distort per-strategy stats, so the mechanic now edits the one bot order directly
 	// and RecordPaperOrderAdjustment (below) is the audit trail that replaces the fork.
 	UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error
 	ListOpenPaperOrders(ctx context.Context, instID string) ([]PaperOrder, error)
@@ -704,78 +704,78 @@ type Repository interface {
 	// count, without pulling every row back just to len() it.
 	CountPositions(ctx context.Context, f PositionFilter) (int, error)
 
-	// OpenRealOrder inserts a real order and returns its id (CLAUDE.md, real-trading readiness
-	// plan, 2026-09-04). Callers MUST set o.Status explicitly (normally "pending" — see RealOrder's
+	// OpenBotOrder inserts a bot order and returns its id (CLAUDE.md, real-trading readiness
+	// plan, 2026-09-04). Callers MUST set o.Status explicitly (normally "pending" — see BotOrder's
 	// doc comment) rather than relying on the column default, matching this codebase's existing
 	// style of Go-side explicitness for values the caller already knows.
-	OpenRealOrder(ctx context.Context, o RealOrder) (int64, error)
-	// GetRealOrder fetches a single real order by id, mirroring GetPaperOrder.
-	GetRealOrder(ctx context.Context, id int64) (RealOrder, error)
-	// UpdateRealOrderStatus transitions a real order's fill status once PlaceOrder's outcome is
+	OpenBotOrder(ctx context.Context, o BotOrder) (int64, error)
+	// GetBotOrder fetches a single bot order by id, mirroring GetPaperOrder.
+	GetBotOrder(ctx context.Context, id int64) (BotOrder, error)
+	// UpdateBotOrderStatus transitions a real order's fill status once PlaceOrder's outcome is
 	// known: "filled" or "partial" (entryPx/size non-nil, corrected to the exchange-confirmed
 	// avgPx/filled size) or "canceled" (both nil — the entry never filled, no position exists).
-	UpdateRealOrderStatus(ctx context.Context, id int64, status string, entryPx, size, contracts *decimal.Decimal) error
-	// SetRealOrderFeatures records the decision-time observation snapshot, mirroring how
+	UpdateBotOrderStatus(ctx context.Context, id int64, status string, entryPx, size, contracts *decimal.Decimal) error
+	// SetBotOrderFeatures records the decision-time observation snapshot, mirroring how
 	// FeaturesJSON is set on PaperOrder — called once the fill/partial/canceled outcome is known.
-	SetRealOrderFeatures(ctx context.Context, id int64, featuresJSON json.RawMessage) error
-	// SetRealOrderExchangeAlgoOrderID mirrors SetExchangeAlgoOrderID for real_orders. Kept for
+	SetBotOrderFeatures(ctx context.Context, id int64, featuresJSON json.RawMessage) error
+	// SetBotOrderExchangeAlgoOrderID mirrors SetExchangeAlgoOrderID for bot_orders. Kept for
 	// parity even though no resting exchange-side algo order is placed today (§27.3's correction:
 	// real trading watches SL/TP in-process, the same mechanism paper trading uses).
-	SetRealOrderExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error
-	// CloseRealOrder mirrors ClosePaperOrder.
-	CloseRealOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error
-	// UpdateRealOrderSLTP mirrors UpdatePaperOrderSLTP — callers must have already clamped the
+	SetBotOrderExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error
+	// CloseBotOrder mirrors ClosePaperOrder.
+	CloseBotOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error
+	// UpdateBotOrderSLTP mirrors UpdatePaperOrderSLTP — callers must have already clamped the
 	// proposed levels (RatchetSLTP for a model-driven edit; no clamp at all for a manual/operator
 	// edit, CLAUDE.md §27.7 commit 6) before calling this. manualOverride is true only for the
-	// operator's own edit and locks the order out of RealTrader.runUpdates from then on
+	// operator's own edit and locks the order out of BotTrader.runUpdates from then on
 	// (2026-09-06) — pass false for every model-driven call.
-	UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal, manualOverride bool) error
-	// ListOpenRealOrders mirrors ListOpenPaperOrders, restricted to Status IN ('filled','partial')
+	UpdateBotOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal, manualOverride bool) error
+	// ListOpenBotOrders mirrors ListOpenPaperOrders, restricted to Status IN ('filled','partial')
 	// — a still-pending order is not yet a real position and must never be double-counted as one.
-	ListOpenRealOrders(ctx context.Context, instID string) ([]RealOrder, error)
-	// RequestRealManualClose mirrors RequestManualClose — flags an open real order for RealTrader's
-	// own tick loop to close on its next tick (RealTrader.monitorOpenPositions), the same
+	ListOpenBotOrders(ctx context.Context, instID string) ([]BotOrder, error)
+	// RequestBotManualClose mirrors RequestManualClose — flags an open bot order for BotTrader's
+	// own tick loop to close on its next tick (BotTrader.monitorOpenPositions), the same
 	// intent-not-action pattern RequestManualClose uses since cmd/api runs in a separate process.
-	RequestRealManualClose(ctx context.Context, id int64) error
-	// RequestRealManualCloseAll is RequestRealManualClose's bulk form, mirroring
+	RequestBotManualClose(ctx context.Context, id int64) error
+	// RequestBotManualCloseAll is RequestBotManualClose's bulk form, mirroring
 	// RequestManualCloseAll — used when the operator sets trading_state="stopped" for real mode
 	// from the panel: flags every open real position for close on its very next tick, independent
 	// of the trader process restarting. Returns how many rows were flagged.
-	RequestRealManualCloseAll(ctx context.Context) (int, error)
-	// SetRealOrderClosing records a flatten as IN FLIGHT: stores the flattening order's id and
+	RequestBotManualCloseAll(ctx context.Context) (int, error)
+	// SetBotOrderClosing records a flatten as IN FLIGHT: stores the flattening order's id and
 	// moves the row to status='closing' while leaving ClosedAt nil. The position stays open until
-	// the exchange confirms the flatten filled — real order 3 was recorded closed with nothing
+	// the exchange confirms the flatten filled — bot order 3 was recorded closed with nothing
 	// having verified OKX agreed, and a close that fails now leaves a row visibly stuck in
 	// 'closing' rather than one that lies about being flat.
-	SetRealOrderClosing(ctx context.Context, id int64, closeOrderID string) error
-	// CloseRealOrderConfirmed records an exchange-CONFIRMED close, storing OKX's own realized PnL,
+	SetBotOrderClosing(ctx context.Context, id int64, closeOrderID string) error
+	// CloseBotOrderConfirmed records an exchange-CONFIRMED close, storing OKX's own realized PnL,
 	// fee and fill price alongside the locally computed figures. The exchange values are nil-able:
 	// nil means it did not report that number, deliberately distinct from a genuine zero.
-	CloseRealOrderConfirmed(ctx context.Context, id int64, closePx decimal.Decimal, reason string,
+	CloseBotOrderConfirmed(ctx context.Context, id int64, closePx decimal.Decimal, reason string,
 		realizedPnL decimal.Decimal, exchangePnL, exchangeFee, exchangeClosePx *decimal.Decimal) error
-	// SetRealOrderExchangeRaw stores OKX's own record for one leg of a real order ("open" or
+	// SetBotOrderExchangeRaw stores OKX's own record for one leg of a bot order ("open" or
 	// "close"), captured when that leg reached a terminal state. Best-effort by contract: losing
 	// the record must never fail the trade it describes.
-	SetRealOrderExchangeRaw(ctx context.Context, id int64, leg string, raw json.RawMessage) error
-	// SetRealOrderError records the latest exchange failure for an order so the panel can raise it
+	SetBotOrderExchangeRaw(ctx context.Context, id int64, leg string, raw json.RawMessage) error
+	// SetBotOrderError records the latest exchange failure for an order so the panel can raise it
 	// to a human. Does NOT change status, so a stuck order stays visibly stuck.
-	SetRealOrderError(ctx context.Context, id int64, message string) error
-	// ClearRealOrderError clears a recorded error once a later attempt succeeded.
-	ClearRealOrderError(ctx context.Context, id int64) error
-	// UpdateRealOrderPnLExtremes mirrors UpdatePaperOrderPnLExtremes.
-	UpdateRealOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error
-	// ListRealPositions mirrors ListPositions for real_orders. f.Mode is ignored (every row is real
+	SetBotOrderError(ctx context.Context, id int64, message string) error
+	// ClearBotOrderError clears a recorded error once a later attempt succeeded.
+	ClearBotOrderError(ctx context.Context, id int64) error
+	// UpdateBotOrderPnLExtremes mirrors UpdatePaperOrderPnLExtremes.
+	UpdateBotOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error
+	// ListBotPositions mirrors ListPositions for bot_orders. f.Mode is ignored (every row is real
 	// by construction); f.Open filters on Status IN ('filled','partial') AND ClosedAt IS NULL/NOT
 	// NULL as appropriate — a "canceled" row is never "open" (nothing to be open) and is only ever
 	// returned by a f.Open == nil (both) or explicit closed query, never an open-only one.
-	ListRealPositions(ctx context.Context, f PositionFilter) ([]RealOrder, error)
-	// CountRealPositions mirrors CountPositions.
-	CountRealPositions(ctx context.Context, f PositionFilter) (int, error)
-	// RecordRealOrderAdjustment mirrors RecordPaperOrderAdjustment, into real_order_adjustments.
-	RecordRealOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error
-	// ListRealOrderAdjustments mirrors ListPaperOrderAdjustments. Reuses the PaperOrderAdjustment
-	// shape (the fields are identical) rather than a parallel RealOrderAdjustment struct.
-	ListRealOrderAdjustments(ctx context.Context, orderID int64) ([]PaperOrderAdjustment, error)
+	ListBotPositions(ctx context.Context, f PositionFilter) ([]BotOrder, error)
+	// CountBotPositions mirrors CountPositions.
+	CountBotPositions(ctx context.Context, f PositionFilter) (int, error)
+	// RecordBotOrderAdjustment mirrors RecordPaperOrderAdjustment, into bot_order_adjustments.
+	RecordBotOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error
+	// ListBotOrderAdjustments mirrors ListPaperOrderAdjustments. Reuses the PaperOrderAdjustment
+	// shape (the fields are identical) rather than a parallel BotOrderAdjustment struct.
+	ListBotOrderAdjustments(ctx context.Context, orderID int64) ([]PaperOrderAdjustment, error)
 
 	// CreateManualOrderIntent inserts a new open-order request (docs/MANUAL_TRADE_PLAN.md §2.3),
 	// status "pending", and returns its id — cmd/api's POST /api/manual/orders handler calls this
@@ -784,7 +784,7 @@ type Repository interface {
 	CreateManualOrderIntent(ctx context.Context, in ManualOrderIntent) (int64, error)
 	// ClaimPendingManualOrderIntents atomically claims every "pending" intent (UPDATE ... SET
 	// status='claimed' WHERE status='pending' RETURNING *, the same conditional-UPDATE-not-mutex
-	// pattern as RequestManualClose/CloseRealOrderConfirmed's own idempotency guards) and returns
+	// pattern as RequestManualClose/CloseBotOrderConfirmed's own idempotency guards) and returns
 	// them — called by ManualTrader's poll loop. A row claimed here is guaranteed not to be claimed
 	// by a second concurrent caller (relevant if ManualTrader is ever run with more than one
 	// instance, or during a restart race).
@@ -796,26 +796,26 @@ type Repository interface {
 	// still being placed (status="pending"/"claimed") before a manual_orders row exists yet.
 	GetManualOrderIntent(ctx context.Context, id int64) (ManualOrderIntent, error)
 
-	// OpenManualOrder inserts a new manual order and returns its id. Mirrors OpenRealOrder: callers
+	// OpenManualOrder inserts a new manual order and returns its id. Mirrors OpenBotOrder: callers
 	// must set o.Status explicitly.
 	OpenManualOrder(ctx context.Context, o ManualOrder) (int64, error)
 	// GetManualOrder fetches a single manual order by id.
 	GetManualOrder(ctx context.Context, id int64) (ManualOrder, error)
-	// UpdateManualOrderStatus mirrors UpdateRealOrderStatus, widened for the "resting" (limit order
-	// accepted, not yet filled) state RealOrder has never needed. entryPx/size/contracts are
+	// UpdateManualOrderStatus mirrors UpdateBotOrderStatus, widened for the "resting" (limit order
+	// accepted, not yet filled) state BotOrder has never needed. entryPx/size/contracts are
 	// nil-able the same way: non-nil for a "filled"/"partial" transition (corrected to the
 	// exchange-confirmed values), nil for "resting"/"canceled" (nothing to correct yet, or ever).
 	UpdateManualOrderStatus(ctx context.Context, id int64, status string, entryPx, size, contracts *decimal.Decimal) error
 	// SetManualOrderProtection records the outcome of ManualTrader's post-fill protection step
 	// (§8.4/§4): either algoOrderID is set (a fresh protective order was placed) or
-	// protectedByStrategy is true (RealTrader already had one on this token, so none was placed) —
+	// protectedByStrategy is true (BotTrader already had one on this token, so none was placed) —
 	// never both, and the caller is responsible for that invariant.
 	SetManualOrderProtection(ctx context.Context, id int64, algoOrderID *string, protectedByStrategy bool) error
-	// CloseManualOrder mirrors CloseRealOrderConfirmed (an exchange-confirmed close, not just an
-	// intent) — exchangeFee is nil-able, matching RealOrder's "nil means the exchange did not
+	// CloseManualOrder mirrors CloseBotOrderConfirmed (an exchange-confirmed close, not just an
+	// intent) — exchangeFee is nil-able, matching BotOrder's "nil means the exchange did not
 	// report it" convention.
 	CloseManualOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal, exchangeFee *decimal.Decimal) error
-	// RequestManualOrderClose mirrors RequestRealManualClose — flags an open manual order for
+	// RequestManualOrderClose mirrors RequestBotManualClose — flags an open manual order for
 	// ManualTrader's own tick loop to close on its next tick, the same intent-not-action pattern
 	// every cross-process close request in this codebase uses.
 	RequestManualOrderClose(ctx context.Context, id int64) error
@@ -824,16 +824,16 @@ type Repository interface {
 	// and a different terminal state (close_reason='canceled', no position ever existed), so this
 	// is a separate method rather than overloading RequestManualOrderClose's semantics (§8.1).
 	CancelManualOrder(ctx context.Context, id int64) error
-	// SetManualOrderError / ClearManualOrderError mirror the RealOrder equivalents.
+	// SetManualOrderError / ClearManualOrderError mirror the BotOrder equivalents.
 	SetManualOrderError(ctx context.Context, id int64, message string) error
 	ClearManualOrderError(ctx context.Context, id int64) error
-	// ListOpenManualOrders mirrors ListOpenRealOrders, restricted to Status IN ('filled','partial')
+	// ListOpenManualOrders mirrors ListOpenBotOrders, restricted to Status IN ('filled','partial')
 	// — a still-pending/resting order is not yet a real position.
 	ListOpenManualOrders(ctx context.Context, instID string) ([]ManualOrder, error)
 	// ListManualOrders lists manual orders for the panel, filtered/sorted/paged per f (f.Mode is
-	// ignored — every row is real by construction, matching ListRealPositions).
+	// ignored — every row is real by construction, matching ListBotPositions).
 	ListManualOrders(ctx context.Context, f PositionFilter) ([]ManualOrder, error)
-	// RecordManualOrderAdjustment / ListManualOrderAdjustments mirror the real_order_adjustments
+	// RecordManualOrderAdjustment / ListManualOrderAdjustments mirror the bot_order_adjustments
 	// equivalents, minus a Source column (every adjustment here is manual by construction).
 	RecordManualOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal) error
 	ListManualOrderAdjustments(ctx context.Context, orderID int64) ([]ManualOrderAdjustment, error)
@@ -842,7 +842,7 @@ type Repository interface {
 	// a reason="seed" history point) if it doesn't exist yet — CLAUDE.md §15.6.
 	GetAccountEquity(ctx context.Context, mode string, initialUSD decimal.Decimal) (AccountEquity, error)
 	// ApplyRealizedPnL adds pnl (signed) to mode's running balance and records an EquityPoint for
-	// it. If the resulting equity is <= 0 AND mode is not "real", it is reset back to InitialUSD,
+	// it. If the resulting equity is <= 0 AND mode is not "bot", it is reset back to InitialUSD,
 	// ResetCount/LastResetAt are recorded, and a second reason="reset" point is written
 	// (CLAUDE.md §15.7's "give it another chance"). Real mode NEVER auto-resets — a drained real
 	// account is a stop condition requiring a human decision, so it is left at/below zero and
@@ -856,7 +856,7 @@ type Repository interface {
 	// position sizing reads) is then set to max(new AccountBalanceUSD - safeMoneyUSD, 0) in the
 	// SAME transaction, with NO separate history point of its own: subtracting a reserve is a
 	// bookkeeping split, not a second P&L event, and must never be misreported as one (CLAUDE.md
-	// §32's balance-corruption incident — RecordEquityReal used to route the reserve-adjusted
+	// §32's balance-corruption incident — RecordEquityBot used to route the reserve-adjusted
 	// number through ApplyRealizedPnL directly, which dragged the real AccountBalanceUSD down by
 	// the reserve amount the very first time SafeMoneyUSD was set). Real mode never auto-resets,
 	// same carve-out as ApplyRealizedPnL. Returns the updated row.
@@ -961,7 +961,7 @@ type Repository interface {
 	// every exchange; limit 0 means no limit.
 	ListMarketTokens(ctx context.Context, exchange string, limit int) ([]MarketToken, error)
 
-	// GetPaperTradingConfig returns mode's ("paper" or "real") panel-editable control-box config
+	// GetPaperTradingConfig returns mode's ("paper" or "bot") panel-editable control-box config
 	// (CLAUDE.md real-trading readiness plan, 2026-09-04 — paper_trading_config is now one row per
 	// mode), seeding it at column defaults if it hasn't been written yet.
 	GetPaperTradingConfig(ctx context.Context, mode string) (PaperTradingConfig, error)

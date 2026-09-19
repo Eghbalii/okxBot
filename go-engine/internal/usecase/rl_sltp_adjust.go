@@ -83,7 +83,7 @@ func (e *PaperTrader) rlSizing(
 }
 
 // sizingConfig is the sizing-relevant slice of PaperTrader's config, extracted so
-// sizeFromModelAction can be shared verbatim by RealTrader (CLAUDE.md §27's plan, commit 2) without
+// sizeFromModelAction can be shared verbatim by BotTrader (CLAUDE.md §27's plan, commit 2) without
 // either type needing to embed the other. Position sizing math is the one piece of real financial
 // logic that MUST be identical between paper and real trading, so sharing the literal function is
 // the safest option, not merely the least-duplicate one.
@@ -116,7 +116,7 @@ func (e *PaperTrader) sizeFromAction(
 // (which has already called the model to get the buy/sell answer) can reuse the exact same sizing
 // and capping rules without issuing a second Predict for one decision — two calls would not only
 // waste inference, they could return different answers and leave the order sized against one while
-// its levels came from the other. A free function (not a PaperTrader method) so RealTrader can call
+// its levels came from the other. A free function (not a PaperTrader method) so BotTrader can call
 // it directly against its own sizingConfig, with zero risk of drift between the two.
 func sizeFromModelAction(
 	cfg sizingConfig,
@@ -342,7 +342,7 @@ func levelAdjustPct(current *decimal.Decimal, proposed, price decimal.Decimal) d
 
 // computeAdjustedLevels is the pure half of applyAdjustment: given an order, the model's proposed
 // action, and the current price, it returns the ratchet-checked new SL/TP and whether anything
-// actually changed. Extracted as a free function (CLAUDE.md §27's plan, commit 2) so RealTrader's
+// actually changed. Extracted as a free function (CLAUDE.md §27's plan, commit 2) so BotTrader's
 // in-place-edit update path (no shadow fork, §27.3) can reuse the exact same computation the
 // already-proven paper-trading path uses, with the IO (persisting, logging, recording the audit
 // row) left to each caller since paper and real trading write to different places.

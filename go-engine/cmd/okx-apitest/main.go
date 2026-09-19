@@ -17,7 +17,7 @@
 //     limit above market never fills against a market that hasn't rallied 5% in the test's
 //     lifetime), with attached TP/SL fields on the SAME order request (OKX's "Way 1": tpTriggerPx/
 //     tpOrdPx/slTriggerPx/slOrdPx) to verify that attach-on-open path works.
-//  3. Waits up to 60s using RealTrader.WaitForFillForTesting — a thin export of the actual
+//  3. Waits up to 60s using BotTrader.WaitForFillForTesting — a thin export of the actual
 //     production timeout/cancel function (CLAUDE.md §27.5), not a reimplementation — to confirm
 //     the real timeout+cancel logic actually cancels an order that will never fill. If it does NOT
 //     come back canceled, this script cancels it manually and prints a clearly flagged BUG line.
@@ -204,13 +204,13 @@ func runOrder1(ctx context.Context, client *rest.Client, raw rawClient, logger *
 		log.Fatalf("order #1 was rejected by OKX (sCode=%s sMsg=%s) — stopping", result.SCode, result.SMsg)
 	}
 
-	trader := &usecase.RealTrader{
+	trader := &usecase.BotTrader{
 		InstID:      instID,
 		Exchange:    client,
 		FillTimeout: 60 * time.Second,
 	}
 
-	fmt.Println("  waiting up to 60s via RealTrader.WaitForFillForTesting (the real production timeout+cancel path)...")
+	fmt.Println("  waiting up to 60s via BotTrader.WaitForFillForTesting (the real production timeout+cancel path)...")
 	status, err := trader.WaitForFillForTesting(ctx, result.OrdID, logger)
 	if err != nil {
 		fmt.Printf("  WaitForFillForTesting returned error: %v\n", err)
@@ -230,7 +230,7 @@ func runOrder1(ctx context.Context, client *rest.Client, raw rawClient, logger *
 		if err := client.CancelOrder(instID, result.OrdID); err != nil {
 			fmt.Printf("  BUG: manual cancel also failed: %v\n", err)
 		} else {
-			fmt.Println("  manual cancel succeeded. Investigate RealTrader.waitForFill / fillTimeout before relying on this in production.")
+			fmt.Println("  manual cancel succeeded. Investigate BotTrader.waitForFill / fillTimeout before relying on this in production.")
 		}
 		return
 	}

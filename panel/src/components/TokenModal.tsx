@@ -89,7 +89,7 @@ export default function TokenModal({
   const [stats, setStats] = useState<Record<string, TokenStats>>({})
   const [statsLoading, setStatsLoading] = useState(true)
   // Per-token affordability: the exchange's smallest acceptable position against the current
-  // per-token budget (2026-09-08). Real mode only — paper has no exchange minimums, so the
+  // per-token budget (2026-09-08). Bot mode only — paper has no exchange minimums, so the
   // endpoint returns an empty list there and the column simply stays blank.
   const [afford, setAfford] = useState<Record<string, TokenAffordability>>({})
   const [saving, setSaving] = useState(false)

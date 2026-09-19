@@ -18,7 +18,7 @@ const defaultEquityHistoryLimit = 1000
 // validModes are the trading modes an account balance is tracked for (CLAUDE.md §15.6). Validated
 // here rather than passed through, so a typo'd mode is a 400 instead of silently seeding a new
 // account row for a mode nothing ever trades against.
-var validModes = map[string]bool{"paper": true, "real": true}
+var validModes = map[string]bool{"paper": true, "bot": true}
 
 // queryMode resolves the ?mode= parameter, defaulting to "paper" (the only mode with a live writer
 // today, CLAUDE.md §11.4). Reports false after writing a 400 if the mode isn't recognized.
@@ -28,7 +28,7 @@ func queryMode(w http.ResponseWriter, r *http.Request) (string, bool) {
 		return "paper", true
 	}
 	if !validModes[mode] {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real): "+mode)
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot): "+mode)
 		return "", false
 	}
 	return mode, true
@@ -86,7 +86,7 @@ func (s *Server) handleSetAccountCap(w http.ResponseWriter, r *http.Request) {
 		mode = "paper"
 	}
 	if !validModes[mode] {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real): "+mode)
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot): "+mode)
 		return
 	}
 	if !req.NewCapUSD.IsPositive() {
@@ -106,7 +106,7 @@ func (s *Server) handleSetAccountCap(w http.ResponseWriter, r *http.Request) {
 	//           and the untraded remainder is a derived reserve.
 	var account port.AccountEquity
 	var err error
-	if mode == "real" {
+	if mode == "bot" {
 		account, err = s.Repo.SetTradingCap(r.Context(), mode, req.NewCapUSD)
 	} else {
 		account, err = s.Repo.SetAccountCap(r.Context(), mode, req.NewCapUSD)

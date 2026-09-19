@@ -27,8 +27,8 @@ func newTestRiskManager() *risk.Manager {
 	return risk.NewManager(limits, dec("1000"))
 }
 
-func newTestRealTrader(repo port.Repository, exchange *fakeExchangeClient, model port.ModelClient, strategies []StrategyAssignment) *RealTrader {
-	return &RealTrader{
+func newTestBotTrader(repo port.Repository, exchange *fakeExchangeClient, model port.ModelClient, strategies []StrategyAssignment) *BotTrader {
+	return &BotTrader{
 		InstID:              "BTC-USDT-SWAP",
 		Bars:                []string{"1m"},
 		CandleWindow:        100,
@@ -39,7 +39,7 @@ func newTestRealTrader(repo port.Repository, exchange *fakeExchangeClient, model
 		RiskManager:         newTestRiskManager(),
 		TdMode:              "cross",
 		PosMode:             "net",
-		Mode:                "real",
+		Mode:                "bot",
 		AccountInitialUSD:   dec("1000"),
 		MaxLeverage:         dec("10"),
 		MaxPositionPct:      dec("0.5"),
@@ -77,18 +77,18 @@ func realTraderWindow(price string) []domain.Candle {
 	return w
 }
 
-// TestOpenReal_ModelOpenPlacesRealOrderAndPersists confirms a model "open" answer results in
-// exactly one real PlaceOrder call and one persisted real_orders row with status="filled" (the
+// TestOpenBot_ModelOpenPlacesBotOrderAndPersists confirms a model "open" answer results in
+// exactly one real PlaceOrder call and one persisted bot_orders row with status="filled" (the
 // fake exchange's default order status has no explicit fill data, so waitForFill's no-ExchangeOrderID
 // fallback treats it as immediately filled).
-func TestOpenReal_ModelOpenPlacesRealOrderAndPersists(t *testing.T) {
+func TestOpenBot_ModelOpenPlacesBotOrderAndPersists(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClient{action: domain.Action{
 		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	// GetBalance backs buildObservation's AccountEquityUSD (ground truth from the exchange).
@@ -99,7 +99,7 @@ func TestOpenReal_ModelOpenPlacesRealOrderAndPersists(t *testing.T) {
 	}
 
 	if len(exchange.placedOrders) != 1 {
-		t.Fatalf("expected exactly 1 real order placed, got %d", len(exchange.placedOrders))
+		t.Fatalf("expected exactly 1 bot order placed, got %d", len(exchange.placedOrders))
 	}
 	if exchange.placedOrders[0].Side != "buy" {
 		t.Errorf("expected a buy order, got %q", exchange.placedOrders[0].Side)
@@ -120,14 +120,14 @@ func TestOpenReal_ModelOpenPlacesRealOrderAndPersists(t *testing.T) {
 	}
 }
 
-// TestOpenReal_ModelSkipPlacesNoOrder confirms a model "skip" answer declines the signal — no
+// TestOpenBot_ModelSkipPlacesNoOrder confirms a model "skip" answer declines the signal — no
 // exchange call, no persisted row.
-func TestOpenReal_ModelSkipPlacesNoOrder(t *testing.T) {
+func TestOpenBot_ModelSkipPlacesNoOrder(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}}
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionSkip}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
@@ -143,13 +143,13 @@ func TestOpenReal_ModelSkipPlacesNoOrder(t *testing.T) {
 	}
 }
 
-// TestOpenReal_NoModelDeclinesEntirely confirms a nil Model (not yet wired, or misconfigured)
-// never places a real order — real trading must not default to "open" when it has no answer.
-func TestOpenReal_NoModelDeclinesEntirely(t *testing.T) {
+// TestOpenBot_NoModelDeclinesEntirely confirms a nil Model (not yet wired, or misconfigured)
+// never places a bot order — real trading must not default to "open" when it has no answer.
+func TestOpenBot_NoModelDeclinesEntirely(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, nil, strategies)
+	rt := newTestBotTrader(repo, exchange, nil, strategies)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
@@ -168,12 +168,12 @@ func TestEvaluateStrategies_OnePositionPerTokenBlocksASecondOpen(t *testing.T) {
 	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}}
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.3"), LeverageFrac: dec("0.2")}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
 	// Pre-seed an already-open real position for this instrument directly in the fake.
-	repo.realOrders[999] = port.RealOrder{ID: 999, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("99"), Size: dec("10"), Leverage: dec("1")}
-	repo.nextRealID = 999
+	repo.realOrders[999] = port.BotOrder{ID: 999, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("99"), Size: dec("10"), Leverage: dec("1")}
+	repo.nextBotID = 999
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -184,18 +184,18 @@ func TestEvaluateStrategies_OnePositionPerTokenBlocksASecondOpen(t *testing.T) {
 }
 
 // TestEvaluateStrategies_PendingOrderDoesNotBlockASecondOpen confirms a still-pending (not yet
-// filled) real order does NOT occupy the one-position-per-token slot — CLAUDE.md real-trading
+// filled) bot order does NOT occupy the one-position-per-token slot — CLAUDE.md real-trading
 // readiness plan, 2026-09-04: a pending row is visible on the panel but is not yet a real position.
 func TestEvaluateStrategies_PendingOrderDoesNotBlockASecondOpen(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}}
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.3"), LeverageFrac: dec("0.2")}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
-	repo.realOrders[999] = port.RealOrder{ID: 999, InstID: rt.InstID, Status: "pending", Side: "buy", EntryPx: dec("99"), Size: dec("10"), Leverage: dec("1")}
-	repo.nextRealID = 999
+	repo.realOrders[999] = port.BotOrder{ID: 999, InstID: rt.InstID, Status: "pending", Side: "buy", EntryPx: dec("99"), Size: dec("10"), Leverage: dec("1")}
+	repo.nextBotID = 999
 
 	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
@@ -205,18 +205,18 @@ func TestEvaluateStrategies_PendingOrderDoesNotBlockASecondOpen(t *testing.T) {
 	}
 }
 
-// TestApplyRealAdjustment_AmendsTheExchangeThenPersists confirms the SL/TP edit reaches the
+// TestApplyBotAdjustment_AmendsTheExchangeThenPersists confirms the SL/TP edit reaches the
 // EXCHANGE, not just the database (2026-09-09 request). This test previously asserted the exact
-// opposite — that an adjustment made ZERO exchange calls — which is the behavior real order 33
+// opposite — that an adjustment made ZERO exchange calls — which is the behavior bot order 33
 // exposed as unsafe: a stop moved only locally leaves OKX holding the old one.
-func TestApplyRealAdjustment_AmendsTheExchangeThenPersists(t *testing.T) {
+func TestApplyBotAdjustment_AmendsTheExchangeThenPersists(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl := dec("95")
 	algoID := "algo-7"
-	order := port.RealOrder{
+	order := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl,
 		Size: dec("10"), Leverage: dec("1"), ExchangeAlgoOrderID: &algoID,
 	}
@@ -226,7 +226,7 @@ func TestApplyRealAdjustment_AmendsTheExchangeThenPersists(t *testing.T) {
 	// (removed 2026-09-04, explicit operator decision), so it applies in full since it's in the
 	// risk-reducing direction for a long (98 > 95).
 	action := &domain.Action{Action: domain.ActionUpdate, SLPx: dec("98")}
-	rt.applyRealAdjustment(context.Background(), order, action, dec("100"), testLogger())
+	rt.applyBotAdjustment(context.Background(), order, action, dec("100"), testLogger())
 
 	if len(exchange.amendedAlgoOrders) != 1 {
 		t.Fatalf("expected the adjustment to amend the resting exchange order once, got %d", len(exchange.amendedAlgoOrders))
@@ -242,7 +242,7 @@ func TestApplyRealAdjustment_AmendsTheExchangeThenPersists(t *testing.T) {
 	if updated.SLPx == nil || !updated.SLPx.Equal(dec("98")) {
 		t.Errorf("expected SL applied in full at 98 (no size cap), got %v", updated.SLPx)
 	}
-	adjustments, _ := repo.ListRealOrderAdjustments(context.Background(), 1)
+	adjustments, _ := repo.ListBotOrderAdjustments(context.Background(), 1)
 	if len(adjustments) != 1 {
 		t.Fatalf("expected exactly 1 adjustment row, got %d", len(adjustments))
 	}
@@ -255,69 +255,69 @@ func TestApplyRealAdjustment_AmendsTheExchangeThenPersists(t *testing.T) {
 // are "both old" and "both new"; the state this guards against is the exchange holding the old
 // stop while the database claims the new one, which would hide an unprotected level behind a row
 // that looks correct.
-func TestApplyRealAdjustment_ExchangeAmendFailureLeavesLevelsUnchanged(t *testing.T) {
+func TestApplyBotAdjustment_ExchangeAmendFailureLeavesLevelsUnchanged(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{amendAlgoErr: context.DeadlineExceeded}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl := dec("95")
 	algoID := "algo-7"
-	order := port.RealOrder{
+	order := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl,
 		Size: dec("10"), Leverage: dec("1"), ExchangeAlgoOrderID: &algoID,
 	}
 	repo.realOrders[1] = order
 
 	action := &domain.Action{Action: domain.ActionUpdate, SLPx: dec("98")}
-	rt.applyRealAdjustment(context.Background(), order, action, dec("100"), testLogger())
+	rt.applyBotAdjustment(context.Background(), order, action, dec("100"), testLogger())
 
 	updated := repo.realOrders[1]
 	if updated.SLPx == nil || !updated.SLPx.Equal(dec("95")) {
 		t.Errorf("a failed exchange amend must leave the stored stop at 95, got %v", updated.SLPx)
 	}
-	if adjustments, _ := repo.ListRealOrderAdjustments(context.Background(), 1); len(adjustments) != 0 {
+	if adjustments, _ := repo.ListBotOrderAdjustments(context.Background(), 1); len(adjustments) != 0 {
 		t.Errorf("a failed amend must record no adjustment row, got %d", len(adjustments))
 	}
 }
 
-// TestCloseReal_ExchangeFailureDoesNotCloseInDB confirms exchange-first ordering: if PlaceOrder
-// (the flattening order) fails, CloseRealOrder must never be called — a DB failure-to-flatten
+// TestCloseBot_ExchangeFailureDoesNotCloseInDB confirms exchange-first ordering: if PlaceOrder
+// (the flattening order) fails, CloseBotOrder must never be called — a DB failure-to-flatten
 // must never leave the system believing a still-open real position is closed.
-func TestCloseReal_ExchangeFailureDoesNotCloseInDB(t *testing.T) {
+func TestCloseBot_ExchangeFailureDoesNotCloseInDB(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{placeOrderErr: context.DeadlineExceeded}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
-	order := port.RealOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+	order := port.BotOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
 	repo.realOrders[1] = order
 
-	err := rt.closeReal(context.Background(), order, dec("110"), "sl", testLogger())
+	err := rt.closeBot(context.Background(), order, dec("110"), "sl", testLogger())
 	if err == nil {
-		t.Fatal("expected closeReal to return an error when the flattening order fails")
+		t.Fatal("expected closeBot to return an error when the flattening order fails")
 	}
 	if repo.realOrders[1].ClosedAt != nil {
 		t.Error("expected the order to remain open in the DB when the exchange close failed")
 	}
 }
 
-// TestCloseReal_SucceedsAndReportsTerminal confirms a successful close places exactly one
+// TestCloseBot_SucceedsAndReportsTerminal confirms a successful close places exactly one
 // flattening order, closes the DB row, and (with a model configured) delivers the terminal call.
-func TestCloseReal_SucceedsAndReportsTerminal(t *testing.T) {
+func TestCloseBot_SucceedsAndReportsTerminal(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClient{}
-	rt := newTestRealTrader(repo, exchange, model, nil)
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	rt := newTestBotTrader(repo, exchange, model, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 	// The terminal call needs a buildable observation like any other: v8 refuses to send a short
 	// one, so a trade closed with no candle window trains nothing (docs/RL_V8_PLAN.md).
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("110")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
-	order := port.RealOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+	order := port.BotOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
 	repo.realOrders[1] = order
 
-	if err := rt.closeReal(context.Background(), order, dec("110"), "tp", testLogger()); err != nil {
-		t.Fatalf("closeReal returned error: %v", err)
+	if err := rt.closeBot(context.Background(), order, dec("110"), "tp", testLogger()); err != nil {
+		t.Fatalf("closeBot returned error: %v", err)
 	}
 	if len(exchange.placedOrders) != 1 {
 		t.Fatalf("expected exactly 1 flattening order, got %d", len(exchange.placedOrders))
@@ -339,11 +339,11 @@ func TestCloseReal_SucceedsAndReportsTerminal(t *testing.T) {
 func TestMonitorOpenPositions_ManualCloseTakesPriorityOverSLTPTouch(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
 	sl := dec("95")
-	order := port.RealOrder{
+	order := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("100"), SLPx: &sl,
 		Size: dec("10"), Leverage: dec("1"), ManualCloseRequested: true,
 	}
@@ -372,10 +372,10 @@ func TestReconcile_ExchangeReportsFlatClosesLocallyOpenPosition(t *testing.T) {
 		positions: nil, // exchange reports no open position
 		balances:  []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
 	}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
-	order := port.RealOrder{ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+	order := port.BotOrder{ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
 	repo.realOrders[1] = order
 
 	rt.reconcile(context.Background(), testLogger())
@@ -399,8 +399,8 @@ func TestReconcile_UntrackedExchangePositionHalts(t *testing.T) {
 		positions: []domain.Position{{InstID: "BTC-USDT-SWAP", Pos: dec("1"), PosSide: "long"}},
 		balances:  []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
 	}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
 	rt.reconcile(context.Background(), testLogger())
 
@@ -417,9 +417,9 @@ func TestReconcile_MatchingStateIsANoOp(t *testing.T) {
 		positions: []domain.Position{{InstID: "BTC-USDT-SWAP", Pos: dec("1"), PosSide: "long"}},
 		balances:  []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
 	}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
-	repo.realOrders[1] = port.RealOrder{ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.realOrders[1] = port.BotOrder{ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
 
 	rt.reconcile(context.Background(), testLogger())
 
@@ -435,7 +435,7 @@ func TestReconcile_MatchingStateIsANoOp(t *testing.T) {
 }
 
 // TestBuildObservation_UsesExchangeBalanceNotRepoBookkeeping is the dedicated test CLAUDE.md §27's
-// plan §6 calls out by name: RealTrader does not own its account balance the way PaperTrader owns
+// plan §6 calls out by name: BotTrader does not own its account balance the way PaperTrader owns
 // its shared "paper" row — the exchange is ground truth. This asserts the two sources deliberately
 // DISAGREE and the observation still reports the exchange's number, not Repo.GetAccountEquity's —
 // the one spot flagged as easy to get wrong by careless reuse of PaperTrader's buildObservation.
@@ -443,10 +443,10 @@ func TestBuildObservation_UsesExchangeBalanceNotRepoBookkeeping(t *testing.T) {
 	repo := newFakeRepository()
 	// Seed a DIFFERENT balance in the repo's own bookkeeping row than what the exchange reports —
 	// if buildObservation ever fell back to (or blended with) this, the test would catch it.
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("42")}
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("42")}
 
 	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("777")}}}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 	rt.candles = map[string][]domain.Candle{"1m": testCandleWindow(100)}
 
 	obs, err := rt.buildObservation(context.Background(), "1m", dec("100"), testLogger())
@@ -465,7 +465,7 @@ func TestBuildObservation_UsesExchangeBalanceNotRepoBookkeeping(t *testing.T) {
 // balance (real-trading readiness plan, 2026-09-04 operator decision: capital that must stay
 // untouched even if every open position were liquidated, since isolated margin never draws on it).
 func TestTradableEquity_SubtractsSafeMoney(t *testing.T) {
-	rt := &RealTrader{SafeMoneyUSD: dec("20")}
+	rt := &BotTrader{SafeMoneyUSD: dec("20")}
 	got := rt.tradableEquity(dec("40"))
 	if !got.Equal(dec("20")) {
 		t.Errorf("expected tradableEquity(40) with SafeMoneyUSD=20 to be 20, got %s", got)
@@ -476,7 +476,7 @@ func TestTradableEquity_SubtractsSafeMoney(t *testing.T) {
 // negative — negative would misleadingly read as a drained/liquidated account rather than merely
 // under the configured reserve.
 func TestTradableEquity_FloorsAtZero(t *testing.T) {
-	rt := &RealTrader{SafeMoneyUSD: dec("20")}
+	rt := &BotTrader{SafeMoneyUSD: dec("20")}
 	got := rt.tradableEquity(dec("15"))
 	if !got.IsZero() {
 		t.Errorf("expected tradableEquity(15) with SafeMoneyUSD=20 to floor at 0, got %s", got)
@@ -486,7 +486,7 @@ func TestTradableEquity_FloorsAtZero(t *testing.T) {
 // TestTradableEquity_ZeroSafeMoneyIsIdentity confirms the default (SafeMoneyUSD unset) preserves
 // today's behavior of using the full reported balance.
 func TestTradableEquity_ZeroSafeMoneyIsIdentity(t *testing.T) {
-	rt := &RealTrader{}
+	rt := &BotTrader{}
 	got := rt.tradableEquity(dec("777"))
 	if !got.Equal(dec("777")) {
 		t.Errorf("expected tradableEquity(777) with no SafeMoneyUSD to be unchanged, got %s", got)
@@ -498,7 +498,7 @@ func TestTradableEquity_ZeroSafeMoneyIsIdentity(t *testing.T) {
 func TestBuildObservation_SubtractsSafeMoneyFromExchangeBalance(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("40")}}}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 	rt.SafeMoneyUSD = dec("20")
 	rt.candles = map[string][]domain.Candle{"1m": testCandleWindow(100)}
 
@@ -512,11 +512,11 @@ func TestBuildObservation_SubtractsSafeMoneyFromExchangeBalance(t *testing.T) {
 	}
 }
 
-// TestOpenReal_FillConfirmedImmediatelyRecordsEntryPx confirms the fast path (the expected case
+// TestOpenBot_FillConfirmedImmediatelyRecordsEntryPx confirms the fast path (the expected case
 // for a market order against a liquid perpetual, CLAUDE.md §27.5): a "filled" status with an
 // AvgPx overwrites the naive candle-close entry price with the exchange's own reported fill price,
 // and the persisted row's Status reads "filled".
-func TestOpenReal_FillConfirmedImmediatelyRecordsEntryPx(t *testing.T) {
+func TestOpenBot_FillConfirmedImmediatelyRecordsEntryPx(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{
 		balances:    []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
@@ -524,7 +524,7 @@ func TestOpenReal_FillConfirmedImmediatelyRecordsEntryPx(t *testing.T) {
 	}
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5")}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.FillTimeout = 50 * time.Millisecond
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
@@ -547,12 +547,12 @@ func TestOpenReal_FillConfirmedImmediatelyRecordsEntryPx(t *testing.T) {
 	}
 }
 
-// TestOpenReal_NeverFilledCancelsAndOpensNothing confirms the timeout path: an order that never
+// TestOpenBot_NeverFilledCancelsAndOpensNothing confirms the timeout path: an order that never
 // fills is canceled, no OPEN position exists (openPositions still returns empty since it filters to
-// filled/partial only), but the pending row STAYS in real_orders with status="canceled" — the
+// filled/partial only), but the pending row STAYS in bot_orders with status="canceled" — the
 // deliberate answer to "does a timed-out attempt stay visible" (CLAUDE.md real-trading readiness
 // plan, 2026-09-04).
-func TestOpenReal_NeverFilledCancelsAndOpensNothing(t *testing.T) {
+func TestOpenBot_NeverFilledCancelsAndOpensNothing(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{
 		balances:    []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
@@ -560,7 +560,7 @@ func TestOpenReal_NeverFilledCancelsAndOpensNothing(t *testing.T) {
 	}
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5")}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.FillTimeout = 50 * time.Millisecond
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
@@ -585,11 +585,11 @@ func TestOpenReal_NeverFilledCancelsAndOpensNothing(t *testing.T) {
 	}
 }
 
-// TestOpenReal_PendingRowVisibleBeforeFillResolves confirms the pending row is inserted BEFORE
+// TestOpenBot_PendingRowVisibleBeforeFillResolves confirms the pending row is inserted BEFORE
 // waitForFill resolves — CLAUDE.md real-trading readiness plan, 2026-09-04's core requirement
-// ("show pending on the panel"). Simulated by checking that OpenRealOrder was called with
+// ("show pending on the panel"). Simulated by checking that OpenBotOrder was called with
 // status="pending" as an intermediate state, independent of what the fill eventually resolves to.
-func TestOpenReal_PendingRowVisibleBeforeFillResolves(t *testing.T) {
+func TestOpenBot_PendingRowVisibleBeforeFillResolves(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{
 		balances:    []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
@@ -597,7 +597,7 @@ func TestOpenReal_PendingRowVisibleBeforeFillResolves(t *testing.T) {
 	}
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5")}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.FillTimeout = 50 * time.Millisecond
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
@@ -605,23 +605,23 @@ func TestOpenReal_PendingRowVisibleBeforeFillResolves(t *testing.T) {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
 	}
 
-	if repo.nextRealID != 1 {
-		t.Fatalf("expected exactly one real_orders row inserted, got nextRealID=%d", repo.nextRealID)
+	if repo.nextBotID != 1 {
+		t.Fatalf("expected exactly one bot_orders row inserted, got nextBotID=%d", repo.nextBotID)
 	}
 	// By the time evaluateStrategies returns, the row has already transitioned to "filled" — this
-	// test's own value is structural (openReal's insert-then-update-status sequencing exists at
+	// test's own value is structural (openBot's insert-then-update-status sequencing exists at
 	// all, exercised by every open test in this file), not a distinct runtime assertion beyond what
-	// TestOpenReal_ModelOpenPlacesRealOrderAndPersists already checks.
+	// TestOpenBot_ModelOpenPlacesBotOrderAndPersists already checks.
 	if repo.realOrders[1].Status != "filled" {
 		t.Errorf("expected the row to have transitioned to filled, got %q", repo.realOrders[1].Status)
 	}
 }
 
-// TestOpenReal_PartialFillRecordsActualSize confirms a partial fill within the timeout window is
+// TestOpenBot_PartialFillRecordsActualSize confirms a partial fill within the timeout window is
 // recorded as a real, smaller-than-intended position (proportional to what actually filled), not
 // left ambiguous or recorded at the originally requested size (CLAUDE.md §27.5), with
 // Status="partial".
-func TestOpenReal_PartialFillRecordsActualSize(t *testing.T) {
+func TestOpenBot_PartialFillRecordsActualSize(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{
 		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
@@ -631,7 +631,7 @@ func TestOpenReal_PartialFillRecordsActualSize(t *testing.T) {
 	}
 	model := &fakeModelClient{action: domain.Action{Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5")}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.FillTimeout = 50 * time.Millisecond
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 
@@ -665,23 +665,23 @@ func TestOpenReal_PartialFillRecordsActualSize(t *testing.T) {
 	}
 }
 
-// TestCloseReal_UnfilledFlattenDoesNotMarkClosed confirms the flatten leg's own fill-timeout path:
+// TestCloseBot_UnfilledFlattenDoesNotMarkClosed confirms the flatten leg's own fill-timeout path:
 // if the closing order doesn't fully fill, the DB row must NOT be marked closed — a partially- or
 // un-flattened position is still real exposure on the exchange (CLAUDE.md §27.5).
-func TestCloseReal_UnfilledFlattenDoesNotMarkClosed(t *testing.T) {
+func TestCloseBot_UnfilledFlattenDoesNotMarkClosed(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{
 		orderStatus: &domain.OrderStatus{State: "live", AccFillSz: dec("0"), Sz: dec("1")},
 	}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 	rt.FillTimeout = 50 * time.Millisecond
 
-	order := port.RealOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
+	order := port.BotOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
 	repo.realOrders[1] = order
 
-	err := rt.closeReal(context.Background(), order, dec("110"), "sl", testLogger())
+	err := rt.closeBot(context.Background(), order, dec("110"), "sl", testLogger())
 	if err == nil {
-		t.Fatal("expected closeReal to return an error when the flatten order doesn't fill")
+		t.Fatal("expected closeBot to return an error when the flatten order doesn't fill")
 	}
 	if repo.realOrders[1].ClosedAt != nil {
 		t.Error("expected the order to remain open in the DB when the flatten didn't confirm fill")
@@ -692,7 +692,7 @@ func TestCloseReal_UnfilledFlattenDoesNotMarkClosed(t *testing.T) {
 }
 
 // TestHandleTick_RunUpdatesThrottled covers the RLAdjustInterval throttle added 2026-09-05 during
-// the first real-trading activation: RealTrader.handleTick previously called runUpdates
+// the first real-trading activation: BotTrader.handleTick previously called runUpdates
 // unconditionally on EVERY tick with no throttle at all (unlike PaperTrader's identical
 // shouldRunRLAdjust gate), which measured live as a continuous, unnecessary Postgres query load
 // across 10 real instruments at OKX's live tick rate. A burst of ticks within one interval must
@@ -701,12 +701,12 @@ func TestHandleTick_RunUpdatesThrottled(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClientRL{action: domain.Action{}}
-	rt := newTestRealTrader(repo, exchange, model, nil)
+	rt := newTestBotTrader(repo, exchange, model, nil)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
 	sl := dec("95")
-	repo.realOrders[1] = port.RealOrder{
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("100"), SLPx: &sl,
 		Size: dec("10"), Leverage: dec("1"),
 	}
@@ -742,12 +742,12 @@ func TestRunUpdates_SkipsManualOverrideEntirely(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClientRL{action: domain.Action{Action: domain.ActionClose}}
-	rt := newTestRealTrader(repo, exchange, model, nil)
+	rt := newTestBotTrader(repo, exchange, model, nil)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
 	sl := dec("95")
-	repo.realOrders[1] = port.RealOrder{
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("100"), SLPx: &sl,
 		Size: dec("10"), Leverage: dec("1"), ManualOverride: true, OpenedAt: time.Now(),
 	}
@@ -774,12 +774,12 @@ func TestHandleTick_RunUpdatesFiresOnFirstTick(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClientRL{action: domain.Action{}}
-	rt := newTestRealTrader(repo, exchange, model, nil)
+	rt := newTestBotTrader(repo, exchange, model, nil)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
 	sl := dec("95")
-	repo.realOrders[1] = port.RealOrder{
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy", EntryPx: dec("100"), SLPx: &sl,
 		Size: dec("10"), Leverage: dec("1"),
 	}
@@ -800,15 +800,15 @@ func TestHandleTick_RunUpdatesFiresOnFirstTick(t *testing.T) {
 func TestTradableEquityFor_PrefersStoredCapOverSafeMoney(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
-	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+	if _, err := repo.GetAccountEquity(ctx, "bot", dec("40")); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if _, err := repo.SetTradingCap(ctx, "real", dec("20")); err != nil {
+	if _, err := repo.SetTradingCap(ctx, "bot", dec("20")); err != nil {
 		t.Fatalf("set cap: %v", err)
 	}
 
 	// SafeMoneyUSD deliberately zero — the cap alone must produce the reserve.
-	e := &RealTrader{Repo: repo}
+	e := &BotTrader{Repo: repo}
 	if got := e.tradableEquityFor(ctx, dec("40")); !got.Equal(dec("20")) {
 		t.Fatalf("tradable against a $20 cap on a $40 balance: want 20, got %s", got)
 	}
@@ -825,23 +825,23 @@ func TestTradableEquityFor_PrefersStoredCapOverSafeMoney(t *testing.T) {
 func TestTradableEquityFor_FallsBackToSafeMoneyWithoutCap(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
-	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+	if _, err := repo.GetAccountEquity(ctx, "bot", dec("40")); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
-	e := &RealTrader{Repo: repo, SafeMoneyUSD: dec("15")}
+	e := &BotTrader{Repo: repo, SafeMoneyUSD: dec("15")}
 	if got := e.tradableEquityFor(ctx, dec("40")); !got.Equal(dec("25")) {
 		t.Fatalf("no cap set, want safe-money fallback 25, got %s", got)
 	}
 }
 
-// Regression for the first real order ever placed (id 3, SOL short, 2026-09-08): it opened with a
+// Regression for the first bot order ever placed (id 3, SOL short, 2026-09-08): it opened with a
 // stop and NO take-profit. The model answered with a non-zero SLPx and a ZERO TPPx, and the old
 // code treated "the model returned levels" as all-or-nothing — so the model's stop replaced the
 // strategy's while the strategy's target was dropped rather than kept, and nothing downstream
-// re-supplied one. Since RealTrader watches SL/TP in-process, that position could only ever end at
+// re-supplied one. Since BotTrader watches SL/TP in-process, that position could only ever end at
 // its stop, at the 6h timeout, or by hand.
-func TestOpenReal_ModelStopWithoutTargetStillGetsATarget(t *testing.T) {
+func TestOpenBot_ModelStopWithoutTargetStillGetsATarget(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
 	// The exact shape that produced order 3: a stop from the model, no target.
@@ -850,7 +850,7 @@ func TestOpenReal_ModelStopWithoutTargetStillGetsATarget(t *testing.T) {
 		SLPx: dec("98"), TPPx: dec("0"),
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
@@ -881,7 +881,7 @@ func TestOpenReal_ModelStopWithoutTargetStillGetsATarget(t *testing.T) {
 // The second layer of the same fix: when NEITHER the model nor the strategy supplies a target,
 // EnsureTarget derives one from the stop distance. The per-side fallback above cannot help here —
 // there is nothing to fall back TO — so without this a position would still open with no target.
-func TestOpenReal_NoTargetAnywhereStillGetsOneFromStopDistance(t *testing.T) {
+func TestOpenBot_NoTargetAnywhereStillGetsOneFromStopDistance(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClient{action: domain.Action{
@@ -892,7 +892,7 @@ func TestOpenReal_NoTargetAnywhereStillGetsOneFromStopDistance(t *testing.T) {
 	sig := buySignal()
 	sig.TPPct = dec("0")
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: sig}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	// The derivation is a RATIO of the stop distance, so it only applies where one is configured —
 	// production sets this (paper_trading.rl_clamps.min_tp_sl_ratio); the shared harness does not.
 	rt.RLClamps.MinTPSLRatio = dec("1.5")
@@ -919,18 +919,18 @@ func TestOpenReal_NoTargetAnywhereStillGetsOneFromStopDistance(t *testing.T) {
 }
 
 // The panel's Max/Min columns read pnl_max_pct/pnl_min_pct, which sat at 0 for every real position
-// no matter how far it moved: UpdateRealOrderPnLExtremes was implemented in internal/postgres and
-// declared on the port, but RealTrader never called it — PaperTrader has trackPnLExtremes,
-// RealTrader had no counterpart (found 2026-09-08).
+// no matter how far it moved: UpdateBotOrderPnLExtremes was implemented in internal/postgres and
+// declared on the port, but BotTrader never called it — PaperTrader has trackPnLExtremes,
+// BotTrader had no counterpart (found 2026-09-08).
 func TestMonitorOpenPositions_TracksPnLExtremes(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	// A long at 100 with levels far enough out that no tick below closes it.
 	sl, tp := dec("50"), dec("200")
-	orderID, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	orderID, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
 		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
 	})
@@ -971,44 +971,44 @@ func TestMonitorOpenPositions_TracksPnLExtremes(t *testing.T) {
 // RecordExchangeBalance is what records that change. Doing both counts the same profit or loss
 // twice against a real account.
 //
-// This was previously "correct" only by accident — closeRealWith did call ApplyRealizedPnL, but it
-// always failed on a foreign key real order ids cannot satisfy, and the error was swallowed. This
+// This was previously "correct" only by accident — closeBotWith did call ApplyRealizedPnL, but it
+// always failed on a foreign key bot order ids cannot satisfy, and the error was swallowed. This
 // test makes the behavior intentional so dropping that constraint (migration 000026) cannot
 // silently reintroduce the double-count.
-func TestCloseReal_DoesNotApplyRealizedPnLToTheAccount(t *testing.T) {
+func TestCloseBot_DoesNotApplyRealizedPnLToTheAccount(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 	rt.AccountInitialUSD = dec("40")
 
-	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+	if _, err := repo.GetAccountEquity(ctx, "bot", dec("40")); err != nil {
 		t.Fatalf("seed account: %v", err)
 	}
 
 	sl, tp := dec("90"), dec("110")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
 		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("open real order: %v", err)
 	}
-	o, err := repo.GetRealOrder(ctx, id)
+	o, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get real order: %v", err)
 	}
 
-	before, err := repo.GetAccountEquity(ctx, "real", dec("40"))
+	before, err := repo.GetAccountEquity(ctx, "bot", dec("40"))
 	if err != nil {
 		t.Fatalf("read account: %v", err)
 	}
 
-	if err := rt.closeReal(ctx, o, dec("110"), "tp", testLogger()); err != nil {
-		t.Fatalf("closeReal: %v", err)
+	if err := rt.closeBot(ctx, o, dec("110"), "tp", testLogger()); err != nil {
+		t.Fatalf("closeBot: %v", err)
 	}
 
-	after, err := repo.GetAccountEquity(ctx, "real", dec("40"))
+	after, err := repo.GetAccountEquity(ctx, "bot", dec("40"))
 	if err != nil {
 		t.Fatalf("read account: %v", err)
 	}
@@ -1025,30 +1025,30 @@ func TestCloseReal_DoesNotApplyRealizedPnLToTheAccount(t *testing.T) {
 // A close must not be recorded until the exchange confirms the flatten filled. Real order 3 was
 // written as closed with nothing having verified OKX agreed — if the flatten had failed, the
 // database would have said "flat" while a real position stayed open on the exchange.
-func TestCloseReal_FailedFlattenLeavesPositionOpenAndRecordsError(t *testing.T) {
+func TestCloseBot_FailedFlattenLeavesPositionOpenAndRecordsError(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{placeOrderErr: fmt.Errorf("okx: insufficient margin")}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, tp := dec("90"), dec("110")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
 		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	o, err := repo.GetRealOrder(ctx, id)
+	o, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 
-	if err := rt.closeReal(ctx, o, dec("110"), "tp", testLogger()); err == nil {
+	if err := rt.closeBot(ctx, o, dec("110"), "tp", testLogger()); err == nil {
 		t.Fatal("expected the close to fail when the exchange rejects the flatten")
 	}
 
-	after, err := repo.GetRealOrder(ctx, id)
+	after, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get after: %v", err)
 	}
@@ -1063,7 +1063,7 @@ func TestCloseReal_FailedFlattenLeavesPositionOpenAndRecordsError(t *testing.T) 
 // The exchange's own fill price, realized PnL and fee are what get stored — not the tick price that
 // merely triggered the close, and not a locally computed PnL. Order 3 recorded close_px=102 from a
 // stale trigger tick while the market was at 103.9.
-func TestCloseReal_PrefersExchangeReportedNumbers(t *testing.T) {
+func TestCloseBot_PrefersExchangeReportedNumbers(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
@@ -1071,27 +1071,27 @@ func TestCloseReal_PrefersExchangeReportedNumbers(t *testing.T) {
 		State: "filled", AvgPx: dec("103.9"), AccFillSz: dec("1"), Sz: dec("1"),
 		Pnl: dec("0.25"), Fee: dec("-0.02"),
 	}}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, tp := dec("90"), dec("110")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
 		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	o, err := repo.GetRealOrder(ctx, id)
+	o, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 
 	// Triggered by a tick at 110, but the exchange actually filled at 103.9.
-	if err := rt.closeReal(ctx, o, dec("110"), "tp", testLogger()); err != nil {
-		t.Fatalf("closeReal: %v", err)
+	if err := rt.closeBot(ctx, o, dec("110"), "tp", testLogger()); err != nil {
+		t.Fatalf("closeBot: %v", err)
 	}
 
-	after, err := repo.GetRealOrder(ctx, id)
+	after, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get after: %v", err)
 	}
@@ -1132,25 +1132,25 @@ func TestCloseEarly_IgnoredWhenDisabled(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 	rt.RLEarlyClose = false
 
 	sl, tp := dec("90"), dec("110")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
 		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	o, err := repo.GetRealOrder(ctx, id)
+	o, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 
 	rt.closeEarly(ctx, o, dec("105"), testLogger())
 
-	after, err := repo.GetRealOrder(ctx, id)
+	after, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get after: %v", err)
 	}
@@ -1168,25 +1168,25 @@ func TestCloseEarly_ClosesWhenEnabled(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 	rt.RLEarlyClose = true
 
 	sl, tp := dec("90"), dec("110")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
 		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	o, err := repo.GetRealOrder(ctx, id)
+	o, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 
 	rt.closeEarly(ctx, o, dec("105"), testLogger())
 
-	after, err := repo.GetRealOrder(ctx, id)
+	after, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get after: %v", err)
 	}
@@ -1204,14 +1204,14 @@ func TestCloseEarly_ClosesWhenEnabled(t *testing.T) {
 // level, and because EnsureStop only fills a NIL one, running EnsureStop first left the stale stop
 // in place to be dropped with nothing to replace it — refusing the open. Observed live rejecting
 // every PUMP signal for 20 minutes while the strategy emitted a perfectly good stop each time.
-func TestOpenReal_StaleWrongSideStopIsReplacedNotRefused(t *testing.T) {
+func TestOpenBot_StaleWrongSideStopIsReplacedNotRefused(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
 	model := &fakeModelClient{action: domain.Action{
 		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
@@ -1267,7 +1267,7 @@ func TestSetOpensDisabled_TakesEffectOnARunningEngine(t *testing.T) {
 		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
@@ -1291,33 +1291,33 @@ func TestSetOpensDisabled_TakesEffectOnARunningEngine(t *testing.T) {
 }
 
 // A confirmed close must leave the row in a settled state, not the in-flight 'closing' marker
-// SetRealOrderClosing wrote while the flatten was pending. Real order 5 (SOL) showed the bug: the
+// SetBotOrderClosing wrote while the flatten was pending. Real order 5 (SOL) showed the bug: the
 // flatten filled on OKX, closed_at was set, no error was recorded, and the exchange reported flat —
 // but status stayed 'closing' forever, so the panel displayed a completed close as stuck.
-func TestCloseReal_ConfirmedCloseClearsTheClosingStatus(t *testing.T) {
+func TestCloseBot_ConfirmedCloseClearsTheClosingStatus(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, tp := dec("90"), dec("110")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
 		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	o, err := repo.GetRealOrder(ctx, id)
+	o, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 
-	if err := rt.closeReal(ctx, o, dec("110"), "manual", testLogger()); err != nil {
-		t.Fatalf("closeReal: %v", err)
+	if err := rt.closeBot(ctx, o, dec("110"), "manual", testLogger()); err != nil {
+		t.Fatalf("closeBot: %v", err)
 	}
 
-	after, err := repo.GetRealOrder(ctx, id)
+	after, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get after: %v", err)
 	}
@@ -1333,33 +1333,33 @@ func TestCloseReal_ConfirmedCloseClearsTheClosingStatus(t *testing.T) {
 }
 
 // The open-side fill state does NOT survive a close, and this documents that rather than pretending
-// otherwise: SetRealOrderClosing overwrites status with 'closing' on the way in, so by the time the
+// otherwise: SetBotOrderClosing overwrites status with 'closing' on the way in, so by the time the
 // exchange confirms there is nothing left to restore. Recording "this opened partially filled"
 // durably needs its own column; status on a closed row is display-only.
-func TestCloseReal_ConfirmedCloseSettlesEvenAPartialFill(t *testing.T) {
+func TestCloseBot_ConfirmedCloseSettlesEvenAPartialFill(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, tp := dec("90"), dec("110")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
 		Size: dec("10"), Leverage: dec("1"), Status: "partial", OpenedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	o, err := repo.GetRealOrder(ctx, id)
+	o, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 
-	if err := rt.closeReal(ctx, o, dec("110"), "manual", testLogger()); err != nil {
-		t.Fatalf("closeReal: %v", err)
+	if err := rt.closeBot(ctx, o, dec("110"), "manual", testLogger()); err != nil {
+		t.Fatalf("closeBot: %v", err)
 	}
 
-	after, err := repo.GetRealOrder(ctx, id)
+	after, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get after: %v", err)
 	}
@@ -1375,7 +1375,7 @@ func TestCloseReal_ConfirmedCloseSettlesEvenAPartialFill(t *testing.T) {
 // and its record is final (2026-09-09 request: "don't call it each time — when the system reads
 // it, save the JSON there"). Every later view is then a row read rather than a live API call
 // against a rate-limit budget shared with real trading.
-func TestCloseReal_CapturesExchangeRecordsForBothLegs(t *testing.T) {
+func TestCloseBot_CapturesExchangeRecordsForBothLegs(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
@@ -1383,7 +1383,7 @@ func TestCloseReal_CapturesExchangeRecordsForBothLegs(t *testing.T) {
 		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
 	}}
 	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
-	rt := newTestRealTrader(repo, exchange, model, strategies)
+	rt := newTestBotTrader(repo, exchange, model, strategies)
 	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
 	exchange.balances = []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}
 
@@ -1398,10 +1398,10 @@ func TestCloseReal_CapturesExchangeRecordsForBothLegs(t *testing.T) {
 		t.Fatal("the open leg's exchange record must be captured once the fill is confirmed")
 	}
 
-	if err := rt.closeReal(ctx, open[0], dec("110"), "manual", testLogger()); err != nil {
-		t.Fatalf("closeReal: %v", err)
+	if err := rt.closeBot(ctx, open[0], dec("110"), "manual", testLogger()); err != nil {
+		t.Fatalf("closeBot: %v", err)
 	}
-	after, err := repo.GetRealOrder(ctx, open[0].ID)
+	after, err := repo.GetBotOrder(ctx, open[0].ID)
 	if err != nil {
 		t.Fatalf("get after: %v", err)
 	}
@@ -1420,29 +1420,29 @@ func TestCloseReal_CapturesExchangeRecordsForBothLegs(t *testing.T) {
 
 // Capturing an audit record is best-effort by design: a failure must degrade the audit trail, never
 // the trade it describes.
-func TestCloseReal_ExchangeRecordFailureDoesNotAffectTheClose(t *testing.T) {
+func TestCloseBot_ExchangeRecordFailureDoesNotAffectTheClose(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{getOrderRawErr: fmt.Errorf("okx: rate limited")}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, tp := dec("90"), dec("110")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
 		Size: dec("10"), Leverage: dec("1"), Status: "filled", OpenedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	o, err := repo.GetRealOrder(ctx, id)
+	o, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 
-	if err := rt.closeReal(ctx, o, dec("110"), "manual", testLogger()); err != nil {
+	if err := rt.closeBot(ctx, o, dec("110"), "manual", testLogger()); err != nil {
 		t.Fatalf("a failed record capture must not fail the close: %v", err)
 	}
-	after, err := repo.GetRealOrder(ctx, id)
+	after, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get after: %v", err)
 	}
@@ -1460,16 +1460,16 @@ func TestCloseReal_ExchangeRecordFailureDoesNotAffectTheClose(t *testing.T) {
 // 1, left 1 live on OKX behind a row recording a complete close, and the untracked position that
 // produced halted real trading for three hours. ETH (5 of 6) and DOGE (20 of 21) failed the same
 // way: whenever price moves in a position's favour, the same margin buys fewer contracts.
-func TestCloseReal_ClosesTheContractsActuallyOpened(t *testing.T) {
+func TestCloseBot_ClosesTheContractsActuallyOpened(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	inst := domain.Instrument{CtVal: dec("0.0001"), LotSz: dec("1"), MinSz: dec("1")}
 	exchange := &fakeExchangeClient{instrument: &inst}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	contracts := dec("2")
 	sl, tp := dec("70000"), dec("90000")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("78863.3"), SLPx: &sl, TPPx: &tp,
 		Size: dec("1.6124186773046364"), Leverage: dec("9.7819879055023189"),
 		Contracts: &contracts, Status: "filled", OpenedAt: time.Now(),
@@ -1477,14 +1477,14 @@ func TestCloseReal_ClosesTheContractsActuallyOpened(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	o, err := repo.GetRealOrder(ctx, id)
+	o, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 
 	// Closing at a price ABOVE entry — the favourable move that triggered the under-close.
-	if err := rt.closeReal(ctx, o, dec("79258.5"), "tp", testLogger()); err != nil {
-		t.Fatalf("closeReal: %v", err)
+	if err := rt.closeBot(ctx, o, dec("79258.5"), "tp", testLogger()); err != nil {
+		t.Fatalf("closeBot: %v", err)
 	}
 
 	if len(exchange.placedOrders) != 1 {
@@ -1499,15 +1499,15 @@ func TestCloseReal_ClosesTheContractsActuallyOpened(t *testing.T) {
 // Rows opened before the contract count was recorded have nothing better to fall back on, but the
 // fallback must at least size at the ENTRY price — the price the position was actually opened at —
 // rather than the current one.
-func TestCloseReal_LegacyRowFallsBackToEntryPriceSizing(t *testing.T) {
+func TestCloseBot_LegacyRowFallsBackToEntryPriceSizing(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	inst := domain.Instrument{CtVal: dec("0.0001"), LotSz: dec("1"), MinSz: dec("1")}
 	exchange := &fakeExchangeClient{instrument: &inst}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, tp := dec("70000"), dec("90000")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("78863.3"), SLPx: &sl, TPPx: &tp,
 		Size: dec("1.6124186773046364"), Leverage: dec("9.7819879055023189"),
 		Status: "filled", OpenedAt: time.Now(), // no Contracts — a pre-migration row
@@ -1515,13 +1515,13 @@ func TestCloseReal_LegacyRowFallsBackToEntryPriceSizing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	o, err := repo.GetRealOrder(ctx, id)
+	o, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 
-	if err := rt.closeReal(ctx, o, dec("79258.5"), "tp", testLogger()); err != nil {
-		t.Fatalf("closeReal: %v", err)
+	if err := rt.closeBot(ctx, o, dec("79258.5"), "tp", testLogger()); err != nil {
+		t.Fatalf("closeBot: %v", err)
 	}
 	if got := exchange.placedOrders[0].Sz; !got.Equal(dec("2")) {
 		t.Fatalf("legacy fallback must size at the entry price: want 2, got %s", got)
@@ -1541,13 +1541,13 @@ func TestReconcile_ClosesAPositionAlreadyPastItsStop(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	entry := dec("0.00000362")
 	sl := dec("0.0000035659802313184517469")
 	tp := dec("0.000003820187702322006")
 	contracts := dec("5")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: entry, SLPx: &sl, TPPx: &tp,
 		Size: dec("1.83"), Leverage: dec("9.8719062805175779"), Contracts: &contracts,
 		Status: "filled", OpenedAt: time.Now(),
@@ -1565,7 +1565,7 @@ func TestReconcile_ClosesAPositionAlreadyPastItsStop(t *testing.T) {
 
 	rt.reconcile(ctx, testLogger())
 
-	after, err := repo.GetRealOrder(ctx, id)
+	after, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get after: %v", err)
 	}
@@ -1584,11 +1584,11 @@ func TestReconcile_LeavesAHealthyPositionOpen(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
+	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, tp := dec("90"), dec("110")
 	contracts := dec("1")
-	id, err := repo.OpenRealOrder(ctx, port.RealOrder{
+	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp,
 		Size: dec("10"), Leverage: dec("1"), Contracts: &contracts,
 		Status: "filled", OpenedAt: time.Now(),
@@ -1603,7 +1603,7 @@ func TestReconcile_LeavesAHealthyPositionOpen(t *testing.T) {
 
 	rt.reconcile(ctx, testLogger())
 
-	after, err := repo.GetRealOrder(ctx, id)
+	after, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get after: %v", err)
 	}
@@ -1680,17 +1680,17 @@ func TestNetRealizedPnL_ExchangeGrossWithNoFeeReported(t *testing.T) {
 	}
 }
 
-// TestCloseRealWith_StoresTheExchangeNetAsRealizedPnL is the end-to-end guard: the stored
+// TestCloseBotWith_StoresTheExchangeNetAsRealizedPnL is the end-to-end guard: the stored
 // realized_pnl must be the exchange-derived net, not the local estimate. Real order 37 is the case
 // that made this matter — stored as a 0.0159 LOSS when the exchange's own figures make it a 0.0071
 // loss, off by roughly a full round-trip fee.
-func TestCloseRealWith_StoresTheExchangeNetAsRealizedPnL(t *testing.T) {
+func TestCloseBotWith_StoresTheExchangeNetAsRealizedPnL(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
-	o := port.RealOrder{
+	o := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
 		EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1"),
 	}
@@ -1699,8 +1699,8 @@ func TestCloseRealWith_StoresTheExchangeNetAsRealizedPnL(t *testing.T) {
 	gross := dec("0.0017")
 	fee := dec("-0.008776")
 	facts := &exchangeCloseFacts{PnL: &gross, Fee: &fee}
-	if err := rt.closeRealWith(context.Background(), o, dec("101"), "sl", true, facts, testLogger()); err != nil {
-		t.Fatalf("closeRealWith: %v", err)
+	if err := rt.closeBotWith(context.Background(), o, dec("101"), "sl", true, facts, testLogger()); err != nil {
+		t.Fatalf("closeBotWith: %v", err)
 	}
 
 	stored := repo.realOrders[1].RealizedPnL
@@ -1712,7 +1712,7 @@ func TestCloseRealWith_StoresTheExchangeNetAsRealizedPnL(t *testing.T) {
 	}
 }
 
-// algoOrderID is the helper the protection tests need — a RealOrder only counts as protected when
+// algoOrderID is the helper the protection tests need — a BotOrder only counts as protected when
 // it actually carries the exchange's algo id.
 func algoOrderID(id string) *string { return &id }
 
@@ -1738,9 +1738,9 @@ func TestMonitorOpenPositions_SkipsTheFlattenWhenTheExchangeAlreadyClosedIt(t *t
 			Pnl: dec("-5"), Fee: dec("-0.02"),
 		},
 	}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
-	repo.realOrders[1] = port.RealOrder{
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
 		EntryPx: dec("100"), SLPx: decPtr("96"), Size: dec("10"), Leverage: dec("1"),
 		ExchangeAlgoOrderID: algoOrderID("ALGO-1"),
@@ -1773,9 +1773,9 @@ func TestMonitorOpenPositions_StillFlattensWhenTheProtectiveOrderIsStillResting(
 	exchange := &fakeExchangeClient{
 		algoStatus: &domain.AlgoOrderStatus{State: "live"},
 	}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
-	repo.realOrders[1] = port.RealOrder{
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
 		EntryPx: dec("100"), SLPx: decPtr("96"), Size: dec("10"), Leverage: dec("1"),
 		ExchangeAlgoOrderID: algoOrderID("ALGO-1"),
@@ -1796,9 +1796,9 @@ func TestMonitorOpenPositions_StillFlattensWhenTheProtectiveOrderIsStillResting(
 func TestMonitorOpenPositions_FlattensWhenTheProtectiveOrderCannotBeRead(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{getAlgoErr: errors.New("gateway timeout")}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
-	repo.realOrders[1] = port.RealOrder{
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
 		EntryPx: dec("100"), SLPx: decPtr("96"), Size: dec("10"), Leverage: dec("1"),
 		ExchangeAlgoOrderID: algoOrderID("ALGO-1"),
@@ -1821,9 +1821,9 @@ func TestMonitorOpenPositions_ManualCloseIsNotDeferredToTheExchange(t *testing.T
 	exchange := &fakeExchangeClient{
 		algoStatus: &domain.AlgoOrderStatus{State: "effective", ActualSide: "sl", OrdID: "X"},
 	}
-	rt := newTestRealTrader(repo, exchange, nil, nil)
-	repo.accounts["real"] = port.AccountEquity{Mode: "real", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
-	repo.realOrders[1] = port.RealOrder{
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.realOrders[1] = port.BotOrder{
 		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
 		EntryPx: dec("100"), SLPx: decPtr("90"), Size: dec("10"), Leverage: dec("1"),
 		ExchangeAlgoOrderID:  algoOrderID("ALGO-1"),

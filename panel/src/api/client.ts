@@ -112,7 +112,7 @@ export const api = {
     request<{ ok: boolean }>(`/instruments/${id}`, { method: 'DELETE' }),
   runScan: () => requestList<ScanResult>('/market/scan', { method: 'POST' }),
 
-  // Service health + the real-trading halt, with the evidence that gates its reset.
+  // Service health + the bot-trading halt, with the evidence that gates its reset.
   health: async (): Promise<HealthResponse> => {
     const h = await request<HealthResponse>('/health')
     // Go marshals a nil slice as null, which would crash every consumer that maps over it — the
@@ -156,7 +156,7 @@ export const api = {
     request<void>(`/strategies/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   deleteStrategy: (id: number) => request<void>(`/strategies/${id}`, { method: 'DELETE' }),
   resetStrategy: (id: number) => request<void>(`/strategies/${id}/reset`, { method: 'POST' }),
-  // mode ("paper" or "real") scopes the track record — paper and real trading each have a fully
+  // mode ("paper" or "bot") scopes the track record — paper and bot trading each have a fully
   // independent one, sourced from paper_orders vs. real_orders respectively.
   strategyStats: (id: number, mode: PositionMode) => request<StrategyStats>(`/strategies/${id}/stats?mode=${mode}`),
 
@@ -209,8 +209,8 @@ export const api = {
   closePosition: (id: number, mode: PositionMode) =>
     request<{ ok: boolean }>(`/positions/${id}/close?mode=${mode}`, { method: 'POST' }),
 
-  // Manual SL/TP edit for real positions (CLAUDE.md §27's real-trading plan §3b, 2026-09-03) —
-  // real mode only, unlike closePosition above which also supports paper. Each percentage is
+  // Manual SL/TP edit for bot-trader positions (CLAUDE.md §27's real-trading plan §3b, 2026-09-03) —
+  // bot mode only, unlike closePosition above which also supports paper. Each percentage is
   // SIGNED and leverage-adjusted (negative = loss side, positive = profit side, e.g. -5 on a 10x
   // position moves that level to a 0.5% price move from entry) and is applied with NO clamp —
   // an explicit operator/admin action is trusted directly, unlike the model's own automated edits.
@@ -267,7 +267,7 @@ export const api = {
   // 2026-09-04), above the Positions table — mode selects which tab's data this serves.
   paperTradingStats: (mode: PositionMode) => request<PaperTradingStats>(`/paper-trading/stats?mode=${mode}`),
   // "Manage tokens" modal's per-token 24h stats table (2026-09-04 request) — paper-trading only,
-  // no mode param (TokenStats24h has no real-trading equivalent yet).
+  // no mode param (TokenStats24h has no bot-trading equivalent yet).
   tokenStats24h: (mode: PositionMode) => requestList<TokenStats>(`/paper-trading/token-stats?mode=${mode}`),
   // Per-token exchange minimums vs. the current per-token budget, for the Manage Tokens modal's
   // min-size column and auto-disabled tag (2026-09-08). Empty in paper mode by design.

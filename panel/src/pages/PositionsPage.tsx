@@ -31,8 +31,8 @@ function closeReasonBadge(reason: CloseReason | null) {
   return <span className={'badge ' + cls}>{reason}</span>
 }
 
-// Real-order fill-lifecycle status badge (CLAUDE.md real-trading readiness plan, 2026-09-04) —
-// shown only for real positions, where "pending"/"partial" carry real product meaning (an order
+// Bot Trader order fill-lifecycle status badge (CLAUDE.md real-trading readiness plan, 2026-09-04) —
+// shown only for bot-trader positions, where "pending"/"partial" carry real product meaning (an order
 // still in flight or a fill smaller than requested); "filled" is the unremarkable default so it's
 // dimmed rather than colored, and "canceled" reads distinctly from a normal closed/SL/TP row since
 // it never became a position at all.
@@ -105,9 +105,9 @@ function formatPct1(pct: number): string {
 
 export default function PositionsPage() {
   const { mode: rawMode } = useParams<{ mode: string }>()
-  // Only 'paper'/'real' are valid route segments — an unrecognized value (a stale bookmark, a typo)
+  // Only 'paper'/'bot' are valid route segments — an unrecognized value (a stale bookmark, a typo)
   // redirects to paper rather than silently misinterpreting it.
-  if (rawMode !== 'paper' && rawMode !== 'real') {
+  if (rawMode !== 'paper' && rawMode !== 'bot') {
     return <Navigate to="/positions/paper" replace />
   }
   const mode: PositionMode = rawMode
@@ -149,12 +149,12 @@ export default function PositionsPage() {
   // every row on every 5s poll to sort/paginate client-side had become a genuinely slow query and
   // a multi-MB payload. Any change to filter/sort/page now triggers a fresh, bounded query instead.
   //
-  // Cached per query (2026-09-13): switching between the Paper and Real tabs is a ROUTE change, so
-  // this whole page unmounts and `rows` restarts at null — and until it refills, the chart has no
-  // positions and cannot draw its green/red zones. That is the reported "the highlight takes a
-  // while to appear". These are the panel's largest payloads (measured: 210KB paper, 133KB real),
-  // so re-fetching and re-parsing them on every tab switch is the expensive part, not the ~50ms the
-  // server spends.
+  // Cached per query (2026-09-13): switching between the Paper and Bot Trader tabs is a ROUTE
+  // change, so this whole page unmounts and `rows` restarts at null — and until it refills, the
+  // chart has no positions and cannot draw its green/red zones. That is the reported "the highlight
+  // takes a while to appear". These are the panel's largest payloads (measured: 210KB paper, 133KB
+  // bot), so re-fetching and re-parsing them on every tab switch is the expensive part, not the
+  // ~50ms the server spends.
   //
   // wsRefreshCount is deliberately NOT part of the key (fixed 2026-09-14).
   //
@@ -269,7 +269,7 @@ export default function PositionsPage() {
       return
     }
     try {
-      await api.adjustPosition(id, 'real', body)
+      await api.adjustPosition(id, 'bot', body)
       setAdjustingId(null)
     } catch (err) {
       alert(`Failed to adjust position: ${(err as Error).message}`)
@@ -278,12 +278,12 @@ export default function PositionsPage() {
 
   // 12 always-shown columns (ID, Inst, Side, Strategy, TF, Entry, SL/TP, Leverage, Vol, Opened,
   // PnL, Max) plus showLiveColumns' 3 (Last, Updated, the close-button column), showClosedColumns'
-  // 3 (Closed, Reason, Fees — the last added 2026-09-06), and the real-only Status column.
-  const columnCount = 12 + (showLiveColumns ? 3 : 0) + (showClosedColumns ? 3 : 0) + (mode === 'real' ? 1 : 0)
+  // 3 (Closed, Reason, Fees — the last added 2026-09-06), and the bot-only Status column.
+  const columnCount = 12 + (showLiveColumns ? 3 : 0) + (showClosedColumns ? 3 : 0) + (mode === 'bot' ? 1 : 0)
 
   return (
     <div>
-      {/* The Paper/Real selector moved into the header (2026-09-12 request) — it is a mode the
+      {/* The Paper/Bot Trader selector moved into the header (2026-09-12 request) — it is a mode the
           whole panel operates in, not a control belonging to this table. */}
       <PaperTradingStatsBox mode={mode} />
       <PaperTradingConfigBox mode={mode} />
@@ -326,9 +326,9 @@ export default function PositionsPage() {
                 Inst
               </SortableTh>
               <th className="th-static">Side</th>
-              {/* Fill-lifecycle status only carries meaning for real orders (a paper order is
+              {/* Fill-lifecycle status only carries meaning for bot-trader orders (a paper order is
                   always instantly and fully filled). */}
-              {mode === 'real' && <th className="th-static">Status</th>}
+              {mode === 'bot' && <th className="th-static">Status</th>}
               <th className="th-static">Strategy</th>
               <th className="th-static">TF</th>
               <th className="th-static">Entry</th>
@@ -410,7 +410,7 @@ export default function PositionsPage() {
                       {p.Side === 'buy' ? 'long' : 'short'}
                     </span>
                   </td>
-                  {mode === 'real' && <td>{statusBadge(p.Status)}</td>}
+                  {mode === 'bot' && <td>{statusBadge(p.Status)}</td>}
                   <td>{p.StrategyName || '—'}</td>
                   <td className="mono text-dim">{p.Bar || '—'}</td>
                   <td className="mono">{trimPrice(p.EntryPx)}</td>
@@ -442,7 +442,7 @@ export default function PositionsPage() {
                         }
                       >
                         {formatUsd(realized)}
-                        {!realizedFromExchange && p.Mode === 'real' && <span className="pnl-local-marker">*</span>}
+                        {!realizedFromExchange && p.Mode === 'bot' && <span className="pnl-local-marker">*</span>}
                       </div>
                     ) : live ? (
                       <>
@@ -490,7 +490,7 @@ export default function PositionsPage() {
                   {showLiveColumns && (
                     <td className="actions-cell">
                       {/* Close works in BOTH modes. It was gated to paper until 2026-09-08, which
-                          left real positions with no way to exit from the panel at all — the
+                          left bot-trader positions with no way to exit from the panel at all — the
                           backend half (RequestRealManualClose, and RealTrader's own
                           ManualCloseRequested check on every tick) had been in place the whole
                           time, only the button was missing. */}
@@ -503,10 +503,10 @@ export default function PositionsPage() {
                           {closingId === p.ID ? 'Closing…' : 'Close'}
                         </button>
                       )}
-                      {/* Real-trading-only, unlike Close above: paper positions have no exchange
+                      {/* Bot-trading-only, unlike Close above: paper positions have no exchange
                           leg to adjust and are edited through the model only (CLAUDE.md §27's
                           real-trading plan §3b). */}
-                      {!p.ClosedAt && p.Mode === 'real' && (
+                      {!p.ClosedAt && p.Mode === 'bot' && (
                         <button
                           onClick={() => setAdjustingId(p.ID)}
                           title="Manually move this position's SL/TP (no exchange call, unclamped)"

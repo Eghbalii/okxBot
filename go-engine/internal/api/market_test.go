@@ -47,7 +47,7 @@ func (r *marketStubRepo) ListInstruments(_ context.Context, f port.InstrumentFil
 	var out []port.Instrument
 	for _, in := range r.instruments {
 		switch f.Enabled {
-		case "real":
+		case "bot":
 			if in.EnabledReal {
 				out = append(out, in)
 			}

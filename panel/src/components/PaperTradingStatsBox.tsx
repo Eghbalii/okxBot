@@ -133,7 +133,7 @@ function TradingCapTile({
         </button>
       </div>
       <div className="text-dim cap-hint">
-        {mode === 'real' ? `of $${sliderMax.toFixed(2)} on the exchange` : `max $${sliderMax.toFixed(2)}`}
+        {mode === 'bot' ? `of $${sliderMax.toFixed(2)} on the exchange` : `max $${sliderMax.toFixed(2)}`}
       </div>
       {error && <div className="cap-error">{error}</div>}
     </div>
@@ -165,9 +165,9 @@ export default function PaperTradingStatsBox({ mode }: { mode: PositionMode }) {
               <PnLTile label="1M" usd={data.pnl30dUsd} pct={data.pnl30dPct} />
             </div>
 
-            {/* Row 2 — capital. Reserve is real-mode only (paper has no exchange balance to hold
-                back), so the row is 2-up there and 3-up on real. */}
-            <div className={'stats-row ' + (mode === 'real' ? 'stats-row-3' : 'stats-row-2')}>
+            {/* Row 2 — capital. Reserve is bot-mode only (paper has no exchange balance to hold
+                back), so the row is 2-up there and 3-up on bot. */}
+            <div className={'stats-row ' + (mode === 'bot' ? 'stats-row-3' : 'stats-row-2')}>
               <StatTile
                 label="Balance"
                 title="The real, continuous running total — never reset by a trading-cap change"
@@ -176,13 +176,13 @@ export default function PaperTradingStatsBox({ mode }: { mode: PositionMode }) {
               <StatTile
                 label="Equity"
                 title={
-                  mode === 'real'
+                  mode === 'bot'
                     ? 'The slice of the exchange balance this engine trades with — profit and loss accrue here'
                     : 'The balance since the last chosen trading cap — what new positions size against'
                 }
                 value={formatUsd(Number(data.totalEquityUsd)).replace('+', '')}
               />
-              {mode === 'real' && (
+              {mode === 'bot' && (
                 <StatTile
                   label="Reserve"
                   dim

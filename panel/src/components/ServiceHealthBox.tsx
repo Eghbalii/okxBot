@@ -9,7 +9,7 @@ import type { HealthResponse, ServiceHealth } from '../api/types'
 //   §47 the container was CRASH-LOOPING  -> needs a code fix and a rebuild
 //   §48 the container was UP and HALTED  -> needs a reset
 //
-// Both presented as "real trading isn't working". So this shows the distinction directly instead of
+// Both presented as "bot trading isn't working". So this shows the distinction directly instead of
 // leaving it to be inferred from a failed request.
 
 // Colour and label per Docker state. "restarting" is called out explicitly rather than folded into
@@ -82,7 +82,7 @@ function HaltPanel({ health, onChanged }: { health: HealthResponse; onChanged: (
   return (
     <div className="halt-panel">
       <div className="halt-head">
-        <strong>Real trading</strong>
+        <strong>Bot Trader</strong>
         {halt.safeToReset && halt.exchangePositions === halt.localOpenOrders ? (
           <span className="badge badge-green">state agrees with exchange</span>
         ) : (

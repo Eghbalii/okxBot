@@ -1,7 +1,7 @@
 // Command trader runs the live trading loop. Two implementations are wired here behind
 // cfg.Trading.UseConductorLifecycle (CLAUDE.md §27's real-trading plan, commit 8): the original
 // flat delta-notional rebalance loop (usecase.Trader), which remains the default, and
-// usecase.RealTrader — the strategy-signal + conductor-mediated lifecycle usecase.PaperTrader
+// usecase.BotTrader — the strategy-signal + conductor-mediated lifecycle usecase.PaperTrader
 // already runs, adapted for real orders. Off by default; both compile and are reachable, main
 // picks one per config so the cutover is a deliberate, explicit flag flip, not a code change.
 package main
@@ -63,7 +63,7 @@ func main() {
 	rlClient := rlclient.New(cfg.RLService.URL)
 
 	// Mode selects which account_equity row this process's balance timeline is recorded under, and
-	// gates the auto-reset behavior: "real" is never auto-topped-up when drained (CLAUDE.md §15.7).
+	// gates the auto-reset behavior: "bot" is never auto-topped-up when drained (CLAUDE.md §15.7).
 	//
 	// Derived from the GATEWAY's own reported Simulated flag (GET /health), not a local
 	// OKX_SIMULATED_TRADING read — since credentials moved to the gateway (§27.1), that's the only
@@ -75,7 +75,7 @@ func main() {
 		logger.Error("failed to reach okx-gateway for mode detection; refusing to start", "error", err)
 		os.Exit(1)
 	}
-	mode := "real"
+	mode := "bot"
 	if health.Simulated {
 		mode = "demo"
 	}
@@ -84,7 +84,7 @@ func main() {
 	// demo) show a real win rate. Require it to be stated outright rather than reached by leaving
 	// OKX_SIMULATED_TRADING (on the gateway) unset — an unset env var is the single easiest way to
 	// end up live by accident, and everything else in this stack defaults to simulated.
-	if mode == "real" && !cfg.Trading.AllowRealMoney {
+	if mode == "bot" && !cfg.Trading.AllowRealMoney {
 		logger.Error("refusing to start against REAL money: okx-gateway reports simulated=false " +
 			"and trading.allow_real_money is false. Set trading.allow_real_money: true only when " +
 			"you intend to trade real capital (CLAUDE.md §15.6's paper -> demo -> real progression).")
@@ -111,13 +111,13 @@ func main() {
 
 	// Postgres is OPTIONAL for the old Trader (it's used only to record the equity timeline for the
 	// panel's chart, and a database problem must never stop a live trading loop), but REQUIRED for
-	// RealTrader — it needs strategy assignments, candle history, and open-position bookkeeping the
+	// BotTrader — it needs strategy assignments, candle history, and open-position bookkeeping the
 	// same way cmd/paper-trader does, none of which have a "keep trading without it" fallback.
 	var repo port.Repository
 	pgRepo, pgErr := postgres.New(ctx, cfg.Postgres.DSN)
 	if pgErr != nil {
 		if cfg.Trading.UseConductorLifecycle {
-			logger.Error("failed to connect to postgres; RealTrader cannot run without it", "error", pgErr)
+			logger.Error("failed to connect to postgres; BotTrader cannot run without it", "error", pgErr)
 			os.Exit(1)
 		}
 		logger.Warn("equity timeline disabled: could not connect to postgres", "error", pgErr)
@@ -125,7 +125,7 @@ func main() {
 		defer pgRepo.Close()
 		if err := pgRepo.Migrate(ctx); err != nil {
 			if cfg.Trading.UseConductorLifecycle {
-				logger.Error("migrations failed; RealTrader cannot run without them", "error", err)
+				logger.Error("migrations failed; BotTrader cannot run without them", "error", err)
 				os.Exit(1)
 			}
 			logger.Warn("equity timeline: migrations failed", "error", err)
@@ -156,7 +156,7 @@ func main() {
 	riskManager := risk.NewManager(riskLimits, startEquity)
 
 	if cfg.Trading.UseConductorLifecycle {
-		runRealTrader(ctx, logger, cfg, exchangeClient, rlClient, riskManager, pgRepo, mode, execInstIDFor)
+		runBotTrader(ctx, logger, cfg, exchangeClient, rlClient, riskManager, pgRepo, mode, execInstIDFor)
 		return
 	}
 
@@ -192,11 +192,11 @@ func main() {
 	logger.Info("shutting down trader")
 }
 
-// runRealTrader builds and runs one usecase.RealTrader per configured instrument, mirroring
+// runBotTrader builds and runs one usecase.BotTrader per configured instrument, mirroring
 // cmd/paper-trader/main.go's Kafka-dispatcher and strategy-assignment wiring (CLAUDE.md §27's plan,
-// commit 8) — the shape RealTrader was designed against. repo must be non-nil; the caller already
-// enforces this since RealTrader has no "run without a database" fallback.
-func runRealTrader(
+// commit 8) — the shape BotTrader was designed against. repo must be non-nil; the caller already
+// enforces this since BotTrader has no "run without a database" fallback.
+func runBotTrader(
 	ctx context.Context,
 	logger *slog.Logger,
 	cfg *config.Config,
@@ -216,7 +216,7 @@ func runRealTrader(
 	// mirrors cmd/paper-trader/main.go's identical read exactly. Before this, cmd/trader never read
 	// paper_trading_config at all, so the Real tab's Pause/Stop/disable-long/disable-short/active-
 	// strategies/active-tokens controls appeared to save successfully but had zero effect.
-	ptCfg, err := repo.GetPaperTradingConfig(ctx, "real")
+	ptCfg, err := repo.GetPaperTradingConfig(ctx, "bot")
 	if err != nil {
 		logger.Error("failed to load real-mode paper trading config", "error", err)
 		os.Exit(1)
@@ -225,8 +225,8 @@ func runRealTrader(
 	if tradingPaused {
 		logger.Info("real trading is not in the running state", "tradingState", ptCfg.TradingState)
 	}
-	// Global per-kind "active strategies" toggle, scoped to mode=real — bulk-applied BEFORE
-	// loadRealTraderStrategyAssignments reads them below, mirroring cmd/paper-trader's own
+	// Global per-kind "active strategies" toggle, scoped to mode=bot — bulk-applied BEFORE
+	// loadBotTraderStrategyAssignments reads them below, mirroring cmd/paper-trader's own
 	// sequencing exactly. A no-op when ActiveKinds is empty (no restriction configured).
 	// Reuses PaperTrading.Bars/CandleLimit/RLClamps/RLUpdate*/RLEarlyClose/RLMaxOpenDuration —
 	// real trading does not need its own separate bar-list or clamp config section (CLAUDE.md §27's
@@ -238,7 +238,7 @@ func runRealTrader(
 		decisionBars = ptCfg.ActiveBars
 	}
 	if len(decisionBars) == 0 {
-		logger.Error("paper_trading.bars is empty; RealTrader needs at least one decision bar")
+		logger.Error("paper_trading.bars is empty; BotTrader needs at least one decision bar")
 		os.Exit(1)
 	}
 	// The instrument roster comes from the DATABASE, filtered to rows a person has explicitly enabled
@@ -250,7 +250,7 @@ func runRealTrader(
 	// empty table from config.yaml so an existing deployment keeps collecting and paper-trading
 	// exactly what it did before. Seeding real-money instruments from a config file on a service's
 	// own initiative is a different kind of act, and this process refuses rather than assumes.
-	realRoster, err := usecase.RosterFor(ctx, repo, "okx", "real", nil, nil, "", logger)
+	realRoster, err := usecase.RosterFor(ctx, repo, "okx", "bot", nil, nil, "", logger)
 	if err != nil {
 		logger.Error("failed to load real-mode instrument roster", "error", err)
 		os.Exit(1)
@@ -271,7 +271,7 @@ func runRealTrader(
 	// Restart when the real roster changes, so enabling a token from the panel takes effect without a
 	// manual redeploy — the same mechanism the other two services use.
 	go (&usecase.RosterWatcher{
-		Repo: repo, Exchange: "okx", Consumer: "real",
+		Repo: repo, Exchange: "okx", Consumer: "bot",
 		Interval: time.Minute, Logger: logger, Baseline: instIDs,
 		OnChange: func(reason string) {
 			logger.Info("restarting to pick up the new real-mode instrument roster", "reason", reason)
@@ -279,7 +279,7 @@ func runRealTrader(
 		},
 	}).Run(ctx)
 
-	if err := repo.SetAssignmentsEnabledForKinds(ctx, "real", ptCfg.ActiveKinds, instIDs, decisionBars); err != nil {
+	if err := repo.SetAssignmentsEnabledForKinds(ctx, "bot", ptCfg.ActiveKinds, instIDs, decisionBars); err != nil {
 		logger.Error("failed to apply real-mode active-strategy-kinds restriction", "error", err)
 		os.Exit(1)
 	}
@@ -289,13 +289,13 @@ func runRealTrader(
 	if ptCfg.TradingState == "stopped" {
 		openOnly := true
 		for _, instID := range instIDs {
-			open, err := repo.ListRealPositions(ctx, port.PositionFilter{InstID: instID, Open: &openOnly})
+			open, err := repo.ListBotPositions(ctx, port.PositionFilter{InstID: instID, Open: &openOnly})
 			if err != nil {
-				logger.Error("failed to list open real positions for stopped sweep", "instId", instID, "error", err)
+				logger.Error("failed to list open bot positions for stopped sweep", "instId", instID, "error", err)
 				os.Exit(1)
 			}
 			for _, o := range open {
-				if err := repo.RequestRealManualClose(ctx, o.ID); err != nil {
+				if err := repo.RequestBotManualClose(ctx, o.ID); err != nil {
 					logger.Error("failed to request manual close of real order", "id", o.ID, "error", err)
 					os.Exit(1)
 				}
@@ -345,7 +345,7 @@ func runRealTrader(
 
 	// Restart-only HTTP surface (CLAUDE.md real-trading readiness plan, 2026-09-04) — mirrors
 	// cmd/paper-trader's own control-box POST /restart, so cmd/api's mode-aware restart proxy has
-	// something to forward to for mode=real. See handlers.go for why this is restart-only.
+	// something to forward to for mode=bot. See handlers.go for why this is restart-only.
 	traderSvc := &traderService{logger: logger}
 	traderAddr := envOr("TRADER_ADDR", "0.0.0.0:8095")
 	traderHTTPServer := &http.Server{Addr: traderAddr, Handler: traderSvc.routes()}
@@ -356,15 +356,15 @@ func runRealTrader(
 		}
 	}()
 
-	clamps := buildRealTraderClamps(cfg)
+	clamps := buildBotTraderClamps(cfg)
 
 	errCh := make(chan error, len(instIDs)+1+len(candleDispatchers))
 	const engineStartStagger = 300 * time.Millisecond
 	// Kept so the affordability service can push roster changes into engines that are already
 	// running, rather than the change only landing at the next restart.
-	engines := make(map[string]*usecase.RealTrader, len(instIDs))
+	engines := make(map[string]*usecase.BotTrader, len(instIDs))
 	for i, instID := range instIDs {
-		strategies, err := loadRealTraderStrategyAssignments(ctx, repo, instID, logger)
+		strategies, err := loadBotTraderStrategyAssignments(ctx, repo, instID, logger)
 		if err != nil {
 			logger.Error("failed to load strategy assignments", "instId", instID, "error", err)
 			os.Exit(1)
@@ -375,7 +375,7 @@ func runRealTrader(
 			candleConsumers[bar] = d.ForInstrument(instID)
 		}
 
-		engine := &usecase.RealTrader{
+		engine := &usecase.BotTrader{
 			InstID:          instID,
 			Bars:            candleBars,
 			CandleWindow:    cfg.PaperTrading.CandleLimit,
@@ -448,7 +448,7 @@ func runRealTrader(
 	}
 
 	// Manual/discretionary trading (docs/MANUAL_TRADE_PLAN.md): one account-wide ManualTrader,
-	// unlike RealTrader which is one-per-configured-instrument — a manual order can be placed on
+	// unlike BotTrader which is one-per-configured-instrument — a manual order can be placed on
 	// ANY token the operator picks from a live search, not just the pre-configured roster.
 	manualTrader := &usecase.ManualTrader{
 		Repo:          repo,
@@ -463,17 +463,17 @@ func runRealTrader(
 		OrderEvents:   orderEventsPub,
 		// §8.4: a manual order and a strategy position can share ONE net exchange position, and
 		// OKX's conditional orders for a position don't stack cleanly — so before placing its own
-		// protective order, ManualTrader checks whether RealTrader already holds a live one on this
+		// protective order, ManualTrader checks whether BotTrader already holds a live one on this
 		// token. A pure in-memory/DB check against the already-running engines map, no extra
-		// exchange call: RealTrader itself is the source of truth for whether IT protects a token,
+		// exchange call: BotTrader itself is the source of truth for whether IT protects a token,
 		// via the algo order id it already recorded when it opened.
-		RealTraderProtects: func(instID string) bool {
+		BotTraderProtects: func(instID string) bool {
 			if _, ok := engines[instID]; !ok {
-				// Not a token RealTrader watches at all — nothing it could be protecting.
+				// Not a token BotTrader watches at all — nothing it could be protecting.
 				return false
 			}
 			open := true
-			positions, err := repo.ListRealPositions(ctx, port.PositionFilter{InstID: instID, Open: &open})
+			positions, err := repo.ListBotPositions(ctx, port.PositionFilter{InstID: instID, Open: &open})
 			if err != nil {
 				logger.Warn("manual trader: could not check for an existing strategy position", "instId", instID, "error", err)
 				return false
@@ -504,7 +504,7 @@ func runRealTrader(
 		Repo:     repo,
 		Exchange: exchangeClient,
 		Logger:   logger,
-		Mode:     "real",
+		Mode:     "bot",
 		// The full CONFIGURED set, not the real-enabled roster: this service decides which tokens
 		// are affordable and re-enables one that has become affordable again, so handing it only the
 		// already-enabled subset would leave it unable to ever restore a token it disabled itself.
@@ -527,7 +527,7 @@ func runRealTrader(
 		}
 	}()
 
-	// One reconciliation poll for the whole roster, replacing the per-engine loop each RealTrader
+	// One reconciliation poll for the whole roster, replacing the per-engine loop each BotTrader
 	// used to run (2026-09-10). GetPositions and GetBalance are ACCOUNT-wide — they take no
 	// instrument and returned an identical response to all 10 engines — so the old shape issued 20
 	// calls per cycle to learn what 2 calls carry, and OKX rate-limited it (CLAUDE.md §38.2).
@@ -592,14 +592,14 @@ func runRealTrader(
 	}
 }
 
-// buildRealTraderClamps mirrors cmd/paper-trader/main.go's buildRLClamps exactly (same "a field
+// buildBotTraderClamps mirrors cmd/paper-trader/main.go's buildRLClamps exactly (same "a field
 // silently dropped from a large inline struct literal" incident that fix guards against, CLAUDE.md
 // §23) — a separate copy rather than an import specifically so a future field added to one config
 // section doesn't silently also need to change the other's caller; both map their own
 // cfg.*.RLClamps into conductor.Clamps field-by-field.
 // realEarlyCloseAllowed reads real trading's OWN early-close switch, deliberately NOT
 // paper_trading.rl_early_close (2026-09-08 request). Extracted as a named function rather than
-// left as a field read inside main()'s struct literal for the same reason buildRealTraderClamps
+// left as a field read inside main()'s struct literal for the same reason buildBotTraderClamps
 // was: a value buried in a large literal is exactly what got silently dropped in the incident that
 // left every real position uncapped, so the mapping gets a test that fails if it ever points back
 // at the paper flag.
@@ -607,7 +607,7 @@ func realEarlyCloseAllowed(cfg *config.Config) bool {
 	return cfg.Trading.AllowRLEarlyClose
 }
 
-func buildRealTraderClamps(cfg *config.Config) conductor.Clamps {
+func buildBotTraderClamps(cfg *config.Config) conductor.Clamps {
 	return conductor.Clamps{
 		MinSLDistPct: cfg.PaperTrading.RLClamps.MinSLDistPct,
 		MaxSLDistPct: cfg.PaperTrading.RLClamps.MaxSLDistPct,
@@ -624,10 +624,10 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// loadRealTraderStrategyAssignments mirrors cmd/paper-trader/main.go's loadStrategyAssignments —
+// loadBotTraderStrategyAssignments mirrors cmd/paper-trader/main.go's loadStrategyAssignments —
 // resolves durable strategy_assignments rows into live usecase.StrategyAssignment values.
-func loadRealTraderStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID string, logger *slog.Logger) ([]usecase.StrategyAssignment, error) {
-	rows, err := repo.ListAssignments(ctx, instID, true, "real")
+func loadBotTraderStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID string, logger *slog.Logger) ([]usecase.StrategyAssignment, error) {
+	rows, err := repo.ListAssignments(ctx, instID, true, "bot")
 	if err != nil {
 		return nil, err
 	}

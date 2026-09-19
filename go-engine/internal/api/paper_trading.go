@@ -31,14 +31,14 @@ type paperTradingStatsView struct {
 	PnL30dPct         string `json:"pnl30dPct"`
 }
 
-// statsMode resolves the mode query param to "paper" or "real" — CLAUDE.md real-trading readiness
+// statsMode resolves the mode query param to "paper" or "bot" — CLAUDE.md real-trading readiness
 // plan, 2026-09-04: stats/config now serve both tabs from one handler rather than a hardcoded
 // "paper". Defaults to "paper" (every caller before this change implicitly meant paper trading).
 func statsMode(raw string) (string, bool) {
 	switch raw {
 	case "":
 		return "paper", true
-	case "paper", "real":
+	case "paper", "bot":
 		return raw, true
 	default:
 		return "", false
@@ -49,14 +49,14 @@ func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request)
 	ctx := r.Context()
 	mode, ok := statsMode(r.URL.Query().Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
 
 	open := true
 	var openCount int
-	if mode == "real" {
-		positions, err := s.Repo.ListRealPositions(ctx, port.PositionFilter{Open: &open})
+	if mode == "bot" {
+		positions, err := s.Repo.ListBotPositions(ctx, port.PositionFilter{Open: &open})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -143,7 +143,7 @@ type tokenStatsView struct {
 func (s *Server) handleTokenStats24h(w http.ResponseWriter, r *http.Request) {
 	mode, ok := statsMode(r.URL.Query().Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
 	stats, err := s.Repo.TokenStats24h(r.Context(), mode)
@@ -186,7 +186,7 @@ type paperTradingConfigView struct {
 func (s *Server) handleGetPaperTradingConfig(w http.ResponseWriter, r *http.Request) {
 	mode, ok := statsMode(r.URL.Query().Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
 	c, err := s.Repo.GetPaperTradingConfig(r.Context(), mode)
@@ -223,7 +223,7 @@ func (s *Server) handleSavePaperTradingConfig(w http.ResponseWriter, r *http.Req
 	}
 	mode, ok := statsMode(req.Mode)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
 	if req.TradingState != nil {
@@ -251,8 +251,8 @@ func (s *Server) handleSavePaperTradingConfig(w http.ResponseWriter, r *http.Req
 	// trading_state='stopped' at its own next startup — a market-volatility emergency stop must not
 	// depend on a restart completing. Paper mode keeps its existing behavior (cmd/paper-trader's own
 	// startup sweep, RequestManualCloseAll) unchanged; this is additive, real-mode-only.
-	if mode == "real" && req.TradingState != nil && *req.TradingState == "stopped" {
-		if _, err := s.Repo.RequestRealManualCloseAll(r.Context()); err != nil {
+	if mode == "bot" && req.TradingState != nil && *req.TradingState == "stopped" {
+		if _, err := s.Repo.RequestBotManualCloseAll(r.Context()); err != nil {
 			s.Logger.Error("failed to request immediate close of all open real positions", "error", err)
 		}
 	}

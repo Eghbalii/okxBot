@@ -10,7 +10,7 @@ import (
 // Regression test for the bug found live 2026-09-04 (cmd/okx-apitest's diagnostic against a real
 // OKX account): GET /api/v5/trade/order returns avgPx/accFillSz/sz as "" (not "0") for an order
 // that has not started filling yet. decimal.Decimal's own UnmarshalJSON rejects "", which made
-// every poll of RealTrader.waitForFill's fill-timeout loop fail and retry until the timeout
+// every poll of BotTrader.waitForFill's fill-timeout loop fail and retry until the timeout
 // elapsed — harmless (the retry loop already tolerated it) but noisy, and a real correctness gap
 // waiting to bite the next caller that doesn't retry.
 func TestOrderStatus_DecodesBlankDecimalFieldsAsZero(t *testing.T) {

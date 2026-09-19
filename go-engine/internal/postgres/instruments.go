@@ -31,7 +31,7 @@ func instrumentWhere(f port.InstrumentFilter) (where string, args []any, err err
 		where += " AND enabled_ingest"
 	case "paper":
 		where += " AND enabled_paper"
-	case "real":
+	case "bot":
 		where += " AND enabled_real"
 	default:
 		return "", nil, fmt.Errorf("unknown enabled filter %q", f.Enabled)

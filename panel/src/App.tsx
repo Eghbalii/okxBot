@@ -24,14 +24,14 @@ export default function App() {
   const onPositions = location.pathname.startsWith('/positions')
   // Derived from the URL rather than held in state, so the header and the page can never disagree
   // about which mode is showing.
-  const mode: PositionMode = location.pathname.startsWith('/positions/real') ? 'real' : 'paper'
+  const mode: PositionMode = location.pathname.startsWith('/positions/bot') ? 'bot' : 'paper'
   return (
     <div className="app">
       <header className="app-header">
         <span className="app-title">okxBot Panel</span>
         <nav className="app-nav">
           {tabs.map((tab) => {
-            // Positions' own link target is /positions/paper, but /positions/real should still
+            // Positions' own link target is /positions/paper, but /positions/bot should still
             // highlight this tab — match on the /positions prefix rather than the exact path.
             const active =
               tab.to === '/positions/paper'

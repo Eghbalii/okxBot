@@ -146,11 +146,11 @@ export default function TokenChartModal({
   )
 
   // --- chart-side SL/TP editing (2026-09-12 request) -----------------------------------------
-  // Only a REAL, still-open position can be edited: the endpoint is real-only by construction
+  // Only a BOT TRADER, still-open position can be edited: the endpoint is bot-only by construction
   // (paper ids route to a table with no manual-edit path) and a closed position has no resting
   // order on the exchange to amend.
   const editable = useMemo(
-    () => shown.filter((p) => !p.ClosedAt && mode === 'real'),
+    () => shown.filter((p) => !p.ClosedAt && mode === 'bot'),
     [shown, mode],
   )
   // Which position the side panel edits. With the header's old dropdown gone, this is set by

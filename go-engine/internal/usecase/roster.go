@@ -35,7 +35,7 @@ type Roster struct {
 	Exchange map[string]string
 }
 
-// RosterFor reads one consumer's enabled instruments. consumer is "ingest", "paper" or "real" — the
+// RosterFor reads one consumer's enabled instruments. consumer is "ingest", "paper" or "bot" — the
 // three independent flags migration 000031 keeps separate precisely so a discovered token can
 // collect data and paper-trade while staying off for real money.
 //
@@ -138,7 +138,7 @@ func enabledFor(in port.Instrument, consumer string) (bool, error) {
 		return in.EnabledIngest, nil
 	case "paper":
 		return in.EnabledPaper, nil
-	case "real":
+	case "bot":
 		return in.EnabledReal, nil
 	default:
 		return false, fmt.Errorf("load roster: unknown consumer %q", consumer)
@@ -214,7 +214,7 @@ func SeedExecIDs(symbolMap map[string]string, symbols []string) (map[string]stri
 type RosterWatcher struct {
 	Repo     port.Repository
 	Exchange string
-	Consumer string // "ingest", "paper" or "real"
+	Consumer string // "ingest", "paper" or "bot"
 	Interval time.Duration
 	Logger   *slog.Logger
 	// OnChange is called once, with the reason, when the enabled set differs from Baseline. The

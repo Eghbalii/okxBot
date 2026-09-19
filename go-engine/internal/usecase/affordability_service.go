@@ -45,7 +45,7 @@ type AffordabilityService struct {
 	Exchange port.ExchangeClient
 	Logger   *slog.Logger
 
-	// Mode is the trading mode whose config is managed ("real" or "paper").
+	// Mode is the trading mode whose config is managed ("bot" or "paper").
 	Mode string
 	// AllTokens is the full configured roster (trading.inst_ids), in short-symbol form.
 	AllTokens []string
@@ -110,7 +110,7 @@ func (s *AffordabilityService) leverage() decimal.Decimal {
 
 func (s *AffordabilityService) mode() string {
 	if s.Mode == "" {
-		return "real"
+		return "bot"
 	}
 	return s.Mode
 }

@@ -46,10 +46,10 @@ type tokenAffordabilityView struct {
 func (s *Server) handleTokenAffordability(w http.ResponseWriter, r *http.Request) {
 	mode, ok := statsMode(r.URL.Query().Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or real)")
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
-	if mode != "real" || s.Affordability == nil {
+	if mode != "bot" || s.Affordability == nil {
 		writeJSON(w, http.StatusOK, []tokenAffordabilityView{})
 		return
 	}

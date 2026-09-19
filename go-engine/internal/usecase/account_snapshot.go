@@ -77,7 +77,7 @@ func FetchAccountSnapshot(exchange port.ExchangeClient, instType, settleCcy stri
 // account_equity row, so N engines calling it wrote N transactions for one row's worth of work —
 // and when the delta was nonzero, whichever engine happened to run first stamped its own instID on
 // the history row, making an account-wide balance change look attributable to one arbitrary token.
-func (e *RealTrader) RecordEquity(ctx context.Context, snap AccountSnapshot, logger *slog.Logger) {
+func (e *BotTrader) RecordEquity(ctx context.Context, snap AccountSnapshot, logger *slog.Logger) {
 	if !snap.HasBalance {
 		return
 	}
@@ -87,5 +87,5 @@ func (e *RealTrader) RecordEquity(ctx context.Context, snap AccountSnapshot, log
 	if logger == nil {
 		logger = slog.Default()
 	}
-	e.recordEquityReal(ctx, snap.Balance.Eq, logger)
+	e.recordEquityBot(ctx, snap.Balance.Eq, logger)
 }

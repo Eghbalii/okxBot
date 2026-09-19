@@ -16,9 +16,9 @@ import (
 // from cmd/api, not wait for cmd/trader to notice trading_state='stopped' at its own restart).
 type stopStubRepo struct {
 	port.Repository
-	savedPatch                     port.PaperTradingConfigPatch
-	requestRealManualCloseAllCalls int
-	closeAllErr                    error
+	savedPatch                    port.PaperTradingConfigPatch
+	requestBotManualCloseAllCalls int
+	closeAllErr                   error
 }
 
 func (s *stopStubRepo) SavePaperTradingConfig(ctx context.Context, mode string, patch port.PaperTradingConfigPatch) (port.PaperTradingConfig, error) {
@@ -26,8 +26,8 @@ func (s *stopStubRepo) SavePaperTradingConfig(ctx context.Context, mode string, 
 	return port.PaperTradingConfig{}, nil
 }
 
-func (s *stopStubRepo) RequestRealManualCloseAll(ctx context.Context) (int, error) {
-	s.requestRealManualCloseAllCalls++
+func (s *stopStubRepo) RequestBotManualCloseAll(ctx context.Context) (int, error) {
+	s.requestBotManualCloseAllCalls++
 	return 3, s.closeAllErr
 }
 
@@ -41,44 +41,44 @@ func doSaveConfig(srv *Server, mode string, tradingState *string) *httptest.Resp
 
 func strPtr(s string) *string { return &s }
 
-// TestHandleSavePaperTradingConfig_RealStopClosesEveryOpenPositionImmediately confirms the safety-
-// critical path: setting mode=real tradingState=stopped calls RequestRealManualCloseAll in the
+// TestHandleSavePaperTradingConfig_BotStopClosesEveryOpenPositionImmediately confirms the safety-
+// critical path: setting mode=bot tradingState=stopped calls RequestBotManualCloseAll in the
 // SAME request, not merely saving a flag for cmd/trader to notice on its own next restart. This is
 // what makes the panel's Stop button an actual emergency stop rather than a delayed one.
-func TestHandleSavePaperTradingConfig_RealStopClosesEveryOpenPositionImmediately(t *testing.T) {
+func TestHandleSavePaperTradingConfig_BotStopClosesEveryOpenPositionImmediately(t *testing.T) {
 	repo := &stopStubRepo{}
 	srv := &Server{Repo: repo, Logger: slog.Default()}
 
-	rec := doSaveConfig(srv, "real", strPtr("stopped"))
+	rec := doSaveConfig(srv, "bot", strPtr("stopped"))
 
 	if rec.Code != 200 {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if repo.requestRealManualCloseAllCalls != 1 {
-		t.Errorf("expected RequestRealManualCloseAll called exactly once, got %d", repo.requestRealManualCloseAllCalls)
+	if repo.requestBotManualCloseAllCalls != 1 {
+		t.Errorf("expected RequestBotManualCloseAll called exactly once, got %d", repo.requestBotManualCloseAllCalls)
 	}
 }
 
-// TestHandleSavePaperTradingConfig_RealPausedDoesNotCloseAnything confirms only "stopped" triggers
+// TestHandleSavePaperTradingConfig_BotPausedDoesNotCloseAnything confirms only "stopped" triggers
 // the immediate close sweep — "paused" (existing positions keep running) must not.
-func TestHandleSavePaperTradingConfig_RealPausedDoesNotCloseAnything(t *testing.T) {
+func TestHandleSavePaperTradingConfig_BotPausedDoesNotCloseAnything(t *testing.T) {
 	repo := &stopStubRepo{}
 	srv := &Server{Repo: repo, Logger: slog.Default()}
 
-	rec := doSaveConfig(srv, "real", strPtr("paused"))
+	rec := doSaveConfig(srv, "bot", strPtr("paused"))
 
 	if rec.Code != 200 {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if repo.requestRealManualCloseAllCalls != 0 {
-		t.Errorf("expected no RequestRealManualCloseAll call for paused, got %d", repo.requestRealManualCloseAllCalls)
+	if repo.requestBotManualCloseAllCalls != 0 {
+		t.Errorf("expected no RequestBotManualCloseAll call for paused, got %d", repo.requestBotManualCloseAllCalls)
 	}
 }
 
-// TestHandleSavePaperTradingConfig_PaperStopDoesNotCallRealCloseAll confirms mode=paper's own Stop
+// TestHandleSavePaperTradingConfig_PaperStopDoesNotCallBotCloseAll confirms mode=paper's own Stop
 // keeps using its existing startup-sweep mechanism (cmd/paper-trader's RequestManualCloseAll,
 // unrelated to this real-only addition) rather than the real-mode bulk-close path.
-func TestHandleSavePaperTradingConfig_PaperStopDoesNotCallRealCloseAll(t *testing.T) {
+func TestHandleSavePaperTradingConfig_PaperStopDoesNotCallBotCloseAll(t *testing.T) {
 	repo := &stopStubRepo{}
 	srv := &Server{Repo: repo, Logger: slog.Default()}
 
@@ -87,8 +87,8 @@ func TestHandleSavePaperTradingConfig_PaperStopDoesNotCallRealCloseAll(t *testin
 	if rec.Code != 200 {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if repo.requestRealManualCloseAllCalls != 0 {
-		t.Errorf("expected no RequestRealManualCloseAll call for mode=paper, got %d", repo.requestRealManualCloseAllCalls)
+	if repo.requestBotManualCloseAllCalls != 0 {
+		t.Errorf("expected no RequestBotManualCloseAll call for mode=paper, got %d", repo.requestBotManualCloseAllCalls)
 	}
 }
 
@@ -100,7 +100,7 @@ func TestHandleSavePaperTradingConfig_CloseAllErrorStillSavesConfig(t *testing.T
 	repo := &stopStubRepo{closeAllErr: context.DeadlineExceeded}
 	srv := &Server{Repo: repo, Logger: slog.Default()}
 
-	rec := doSaveConfig(srv, "real", strPtr("stopped"))
+	rec := doSaveConfig(srv, "bot", strPtr("stopped"))
 
 	if rec.Code != 200 {
 		t.Fatalf("expected 200 even when the close-all sweep errors, got %d: %s", rec.Code, rec.Body.String())

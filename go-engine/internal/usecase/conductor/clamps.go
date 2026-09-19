@@ -210,7 +210,7 @@ func clampRange(v, min, max decimal.Decimal) decimal.Decimal {
 //
 // This is the take-profit counterpart to EnsureStop, added 2026-09-08 after the first real order
 // opened with a stop and no target: the model emitted SLPx but a zero TPPx, and nothing downstream
-// re-supplied it. RealTrader watches SL/TP in-process rather than resting orders on the exchange,
+// re-supplied it. BotTrader watches SL/TP in-process rather than resting orders on the exchange,
 // so a position with no target cannot take profit at all — it can only end at its stop, at the
 // timeout, or by hand, which is strictly worse than an imperfect target.
 //

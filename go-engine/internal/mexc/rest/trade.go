@@ -60,7 +60,7 @@ func openTypeFor(mode string) int {
 // posSide carries whether this order opens or closes. In hedge mode the domain sets it to
 // "long"/"short"; a close is expressed by side opposing posSide — selling while long closes, buying
 // while long opens. With no posSide (net mode) the order is treated as opening, which matches how
-// RealTrader places entries.
+// BotTrader places entries.
 func sideCodeFor(side, posSide string) (int, error) {
 	buy := strings.EqualFold(side, "buy")
 	sell := strings.EqualFold(side, "sell")

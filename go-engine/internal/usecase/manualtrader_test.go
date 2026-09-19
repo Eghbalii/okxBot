@@ -126,7 +126,7 @@ func TestManualTrader_LimitOrderRestsUnfilled(t *testing.T) {
 	}
 }
 
-// §8.4: when RealTrader already protects this token, ManualTrader must NOT place a second
+// §8.4: when BotTrader already protects this token, ManualTrader must NOT place a second
 // protective order — it records protected_by_strategy instead.
 func TestManualTrader_SkipsProtectionWhenStrategyAlreadyProtects(t *testing.T) {
 	repo := newFakeRepository()
@@ -135,7 +135,7 @@ func TestManualTrader_SkipsProtectionWhenStrategyAlreadyProtects(t *testing.T) {
 		ticker:     domain.Ticker{Last: decimal.NewFromInt(100)},
 	}
 	mt := newTestManualTrader(repo, exchange)
-	mt.RealTraderProtects = func(instID string) bool { return instID == "BTC" }
+	mt.BotTraderProtects = func(instID string) bool { return instID == "BTC" }
 
 	_, err := repo.CreateManualOrderIntent(context.Background(), port.ManualOrderIntent{
 		InstID: "BTC", Side: "buy", OrderType: "market",
@@ -167,7 +167,7 @@ func TestManualTrader_SkipsProtectionWhenStrategyAlreadyProtects(t *testing.T) {
 }
 
 // A position that cannot be protected is closed again immediately rather than left running
-// unprotected — the same posture RealTrader.openReal enforces.
+// unprotected — the same posture BotTrader.openBot enforces.
 func TestManualTrader_ClosesPositionWhenProtectionFails(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{
@@ -243,7 +243,7 @@ func TestManualTrader_CloseFlattensAndRecordsOutcome(t *testing.T) {
 	}
 }
 
-// Closing an already-closed order is a no-op, not an error — mirrors CloseRealOrderConfirmed's own
+// Closing an already-closed order is a no-op, not an error — mirrors CloseBotOrderConfirmed's own
 // idempotency guard, which exists because two racing close paths must not both succeed.
 func TestManualTrader_CloseIsIdempotent(t *testing.T) {
 	repo := newFakeRepository()

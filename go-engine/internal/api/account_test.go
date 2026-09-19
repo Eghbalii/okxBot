@@ -148,16 +148,16 @@ func TestHandleSetAccountCap_RejectsInvalidMode(t *testing.T) {
 // keeps AccountBalanceUSD — RecordExchangeBalance's reconciliation anchor against the exchange's
 // own reported balance — from being overwritten with an operator-chosen number, which would make
 // the very next poll record the difference as realized PnL that never happened.
-func TestHandleSetAccountCap_RealModeRoutesToSetTradingCap(t *testing.T) {
-	repo := &accountStubRepo{setCapResult: port.AccountEquity{Mode: "real", EquityUSD: dec("500")}}
+func TestHandleSetAccountCap_BotModeRoutesToSetTradingCap(t *testing.T) {
+	repo := &accountStubRepo{setCapResult: port.AccountEquity{Mode: "bot", EquityUSD: dec("500")}}
 	srv := newTestServer2(repo)
 
-	rec := doSetAccountCap(srv, map[string]any{"mode": "real", "newCapUsd": 500})
+	rec := doSetAccountCap(srv, map[string]any{"mode": "bot", "newCapUsd": 500})
 	if rec.Code != 200 {
-		t.Fatalf("expected 200 for mode=real, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 200 for mode=bot, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if len(repo.tradingCapCalls) != 1 || repo.tradingCapCalls[0].mode != "real" {
-		t.Fatalf("expected one SetTradingCap call for mode=real, got %+v", repo.tradingCapCalls)
+	if len(repo.tradingCapCalls) != 1 || repo.tradingCapCalls[0].mode != "bot" {
+		t.Fatalf("expected one SetTradingCap call for mode=bot, got %+v", repo.tradingCapCalls)
 	}
 	if len(repo.setCapCalls) != 0 {
 		t.Fatalf("real mode must NOT call SetAccountCap (it would overwrite the exchange balance anchor), got %+v", repo.setCapCalls)

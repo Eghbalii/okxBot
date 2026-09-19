@@ -11,19 +11,19 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
-// TestBuildRealTraderClamps_MapsMaxLossPct guards against the exact class of bug CLAUDE.md §23
+// TestBuildBotTraderClamps_MapsMaxLossPct guards against the exact class of bug CLAUDE.md §23
 // documents for cmd/paper-trader's own buildRLClamps: a struct literal silently dropping a field
 // (there, MaxLossPct — §19.2's leverage-aware 15%-loss cap never actually applied to a real order).
-// buildRealTraderClamps is a separate copy of that mapping for RealTrader, so it needs its own
+// buildBotTraderClamps is a separate copy of that mapping for BotTrader, so it needs its own
 // regression test rather than assuming the paper-trader fix covers it.
-func TestBuildRealTraderClamps_MapsMaxLossPct(t *testing.T) {
+func TestBuildBotTraderClamps_MapsMaxLossPct(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.PaperTrading.RLClamps.MinSLDistPct = decimal.NewFromFloat(0.005)
 	cfg.PaperTrading.RLClamps.MaxSLDistPct = decimal.NewFromFloat(0.05)
 	cfg.PaperTrading.RLClamps.MaxLossPct = decimal.NewFromFloat(0.15)
 	cfg.PaperTrading.RLClamps.MinTPSLRatio = decimal.NewFromFloat(1.5)
 
-	got := buildRealTraderClamps(cfg)
+	got := buildBotTraderClamps(cfg)
 
 	if !got.MinSLDistPct.Equal(cfg.PaperTrading.RLClamps.MinSLDistPct) {
 		t.Errorf("MinSLDistPct not mapped: got %s", got.MinSLDistPct)
@@ -39,16 +39,16 @@ func TestBuildRealTraderClamps_MapsMaxLossPct(t *testing.T) {
 	}
 }
 
-// TestBuildRealTraderClamps_ProductionScenarioIsNowCaught reproduces CLAUDE.md §23's order-636
+// TestBuildBotTraderClamps_ProductionScenarioIsNowCaught reproduces CLAUDE.md §23's order-636
 // scenario (20x leverage, a naive 5%-distance stop — inside MaxSLDistPct alone) through
-// buildRealTraderClamps + the real conductor.Clamps.Apply pipeline, confirming the resulting stop
+// buildBotTraderClamps + the real conductor.Clamps.Apply pipeline, confirming the resulting stop
 // respects MaxLossPct rather than the leverage-blind raw distance.
-func TestBuildRealTraderClamps_ProductionScenarioIsNowCaught(t *testing.T) {
+func TestBuildBotTraderClamps_ProductionScenarioIsNowCaught(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.PaperTrading.RLClamps.MinSLDistPct = decimal.NewFromFloat(0.005)
 	cfg.PaperTrading.RLClamps.MaxSLDistPct = decimal.NewFromFloat(0.05)
 	cfg.PaperTrading.RLClamps.MaxLossPct = decimal.NewFromFloat(0.15)
-	clamps := buildRealTraderClamps(cfg)
+	clamps := buildBotTraderClamps(cfg)
 
 	entry := decimal.NewFromFloat(0.004533)
 	leverage := decimal.NewFromInt(20)
@@ -84,7 +84,7 @@ func TestUseConductorLifecycle_DefaultsOff(t *testing.T) {
 // for paper research must not silently enable it against real capital (2026-09-08 request). This
 // asserts the two are genuinely independent in BOTH directions, since a mapping that reads the
 // wrong field would still look right whenever the two flags happen to agree.
-func TestRealEarlyCloseAllowed_IsIndependentOfPaperFlag(t *testing.T) {
+func TestBotEarlyCloseAllowed_IsIndependentOfPaperFlag(t *testing.T) {
 	var cfg config.Config
 
 	cfg.Trading.AllowRLEarlyClose = false
@@ -102,7 +102,7 @@ func TestRealEarlyCloseAllowed_IsIndependentOfPaperFlag(t *testing.T) {
 
 // Off by default (Go's zero value), so a config that never mentions the key ignores the model's
 // early-close action rather than acting on it against real money.
-func TestRealEarlyCloseAllowed_DefaultsOff(t *testing.T) {
+func TestBotEarlyCloseAllowed_DefaultsOff(t *testing.T) {
 	if realEarlyCloseAllowed(&config.Config{}) {
 		t.Error("allow_rl_early_close must default to false")
 	}
@@ -162,7 +162,7 @@ func TestRestartHandlerExitCodeMatchesRestartPolicy(t *testing.T) {
 // except the call volume.
 //
 // Asserted against the source rather than a constructor because the engine literal lives inline in
-// main(); this is the same class of guard as buildRealTraderClamps' own tests, which exist because a
+// main(); this is the same class of guard as buildBotTraderClamps' own tests, which exist because a
 // field silently dropped from a large struct literal is precisely what left every real position
 // uncapped (§23).
 func TestEnginesAreMarkedReconciledExternally(t *testing.T) {
@@ -185,7 +185,7 @@ func TestEnginesAreMarkedReconciledExternally(t *testing.T) {
 // A deliberate copy of cmd/paper-trader's equivalent rather than a shared helper: the two mains
 // build their own struct literals, and §23's lesson is that a field dropped from one must not hide
 // behind the other already being correct. Both get their own test for that reason.
-func TestRealTraderWiresTheV8ObservationInputs(t *testing.T) {
+func TestBotTraderWiresTheV8ObservationInputs(t *testing.T) {
 	src, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatalf("read main.go: %v", err)
@@ -197,7 +197,7 @@ func TestRealTraderWiresTheV8ObservationInputs(t *testing.T) {
 		"errCh <- tokenStats.Run(ctx, logger)",
 	} {
 		if !strings.Contains(string(src), want) {
-			t.Errorf("cmd/trader no longer wires %q — without it RealTrader builds no valid "+
+			t.Errorf("cmd/trader no longer wires %q — without it BotTrader builds no valid "+
 				"observation and silently never calls the model", want)
 		}
 	}

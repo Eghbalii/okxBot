@@ -120,7 +120,7 @@ func main() {
 			Repo:           repo,
 			Exchange:       gatewayclient.New(cfg.Gateway.URL, "api"),
 			Logger:         logger,
-			Mode:           "real",
+			Mode:           "bot",
 			AllTokens:      cfg.Trading.InstIDs,
 			Symbols:        okx.SymbolMap(cfg.Trading.SymbolMap),
 			ExecInstType:   cfg.Trading.ExecInstType,

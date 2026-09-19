@@ -19,11 +19,11 @@ import (
 // else panics loudly rather than silently returning a zero value.
 type healthStubRepo struct {
 	port.Repository
-	open []port.RealOrder
+	open []port.BotOrder
 	err  error
 }
 
-func (r *healthStubRepo) ListRealPositions(context.Context, port.PositionFilter) ([]port.RealOrder, error) {
+func (r *healthStubRepo) ListBotPositions(context.Context, port.PositionFilter) ([]port.BotOrder, error) {
 	return r.open, r.err
 }
 
@@ -144,7 +144,7 @@ func TestHealth_ReportsRestartingDistinctly(t *testing.T) {
 	}
 }
 
-// TestHaltStatus_ReadsRealOrdersNotPaperOrders pins the table this check reads.
+// TestHaltStatus_ReadsBotOrdersNotPaperOrders pins the table this check reads.
 //
 // The first deployed version called Repo.ListPositions, which reads paper_orders — real orders have
 // lived in their own table since §34. Against live data it reported "2 exchange positions, 0
@@ -152,12 +152,12 @@ func TestHealth_ReportsRestartingDistinctly(t *testing.T) {
 // locking the reset button. Nothing about that failure was visible from a unit test using a stub
 // that answered whichever method was called.
 //
-// The stub here implements ONLY ListRealPositions, so calling the paper one panics on the embedded
+// The stub here implements ONLY ListBotPositions, so calling the paper one panics on the embedded
 // nil interface rather than quietly returning an empty slice that looks like real drift.
-func TestHaltStatus_ReadsRealOrdersNotPaperOrders(t *testing.T) {
+func TestHaltStatus_ReadsBotOrdersNotPaperOrders(t *testing.T) {
 	s := &Server{
 		Positions: &fakePositions{positions: []domain.Position{pos("DOGE", -47), pos("SOL", -37)}},
-		Repo: &healthStubRepo{open: []port.RealOrder{
+		Repo: &healthStubRepo{open: []port.BotOrder{
 			{ID: 130, InstID: "DOGE"},
 			{ID: 135, InstID: "SOL"},
 		}},

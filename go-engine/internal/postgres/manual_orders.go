@@ -10,7 +10,7 @@ import (
 )
 
 // CreateManualOrderIntent inserts a new open-order request, status "pending". Mirrors the general
-// shape of OpenRealOrder but for the handshake table (docs/MANUAL_TRADE_PLAN.md §2.3).
+// shape of OpenBotOrder but for the handshake table (docs/MANUAL_TRADE_PLAN.md §2.3).
 func (r *Repository) CreateManualOrderIntent(ctx context.Context, in port.ManualOrderIntent) (int64, error) {
 	orderType := in.OrderType
 	if orderType == "" {
@@ -31,7 +31,7 @@ func (r *Repository) CreateManualOrderIntent(ctx context.Context, in port.Manual
 // ClaimPendingManualOrderIntents atomically claims every "pending" intent and returns them.
 // UPDATE ... RETURNING is what makes this atomic across concurrent callers — the same conditional-
 // write-not-mutex pattern this codebase already relies on for RequestManualClose/
-// CloseRealOrderConfirmed's own idempotency guards (a mutex cannot cover two separate processes or
+// CloseBotOrderConfirmed's own idempotency guards (a mutex cannot cover two separate processes or
 // a restart racing an in-flight claim; a single conditional statement does).
 func (r *Repository) ClaimPendingManualOrderIntents(ctx context.Context) ([]port.ManualOrderIntent, error) {
 	rows, err := r.pool.Query(ctx, `
@@ -92,7 +92,7 @@ func (r *Repository) GetManualOrderIntent(ctx context.Context, id int64) (port.M
 	return in, nil
 }
 
-// OpenManualOrder inserts a new manual order and returns its id. Mirrors OpenRealOrder: the caller
+// OpenManualOrder inserts a new manual order and returns its id. Mirrors OpenBotOrder: the caller
 // must set o.Status explicitly (normally "pending" for market, "resting" for an accepted-but-
 // unfilled limit order — see port.ManualOrder's doc comment).
 func (r *Repository) OpenManualOrder(ctx context.Context, o port.ManualOrder) (int64, error) {
@@ -132,9 +132,9 @@ func (r *Repository) GetManualOrder(ctx context.Context, id int64) (port.ManualO
 	return o, nil
 }
 
-// UpdateManualOrderStatus transitions a manual order's fill status. Mirrors UpdateRealOrderStatus,
+// UpdateManualOrderStatus transitions a manual order's fill status. Mirrors UpdateBotOrderStatus,
 // widened for the "resting" state (a limit order accepted by the exchange, not yet filled) that
-// real_orders has never needed. opened_at is stamped the first time the order reaches a state where
+// bot_orders has never needed. opened_at is stamped the first time the order reaches a state where
 // a position genuinely exists ("filled"/"partial") — a still-resting limit order has no opened_at
 // yet, since nothing has actually opened.
 func (r *Repository) UpdateManualOrderStatus(ctx context.Context, id int64, status string, entryPx, size, contracts *decimal.Decimal) error {
@@ -155,7 +155,7 @@ func (r *Repository) UpdateManualOrderStatus(ctx context.Context, id int64, stat
 
 // SetManualOrderProtection records the outcome of ManualTrader's post-fill protection step
 // (docs/MANUAL_TRADE_PLAN.md §4/§8.4): either algoOrderID is set (a fresh protective order was
-// placed) or protectedByStrategy is true (RealTrader already had one on this token, so none was
+// placed) or protectedByStrategy is true (BotTrader already had one on this token, so none was
 // placed) — never both; the caller is responsible for that invariant.
 func (r *Repository) SetManualOrderProtection(ctx context.Context, id int64, algoOrderID *string, protectedByStrategy bool) error {
 	_, err := r.pool.Exec(ctx, `
@@ -167,7 +167,7 @@ func (r *Repository) SetManualOrderProtection(ctx context.Context, id int64, alg
 	return nil
 }
 
-// CloseManualOrder records an exchange-confirmed close. Mirrors CloseRealOrderConfirmed's
+// CloseManualOrder records an exchange-confirmed close. Mirrors CloseBotOrderConfirmed's
 // idempotency guard exactly (the same "AND closed_at IS NULL" reasoning: two racing close paths
 // must not both succeed and overwrite each other's outcome).
 func (r *Repository) CloseManualOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal, exchangeFee *decimal.Decimal) error {
@@ -191,7 +191,7 @@ func (r *Repository) CloseManualOrder(ctx context.Context, id int64, closePx dec
 // both cases safely because a row's status is never simultaneously "resting" and "filled/partial"
 // (docs/MANUAL_TRADE_PLAN.md §8.1): ManualTrader.Run reads the CURRENT status when it processes the
 // flag and picks the matching action, so there is no ambiguity about which one applies. Mirrors
-// RequestRealManualClose's async-intent shape (flag now, act on the process's own next tick).
+// RequestBotManualClose's async-intent shape (flag now, act on the process's own next tick).
 func (r *Repository) RequestManualOrderClose(ctx context.Context, id int64) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE manual_orders SET manual_close_requested = true
@@ -213,7 +213,7 @@ func (r *Repository) RequestManualOrderClose(ctx context.Context, id int64) erro
 //
 // Zero rows affected is reported as ErrOrderAlreadyClosed regardless of whether the row was never
 // resting at all or a second racing caller already resolved it — the same idempotency guard
-// CloseManualOrder/CloseRealOrderConfirmed use, since both cases mean the same thing to a caller
+// CloseManualOrder/CloseBotOrderConfirmed use, since both cases mean the same thing to a caller
 // here: there is nothing left for this call to do.
 func (r *Repository) CancelManualOrder(ctx context.Context, id int64) error {
 	tag, err := r.pool.Exec(ctx, `
@@ -230,7 +230,7 @@ func (r *Repository) CancelManualOrder(ctx context.Context, id int64) error {
 	return nil
 }
 
-// SetManualOrderError records the latest exchange failure for an order. Mirrors SetRealOrderError:
+// SetManualOrderError records the latest exchange failure for an order. Mirrors SetBotOrderError:
 // deliberately does not change status, so a stuck order stays visibly stuck.
 func (r *Repository) SetManualOrderError(ctx context.Context, id int64, message string) error {
 	_, err := r.pool.Exec(ctx, `
@@ -254,7 +254,7 @@ func (r *Repository) ClearManualOrderError(ctx context.Context, id int64) error 
 }
 
 // ListOpenManualOrders returns still-open manual positions for an instrument, restricted to
-// status IN ('filled','partial') — mirrors ListOpenRealOrders. A resting/pending order is not yet a
+// status IN ('filled','partial') — mirrors ListOpenBotOrders. A resting/pending order is not yet a
 // position and must never be double-counted as one.
 func (r *Repository) ListOpenManualOrders(ctx context.Context, instID string) ([]port.ManualOrder, error) {
 	rows, err := r.pool.Query(ctx, `
@@ -284,7 +284,7 @@ func (r *Repository) ListOpenManualOrders(ctx context.Context, instID string) ([
 }
 
 // ListManualOrders lists manual orders for the panel, filtered/sorted/paged per f — mirrors
-// ListRealPositions. f.Mode is ignored (every row is real by construction).
+// ListBotPositions. f.Mode is ignored (every row is real by construction).
 func (r *Repository) ListManualOrders(ctx context.Context, f port.PositionFilter) ([]port.ManualOrder, error) {
 	col, ok := positionSortColumns[f.SortBy]
 	if !ok {

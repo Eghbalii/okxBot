@@ -15,9 +15,9 @@ import (
 //
 // Production sequence, from the trader's own logs:
 //
-//	15:35:02  opened real order id=148 instId=PUMP (SL rested on the exchange)
+//	15:35:02  opened bot order id=148 instId=PUMP (SL rested on the exchange)
 //	15:35:05  reconcile: "exchange reports flat but local state shows an open position"
-//	15:35:06  cancelled the resting protective order; closed real order id=148
+//	15:35:06  cancelled the resting protective order; closed bot order id=148
 //	15:35:24  reconcile: "exchange reports an open position this system has no record of"
 //
 // OKX's positions endpoint trailed its own fill by ~20 seconds. Reconcile believed the first flat
@@ -26,10 +26,10 @@ import (
 func TestReconcile_DoesNotCloseAJustOpenedPositionOnAFlatReading(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	e := newTestRealTrader(repo, exchange, nil, nil)
+	e := newTestBotTrader(repo, exchange, nil, nil)
 
 	// A position opened moments ago, exactly as order 148 was.
-	id, err := repo.OpenRealOrder(context.Background(), port.RealOrder{
+	id, err := repo.OpenBotOrder(context.Background(), port.BotOrder{
 		InstID:   e.InstID,
 		Side:     "buy",
 		Status:   "filled",
@@ -48,7 +48,7 @@ func TestReconcile_DoesNotCloseAJustOpenedPositionOnAFlatReading(t *testing.T) {
 	// The exchange reports FLAT — the lagging reading that caused the incident.
 	e.ReconcileWith(context.Background(), AccountSnapshot{}, logger)
 
-	open, err := repo.ListRealPositions(context.Background(), port.PositionFilter{Mode: "real", Open: boolPtr(true)})
+	open, err := repo.ListBotPositions(context.Background(), port.PositionFilter{Mode: "bot", Open: boolPtr(true)})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -71,10 +71,10 @@ func TestReconcile_DoesNotCloseAJustOpenedPositionOnAFlatReading(t *testing.T) {
 func TestReconcile_StillClosesAnOlderPositionReportedFlat(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
-	e := newTestRealTrader(repo, exchange, nil, nil)
+	e := newTestBotTrader(repo, exchange, nil, nil)
 
 	// Opened well beyond the grace period.
-	if _, err := repo.OpenRealOrder(context.Background(), port.RealOrder{
+	if _, err := repo.OpenBotOrder(context.Background(), port.BotOrder{
 		InstID:   e.InstID,
 		Side:     "buy",
 		Status:   "filled",
@@ -88,7 +88,7 @@ func TestReconcile_StillClosesAnOlderPositionReportedFlat(t *testing.T) {
 
 	e.ReconcileWith(context.Background(), AccountSnapshot{}, slog.New(slog.NewTextHandler(&strings.Builder{}, nil)))
 
-	open, err := repo.ListRealPositions(context.Background(), port.PositionFilter{Mode: "real", Open: boolPtr(true)})
+	open, err := repo.ListBotPositions(context.Background(), port.PositionFilter{Mode: "bot", Open: boolPtr(true)})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}

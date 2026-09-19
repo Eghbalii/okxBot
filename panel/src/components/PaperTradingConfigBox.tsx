@@ -17,8 +17,8 @@ const STATE_META: Record<string, { label: string; badge: string; dot: string }> 
   stopped: { label: 'Stopped', badge: 'badge-red', dot: 'var(--red)' },
 }
 
-// Trading controls for one mode (Paper or Real) — the page-level tab (PositionsPage) now owns mode
-// selection, so this component just renders whichever mode it's given (CLAUDE.md real-trading
+// Trading controls for one mode (Paper or Bot Trader) — the page-level tab (PositionsPage) now owns
+// mode selection, so this component just renders whichever mode it's given (CLAUDE.md real-trading
 // readiness plan, 2026-09-04: both modes are wired up identically, reading/writing the same
 // mode-scoped Postgres rows via cmd/api's now mode-aware endpoints).
 export default function PaperTradingConfigBox({ mode }: { mode: PositionMode }) {
@@ -54,9 +54,9 @@ function TradingHealthBanner({ mode }: { mode: PositionMode }) {
   if (!data) return null
 
   const downCritical = data.services.filter((s) => s.critical && s.state !== 'running')
-  // A halt applies to real trading only, so it is not reported on the Paper tab where it would be
+  // A halt applies to bot trading only, so it is not reported on the Paper tab where it would be
   // a distraction the operator cannot act on.
-  const halt = mode === 'real' ? data.halt : undefined
+  const halt = mode === 'bot' ? data.halt : undefined
   const blocked = halt && !halt.safeToReset && (halt.blockers?.length ?? 0) > 0
 
   if (downCritical.length === 0 && !blocked) return null

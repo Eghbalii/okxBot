@@ -41,8 +41,8 @@ export interface TokenStats {
 }
 
 // 'demo' was dropped 2026-09-04 (real-trading readiness plan) — the project never built a demo
-// controller and decided not to pursue one; only paper and real trading exist going forward.
-export type PositionMode = 'paper' | 'real'
+// controller and decided not to pursue one; only paper and bot trading exist going forward.
+export type PositionMode = 'paper' | 'bot'
 // Fill-lifecycle status for a real order (real_orders.status) — null for paper/demo rows, which
 // have no fill lifecycle (a paper order is always instantly and fully filled).
 // 'opening'/'closing' mean a request is in flight with the exchange and its outcome is not yet
@@ -101,7 +101,7 @@ export interface Position {
   FeaturesJSON: unknown
   // Status is the fill lifecycle for a real order (real_orders.status) — null for paper/demo rows.
   Status: OrderStatus | null
-  // Real-trading only. The EXCHANGE's own accounting for the close, preferred over the locally
+  // Bot-trading only. The EXCHANGE's own accounting for the close, preferred over the locally
   // computed RealizedPnL/ClosePx wherever present (2026-09-08) — a local calculation cannot see
   // fees, funding, or the true fill price. null means the exchange did not report it, which is
   // deliberately distinct from a zero.
@@ -290,7 +290,7 @@ export interface EquityPoint {
 }
 
 // One row of GET /api/paper-trading/affordability — the Manage Tokens modal's min-size column and
-// its auto-disabled tag (2026-09-08). Real mode only: paper has no exchange minimums, so the
+// its auto-disabled tag (2026-09-08). Bot mode only: paper has no exchange minimums, so the
 // endpoint returns an empty list there.
 export interface TokenAffordability {
   instId: string

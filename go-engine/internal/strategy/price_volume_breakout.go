@@ -129,7 +129,7 @@ func (s *PriceVolumeBreakout) Evaluate(candles []Candle) (Signal, error) {
 
 	// Exit: 5 consecutive closes below the trend SMA — the source's own `strategy.close` condition,
 	// modeled as an opposite-side Signal per this package's "close = opposite signal" convention
-	// (CLAUDE.md §27.3). Only meaningful while a long is actually open; PaperTrader/RealTrader route
+	// (CLAUDE.md §27.3). Only meaningful while a long is actually open; PaperTrader/BotTrader route
 	// an opposite-side signal on a flat token as a fresh (and here, long-only-by-design) decision,
 	// so this deliberately checks a genuinely bearish run rather than firing constantly.
 	if len(candles) >= s.TrendLen+5 {

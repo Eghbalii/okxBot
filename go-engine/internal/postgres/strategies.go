@@ -186,12 +186,12 @@ func (r *Repository) DeleteAssignment(ctx context.Context, id int64) error {
 // same underlying signal monitored a second time, not independent evidence of the strategy's
 // quality — counting them here would let fork volume dilute/skew a strategy's real track record.
 // StrategyStatsFor computes strategyID's track record for mode, sourced from paper_orders
-// (filtered to variant='baseline', excluding shadow forks) or real_orders (no variant column at
+// (filtered to variant='baseline', excluding shadow forks) or bot_orders (no variant column at
 // all — real trading has no forking, §27.3, so every row already counts) depending on mode.
 func (r *Repository) StrategyStatsFor(ctx context.Context, strategyID int64, mode string) (port.StrategyStats, error) {
 	stats := port.StrategyStats{StrategyID: strategyID}
 	var query string
-	if mode == "real" {
+	if mode == "bot" {
 		query = `
 			SELECT
 				count(*),
@@ -201,7 +201,7 @@ func (r *Repository) StrategyStatsFor(ctx context.Context, strategyID int64, mod
 				coalesce(sum(realized_pnl), 0),
 				min(opened_at),
 				max(coalesce(closed_at, opened_at))
-			FROM real_orders
+			FROM bot_orders
 			WHERE strategy_id = $1
 		`
 	} else {

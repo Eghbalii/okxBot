@@ -127,7 +127,7 @@ func main() {
 			}
 			for _, r := range raw {
 				// Rewrite the wire instId field to the short symbol before publishing, so every
-				// downstream consumer (paper-trader, RealTrader, the panel) only ever sees the
+				// downstream consumer (paper-trader, BotTrader, the panel) only ever sees the
 				// internal identity, never OKX's own wire format.
 				rewritten, err := rewriteInstID(r, sym)
 				if err != nil {

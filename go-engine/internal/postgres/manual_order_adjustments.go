@@ -10,7 +10,7 @@ import (
 )
 
 // RecordManualOrderAdjustment appends one entry to a manual order's in-trade SL/TP adjustment
-// history. Mirrors RecordRealOrderAdjustment, minus a source column — every adjustment on a manual
+// history. Mirrors RecordBotOrderAdjustment, minus a source column — every adjustment on a manual
 // order is manual by construction.
 func (r *Repository) RecordManualOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal) error {
 	_, err := r.pool.Exec(ctx, `

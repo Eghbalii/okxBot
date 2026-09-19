@@ -16,24 +16,24 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 )
 
-// This file is the tick/candle IO skeleton shared by PaperTrader and RealTrader (CLAUDE.md §27,
+// This file is the tick/candle IO skeleton shared by PaperTrader and BotTrader (CLAUDE.md §27,
 // the real-trading conductor-lifecycle plan) — mutex-guarded candle-window storage, seeding from
 // Postgres at startup, and the tick/candle event decode shell. None of it makes a lifecycle
 // decision (open/update/close); it only maintains "what does the market look like right now,"
 // which both engines need identically. Extracted as free functions/a small candleStore type
-// rather than a struct PaperTrader/RealTrader embed, specifically so neither type's existing
+// rather than a struct PaperTrader/BotTrader embed, specifically so neither type's existing
 // field layout (and the ~40 struct-literal test constructions already built against
 // PaperTrader's exact shape) needs to change — see the design note in CLAUDE.md §27's plan doc
 // for why the embedding approach was tried and rejected in favor of this one.
 
 // The candle-window state itself (a mutex + map[bar][]domain.Candle) stays as a plain pair of
-// fields on each of PaperTrader/RealTrader, rather than a shared struct type — PaperTrader's
+// fields on each of PaperTrader/BotTrader, rather than a shared struct type — PaperTrader's
 // existing tests reach directly into pt.candles/pt.candlesMu (struct-literal construction,
 // direct assignment, explicit Lock/Unlock in ~10 places), so replacing those two fields with an
 // embedded/nested type would force touching every one of those call sites for a refactor that is
 // supposed to be behavior-preserving and low-risk. The functions below operate on that mutex+map
 // pair directly (passed as parameters) so the LOGIC is shared even though the storage fields are
-// not — RealTrader declares its own candlesMu/candles of the identical shape and calls the same
+// not — BotTrader declares its own candlesMu/candles of the identical shape and calls the same
 // functions.
 
 // snapshotCandles returns a deep-enough copy of every maintained bar under one lock, so a
@@ -132,7 +132,7 @@ func barSeconds(bar string) int {
 // decisionBarFor picks which timeframe's strategy signals and price context feed a TICK-driven RL
 // decision (CLAUDE.md §15.3/§15.9) — explicit if set, otherwise the shortest configured bar (the
 // freshest read of what price is doing right now). Shared by PaperTrader.decisionBar and
-// RealTrader's equivalent so the "shortest bar wins" rule can't drift between the two.
+// BotTrader's equivalent so the "shortest bar wins" rule can't drift between the two.
 func decisionBarFor(explicit string, bars []string) string {
 	if explicit != "" {
 		return explicit
@@ -147,7 +147,7 @@ func decisionBarFor(explicit string, bars []string) string {
 }
 
 // tickEvent/candleEvent mirror OKX's tick/candle Kafka payload shape (CLAUDE.md §12) — shared
-// decode types so PaperTrader and RealTrader parse the exact same wire format identically.
+// decode types so PaperTrader and BotTrader parse the exact same wire format identically.
 type tickEvent struct {
 	InstID string `json:"instId"`
 	Last   string `json:"last"`

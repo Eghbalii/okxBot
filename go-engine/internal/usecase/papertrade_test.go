@@ -35,13 +35,13 @@ type fakeRepository struct {
 	paperTradingConfig         map[string]*port.PaperTradingConfig
 	fundingRates               []port.FundingRate
 
-	// realOrders uses its own counter (nextRealID), deliberately NOT sharing nextID with the
-	// paper orders map — real_orders and paper_orders are independent Postgres sequences post-
+	// realOrders uses its own counter (nextBotID), deliberately NOT sharing nextID with the
+	// paper orders map — bot_orders and paper_orders are independent Postgres sequences post-
 	// split (CLAUDE.md, real-trading readiness plan, 2026-09-04), so a test can construct the
-	// exact cross-table id-collision scenario (paper order id=3 and real order id=3 coexisting)
+	// exact cross-table id-collision scenario (paper order id=3 and bot order id=3 coexisting)
 	// production code must disambiguate correctly by mode/table, not by assuming ids are unique.
-	nextRealID           int64
-	realOrders           map[int64]port.RealOrder
+	nextBotID            int64
+	realOrders           map[int64]port.BotOrder
 	realOrderAdjustments []port.PaperOrderAdjustment
 
 	nextInstrumentID int64
@@ -54,7 +54,7 @@ type fakeRepository struct {
 	marketTokens          map[string][]port.MarketToken
 
 	// Manual-order state (docs/MANUAL_TRADE_PLAN.md) — independent counters/maps, same
-	// cross-table-id-collision reasoning as realOrders/nextRealID above.
+	// cross-table-id-collision reasoning as realOrders/nextBotID above.
 	nextManualID           int64
 	manualOrders           map[int64]port.ManualOrder
 	manualOrderAdjustments []port.ManualOrderAdjustment
@@ -66,7 +66,7 @@ func newFakeRepository() *fakeRepository {
 	return &fakeRepository{
 		orders:             make(map[int64]port.PaperOrder),
 		accounts:           make(map[string]port.AccountEquity),
-		realOrders:         make(map[int64]port.RealOrder),
+		realOrders:         make(map[int64]port.BotOrder),
 		instruments:        make(map[int64]port.Instrument),
 		marketTokens:       make(map[string][]port.MarketToken),
 		manualOrders:       make(map[int64]port.ManualOrder),
@@ -390,32 +390,32 @@ func (r *fakeRepository) UpdatePaperOrderPnLExtremes(ctx context.Context, id int
 	return nil
 }
 
-func (r *fakeRepository) OpenRealOrder(ctx context.Context, o port.RealOrder) (int64, error) {
+func (r *fakeRepository) OpenBotOrder(ctx context.Context, o port.BotOrder) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.nextRealID++
-	o.ID = r.nextRealID
+	r.nextBotID++
+	o.ID = r.nextBotID
 	if o.Status == "" {
 		o.Status = "pending"
 	}
 	r.realOrders[o.ID] = o
 	return o.ID, nil
 }
-func (r *fakeRepository) GetRealOrder(ctx context.Context, id int64) (port.RealOrder, error) {
+func (r *fakeRepository) GetBotOrder(ctx context.Context, id int64) (port.BotOrder, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
 	if !ok {
-		return port.RealOrder{}, fmt.Errorf("real order %d not found", id)
+		return port.BotOrder{}, fmt.Errorf("bot order %d not found", id)
 	}
 	return o, nil
 }
-func (r *fakeRepository) UpdateRealOrderStatus(ctx context.Context, id int64, status string, entryPx, size, contracts *decimal.Decimal) error {
+func (r *fakeRepository) UpdateBotOrderStatus(ctx context.Context, id int64, status string, entryPx, size, contracts *decimal.Decimal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
 	if !ok {
-		return fmt.Errorf("real order %d not found", id)
+		return fmt.Errorf("bot order %d not found", id)
 	}
 	o.Status = status
 	if entryPx != nil {
@@ -432,36 +432,36 @@ func (r *fakeRepository) UpdateRealOrderStatus(ctx context.Context, id int64, st
 	r.realOrders[id] = o
 	return nil
 }
-func (r *fakeRepository) SetRealOrderFeatures(ctx context.Context, id int64, featuresJSON json.RawMessage) error {
+func (r *fakeRepository) SetBotOrderFeatures(ctx context.Context, id int64, featuresJSON json.RawMessage) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
 	if !ok {
-		return fmt.Errorf("real order %d not found", id)
+		return fmt.Errorf("bot order %d not found", id)
 	}
 	o.FeaturesJSON = featuresJSON
 	r.realOrders[id] = o
 	return nil
 }
-func (r *fakeRepository) SetRealOrderExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error {
+func (r *fakeRepository) SetBotOrderExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
 	if !ok {
-		return fmt.Errorf("real order %d not found", id)
+		return fmt.Errorf("bot order %d not found", id)
 	}
 	aid := algoOrderID
 	o.ExchangeAlgoOrderID = &aid
 	r.realOrders[id] = o
 	return nil
 }
-func (r *fakeRepository) CloseRealOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error {
+func (r *fakeRepository) CloseBotOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o := r.realOrders[id]
-	// Same idempotency guard as the real SQL — see CloseRealOrderConfirmed below.
+	// Same idempotency guard as the real SQL — see CloseBotOrderConfirmed below.
 	if o.ClosedAt != nil {
-		return fmt.Errorf("real order %d: %w", id, port.ErrOrderAlreadyClosed)
+		return fmt.Errorf("bot order %d: %w", id, port.ErrOrderAlreadyClosed)
 	}
 	now := o.OpenedAt
 	o.ClosedAt = &now
@@ -473,7 +473,7 @@ func (r *fakeRepository) CloseRealOrder(ctx context.Context, id int64, closePx d
 	r.realOrders[id] = o
 	return nil
 }
-func (r *fakeRepository) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal, manualOverride bool) error {
+func (r *fakeRepository) UpdateBotOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal, manualOverride bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
@@ -488,10 +488,10 @@ func (r *fakeRepository) UpdateRealOrderSLTP(ctx context.Context, id int64, slPx
 	r.realOrders[id] = o
 	return nil
 }
-func (r *fakeRepository) ListOpenRealOrders(ctx context.Context, instID string) ([]port.RealOrder, error) {
+func (r *fakeRepository) ListOpenBotOrders(ctx context.Context, instID string) ([]port.BotOrder, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var out []port.RealOrder
+	var out []port.BotOrder
 	for _, o := range r.realOrders {
 		if o.InstID == instID && o.ClosedAt == nil && (o.Status == "filled" || o.Status == "partial") {
 			out = append(out, o)
@@ -499,18 +499,18 @@ func (r *fakeRepository) ListOpenRealOrders(ctx context.Context, instID string) 
 	}
 	return out, nil
 }
-func (r *fakeRepository) RequestRealManualClose(ctx context.Context, id int64) error {
+func (r *fakeRepository) RequestBotManualClose(ctx context.Context, id int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
 	if !ok || o.ClosedAt != nil {
-		return fmt.Errorf("real order %d is not open", id)
+		return fmt.Errorf("bot order %d is not open", id)
 	}
 	o.ManualCloseRequested = true
 	r.realOrders[id] = o
 	return nil
 }
-func (r *fakeRepository) RequestRealManualCloseAll(ctx context.Context) (int, error) {
+func (r *fakeRepository) RequestBotManualCloseAll(ctx context.Context) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	n := 0
@@ -523,7 +523,7 @@ func (r *fakeRepository) RequestRealManualCloseAll(ctx context.Context) (int, er
 	}
 	return n, nil
 }
-func (r *fakeRepository) SetRealOrderClosing(ctx context.Context, id int64, closeOrderID string) error {
+func (r *fakeRepository) SetBotOrderClosing(ctx context.Context, id int64, closeOrderID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
@@ -539,17 +539,17 @@ func (r *fakeRepository) SetRealOrderClosing(ctx context.Context, id int64, clos
 	return nil
 }
 
-func (r *fakeRepository) CloseRealOrderConfirmed(ctx context.Context, id int64, closePx decimal.Decimal, reason string,
+func (r *fakeRepository) CloseBotOrderConfirmed(ctx context.Context, id int64, closePx decimal.Decimal, reason string,
 	realizedPnL decimal.Decimal, exchangePnL, exchangeFee, exchangeClosePx *decimal.Decimal) error {
 	r.mu.Lock()
 	o, ok := r.realOrders[id]
 	// Mirrors the real SQL's "WHERE ... AND closed_at IS NULL": closing is idempotent, so a second
 	// close of the same order changes nothing and reports ErrOrderAlreadyClosed. A fake without
 	// this guard would let a test pass against a double-close the real repository refuses — which
-	// is exactly the bug that overwrote real order 38's outcome.
+	// is exactly the bug that overwrote bot order 38's outcome.
 	if ok && o.ClosedAt != nil {
 		r.mu.Unlock()
-		return fmt.Errorf("real order %d: %w", id, port.ErrOrderAlreadyClosed)
+		return fmt.Errorf("bot order %d: %w", id, port.ErrOrderAlreadyClosed)
 	}
 	if ok {
 		o.ExchangeRealizedPnL = exchangePnL
@@ -562,10 +562,10 @@ func (r *fakeRepository) CloseRealOrderConfirmed(ctx context.Context, id int64, 
 		r.realOrders[id] = o
 	}
 	r.mu.Unlock()
-	return r.CloseRealOrder(ctx, id, closePx, reason, realizedPnL)
+	return r.CloseBotOrder(ctx, id, closePx, reason, realizedPnL)
 }
 
-func (r *fakeRepository) SetRealOrderExchangeRaw(ctx context.Context, id int64, leg string, raw json.RawMessage) error {
+func (r *fakeRepository) SetBotOrderExchangeRaw(ctx context.Context, id int64, leg string, raw json.RawMessage) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
@@ -584,7 +584,7 @@ func (r *fakeRepository) SetRealOrderExchangeRaw(ctx context.Context, id int64, 
 	return nil
 }
 
-func (r *fakeRepository) SetRealOrderError(ctx context.Context, id int64, message string) error {
+func (r *fakeRepository) SetBotOrderError(ctx context.Context, id int64, message string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
@@ -597,7 +597,7 @@ func (r *fakeRepository) SetRealOrderError(ctx context.Context, id int64, messag
 	return nil
 }
 
-func (r *fakeRepository) ClearRealOrderError(ctx context.Context, id int64) error {
+func (r *fakeRepository) ClearBotOrderError(ctx context.Context, id int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
@@ -609,7 +609,7 @@ func (r *fakeRepository) ClearRealOrderError(ctx context.Context, id int64) erro
 	return nil
 }
 
-func (r *fakeRepository) UpdateRealOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error {
+func (r *fakeRepository) UpdateBotOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o, ok := r.realOrders[id]
@@ -625,10 +625,10 @@ func (r *fakeRepository) UpdateRealOrderPnLExtremes(ctx context.Context, id int6
 	r.realOrders[id] = o
 	return nil
 }
-func (r *fakeRepository) ListRealPositions(ctx context.Context, f port.PositionFilter) ([]port.RealOrder, error) {
+func (r *fakeRepository) ListBotPositions(ctx context.Context, f port.PositionFilter) ([]port.BotOrder, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var out []port.RealOrder
+	var out []port.BotOrder
 	for _, o := range r.realOrders {
 		if f.InstID != "" && o.InstID != f.InstID {
 			continue
@@ -661,20 +661,20 @@ func (r *fakeRepository) ListRealPositions(ctx context.Context, f port.PositionF
 	}
 	return out, nil
 }
-func (r *fakeRepository) CountRealPositions(ctx context.Context, f port.PositionFilter) (int, error) {
-	out, err := r.ListRealPositions(ctx, f)
+func (r *fakeRepository) CountBotPositions(ctx context.Context, f port.PositionFilter) (int, error) {
+	out, err := r.ListBotPositions(ctx, f)
 	return len(out), err
 }
-func (r *fakeRepository) RecordRealOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error {
+func (r *fakeRepository) RecordBotOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal, source string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.nextRealID++
+	r.nextBotID++
 	r.realOrderAdjustments = append(r.realOrderAdjustments, port.PaperOrderAdjustment{
-		ID: r.nextRealID, OrderID: orderID, Field: field, OldValue: oldValue, NewValue: newValue, Source: source,
+		ID: r.nextBotID, OrderID: orderID, Field: field, OldValue: oldValue, NewValue: newValue, Source: source,
 	})
 	return nil
 }
-func (r *fakeRepository) ListRealOrderAdjustments(ctx context.Context, orderID int64) ([]port.PaperOrderAdjustment, error) {
+func (r *fakeRepository) ListBotOrderAdjustments(ctx context.Context, orderID int64) ([]port.PaperOrderAdjustment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var out []port.PaperOrderAdjustment
@@ -714,7 +714,7 @@ func (r *fakeRepository) ApplyRealizedPnL(ctx context.Context, mode string, pnl 
 	reset := false
 	// Real mode never auto-resets a drained balance (CLAUDE.md §15.7) — mirrored here so tests
 	// exercise the same carve-out the Postgres implementation enforces.
-	if ae.EquityUSD.Sign() <= 0 && mode != "real" {
+	if ae.EquityUSD.Sign() <= 0 && mode != "bot" {
 		drained := ae.EquityUSD
 		ae.EquityUSD = ae.InitialUSD
 		ae.ResetCount++
@@ -1203,8 +1203,8 @@ func TestSeedCandlesFromRepo_RespectsWindowLimit(t *testing.T) {
 // The cost is real and accepted: two strategies on opposite sides of one token largely cancel, minus
 // fees. What is bought is a per-strategy record clean enough to judge each one on.
 //
-// PAPER ONLY. usecase.RealTrader keeps one position per token per side (§27.3) and shares no code
-// with this path — TestRealTrader_* below still pin that.
+// PAPER ONLY. usecase.BotTrader keeps one position per token per side (§27.3) and shares no code
+// with this path — TestBotTrader_* below still pin that.
 // Reverted 2026-09-17 back to one-open-position-per-TOKEN (the original §16.9 rule) after a
 // 2026-09-14 trial widened this to one-per-(strategy,token) — see the comment on the
 // hasOpenBaseline call site in evaluateStrategies for why. This test now asserts the reverted
@@ -2416,14 +2416,14 @@ func TestMonitorOpenOrders_DrainedAccountResetsAndRecordsTimeline(t *testing.T) 
 
 // Real money is never auto-topped-up (CLAUDE.md §15.7): running out is a stop condition for a
 // human, not a bookkeeping event.
-func TestApplyRealizedPnL_RealModeNeverAutoResets(t *testing.T) {
+func TestApplyRealizedPnL_BotModeNeverAutoResets(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
-	if _, err := repo.GetAccountEquity(ctx, "real", dec("100")); err != nil {
+	if _, err := repo.GetAccountEquity(ctx, "bot", dec("100")); err != nil {
 		t.Fatalf("seed account: %v", err)
 	}
 
-	acct, reset, err := repo.ApplyRealizedPnL(ctx, "real", dec("-150"), nil, "BTC-USDT-SWAP")
+	acct, reset, err := repo.ApplyRealizedPnL(ctx, "bot", dec("-150"), nil, "BTC-USDT-SWAP")
 	if err != nil {
 		t.Fatalf("apply pnl: %v", err)
 	}
@@ -2525,7 +2525,7 @@ func TestSetAccountCap_MovesBalanceAndEquityTogether(t *testing.T) {
 // TestRecordExchangeBalance_ReservedNeverReportsAsATrade is the CLAUDE.md §32 incident,
 // reproduced exactly: a real account seeded at $40 (no SafeMoneyUSD reserve applied yet), then the
 // FIRST poll after safe_money_usd=20 is configured reports the exchange's raw balance completely
-// unchanged at $40. Before this fix, RealTrader.recordEquityReal computed
+// unchanged at $40. Before this fix, BotTrader.recordEquityBot computed
 // tradableEquity($40) = $20 FIRST and fed that into ApplyRealizedPnL's delta-from-EquityUSD
 // comparison — which read as a genuine $20 trade loss and dragged the real AccountBalanceUSD down
 // to $20 too, even though the exchange balance never moved. The fix must show AccountBalanceUSD
@@ -2533,13 +2533,13 @@ func TestSetAccountCap_MovesBalanceAndEquityTogether(t *testing.T) {
 func TestRecordExchangeBalance_ReservedNeverReportsAsATrade(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
-	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+	if _, err := repo.GetAccountEquity(ctx, "bot", dec("40")); err != nil {
 		t.Fatalf("seed account: %v", err)
 	}
 
 	// Raw exchange balance is unchanged at $40; a $20 safe-money reserve is applied for the first
 	// time on this poll.
-	acct, err := repo.RecordExchangeBalance(ctx, "real", dec("40"), dec("20"), "BTC")
+	acct, err := repo.RecordExchangeBalance(ctx, "bot", dec("40"), dec("20"), "BTC")
 	if err != nil {
 		t.Fatalf("record exchange balance: %v", err)
 	}
@@ -2553,7 +2553,7 @@ func TestRecordExchangeBalance_ReservedNeverReportsAsATrade(t *testing.T) {
 
 	// No history point should have been written for a zero-delta raw balance, since nothing about
 	// the real account actually changed — only the derived tradable view did.
-	points, err := repo.ListEquityHistory(ctx, "real", time.Time{}, 0)
+	points, err := repo.ListEquityHistory(ctx, "bot", time.Time{}, 0)
 	if err != nil {
 		t.Fatalf("list history: %v", err)
 	}
@@ -2566,7 +2566,7 @@ func TestRecordExchangeBalance_ReservedNeverReportsAsATrade(t *testing.T) {
 	// Now the exchange balance genuinely drops by $5 (a real trade loss) on the next poll — this
 	// must show up as a real $5 delta on AccountBalanceUSD, and EquityUSD must track it minus the
 	// same $20 reserve.
-	acct, err = repo.RecordExchangeBalance(ctx, "real", dec("35"), dec("20"), "BTC")
+	acct, err = repo.RecordExchangeBalance(ctx, "bot", dec("35"), dec("20"), "BTC")
 	if err != nil {
 		t.Fatalf("record exchange balance after real loss: %v", err)
 	}
@@ -3099,11 +3099,11 @@ func TestMonitorOpenOrders_StillTightensAnOverWideStopAfterTheWideningGuard(t *t
 func TestSetTradingCap_PnLAccruesToCapWhileReserveStaysPut(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
-	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+	if _, err := repo.GetAccountEquity(ctx, "bot", dec("40")); err != nil {
 		t.Fatalf("seed real account: %v", err)
 	}
 
-	ae, err := repo.SetTradingCap(ctx, "real", dec("20"))
+	ae, err := repo.SetTradingCap(ctx, "bot", dec("20"))
 	if err != nil {
 		t.Fatalf("set trading cap: %v", err)
 	}
@@ -3126,12 +3126,12 @@ func TestSetTradingCap_PnLAccruesToCapWhileReserveStaysPut(t *testing.T) {
 
 	// Raising the cap re-splits the SAME total: 5 comes out of the reserve, the total holds at 45.
 	repo.mu.Lock()
-	repo.accounts["real"] = port.AccountEquity{
-		Mode: "real", AccountBalanceUSD: rawBalance, EquityUSD: wantEquity, TradingCapUSD: ae.TradingCapUSD,
+	repo.accounts["bot"] = port.AccountEquity{
+		Mode: "bot", AccountBalanceUSD: rawBalance, EquityUSD: wantEquity, TradingCapUSD: ae.TradingCapUSD,
 	}
 	repo.mu.Unlock()
 
-	ae2, err := repo.SetTradingCap(ctx, "real", dec("30"))
+	ae2, err := repo.SetTradingCap(ctx, "bot", dec("30"))
 	if err != nil {
 		t.Fatalf("raise trading cap: %v", err)
 	}
@@ -3152,11 +3152,11 @@ func TestSetTradingCap_PnLAccruesToCapWhileReserveStaysPut(t *testing.T) {
 func TestSetTradingCap_ClampsToRealBalance(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
-	if _, err := repo.GetAccountEquity(ctx, "real", dec("40")); err != nil {
+	if _, err := repo.GetAccountEquity(ctx, "bot", dec("40")); err != nil {
 		t.Fatalf("seed real account: %v", err)
 	}
 
-	ae, err := repo.SetTradingCap(ctx, "real", dec("999"))
+	ae, err := repo.SetTradingCap(ctx, "bot", dec("999"))
 	if err != nil {
 		t.Fatalf("set trading cap: %v", err)
 	}
@@ -3254,7 +3254,7 @@ func (f *fakeRepository) filterInstruments(filter port.InstrumentFilter) ([]port
 			if !in.EnabledPaper {
 				continue
 			}
-		case "real":
+		case "bot":
 			if !in.EnabledReal {
 				continue
 			}

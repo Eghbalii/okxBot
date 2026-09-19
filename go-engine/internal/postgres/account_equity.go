@@ -53,7 +53,7 @@ func (r *Repository) GetAccountEquity(ctx context.Context, mode string, initialU
 
 // ApplyRealizedPnL adds pnl to mode's running balance, recording an EquityPoint for it, and resets
 // a drained EquityUSD (never AccountBalanceUSD — see its doc comment) back to InitialUSD unless
-// mode is "real" — CLAUDE.md §15.6/§15.7. Real money never auto-tops-up: running out is a stop
+// mode is "bot" — CLAUDE.md §15.6/§15.7. Real money never auto-tops-up: running out is a stop
 // condition for a human, not a bookkeeping event.
 //
 // AccountBalanceUSD moves by the exact same pnl, in the exact same transaction, but is never reset
@@ -96,7 +96,7 @@ func (r *Repository) ApplyRealizedPnL(
 	}
 
 	// Real-money mode is deliberately excluded from the reset: see §15.7's carve-out.
-	if ae.EquityUSD.Sign() > 0 || mode == "real" {
+	if ae.EquityUSD.Sign() > 0 || mode == "bot" {
 		if err := tx.Commit(ctx); err != nil {
 			return port.AccountEquity{}, false, fmt.Errorf("commit apply realized pnl: %w", err)
 		}
@@ -133,7 +133,7 @@ func (r *Repository) ApplyRealizedPnL(
 // stored AccountBalanceUSD, applying the real delta as a reason="trade" EquityPoint (mirroring
 // ApplyRealizedPnL exactly), then derives EquityUSD independently as
 // max(AccountBalanceUSD-safeMoneyUSD, 0) with NO history point of its own — CLAUDE.md §32's
-// incident. Before this existed, RealTrader.recordEquityReal computed
+// incident. Before this existed, BotTrader.recordEquityBot computed
 // tradableEquity(rawBalance) = rawBalance-SafeMoneyUSD FIRST and fed that already-reserve-
 // subtracted number into ApplyRealizedPnL's delta-from-EquityUSD comparison — the moment
 // SafeMoneyUSD was set to a nonzero value, that read as a real trade loss equal to the reserve

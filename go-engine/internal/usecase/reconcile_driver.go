@@ -15,12 +15,12 @@ import (
 // 20 calls per cycle where 2 carry the same information, and OKX rate-limited it (CLAUDE.md §38.2).
 //
 // It owns only the FETCH and the cadence. Every decision about a position stays in
-// RealTrader.ReconcileWith, so there remains exactly one definition of how this system responds to
+// BotTrader.ReconcileWith, so there remains exactly one definition of how this system responds to
 // a position change — the same reason the WebSocket push routes through reconcile rather than
 // handling positions itself (CLAUDE.md §35.4).
 type ReconcileDriver struct {
 	// Engines is keyed by short symbol, matching cmd/trader's own engines map.
-	Engines map[string]*RealTrader
+	Engines map[string]*BotTrader
 
 	Exchange port.ExchangeClient
 	Logger   *slog.Logger

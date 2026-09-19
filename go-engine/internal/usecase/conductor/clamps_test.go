@@ -221,7 +221,7 @@ func TestEnsureStop_MaxLossPctBoundsTheFilledStop(t *testing.T) {
 
 // The first real order (id 3, SOL short) opened with a stop from the model and NO take-profit,
 // because the model emitted SLPx but a zero TPPx and nothing downstream re-supplied a target the
-// way EnsureStop re-supplies a stop. RealTrader watches SL/TP in-process, so that position could
+// way EnsureStop re-supplies a stop. BotTrader watches SL/TP in-process, so that position could
 // only ever end at its stop, at the timeout, or by hand.
 func TestEnsureTarget_FillsMissingTargetFromStopDistance(t *testing.T) {
 	cl := Clamps{MinTPSLRatio: decimal.NewFromFloat(1.5)}

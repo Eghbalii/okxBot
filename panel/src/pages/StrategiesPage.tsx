@@ -243,9 +243,9 @@ function ChartPanel({
 }
 
 export default function StrategiesPage() {
-  // Paper and real trading each have a fully independent track record and assignment set
+  // Paper and bot trading each have a fully independent track record and assignment set
   // (CLAUDE.md real-trading readiness plan, 2026-09-04) — this tab picks which one the table/
-  // chart below reflects, same pattern as the Positions page's own Paper/Real tabs.
+  // chart below reflects, same pattern as the Positions page's own Paper/Bot Trader tabs.
   const [mode, setMode] = useState<PositionMode>('paper')
   const [strategies, setStrategies] = useState<StrategyConfig[]>([])
   const [assignments, setAssignments] = useState<StrategyAssignment[]>([])
@@ -290,7 +290,7 @@ export default function StrategiesPage() {
   return (
     <div>
       <div className="mode-tabs" style={{ marginBottom: '0.9rem' }}>
-        {(['paper', 'real'] as PositionMode[]).map((m) => (
+        {(['paper', 'bot'] as PositionMode[]).map((m) => (
           <button
             key={m}
             className={'mode-tab' + (mode === m ? ' active' : '')}

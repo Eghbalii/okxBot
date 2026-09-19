@@ -57,13 +57,13 @@ export default function NotificationBell() {
     try {
       // Both modes, newest failure first. Closed orders are included deliberately: a close that
       // failed is exactly the case worth seeing, and it is closed by then.
-      // Real mode ONLY, and not as an optimisation: paper_orders has no last_error column at
-      // all. Exchange failures are structural to real trading — paper trading never contacts an
+      // Bot Trader mode ONLY, and not as an optimisation: paper_orders has no last_error column at
+      // all. Exchange failures are structural to bot trading — paper trading never contacts an
       // exchange — so the paper request could never have returned a single notification. It was
       // costing a 6.9MB download (those rows carry FeaturesJSON, the whole decision-time
       // observation) that blocked the badge for seconds behind data with nothing to show.
       const r = await api.listPositions({
-        mode: 'real',
+        mode: 'bot',
         pageSize: 100,
         sortBy: 'opened_at',
         sortDesc: true,
@@ -237,7 +237,7 @@ function NotifRow({ p, unread, full }: { p: Position; unread: boolean; full?: bo
   return (
     <li className={'notif-item' + (unread ? ' unread' : '')}>
       <div className="notif-item-head">
-        <span className={'badge ' + (p.Mode === 'real' ? 'badge-red' : 'badge-dim')}>{p.Mode}</span>
+        <span className={'badge ' + (p.Mode === 'bot' ? 'badge-red' : 'badge-dim')}>{p.Mode}</span>
         <strong>
           #{p.ID} {tokenSymbol(p.InstID)}
         </strong>

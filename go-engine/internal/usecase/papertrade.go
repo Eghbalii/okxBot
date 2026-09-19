@@ -81,7 +81,7 @@ type PaperTrader struct {
 	ActiveTokens []string // the roster used to build the token-identity one-hot, CLAUDE.md §15.3
 
 	// Mode is which account balance this engine trades against — "paper" here; cmd/trader uses
-	// "demo"/"real". All three are tracked simultaneously (CLAUDE.md §15.6), and only non-real
+	// "demo"/"bot". All three are tracked simultaneously (CLAUDE.md §15.6), and only non-real
 	// modes ever auto-reset a drained balance (§15.7).
 	Mode string
 	// AccountInitialUSD is the shared account's configured starting balance — what a drained
@@ -241,7 +241,7 @@ var defaultPaperLeverage = decimal.NewFromInt(10)
 // but a multi-timeframe strategy contributing signals to it sees every bar (marketView), so
 // higher-timeframe context still reaches the model through those signals.
 //
-// Delegates to decisionBarFor (tickfeed.go), shared with RealTrader's equivalent.
+// Delegates to decisionBarFor (tickfeed.go), shared with BotTrader's equivalent.
 func (e *PaperTrader) decisionBar() string {
 	return decisionBarFor(e.RLDecisionBar, e.Bars)
 }
@@ -250,7 +250,7 @@ func (e *PaperTrader) decisionBar() string {
 // (CLAUDE.md §9) sees bars that are consistent with each other, and so no lock is held across a
 // Strategy.Evaluate call. bar is the timeframe that just closed — the decision cadence.
 //
-// Delegates to snapshotCandles (tickfeed.go), shared with RealTrader's equivalent.
+// Delegates to snapshotCandles (tickfeed.go), shared with BotTrader's equivalent.
 func (e *PaperTrader) marketView(bar string) strategy.MarketView {
 	return snapshotCandles(&e.candlesMu, e.candles, bar)
 }
@@ -275,7 +275,7 @@ func (e *PaperTrader) marketView(bar string) strategy.MarketView {
 // Best-effort per bar: a read failure leaves that window empty and it refills from the live feed,
 // which is strictly the old behavior. Seeding must never keep the engine from starting.
 //
-// Delegates to the free function of the same name in tickfeed.go, shared with RealTrader's
+// Delegates to the free function of the same name in tickfeed.go, shared with BotTrader's
 // equivalent (Go's method vs. free-function namespaces are distinct, so this name is not a
 // collision).
 func (e *PaperTrader) seedCandlesFromRepo(ctx context.Context, logger *slog.Logger) {
@@ -560,7 +560,7 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 		// per-strategy track-record benefit §54.1 documented is real and may be worth revisiting once
 		// the roster is stable — this revert does not delete that capability, only stops using it.
 		//
-		// This is PAPER ONLY. usecase.RealTrader keeps one position per token per side (§27.3) and
+		// This is PAPER ONLY. usecase.BotTrader keeps one position per token per side (§27.3) and
 		// shares no code with this path, so real trading is untouched.
 		if hasOpenBaseline(open) {
 			continue
@@ -897,7 +897,7 @@ func grossPnL(o port.PaperOrder, closePx decimal.Decimal) decimal.Decimal {
 // more optimistic than a real fill would be. Charged on NOTIONAL (o.Size * o.Leverage), not on
 // o.Size alone: o.Size is the margin committed, and a fee is a percentage of what actually trades on
 // the exchange, which is the leveraged notional. TakerFeeRate is a package-level var, not a
-// PaperTrader field, so this shared function (also used by RealTrader via the same call sites) needs
+// PaperTrader field, so this shared function (also used by BotTrader via the same call sites) needs
 // no struct threaded through it — set once at process startup from config.
 func tradingFee(o port.PaperOrder, closePx decimal.Decimal) decimal.Decimal {
 	if !TakerFeeRate.IsPositive() {
@@ -947,9 +947,9 @@ func realizedPnLWithFunding(ctx context.Context, repo port.Repository, o port.Pa
 }
 
 // TakerFeeRate is set once at process startup (cmd/paper-trader, cmd/trader) from
-// config.Trading.TakerFeeRate. A package-level var rather than a field on PaperTrader/RealTrader
+// config.Trading.TakerFeeRate. A package-level var rather than a field on PaperTrader/BotTrader
 // because realizedPnL/tradingFee are free functions shared by both types (PaperTrader and
-// RealTrader both call realizedPnL) — this keeps paper and real trading's fee model from ever
+// BotTrader both call realizedPnL) — this keeps paper and real trading's fee model from ever
 // silently diverging by construction, rather than by remembering to pass the same config value to
 // two separate struct fields. internal/optimizer's own trial scoring does NOT use this: it
 // deliberately judges purely on SL/TP touch, never PnL (CLAUDE.md §16.1), so a fee has nothing to

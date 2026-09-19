@@ -112,7 +112,7 @@ type Config struct {
 		// restart button through cmd/api (CLAUDE.md §11 / real-trading readiness plan, 2026-09-04).
 		URL string `yaml:"-"`
 		// UseConductorLifecycle switches cmd/trader from the old flat delta-notional rebalance loop
-		// (usecase.Trader) to usecase.RealTrader — the strategy-signal + conductor-mediated
+		// (usecase.Trader) to usecase.BotTrader — the strategy-signal + conductor-mediated
 		// lifecycle usecase.PaperTrader already runs, adapted for real orders (CLAUDE.md §27's
 		// real-trading plan, commit 8). Defaults to false/off: the old Trader remains production
 		// behavior until this is explicitly flipped, matching every other RL feature flag's
@@ -134,7 +134,7 @@ type Config struct {
 		// the model's close action unless it is turned on explicitly here.
 		AllowRLEarlyClose bool `yaml:"allow_rl_early_close"`
 		// SafeMoneyUSD is a reserve subtracted from the exchange's reported real balance before
-		// RealTrader ever sizes a position or records equity for the panel (CLAUDE.md real-trading
+		// BotTrader ever sizes a position or records equity for the panel (CLAUDE.md real-trading
 		// readiness plan, 2026-09-04 operator decision) — capital the operator wants to stay
 		// untouched even if every open position were liquidated, since isolated margin (§27.2)
 		// bounds a position's own loss to its own margin, never the whole account, so money set
@@ -148,7 +148,7 @@ type Config struct {
 		// settles in the same currency). Found load-bearing 2026-09-04 (CLAUDE.md §27): this
 		// project's real account settles in USDC under Multi-currency margin mode, and its
 		// tradeable instruments report instType=FUTURES, not the SWAP/USDT this codebase assumed
-		// pre-2026-09-04. Both empty by default (RealTrader's own accessors fall back to
+		// pre-2026-09-04. Both empty by default (BotTrader's own accessors fall back to
 		// instType=SWAP, currency=USDT) — i.e. no override needed for a deployment whose account
 		// trades the classic SWAP product directly.
 		ExecInstType  string `yaml:"exec_inst_type"`

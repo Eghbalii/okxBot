@@ -57,54 +57,54 @@ var (
 
 	// The exchange-side SL/TP protection counters (2026-09-09). These exist because the failure
 	// this mechanism prevents is SILENT: a real position running without a stop looks exactly like
-	// one running with a stop, right up until it doesn't. RealProtectionMissingTotal is the one to
+	// one running with a stop, right up until it doesn't. BotProtectionMissingTotal is the one to
 	// alert on — any nonzero value means a live position was found unprotected, which should be
 	// impossible if placement and cancellation are both working.
-	RealProtectionPlacedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "okxbot_real_protection_placed_total",
+	BotProtectionPlacedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_bot_protection_placed_total",
 		Help: "Resting SL/TP (algo) orders successfully placed on the exchange, by instrument.",
 	}, []string{"inst_id"})
 
-	RealProtectionFailedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "okxbot_real_protection_failed_total",
+	BotProtectionFailedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_bot_protection_failed_total",
 		Help: "Failed attempts to rest an SL/TP order on the exchange, by instrument.",
 	}, []string{"inst_id"})
 
-	RealProtectionAmendedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "okxbot_real_protection_amended_total",
+	BotProtectionAmendedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_bot_protection_amended_total",
 		Help: "Resting SL/TP orders successfully amended on the exchange, by instrument.",
 	}, []string{"inst_id"})
 
-	RealProtectionAmendFailedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "okxbot_real_protection_amend_failed_total",
+	BotProtectionAmendFailedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_bot_protection_amend_failed_total",
 		Help: "Failed attempts to amend a resting SL/TP order, by instrument.",
 	}, []string{"inst_id"})
 
-	// RealProtectionMissingTotal counts open real positions found with no live protective order on
+	// BotProtectionMissingTotal counts open real positions found with no live protective order on
 	// the exchange during verification — each one a position that was running unprotected.
-	RealProtectionMissingTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "okxbot_real_protection_missing_total",
+	BotProtectionMissingTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_bot_protection_missing_total",
 		Help: "Open real positions found without a live exchange-side SL/TP order, by instrument.",
 	}, []string{"inst_id"})
 
-	// RealUnprotectedClosedTotal counts positions flattened immediately after opening because their
+	// BotUnprotectedClosedTotal counts positions flattened immediately after opening because their
 	// protection could not be placed — the deliberate "never hold an unprotected real position"
 	// response (2026-09-09 decision).
-	RealUnprotectedClosedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "okxbot_real_unprotected_closed_total",
+	BotUnprotectedClosedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_bot_unprotected_closed_total",
 		Help: "Real positions closed immediately because exchange-side SL/TP could not be placed.",
 	}, []string{"inst_id"})
 
-	// RealEarlyCloseIgnoredTotal counts model early-close requests real trading declined because
+	// BotEarlyCloseIgnoredTotal counts model early-close requests real trading declined because
 	// trading.allow_rl_early_close is off (2026-09-08). A growing count is not a fault — it is the
 	// evidence for whether that action is worth enabling: pair it with how those positions
 	// actually resolved (SL, TP, or timeout) to judge whether the model was right to want out.
-	RealEarlyCloseIgnoredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "okxbot_real_early_close_ignored_total",
+	BotEarlyCloseIgnoredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_bot_early_close_ignored_total",
 		Help: "Model early-close requests ignored in real trading because the action is disabled, by instrument.",
 	}, []string{"inst_id"})
 
-	// PaperEarlyCloseIgnoredTotal is the paper-trading twin of RealEarlyCloseIgnoredTotal, added
+	// PaperEarlyCloseIgnoredTotal is the paper-trading twin of BotEarlyCloseIgnoredTotal, added
 	// 2026-09-10 after paper trading's own closeEarly was found to discard the request with NO log
 	// and NO metric while real trading recorded both.
 	//

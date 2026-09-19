@@ -30,7 +30,7 @@ type Trader struct {
 	MinOrderUSD  decimal.Decimal
 	Logger       *slog.Logger
 
-	// ExecInstID/ExecInstType/SettleCcy mirror RealTrader's own fields (CLAUDE.md §27, 2026-09-04
+	// ExecInstID/ExecInstType/SettleCcy mirror BotTrader's own fields (CLAUDE.md §27, 2026-09-04
 	// design): InstID is now a short internal symbol ("BTC"), never OKX's own wire-format instId,
 	// so every exchange call needs the real instId/instType/currency separately. Empty falls back
 	// to InstID directly / instType "SWAP" / currency "USDT" — the pre-2026-09-04 behavior, for a
@@ -45,9 +45,9 @@ type Trader struct {
 	// an all-zero one-hot, which is a token the model has never seen.
 	ActiveTokens []string
 
-	// Mode is which account this trader operates against: "demo" or "real" (CLAUDE.md §15.6).
+	// Mode is which account this trader operates against: "demo" or "bot" (CLAUDE.md §15.6).
 	// It selects which account_equity row the equity timeline is recorded under, and — critically —
-	// "real" is the mode the repository refuses to auto-reset when drained (§15.7).
+	// "bot" is the mode the repository refuses to auto-reset when drained (§15.7).
 	Mode string
 	// AccountInitialUSD is the configured starting balance, reported to the model alongside live
 	// equity so it can see drawdown from the starting point the same way the paper path does.
@@ -178,7 +178,7 @@ func (t *Trader) step(ctx context.Context, logger *slog.Logger) error {
 	// rl_service padded into a full-width vector and answered confidently, which is precisely the
 	// silent-degradation this schema exists to end.
 	//
-	// RealTrader supersedes this loop (§27.3) and is what cmd/trader constructs when
+	// BotTrader supersedes this loop (§27.3) and is what cmd/trader constructs when
 	// trading.use_conductor_lifecycle is on. Until this path is retired, it runs WITHOUT the model
 	// rather than consulting it on data it cannot supply — the same "skip rather than pad" rule
 	// every other caller now follows.
@@ -210,7 +210,7 @@ func (t *Trader) stepWithoutModel(
 //
 // Unlike paper mode, the balance here isn't ours to compute — the exchange owns it. So rather than
 // applying a PnL delta, this observes the reported equity and records the difference from what was
-// last stored. A reset is never triggered from this path: for "real" the repository refuses to
+// last stored. A reset is never triggered from this path: for "bot" the repository refuses to
 // auto-reset by design, and for "demo" the exchange's own balance is authoritative, so topping up a
 // local row would just desynchronize it from reality.
 //
@@ -342,14 +342,14 @@ func (t *Trader) execute(
 	// a raw notional/price division assumes a contract multiplier of 1, which sized an order
 	// roughly 10,000x too large against this account's real X-Perp instrument). Reuses
 	// sizeToContracts/instrumentMeta-shaped logic via a direct GetInstrument call rather than
-	// caching per-call the way RealTrader does — this path polls once every PollInterval, not
-	// once per order, so the extra call is not the hot path RealTrader's sync.Once optimizes for.
+	// caching per-call the way BotTrader does — this path polls once every PollInterval, not
+	// once per order, so the extra call is not the hot path BotTrader's sync.Once optimizes for.
 	inst, err := t.Exchange.GetInstrument(t.execInstType(), t.execInstID())
 	if err != nil {
 		return fmt.Errorf("fetch instrument metadata: %w", err)
 	}
 	// Leverage 1 deliberately: deltaNotional is ALREADY a position notional here (this path
-	// computes a target exposure directly), unlike RealTrader's own call site which passes margin
+	// computes a target exposure directly), unlike BotTrader's own call site which passes margin
 	// and needs leverage applied to reach the notional. Passing the real leverage would multiply a
 	// notional that already accounts for it.
 	sz := sizeToContracts(deltaNotional.Abs(), decimal.NewFromInt(1), mid, inst)

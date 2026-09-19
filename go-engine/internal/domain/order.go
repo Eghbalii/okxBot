@@ -63,7 +63,7 @@ func (s OrderStatus) IsTerminal() bool { return s.State == "filled" || s.State =
 //
 // This is what makes a real position's protection live on the EXCHANGE rather than only in this
 // process (2026-09-09 request: "we should set sl/tp on exchange always"). Before it, a real
-// position's SL/TP existed solely as columns in real_orders that RealTrader's own tick monitor
+// position's SL/TP existed solely as columns in bot_orders that BotTrader's own tick monitor
 // watched — so any interruption of this service (crash, restart, deploy, network partition, the
 // Kafka tick feed stalling) left real capital running with no protection whatsoever, which is
 // exactly the exposure the exchange-side order removes.
