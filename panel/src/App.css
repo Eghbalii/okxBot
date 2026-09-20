@@ -2387,3 +2387,82 @@ input[type='number'] {
 }
 .ot-submit-long, .ot-submit-short { padding: 10px; font-size: 14px; }
 .ot-position-head { display: flex; align-items: center; gap: 8px; }
+
+/* --- Account page (2026-09-20 redesign) --- */
+.account-page { display: flex; flex-direction: column; gap: 16px; }
+
+/* Ghost button: a plain button with no fill, used for the exchange card's placeholder actions
+   (Sync/Add/Remove key) — visually secondary to .btn-primary since none of these do anything real
+   yet (see ExchangeAccountCard's own comment), and disabled state must read as "not built," not
+   "temporarily broken." */
+.btn-ghost {
+  background: transparent;
+  font-size: 12px;
+  padding: 0.3rem 0.6rem;
+}
+.btn-ghost:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-ghost-danger { color: var(--red); border-color: rgba(248, 81, 73, 0.4); }
+.btn-ghost-danger:hover:not(:disabled) { border-color: var(--red); background: rgba(248, 81, 73, 0.08); }
+
+/* Exchange account card: logo + name lead (identity first), balance is a secondary line, then a
+   meta row and an actions row — replaces a first version that was a big box around one number. */
+.xcard-grid { display: flex; flex-wrap: wrap; gap: 12px; }
+.xcard {
+  flex: 1 1 260px;
+  min-width: 240px;
+  padding: 14px 16px;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.xcard-unconfigured { opacity: 0.68; }
+.xcard-head { display: flex; align-items: center; gap: 10px; }
+.xcard-title { display: flex; flex-direction: column; gap: 2px; }
+.xcard-name { font-size: 15px; font-weight: 700; letter-spacing: 0.02em; }
+.xcard-status { font-size: 11px; color: var(--text-dim); }
+.xcard-status-ok { color: var(--green); }
+.xcard-status-error { color: var(--red); }
+.xcard-balance-row { border-top: 1px solid var(--border); padding-top: 8px; }
+.xcard-balance { font-size: 22px; font-weight: 600; }
+.xcard-ccy { font-size: 12px; color: var(--text-dim); font-weight: 400; }
+.xcard-avail { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+.xcard-balance-muted { font-size: 13px; color: var(--text-dim); }
+.xcard-balance-error { font-size: 13px; color: var(--red); }
+.xcard-meta { font-size: 11px; color: var(--text-dim); display: flex; gap: 6px; }
+.xcard-meta-sep { opacity: 0.5; }
+.xcard-actions { display: flex; gap: 6px; margin-top: 2px; }
+
+/* Capital allocation: donut + legend beside the existing per-mode cap sliders. */
+.alloc-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.alloc-head h2 { margin: 0; }
+.alloc-picker { display: flex; gap: 6px; }
+.alloc-picker-btn {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600;
+  background: transparent;
+}
+.alloc-picker-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(88, 166, 255, 0.08); }
+.alloc-warning {
+  background: rgba(210, 153, 34, 0.1);
+  border: 1px solid rgba(210, 153, 34, 0.4);
+  color: var(--yellow);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.alloc-body { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+.alloc-controls { flex: 1 1 380px; min-width: 300px; display: flex; flex-direction: column; gap: 16px; }
+
+.capital-donut { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+.capital-donut-svg { flex-shrink: 0; }
+.capital-donut-total { fill: var(--text); font-size: 18px; font-weight: 700; }
+.capital-donut-caption { fill: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+.capital-donut-legend { display: flex; flex-direction: column; gap: 8px; min-width: 160px; }
+.capital-donut-legend-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.capital-donut-swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+.capital-donut-legend-label { flex: 1; color: var(--text-dim); }
+.capital-donut-legend-value { font-family: monospace; }
