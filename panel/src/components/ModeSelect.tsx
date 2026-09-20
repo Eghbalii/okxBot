@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { PositionMode } from '../api/types'
 
+// 'manual' was a third entry here until 2026-09-20 — manually-opened positions now show as their
+// own table at the bottom of the Trade page instead, since that's where they're opened and
+// reviewing them there is the natural place, not a third tab on this mode-selector at all.
 const MODES: { value: PositionMode; label: string; hint: string }[] = [
   { value: 'paper', label: 'Paper', hint: 'Simulated — no orders reach the exchange' },
   { value: 'bot', label: 'Bot Trader', hint: 'Live money — orders execute on OKX' },

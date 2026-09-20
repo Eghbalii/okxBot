@@ -42,7 +42,9 @@ export interface TokenStats {
 
 // 'demo' was dropped 2026-09-04 (real-trading readiness plan) — the project never built a demo
 // controller and decided not to pursue one; only paper and bot trading exist going forward.
-export type PositionMode = 'paper' | 'bot'
+// 'manual' added 2026-09-19: the /trade page's own discretionary orders (manual_orders), shown on
+// the Positions page the same way bot/paper positions are — same shape, separate table.
+export type PositionMode = 'paper' | 'bot' | 'manual'
 // Fill-lifecycle status for a real order (real_orders.status) — null for paper/demo rows, which
 // have no fill lifecycle (a paper order is always instantly and fully filled).
 // 'opening'/'closing' mean a request is in flight with the exchange and its outcome is not yet
@@ -233,6 +235,11 @@ export interface PaperTradingStats {
   // "Account Balance": the real, continuous running total, never reset by a baseline change
   // (CLAUDE.md §31.2). Equal to totalEquityUsd until the account's first-ever reset, then diverges.
   accountBalanceUsd: string
+  // Sum of every open position's margin, and totalEquityUsd minus that (floored at zero) — added
+  // 2026-09-20 for the Trade page's order ticket, which needs to know how much of the trading cap
+  // is actually free to size a new position against.
+  usedMarginUsd: string
+  availableMarginUsd: string
   pnl24hUsd: string
   pnl24hPct: string
   pnl7dUsd: string
@@ -324,12 +331,28 @@ export interface ExchangeOrderRaw {
   closeOrderId?: string
 }
 
-// POST /api/system/cleanup — what a disk-cleanup run reclaimed. Build cache only: images and
-// volumes are deliberately never touched (the RL model's replay buffer and the database live in
-// volumes, and an image with no running container is still needed at the next deploy).
+// POST /api/system/cleanup — what an automatic disk-cleanup run reclaimed (2026-09-20 redesign).
+// Fully automatic and safe by Docker's own construction: build cache, stopped/exited containers
+// (Docker never removes a running one via this call), and images with zero containers (running or
+// stopped) referencing them. Volumes are still never touched — the RL model's replay buffer and
+// the database live there.
 export interface CleanupResult {
   buildCacheBytes: number
+  containersBytes: number
+  imagesBytes: number
   error?: string
+}
+
+// GET /api/system/cleanup-candidates — files/directories a person can choose to delete, each with
+// enough context to decide without knowing what any of these paths are for. Never deleted
+// automatically; POST /api/system/cleanup-candidates/delete removes exactly one, by id, only after
+// an explicit confirmation in the panel.
+export interface CleanupCandidate {
+  id: string
+  path: string
+  description: string
+  sizeBytes: number
+  modifiedAt: string // RFC3339
 }
 
 // GET /api/health — one service's container state. `state` is Docker's own vocabulary

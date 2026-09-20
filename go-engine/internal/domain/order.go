@@ -150,3 +150,14 @@ func (s AlgoOrderStatus) TriggeredReason() (string, bool) {
 // its trigger is reached. Anything else — triggered, canceled, failed, or absent — means the
 // position it protected is no longer protected by it.
 func (s AlgoOrderStatus) IsLive() bool { return s.State == "live" }
+
+// AccountConfig is the account-wide settings that affect how every order is shaped — today just
+// position mode, the one setting genuinely account-wide rather than per-order (unlike TdMode/
+// PosSide above, which OKX accepts per-request on every order/leverage call). PosMode mirrors
+// OKX's own wire values ("net_mode" or "long_short_mode") rather than this codebase's shorter
+// "net"/"long_short" convention elsewhere (config.Trading.PosMode) — kept as OKX's own strings at
+// this layer since this type exists specifically to round-trip GetAccountConfig/SetPositionMode
+// against the exchange; the panel-facing translation to "net"/"hedge" happens at the API boundary.
+type AccountConfig struct {
+	PosMode string // "net_mode" or "long_short_mode"
+}

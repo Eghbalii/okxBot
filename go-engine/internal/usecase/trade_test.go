@@ -61,6 +61,10 @@ type fakeExchangeClient struct {
 	instrument       *domain.Instrument
 	getInstrumentErr error
 
+	accountConfig    domain.AccountConfig
+	accountConfigErr error
+	setPosModeCalls  []string
+
 	// The resting SL/TP (algo) order calls — the exchange-side protection every real position
 	// carries since 2026-09-09. Recorded rather than merely counted so a test can assert the
 	// TRIGGER PRICES that actually reached the exchange, which is the entire property at stake:
@@ -243,6 +247,18 @@ func (f *fakeExchangeClient) GetInstrument(instType, instID string) (domain.Inst
 
 func (f *fakeExchangeClient) GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error) {
 	return nil, nil
+}
+
+func (f *fakeExchangeClient) GetAccountConfig() (domain.AccountConfig, error) {
+	if f.accountConfigErr != nil {
+		return domain.AccountConfig{}, f.accountConfigErr
+	}
+	return f.accountConfig, nil
+}
+
+func (f *fakeExchangeClient) SetPositionMode(posMode string) error {
+	f.setPosModeCalls = append(f.setPosModeCalls, posMode)
+	return nil
 }
 
 // fakeModelClient is a hand-rolled port.ModelClient returning a configured Action.

@@ -16,10 +16,36 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
+	"github.com/eghbalii/okxBot/go-engine/internal/okx"
 	"github.com/eghbalii/okxBot/go-engine/internal/okx/ws"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )
+
+// bookLevel/orderbookEvent mirror cmd/api's own private types of the same name byte-for-byte (the
+// wire contract both sides of okx.orderbook must agree on) — kept as a separate copy rather than a
+// shared package because neither side imports the other today and a shared type for exactly one
+// Kafka topic's payload would be more indirection than the two ~10-line structs it replaces.
+type bookLevel [4]string
+
+type orderbookEvent struct {
+	InstID string      `json:"instId"`
+	Asks   []bookLevel `json:"asks"`
+	Bids   []bookLevel `json:"bids"`
+	Ts     string      `json:"ts"`
+}
+
+// toWireLevels converts the merger's BookLevel (raw price/size strings) into the [4]string wire
+// shape cmd/api's reshapeBookLevels already knows how to read — only indices 0/1 are ever
+// populated (price, size); the "deprecated"/numOrders fields (books5's own [2]/[3]) have no
+// equivalent from a merged book and are left empty, which reshapeBookLevels never reads anyway.
+func toWireLevels(levels []okx.BookLevel) []bookLevel {
+	out := make([]bookLevel, len(levels))
+	for i, l := range levels {
+		out[i] = bookLevel{l.Px, l.Sz, "", ""}
+	}
+	return out
+}
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -184,20 +210,61 @@ func main() {
 		})
 	}
 
-	// Order book (docs/MANUAL_TRADE_PLAN.md §7): books5 (5 levels/side) permanently for the WHOLE
-	// roster, matching tickers/candles' own "always on" lifecycle rather than a per-viewer dynamic
-	// subscription — OKX pushes it at almost exactly the same rate as tickers (measured ~6/s on
-	// BTC, the busiest configured instrument), so this does not meaningfully change the ingestor's
-	// existing WS/Kafka load. books5 sends a full 5-level snapshot on every push, so unlike the
-	// deeper `books` channel there is no delta merge or checksum to maintain — every message is
-	// immediately displayable on its own. Aggregating to a wider grouping (10/100/1000) needs more
-	// real depth than 5 levels can honestly provide; that is deferred to a future per-instrument
-	// upgrade to the full `books` channel when a viewer actually asks for it, not built here.
+	// Order book (docs/MANUAL_TRADE_PLAN.md §7, widened 2026-09-19): the full `books` channel (up
+	// to 400 levels/side, snapshot + incremental delta updates + a checksum field) replaces
+	// `books5`, which is hard-capped at exactly 5 levels/side with no way to widen it — confirmed
+	// live before this change (the operator needed at least 7-8 rows, which books5 structurally
+	// cannot provide). `books` is public/unauthenticated on the same host every other socket here
+	// already uses. Subscription stays permanent/full-roster, unchanged from the original books5
+	// design (§7's original "always on for the whole roster" call, confirmed still correct — OKX
+	// lets many instruments share one connection either way).
+	//
+	// One okx.BookMerger per instrument (NOT safe for concurrent use, internal/okx/orderbook.go's
+	// own doc comment) — safe here because every message for one instId always arrives on this
+	// same read-then-dispatch goroutine sequence, the same single-goroutine-per-instrument
+	// assumption every other per-instrument state in this codebase already relies on. A checksum
+	// mismatch drops the book and logs; the WS client's own reconnect-with-backoff (already
+	// implemented in ws.PublicClient.Run) resends a fresh snapshot on the next connection, so no
+	// separate resubscribe logic is needed here — reconnecting the whole client is a safe superset.
+	//
+	// Publishing is rate-limited to orderbookPublishInterval per instrument: `books` pushes a delta
+	// on every price-level change (far more often than books5's periodic full snapshot), but the
+	// panel only needs a human-perceptible refresh rate, not every tick-level book event.
 	orderbookPub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "okx.orderbook")
 	defer orderbookPub.Close()
+
+	// okx.orderbook is far higher-volume than every other topic (a delta roughly every 150ms per
+	// instrument, vs. tickers/candles' much sparser rate), so the broker-wide retention/segment
+	// defaults tuned for those (docker-compose.yml, 6h/128MB) let this one topic alone accumulate
+	// several GB — measured at 3.9GB on 2026-09-20, the single largest disk consumer found while
+	// investigating why the Resources page's cleanup button reclaimed almost nothing (it only ever
+	// pruned Docker's build cache, which was never where the real usage was). Order-book depth is
+	// meaningless to retain past a very short window — nothing ever reads a stale snapshot — so
+	// this overrides just this one topic to 30 minutes with a smaller segment size (segment.bytes
+	// has to be small enough to actually close within the retention window, or retention can never
+	// delete anything). Self-healing on every restart: internal/kafkastream.EnsureTopicRetention's
+	// own doc comment explains why this can't simply be a docker-compose.yml env var.
+	const orderbookRetentionMs = 30 * 60 * 1000    // 30 minutes
+	const orderbookSegmentBytes = 16 * 1024 * 1024 // 16MB
+	kafkastream.EnsureTopicRetentionInBackground(ctx, logger, cfg.Kafka.Brokers, "okx.orderbook", orderbookRetentionMs, orderbookSegmentBytes)
+
+	// orderbookDepth was 8 when this section first shipped (2026-09-19) — just enough to show a
+	// handful of raw rows. That is not enough RAW data for the panel's own price-relative grouping
+	// to aggregate meaningfully: with only 8 levels spanning a narrow price band, a wider bucket
+	// (10x/100x the tick size) collapses nearly all of them into one or two buckets, which reads as
+	// "grouping does nothing" — reported directly by the operator the same day. Raised to 50 so a
+	// wide grouping selection actually has enough raw levels underneath it to combine into several
+	// real buckets; the panel itself only ever renders up to 16 rows total (OrderbookLadder's own
+	// per-side cap), so this is headroom for aggregation, not a change to what's displayed.
+	const orderbookDepth = 50
+	const orderbookPublishInterval = 150 * time.Millisecond
+
+	mergers := make(map[string]*okx.BookMerger, len(wsInstIDs))
+	lastPublished := make(map[string]time.Time, len(wsInstIDs))
+
 	orderbookClient := &ws.PublicClient{
 		URL:     cfg.OKX.PublicWSURL,
-		Channel: "books5",
+		Channel: "books",
 		InstIDs: wsInstIDs,
 		Logger:  logger,
 		Handler: func(msg ws.Message) {
@@ -206,23 +273,53 @@ func main() {
 				logger.Warn("failed to resolve inbound orderbook instId to a symbol", "error", err)
 				return
 			}
-			var raw []json.RawMessage
-			if err := json.Unmarshal(msg.Data, &raw); err != nil {
-				logger.Warn("failed to decode orderbook payload", "error", err)
+			var pushes []okx.BooksPush
+			if err := json.Unmarshal(msg.Data, &pushes); err != nil {
+				logger.Warn("failed to decode orderbook payload", "instId", sym, "error", err)
 				return
 			}
-			for _, r := range raw {
-				rewritten, err := rewriteInstID(r, sym)
-				if err != nil {
-					logger.Warn("failed to rewrite orderbook instId", "error", err)
-					continue
-				}
-				if err := orderbookPub.Publish(ctx, sym, rewritten); err != nil {
-					logger.Warn("failed to publish orderbook snapshot to kafka", "error", err)
-					continue
-				}
-				metrics.IngestorEventsTotal.WithLabelValues("orderbook", sym).Inc()
+			if len(pushes) == 0 {
+				return
 			}
+
+			merger, ok := mergers[sym]
+			if !ok {
+				merger = okx.NewBookMerger()
+				mergers[sym] = merger
+			}
+			if err := merger.Apply(msg.Action, pushes[0]); err != nil {
+				logger.Warn("orderbook checksum/merge failed, dropping book until resubscribe", "instId", sym, "action", msg.Action, "error", err)
+				delete(mergers, sym) // force a fresh snapshot to be required before this instrument's book is used again
+				return
+			}
+
+			if since := time.Since(lastPublished[sym]); since < orderbookPublishInterval {
+				return
+			}
+			lastPublished[sym] = time.Now()
+
+			asks, bids := merger.TopN(orderbookDepth)
+			event := orderbookEvent{
+				InstID: sym,
+				Asks:   toWireLevels(asks),
+				Bids:   toWireLevels(bids),
+				Ts:     pushes[0].Ts,
+			}
+			// Publish takes the STRUCT, not pre-marshaled bytes — Publisher.Publish already calls
+			// json.Marshal internally (matching every other publisher call in this file). Passing
+			// an already-marshaled []byte here was a real bug caught live: plain []byte has no
+			// custom MarshalJSON, so Go's default encoding base64-encodes it into a JSON STRING
+			// (unlike json.RawMessage, which the ticker rewrite path above correctly uses and which
+			// marshals to itself verbatim) — cmd/api's consumer then failed
+			// `json: cannot unmarshal string into Go value of type main.orderbookEvent` on every
+			// single message, silently (the handler swallows a decode error and returns nil), so
+			// the orderbook Kafka topic filled up and the consumer group's offset advanced
+			// normally while broadcasting nothing to the panel at all.
+			if err := orderbookPub.Publish(ctx, sym, event); err != nil {
+				logger.Warn("failed to publish orderbook snapshot to kafka", "error", err)
+				return
+			}
+			metrics.IngestorEventsTotal.WithLabelValues("orderbook", sym).Inc()
 		},
 	}
 

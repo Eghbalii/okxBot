@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import ServiceHealthBox from '../components/ServiceHealthBox'
 import { usePolling } from '../hooks/usePolling'
-import { api } from '../api/client'
-import type { CleanupResult } from '../api/types'
+import { api, ApiError } from '../api/client'
+import type { CleanupCandidate, CleanupResult } from '../api/types'
 
 // Bytes as a human figure — this reports gigabytes routinely (7.28GB of build cache accumulated in
 // a single day of rebuilds), so raw bytes would be unreadable.
@@ -18,15 +18,21 @@ function formatBytes(n: number): string {
   return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
 }
 
-// Reclaims the Docker build cache, which is what actually fills this box: rebuilding services
-// accumulates gigabytes of it, and nothing reclaims it on its own.
-//
-// Build cache only, by design. Images are not pruned (a service with no running container between
-// deploys is still needed at the next one) and neither are volumes (the database and the RL model's
-// replay buffer live there — losing the buffer makes the model forget every experience it has
-// collected). Those calls do not exist in the backend at all rather than sitting behind a
-// confirmation, since a button that can destroy them is one that eventually does.
-function DiskCleanup() {
+// A relative date is easier to act on than a bare timestamp for someone deciding "is this old
+// enough to delete" — e.g. "12 days ago" rather than a raw ISO string.
+function formatRelativeDate(iso: string): string {
+  const then = new Date(iso).getTime()
+  if (Number.isNaN(then)) return iso
+  const days = Math.floor((Date.now() - then) / (1000 * 60 * 60 * 24))
+  if (days <= 0) return 'today'
+  if (days === 1) return 'yesterday'
+  return `${days} days ago`
+}
+
+// Automatic cleanup: build cache, stopped containers, and images nothing runs anymore. Every one
+// of these is safe by Docker's own construction (see the backend endpoint's own doc comment) —
+// no confirmation is asked because none of these can ever be a service's live data.
+function AutomaticCleanup() {
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState<CleanupResult | null>(null)
 
@@ -36,29 +42,169 @@ function DiskCleanup() {
     try {
       setResult(await api.cleanupDisk())
     } catch (err) {
-      setResult({ buildCacheBytes: 0, error: (err as Error).message })
+      setResult({ buildCacheBytes: 0, containersBytes: 0, imagesBytes: 0, error: (err as Error).message })
     } finally {
       setRunning(false)
     }
   }
 
+  const total = result ? result.buildCacheBytes + result.containersBytes + result.imagesBytes : 0
+
   return (
     <div className="card">
-      <h2>Disk cleanup</h2>
+      <h2>Automatic cleanup</h2>
       <p className="text-dim">
-        Frees the Docker build cache, which grows by gigabytes as services are rebuilt and is never
-        reclaimed automatically. Images, volumes and the RL model files are never touched.
+        Removes leftover Docker build cache, old stopped containers, and unused images — things
+        nothing on this server actually uses anymore. This never touches your database, the trading
+        model, or anything a running service depends on, so it's always safe to run.
       </p>
       <button className="btn-primary" onClick={run} disabled={running}>
         {running ? 'Cleaning…' : 'Free disk space'}
       </button>
       {result && !result.error && (
-        <div className="stat-row" style={{ marginTop: '0.75rem' }}>
-          <span className="text-dim">Reclaimed</span>
-          <span className="mono">{formatBytes(result.buildCacheBytes)}</span>
+        <div style={{ marginTop: '0.75rem' }}>
+          <div className="stat-row">
+            <span className="text-dim">Total reclaimed</span>
+            <span className="mono">{formatBytes(total)}</span>
+          </div>
+          {total === 0 && (
+            <p className="text-dim" style={{ marginTop: '0.5rem' }}>
+              Nothing to clean up right now — your server is already tidy.
+            </p>
+          )}
         </div>
       )}
       {result?.error && <div className="error-banner" style={{ marginTop: '0.75rem' }}>{result.error}</div>}
+    </div>
+  )
+}
+
+// Confirm-per-item cleanup: real accumulated files (old training data, model backups, config
+// backups) that are safe to delete but represent a real choice — an operator should see what a
+// file is, how big it is, and how old it is before it's removed, per the explicit 2026-09-20
+// request that this NOT be folded into the automatic button above.
+function FileCleanup() {
+  const [candidates, setCandidates] = useState<CleanupCandidate[] | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [confirming, setConfirming] = useState<CleanupCandidate | null>(null)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+
+  async function load() {
+    try {
+      setCandidates(await api.cleanupCandidates())
+      setLoadError(null)
+    } catch (err) {
+      // A 503 means this deployment hasn't enabled the feature — not an error to alarm over, just
+      // nothing to show (same as an empty candidate list).
+      if (err instanceof ApiError && err.status === 503) {
+        setCandidates([])
+        setLoadError(null)
+        return
+      }
+      setLoadError((err as Error).message)
+    }
+  }
+
+  useEffect(() => {
+    load()
+  }, [])
+
+  async function confirmDelete() {
+    if (!confirming) return
+    setDeletingId(confirming.id)
+    setActionError(null)
+    try {
+      const res = await api.deleteCleanupCandidate(confirming.id)
+      setNotice(`Removed ${res.deleted} (${formatBytes(res.sizeBytes)} freed)`)
+      setConfirming(null)
+      await load()
+    } catch (err) {
+      setActionError((err as Error).message)
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  if (loadError) {
+    return (
+      <div className="card">
+        <h2>Old files</h2>
+        <div className="error-banner">{loadError}</div>
+      </div>
+    )
+  }
+
+  if (candidates && candidates.length === 0) {
+    return null // nothing to show, and nothing to explain — an empty list isn't news
+  }
+
+  return (
+    <div className="card">
+      <h2>Old files</h2>
+      <p className="text-dim">
+        These are files that have piled up over time and are no longer needed by anything running.
+        Nothing here is deleted automatically — review each one and confirm before it's removed.
+      </p>
+      {notice && <div className="stat-row" style={{ marginTop: '0.5rem' }}><span>{notice}</span></div>}
+      {candidates?.map((c) => (
+        <div
+          key={c.id}
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: '1rem',
+            padding: '0.6rem 0',
+            borderTop: '1px solid var(--border)',
+          }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <div className="mono" style={{ fontSize: '0.85rem' }}>{c.path}</div>
+            <div className="text-dim" style={{ fontSize: '0.85rem' }}>{c.description}</div>
+            <div className="text-dim" style={{ fontSize: '0.8rem' }}>
+              {formatBytes(c.sizeBytes)} · last changed {formatRelativeDate(c.modifiedAt)}
+            </div>
+          </div>
+          <button onClick={() => setConfirming(c)} disabled={deletingId !== null}>
+            Delete
+          </button>
+        </div>
+      ))}
+
+      {confirming && (
+        <div
+          role="dialog"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.5)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+        >
+          <div className="card" style={{ maxWidth: 480 }}>
+            <h3>Delete this file?</h3>
+            <p className="mono" style={{ fontSize: '0.85rem' }}>{confirming.path}</p>
+            <p>{confirming.description}</p>
+            <p className="text-dim">
+              Size: {formatBytes(confirming.sizeBytes)} · Last changed: {formatRelativeDate(confirming.modifiedAt)}
+            </p>
+            {actionError && <div className="error-banner">{actionError}</div>}
+            <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem' }}>
+              <button className="btn-primary" onClick={confirmDelete} disabled={deletingId !== null}>
+                {deletingId ? 'Deleting…' : 'Yes, delete it'}
+              </button>
+              <button onClick={() => setConfirming(null)} disabled={deletingId !== null}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -104,7 +250,8 @@ export default function ResourcesPage() {
         )}
       </div>
 
-      <DiskCleanup />
+      <AutomaticCleanup />
+      <FileCleanup />
     </div>
   )
 }

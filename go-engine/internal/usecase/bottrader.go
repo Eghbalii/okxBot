@@ -530,6 +530,27 @@ func (e *BotTrader) tradableEquityFor(ctx context.Context, rawBalance decimal.De
 	return e.tradableEquity(rawBalance)
 }
 
+// tradingCapUSD reads this mode's own configured trading cap, for the cross-margin SL guard
+// (conductor.ClampSLToCapUSD). Returns zero (disabling the guard, matching every other
+// zero-means-off clamp field's own convention) when no cap is set or the read fails — a read
+// failure must not block opening a position the way it would if this were treated as fatal; the
+// worst case is the guard simply doesn't apply for this one decision, which is the same posture
+// tradableEquityFor's own fallback takes on the same failure.
+func (e *BotTrader) tradingCapUSD(ctx context.Context, logger *slog.Logger) decimal.Decimal {
+	if e.Repo == nil {
+		return decimal.Zero
+	}
+	ae, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), e.AccountInitialUSD)
+	if err != nil {
+		logger.Warn("cross-margin guard: could not read trading cap, guard not applied for this decision", "error", err)
+		return decimal.Zero
+	}
+	if ae.TradingCapUSD == nil {
+		return decimal.Zero
+	}
+	return *ae.TradingCapUSD
+}
+
 // tradableEquity applies SafeMoneyUSD's reserve to a raw exchange balance — the fallback for an
 // account with no explicit trading cap set. Floored at zero: a balance the reserve exceeds must
 // never report as negative equity (which would read as the account being drained, not merely
@@ -948,6 +969,26 @@ func (e *BotTrader) openBot(
 	if clampedLevels.SLPx == nil {
 		logger.Error("refusing to open a real position with no stop-loss", "instId", e.InstID, "side", order.Side)
 		return nil, nil
+	}
+	// Cross-margin cap guard (2026-09-20 request): MaxLossPct above only bounds loss as a fraction
+	// of THIS position's own margin, which is the correct bound under isolated margin (a
+	// liquidation there can only ever draw down that position's own margin). Under cross margin the
+	// exchange draws on the whole linked balance to keep a losing position open, so a stop that
+	// looks perfectly safe by MaxLossPct's own math can still let a single bad move realize a loss
+	// up to the ENTIRE trading cap — a $20 cap trading cross with no meaningful stop can genuinely
+	// draw the account to -$20 or worse before the exchange itself steps in. Tightened, never
+	// widened, and only under cross margin: isolated already has the right bound from MaxLossPct
+	// alone, and applying this on top of it there would just be a redundant, tighter-than-intended
+	// restriction with no corresponding real-money risk to justify it.
+	if e.TdMode == "cross" {
+		if capUSD := e.tradingCapUSD(ctx, logger); capUSD.IsPositive() {
+			if tight, moved := conductor.ClampSLToCapUSD(order.Side, price, order.Size, order.Leverage, capUSD, clampedLevels.SLPx); moved {
+				logger.Warn("cross-margin guard: tightened stop-loss so a touch can never exceed the trading cap",
+					"instId", e.InstID, "side", order.Side, "capUsd", capUSD, "marginUsd", order.Size,
+					"leverage", order.Leverage, "originalSl", clampedLevels.SLPx, "tightenedSl", tight)
+				clampedLevels.SLPx = tight
+			}
+		}
 	}
 	// A position with no target never takes profit on its own: BotTrader watches SL/TP in-process
 	// (§3a) and simply has nothing to watch for on the winning side, so the trade can only ever end

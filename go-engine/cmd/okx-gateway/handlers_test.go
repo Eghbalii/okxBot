@@ -29,8 +29,9 @@ type fakeExchange struct {
 	orderResult  *domain.OrderResult
 	orderStatus  domain.OrderStatus
 	instrument   domain.Instrument
-	fundingRates []domain.FundingRate
-	allTickers   []domain.MarketTicker
+	fundingRates  []domain.FundingRate
+	allTickers    []domain.MarketTicker
+	accountConfig domain.AccountConfig
 
 	placeOrderCalls    int
 	cancelOrderCalls   int
@@ -120,6 +121,18 @@ func (f *fakeExchange) GetFundingRateHistory(instID string, limit int) ([]domain
 		return nil, err
 	}
 	return f.fundingRates, nil
+}
+
+func (f *fakeExchange) GetAccountConfig() (domain.AccountConfig, error) {
+	if err := f.maybeFail(); err != nil {
+		return domain.AccountConfig{}, err
+	}
+	return f.accountConfig, nil
+}
+
+func (f *fakeExchange) SetPositionMode(posMode string) error {
+	f.accountConfig.PosMode = posMode
+	return f.maybeFail()
 }
 
 func newTestService(fx *fakeExchange) *service {
@@ -277,6 +290,43 @@ func TestHandleSetLeverage_CallsExchange(t *testing.T) {
 	}
 	if fx.setLeverageCalls != 1 {
 		t.Fatalf("expected exactly 1 SetLeverage call, got %d", fx.setLeverageCalls)
+	}
+}
+
+func TestHandleGetAccountConfig_ReturnsPosMode(t *testing.T) {
+	fx := &fakeExchange{accountConfig: domain.AccountConfig{PosMode: "long_short_mode"}}
+	svc := newTestService(fx)
+
+	req := httptest.NewRequest(http.MethodGet, "/account/config", nil)
+	rec := httptest.NewRecorder()
+	svc.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got domain.AccountConfig
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.PosMode != "long_short_mode" {
+		t.Fatalf("unexpected account config: %+v", got)
+	}
+}
+
+func TestHandleSetPositionMode_CallsExchangeWithPosMode(t *testing.T) {
+	fx := &fakeExchange{}
+	svc := newTestService(fx)
+
+	body, _ := json.Marshal(map[string]string{"posMode": "long_short_mode"})
+	req := httptest.NewRequest(http.MethodPost, "/account/position-mode", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	svc.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if fx.accountConfig.PosMode != "long_short_mode" {
+		t.Fatalf("expected SetPositionMode to be called with long_short_mode, got %q", fx.accountConfig.PosMode)
 	}
 }
 

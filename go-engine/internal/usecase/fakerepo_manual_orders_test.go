@@ -121,6 +121,22 @@ func (r *fakeRepository) UpdateManualOrderStatus(ctx context.Context, id int64, 
 	return nil
 }
 
+func (r *fakeRepository) UpdateManualOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.manualOrders[id]
+	if !ok {
+		return fmt.Errorf("manual order %d not found", id)
+	}
+	if o.ClosedAt != nil {
+		return fmt.Errorf("manual order %d is already closed", id)
+	}
+	o.SLPx = slPx
+	o.TPPx = tpPx
+	r.manualOrders[id] = o
+	return nil
+}
+
 func (r *fakeRepository) SetManualOrderProtection(ctx context.Context, id int64, algoOrderID *string, protectedByStrategy bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -238,6 +254,11 @@ func (r *fakeRepository) ListManualOrders(ctx context.Context, f port.PositionFi
 		out = append(out, o)
 	}
 	return out, nil
+}
+
+func (r *fakeRepository) CountManualOrders(ctx context.Context, f port.PositionFilter) (int, error) {
+	out, err := r.ListManualOrders(ctx, f)
+	return len(out), err
 }
 
 func (r *fakeRepository) RecordManualOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal) error {

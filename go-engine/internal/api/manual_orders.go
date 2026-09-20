@@ -25,6 +25,16 @@ type manualTradeClient interface {
 	// price before the open-order intent is written (handleCreateManualOrder) — a market order has
 	// no price of its own yet, so the live last-traded price stands in for it.
 	GetTicker(instID string) (domain.Ticker, error)
+	// GetAccountConfig/SetPositionMode are the account-wide position-mode (net vs. hedge) pair —
+	// unlike TdMode/PosSide, which every order already carries per-request, position mode is
+	// genuinely account-wide on OKX (2026-09-19 Trade page fixes).
+	GetAccountConfig() (domain.AccountConfig, error)
+	SetPositionMode(posMode string) error
+	// GetPositions backs handleManualAccountMode's own precondition check (zero open positions
+	// before offering a live switch to hedge mode) — a friendlier pre-check ahead of the exchange's
+	// own rejection, matching CLAUDE.md §27.6/§49.2's "ask the exchange, don't just trust local
+	// state" precedent for what "friendlier" means here: read the real thing, don't guess.
+	GetPositions(instType string) ([]domain.Position, error)
 }
 
 type manualInstrumentView struct {

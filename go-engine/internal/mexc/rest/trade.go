@@ -255,6 +255,20 @@ func (c *Client) SetLeverage(req domain.LeverageChange) error {
 	return nil
 }
 
+// GetAccountConfig has no MEXC equivalent — MEXC has no account-wide position-mode setting the
+// way OKX does (net_mode/long_short_mode); its openType/positionType are per-order fields, not a
+// toggle governing the whole account. An honest "not supported" error keeps the port satisfied
+// without pretending a capability this exchange does not have (CLAUDE.md §46.5's fail-safe-
+// defaults pattern: fail loudly rather than fabricate an answer).
+func (c *Client) GetAccountConfig() (domain.AccountConfig, error) {
+	return domain.AccountConfig{}, fmt.Errorf("mexc: account-wide position mode is not a concept this exchange has")
+}
+
+// SetPositionMode has no MEXC equivalent — see GetAccountConfig's doc comment.
+func (c *Client) SetPositionMode(posMode string) error {
+	return fmt.Errorf("mexc: account-wide position mode is not a concept this exchange has")
+}
+
 // positionResp is one entry of /api/v1/private/position/open_positions.
 type positionResp struct {
 	PositionID     json.Number `json:"positionId"`

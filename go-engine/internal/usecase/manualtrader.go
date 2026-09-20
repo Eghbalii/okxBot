@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -12,6 +13,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
+	"github.com/eghbalii/okxBot/go-engine/internal/usecase/conductor"
 )
 
 // ManualTrader is the discretionary/operator-placed order lifecycle (docs/MANUAL_TRADE_PLAN.md),
@@ -40,8 +42,19 @@ type ManualTrader struct {
 
 	ExecInstType string // e.g. "SWAP" or "FUTURES"; defaults to "SWAP" when empty
 	SettleCcy    string // e.g. "USDT" or "USDC"; defaults to "USDT" when empty
-	TdMode       string // "cross" or "isolated"
-	PosMode      string // "net" or "long_short" (hedge mode)
+	TdMode       string // "cross" or "isolated" — a per-request DEFAULT; a claimed intent's own
+	// TdMode (set by the panel, threaded through port.ManualOrderIntent) wins when present, since
+	// margin mode is a per-order choice OKX already accepts per-request (2026-09-19 Trade page
+	// fixes) — this field only covers callers that don't supply one.
+	//
+	// PosMode ("net" or "long_short"/hedge mode) is genuinely account-wide on OKX, unlike TdMode —
+	// stored behind posModeAtomic so a background refresher (RefreshPosMode, polling
+	// GetAccountConfig on cmd/trader's own slower cadence) can keep it honest with what the account
+	// actually is right now, even if it was changed from the panel moments ago, without every order
+	// placement racing that update. This field is only the INITIAL value read at construction.
+	PosMode string
+
+	posModeAtomic atomic.Pointer[string]
 
 	// ExecInstIDFor resolves a short symbol ("BTC") to the instrument orders actually execute
 	// against (CLAUDE.md §33.4) — required since a manual order's token is chosen live, not fixed
@@ -62,7 +75,93 @@ type ManualTrader struct {
 	// DefaultManualIntentPollInterval when unset.
 	PollInterval time.Duration
 
+	// AccountInitialUSD seeds the "manual" mode's account_equity row on first read, the same
+	// config-level starting balance every other mode is seeded with (CLAUDE.md §15.6) — used only
+	// by RecordEquity/GetAccountEquity's own seeding path, never by order placement itself.
+	AccountInitialUSD decimal.Decimal
+
 	instrumentCache map[string]instrumentCacheEntry
+}
+
+// accountMode is "manual", named as a method (not a bare string literal at each call site) to
+// match BotTrader.accountMode's own pattern — both exist so a future third real-money mode has one
+// obvious place to look for how a trader type names its own account_equity row.
+func (m *ManualTrader) accountMode() string { return "manual" }
+
+// RecordEquity writes the manual account's own slice of the shared real exchange balance into its
+// account_equity row (Account page, 2026-09-20 request: manual trading gets its own trading cap
+// alongside bot trading's existing one, both slices of the SAME real balance). Mirrors
+// BotTrader.RecordEquity/recordEquityBot exactly, reusing the ONE account-wide balance snapshot
+// ReconcileDriver already fetches per cycle rather than issuing a second GetBalance call for the
+// same number (CLAUDE.md §38.2/§39's own reasoning against redundant account-scoped reads).
+func (m *ManualTrader) RecordEquity(ctx context.Context, snap AccountSnapshot, logger *slog.Logger) {
+	if !snap.HasBalance {
+		return
+	}
+	if logger == nil {
+		logger = m.logger()
+	}
+	if m.Repo == nil {
+		return
+	}
+	initial := m.AccountInitialUSD
+	if !initial.IsPositive() {
+		initial = snap.Balance.Eq
+	}
+	if _, err := m.Repo.GetAccountEquity(ctx, m.accountMode(), initial); err != nil {
+		logger.Warn("manual trader: equity timeline read failed", "mode", m.accountMode(), "error", err)
+		return
+	}
+	// SafeMoneyUSD has no manual-trading equivalent: the operator's reserve-vs-tradable split for
+	// real money is expressed entirely through the trading cap (SetTradingCap), which
+	// RecordExchangeBalance already prefers over a reserve argument when one is set — passing zero
+	// here is that path's own "no config-level reserve" case, not a missing feature.
+	if _, err := m.Repo.RecordExchangeBalance(ctx, m.accountMode(), snap.Balance.Eq, decimal.Zero, ""); err != nil {
+		logger.Warn("manual trader: equity timeline write failed", "mode", m.accountMode(), "error", err)
+	}
+}
+
+// availableMarginUSD returns capUSD minus the margin already committed to every OPEN manual order
+// — mirrors the same "used margin" sum internal/api's handlePaperTradingStats computes for the
+// panel's own display, kept as a separate computation here rather than calling that handler
+// (this package has no HTTP dependency, by design) but must never disagree with what the panel
+// shows, since both read the exact same rows (ListManualOrders, open only) and sum the same field.
+// Floored at zero, matching the panel's own AvailableMarginUSD convention: a cap lowered below
+// what's already committed reads as "nothing left," never as a negative number.
+func (m *ManualTrader) availableMarginUSD(ctx context.Context, capUSD decimal.Decimal) (decimal.Decimal, error) {
+	open := true
+	positions, err := m.Repo.ListManualOrders(ctx, port.PositionFilter{Open: &open})
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("list open manual orders: %w", err)
+	}
+	var used decimal.Decimal
+	for _, p := range positions {
+		used = used.Add(p.Size)
+	}
+	available := capUSD.Sub(used)
+	if available.IsNegative() {
+		return decimal.Zero, nil
+	}
+	return available, nil
+}
+
+// tradingCapUSD reads manual trading's own configured cap, for the cross-margin SL guard
+// (conductor.ClampSLToCapUSD) — mirrors BotTrader.tradingCapUSD exactly. Returns zero (disabling
+// the guard) on any read failure or when no cap is set, rather than blocking an order on a
+// bookkeeping read failing; the worst case is the guard simply doesn't apply to this one decision.
+func (m *ManualTrader) tradingCapUSD(ctx context.Context, logger *slog.Logger) decimal.Decimal {
+	if m.Repo == nil {
+		return decimal.Zero
+	}
+	ae, err := m.Repo.GetAccountEquity(ctx, m.accountMode(), m.AccountInitialUSD)
+	if err != nil {
+		logger.Warn("cross-margin guard: could not read manual trading cap, guard not applied for this decision", "error", err)
+		return decimal.Zero
+	}
+	if ae.TradingCapUSD == nil {
+		return decimal.Zero
+	}
+	return *ae.TradingCapUSD
 }
 
 type instrumentCacheEntry struct {
@@ -108,6 +207,50 @@ func (m *ManualTrader) fillTimeout() time.Duration {
 		return m.FillTimeout
 	}
 	return DefaultFillTimeout
+}
+
+// posMode returns the live-refreshed position mode when RefreshPosMode has run at least once,
+// falling back to the struct's own initial PosMode field otherwise — so a ManualTrader constructed
+// without a refresher (every existing test, and any future caller that doesn't need live
+// switching) behaves exactly as before.
+func (m *ManualTrader) posMode() string {
+	if p := m.posModeAtomic.Load(); p != nil {
+		return *p
+	}
+	return m.PosMode
+}
+
+// RefreshPosMode re-reads the account's current position mode from the exchange and stores it for
+// posMode() to return — cmd/trader calls this on a slow ticker (independent of Run's own fast
+// intent-polling cadence, since position mode rarely changes and polling it every 1-2s would waste
+// rate-limit budget on a value that's almost always unchanged). Wired so a switch made from the
+// panel (POST /api/manual/account-mode) takes effect for the next order this process places without
+// needing a restart.
+func (m *ManualTrader) RefreshPosMode(ctx context.Context) {
+	cfg, err := m.Exchange.GetAccountConfig()
+	if err != nil {
+		m.logger().Warn("manual trader: refresh position mode failed", "error", err)
+		return
+	}
+	short := "net"
+	if cfg.PosMode == "long_short_mode" {
+		short = "long_short"
+	}
+	m.posModeAtomic.Store(&short)
+}
+
+// orderTdMode picks the margin mode a request affecting an already-opened order should use: the
+// order's OWN recorded TdMode (set at open time from the intent, port.ManualOrder.TdMode's own doc
+// comment) when present, falling back to the trader's static default otherwise. A protection/close
+// call must use the SAME margin mode the order was actually opened with — OKX requires the closing
+// side of a position to match the mode it was opened under, so falling back to whatever the
+// trader's current default happens to be (which the panel can change between requests) would send
+// a close/protect call in a mode that disagrees with the position itself.
+func (m *ManualTrader) orderTdMode(recorded string) string {
+	if recorded != "" {
+		return recorded
+	}
+	return m.TdMode
 }
 
 func (m *ManualTrader) execInstID(symbol string) (string, error) {
@@ -191,14 +334,35 @@ func (m *ManualTrader) processIntent(ctx context.Context, in port.ManualOrderInt
 // a limit order that hasn't filled yet), then protect it — mirroring BotTrader.openBot's proven
 // sequence (docs/MANUAL_TRADE_PLAN.md §4).
 func (m *ManualTrader) openFromIntent(ctx context.Context, in port.ManualOrderIntent, logger *slog.Logger) (*int64, error) {
+	// Cap check (2026-09-20 request): the panel's own order ticket warns when a requested size
+	// exceeds the available manual trading margin, but that is a soft, client-side hint an operator
+	// can proceed past (and a caller hitting POST /api/manual/orders directly bypasses it entirely).
+	// This is the actual enforcement — checked BEFORE any exchange call (leverage, ticker, place
+	// order) so a doomed request fails cheaply rather than after already touching the exchange.
+	// Declined outright rather than silently trimmed to whatever fits: unlike BotTrader's automated
+	// sizing (which trims to headroom because the model's own request is advisory), a manual order's
+	// size is the operator's explicit, considered choice — trimming it without telling them would
+	// silently open a smaller position than they asked for.
+	if capUSD := m.tradingCapUSD(ctx, logger); capUSD.IsPositive() {
+		available, err := m.availableMarginUSD(ctx, capUSD)
+		if err != nil {
+			logger.Warn("manual trader: could not verify available margin, proceeding without the check", "error", err)
+		} else if in.SizeUSD.GreaterThan(available) {
+			return nil, fmt.Errorf("requested size %s exceeds available manual trading margin %s (cap %s, already committed to open positions)",
+				in.SizeUSD, available, capUSD)
+		}
+	}
+
 	execInstID, err := m.execInstID(in.InstID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve execution instrument for %s: %w", in.InstID, err)
 	}
 
+	tdMode := m.orderTdMode(in.TdMode)
+
 	if in.Leverage.IsPositive() {
-		req := domain.LeverageChange{InstID: execInstID, Lever: in.Leverage, MgnMode: m.TdMode}
-		if m.PosMode == "long_short" {
+		req := domain.LeverageChange{InstID: execInstID, Lever: in.Leverage, MgnMode: tdMode}
+		if m.posMode() == "long_short" {
 			req.PosSide = posSideFor(signedNotionalForSide(in.Side))
 		}
 		if err := m.Exchange.SetLeverage(req); err != nil {
@@ -241,8 +405,8 @@ func (m *ManualTrader) openFromIntent(ctx context.Context, in port.ManualOrderIn
 		limitPx = inst.RoundPriceToTick(*in.LimitPx)
 	}
 
-	req := domain.OrderRequest{InstID: execInstID, TdMode: m.TdMode, Side: in.Side, OrdType: orderType, Sz: sz, Px: limitPx}
-	if m.PosMode == "long_short" {
+	req := domain.OrderRequest{InstID: execInstID, TdMode: tdMode, Side: in.Side, OrdType: orderType, Sz: sz, Px: limitPx}
+	if m.posMode() == "long_short" {
 		req.PosSide = posSideFor(signedNotionalForSide(in.Side))
 	}
 	result, err := m.Exchange.PlaceOrder(req)
@@ -264,6 +428,7 @@ func (m *ManualTrader) openFromIntent(ctx context.Context, in port.ManualOrderIn
 		Size:       in.SizeUSD,
 		Leverage:   in.Leverage,
 		Status:     "pending",
+		TdMode:     tdMode,
 	}
 	if result != nil && result.OrdID != "" {
 		ordID := result.OrdID
@@ -456,6 +621,30 @@ func (m *ManualTrader) finishOpen(ctx context.Context, order port.ManualOrder, f
 		order.Contracts = contracts
 	}
 
+	// Cross-margin cap guard (2026-09-20 request, same mechanism as BotTrader.openBot's own): under
+	// cross margin the exchange draws on the WHOLE linked balance to keep a losing position open, so
+	// an operator's own stop — or no stop at all — can let one bad move realize a loss up to the
+	// entire manual trading cap rather than the amount they actually meant to risk. Manual trading
+	// has no other SL bound at all (unlike BotTrader/PaperTrader's MaxLossPct/MaxSLDistPct clamps,
+	// which don't apply here since a manual order's levels are the operator's own explicit choice,
+	// docs/MANUAL_TRADE_PLAN.md), so this is the ONLY safety net a cross-margin manual order gets —
+	// applied here, after the real fill price/size are known, rather than at intent-creation time
+	// against an estimate. Only under cross margin: isolated margin genuinely cannot draw past this
+	// position's own margin, so there is no corresponding real-money risk to guard against there.
+	if order.TdMode == "cross" && entryPx != nil && size != nil {
+		if capUSD := m.tradingCapUSD(ctx, logger); capUSD.IsPositive() {
+			if tight, moved := conductor.ClampSLToCapUSD(order.Side, *entryPx, *size, order.Leverage, capUSD, order.SLPx); moved {
+				logger.Warn("cross-margin guard: tightened a manual position's stop-loss so a touch can never exceed the trading cap",
+					"id", order.ID, "instId", order.InstID, "side", order.Side, "capUsd", capUSD, "marginUsd", *size,
+					"leverage", order.Leverage, "originalSl", order.SLPx, "tightenedSl", tight)
+				order.SLPx = tight
+				if err := m.Repo.UpdateManualOrderSLTP(ctx, order.ID, order.SLPx, order.TPPx); err != nil {
+					logger.Warn("manual trader: failed to persist cross-margin-tightened stop", "id", order.ID, "error", err)
+				}
+			}
+		}
+	}
+
 	// §8.4: if BotTrader already holds a live protective order on this token, this manual order
 	// deliberately does NOT place a second one — OKX's conditional orders for a position don't
 	// stack cleanly, and the two would otherwise contend over one net exchange position.
@@ -507,11 +696,11 @@ func (m *ManualTrader) placeManualProtection(ctx context.Context, o port.ManualO
 	}
 	req := domain.AlgoOrderRequest{
 		InstID: o.ExecInstID,
-		TdMode: m.TdMode,
+		TdMode: m.orderTdMode(o.TdMode),
 		Side:   closingSide(o.Side),
 		Sz:     *o.Contracts,
 	}
-	if m.PosMode == "long_short" {
+	if m.posMode() == "long_short" {
 		req.PosSide = posSideFor(signedNotionalForSide(o.Side))
 	}
 	if o.SLPx != nil && o.SLPx.IsPositive() {
@@ -551,8 +740,8 @@ func (m *ManualTrader) closeManual(ctx context.Context, o port.ManualOrder, reas
 	if o.Side == "sell" {
 		side = "buy"
 	}
-	req := domain.OrderRequest{InstID: o.ExecInstID, TdMode: m.TdMode, Side: side, OrdType: "market", Sz: *o.Contracts}
-	if m.PosMode == "long_short" {
+	req := domain.OrderRequest{InstID: o.ExecInstID, TdMode: m.orderTdMode(o.TdMode), Side: side, OrdType: "market", Sz: *o.Contracts}
+	if m.posMode() == "long_short" {
 		req.PosSide = posSideFor(signedNotionalForSide(o.Side))
 	}
 	result, err := m.Exchange.PlaceOrder(req)

@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 )
@@ -203,6 +204,77 @@ func TestZigZagPA_TradesOneStructureOnlyOnce(t *testing.T) {
 		t.Errorf("one higher-low structure produced %d entries, want at most 1 — the same structural "+
 			"pattern is re-arming on every subsequent candle that still satisfies it", fires)
 	}
+}
+
+// Real production incident (paper order #1127, DOGE, 2026-09-19): zigzag_pa detected a bearish
+// harmonic pattern whose D-pivot (0.0913) had already drifted several candles stale by the time the
+// pattern confirmed — live price had fallen straight through the computed take-profit (0.09042862)
+// to 0.08981 before the order could open. buildPaperOrder fills at the LIVE price, not at the
+// pivot, so conductor.Clamps.Apply then validated the target against 0.08981 as entry: for a short,
+// a take-profit above entry reads as being on the wrong side and is silently dropped — the position
+// opened with a stop but tp_px permanently NULL in paper_orders, confirmed against the live
+// database. This replays the exact real candles from that incident (testdata/DOGE5m.csv, pulled
+// from the production TimescaleDB) and asserts the strategy no longer emits a target that the live
+// price has already passed — the fix strategies must make themselves, since ResolveLevels/Apply
+// downstream have no way to know the level was ever coherent relative to a price that has moved on.
+func TestZigZagPA_DoesNotEmitATargetThePriceHasAlreadyPassed(t *testing.T) {
+	candles := loadRealCandles(t, "DOGE")
+	s := NewZigZagPA()
+
+	// The exact candle index where order #1127 opened: 2026-09-19 17:40:00 UTC close (0.08981),
+	// the tick immediately after which the real engine opened the order. Located by timestamp
+	// rather than hardcoded so a future testdata refresh that shifts row count doesn't silently
+	// start checking the wrong candle.
+	incidentTS := time.Date(2026, 9, 19, 17, 40, 0, 0, time.UTC)
+	incidentIdx := -1
+	for i, c := range candles {
+		if c.Timestamp.Equal(incidentTS) {
+			incidentIdx = i + 1 // Evaluate takes candles[:i], i.e. "up to and including this candle"
+			break
+		}
+	}
+	if incidentIdx == -1 {
+		t.Fatal("testdata/DOGE5m.csv no longer contains the #1127 incident candle (2026-09-19 17:40:00 UTC) — " +
+			"this test can't reproduce the scenario it exists to guard")
+	}
+
+	sig, err := s.Evaluate(candles[:incidentIdx])
+	if err != nil {
+		t.Fatalf("evaluate at the incident candle: %v", err)
+	}
+	// Before the fix this returned Side=Sell, EntryPx(d)=0.0913, TPPx=0.09042862 — a target the
+	// live close (0.08981) had already fallen through, which conductor.Clamps.Apply then silently
+	// dropped for being on the wrong side of the LIVE entry, leaving paper_orders.tp_px NULL.
+	if sig.Side != Hold {
+		t.Errorf("the incident candle produced Side=%s EntryPx(d)=%s TPPx=%s, want Hold — the live "+
+			"close %s has already passed this target, so the order this signal becomes would open "+
+			"with no take-profit at all (exactly paper order #1127's production bug)",
+			sig.Side, sig.EntryPx, sig.TPPx, candles[incidentIdx-1].Close)
+	}
+
+	// General invariant, not just the one known incident: replay the whole file and confirm any
+	// OTHER signal this strategy does fire (a different D-pivot, a different pattern) also has its
+	// target on the correct side of the price the order will actually fill at.
+	fired := 0
+	s = NewZigZagPA()
+	for i := 1; i <= len(candles); i++ {
+		sig, err := s.Evaluate(candles[:i])
+		if err != nil {
+			t.Fatalf("evaluate at i=%d: %v", i, err)
+		}
+		if sig.Side == Hold {
+			continue
+		}
+		fired++
+		liveClose := candles[i-1].Close
+		if sig.Side == Buy && sig.TPPx.LessThanOrEqual(liveClose) {
+			t.Errorf("i=%d: buy target %s is already at/behind the live price %s (d=%s)", i, sig.TPPx, liveClose, sig.EntryPx)
+		}
+		if sig.Side == Sell && sig.TPPx.GreaterThanOrEqual(liveClose) {
+			t.Errorf("i=%d: sell target %s is already at/behind the live price %s (d=%s)", i, sig.TPPx, liveClose, sig.EntryPx)
+		}
+	}
+	t.Logf("zigzag_pa fired %d time(s) on the full DOGE fixture (excluding the suppressed incident signal)", fired)
 }
 
 // The Hull Moving Average must actually respond to a genuine trend reversal — a slope-based

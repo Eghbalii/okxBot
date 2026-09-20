@@ -35,6 +35,8 @@ type exchangeClient interface {
 	GetOrderRaw(instID, ordID string) (json.RawMessage, error)
 	GetInstrument(instType, instID string) (domain.Instrument, error)
 	GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error)
+	GetAccountConfig() (domain.AccountConfig, error)
+	SetPositionMode(posMode string) error
 	// The resting SL/TP (conditional "algo") order calls — the exchange-side protection every real
 	// position now carries (2026-09-09). Routed through the gateway like every other trade action
 	// so they share the trader's priority rate-limit budget rather than competing outside it.
@@ -90,6 +92,8 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("GET /instrument", s.handleGetInstrument)
 	mux.HandleFunc("GET /funding-rate-history", s.handleGetFundingRateHistory)
 	mux.HandleFunc("POST /leverage", s.handleSetLeverage)
+	mux.HandleFunc("GET /account/config", s.handleGetAccountConfig)
+	mux.HandleFunc("POST /account/position-mode", s.handleSetPositionMode)
 	mux.HandleFunc("POST /order/algo", s.handlePlaceAlgoOrder)
 	mux.HandleFunc("POST /order/algo/amend", s.handleAmendAlgoOrder)
 	mux.HandleFunc("POST /order/algo/cancel", s.handleCancelAlgoOrder)
@@ -404,6 +408,38 @@ func (s *service) handleSetLeverage(w http.ResponseWriter, r *http.Request) {
 	}
 	err := s.call(r.Context(), gateway.ClassLeverage, r, func() error {
 		return s.client.SetLeverage(req)
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *service) handleGetAccountConfig(w http.ResponseWriter, r *http.Request) {
+	var result domain.AccountConfig
+	err := s.call(r.Context(), gateway.ClassAccount, r, func() error {
+		var innerErr error
+		result, innerErr = s.client.GetAccountConfig()
+		return innerErr
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *service) handleSetPositionMode(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PosMode string `json:"posMode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	err := s.call(r.Context(), gateway.ClassLeverage, r, func() error {
+		return s.client.SetPositionMode(req.PosMode)
 	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)

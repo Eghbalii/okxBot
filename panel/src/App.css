@@ -1661,6 +1661,11 @@ input[type='number'] {
   box-shadow: 0 0 0 3px rgba(246, 70, 93, 0.18);
 }
 
+.mode-dot-manual {
+  background: #d29922;
+  box-shadow: 0 0 0 3px rgba(210, 153, 34, 0.18);
+}
+
 .mode-menu {
   position: absolute;
   top: calc(100% + 6px);
@@ -2046,6 +2051,14 @@ input[type='number'] {
   left: 0;
   z-index: 30;
   margin-top: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 .trade-search {
   background: var(--bg);
@@ -2053,17 +2066,41 @@ input[type='number'] {
   border-radius: 4px;
   color: var(--text);
   padding: 6px 10px;
-  width: 200px;
+  width: 100%;
 }
-.trade-search-results {
-  background: var(--bg-panel);
+
+/* Favorites/Top tabs — Favorites first, per explicit request. */
+.picker-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); }
+.picker-tab {
+  padding: 6px 4px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+}
+.picker-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+/* Dynamic per-exchange filter — never hardcoded, derived from whatever exchanges are present in
+   the scanned market data (TradePage.tsx's own doc comment). */
+.picker-exchanges { display: flex; gap: 4px; flex-wrap: wrap; }
+.picker-exchange-btn {
+  padding: 2px 8px;
+  font-size: 11px;
   border: 1px solid var(--border);
-  border-radius: 4px;
-  margin: 4px 0 0;
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text-dim);
+}
+.picker-exchange-btn.active { border-color: var(--accent); color: var(--text); }
+
+.trade-search-results {
+  margin: 0;
   max-height: 240px;
   overflow-y: auto;
   list-style: none;
-  padding: 4px;
+  padding: 0;
 }
 .trade-search-results li button {
   display: block;
@@ -2077,6 +2114,35 @@ input[type='number'] {
 }
 .trade-search-results li button:hover { background: var(--border); }
 
+.picker-empty { padding: 12px 4px; font-size: 12px; text-align: center; }
+.picker-row { display: flex; align-items: center; gap: 2px; }
+/* Specificity fix (found via a real-browser check, not by inspection): `.trade-search-results li
+   button` (two element selectors + one class) beats a plain `.picker-row-star`/`.picker-row-select`
+   (one class each) regardless of source order, so its `display: block; width: 100%` was silently
+   overriding BOTH of these rules — the star button stretched to the row's full width (pushing
+   everything else off past the popover's own 300px edge) and the select button's flex row
+   collapsed, which together rendered as "only stars visible, everything else empty." Both rules
+   are re-scoped under `.trade-search-results li` to match that exact specificity so they win. */
+.trade-search-results li .picker-row-star {
+  flex: none;
+  width: 22px;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.trade-search-results li .picker-row-select {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: auto;
+}
+.picker-row-symbol { font-weight: 600; }
+.picker-row-exchange { color: var(--text-dim); font-size: 11px; }
+.picker-row-change { margin-left: auto; font-size: 12px; }
+
 .trade-topbar-stats { display: flex; align-items: center; gap: 32px; overflow-x: auto; }
 .trade-stat { display: flex; flex-direction: column; gap: 2px; font-size: 12px; white-space: nowrap; }
 .trade-stat-label { color: var(--text-dim); }
@@ -2085,9 +2151,12 @@ input[type='number'] {
 .trade-stat-sub { font-size: 12px; font-weight: 600; }
 
 /* --- 3-column workspace --- */
+/* Side columns narrowed 300px -> 240px and the chart's fixed height brought down to roughly match
+   the side columns' own natural height (explicit operator feedback: the chart "has no good scale"
+   at the old width/height — it was disproportionately large next to two narrow columns). */
 .trade-columns {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 300px 300px;
+  grid-template-columns: minmax(0, 1fr) 240px 240px;
   gap: 1px;
   align-items: stretch;
 }
@@ -2098,7 +2167,13 @@ input[type='number'] {
 .trade-col { background: var(--bg-panel); display: flex; flex-direction: column; min-width: 0; }
 .trade-col-chart { padding: 0; }
 .trade-col-book,
-.trade-col-ticket { padding: 12px; }
+.trade-col-ticket { padding: 10px; font-size: 12.5px; }
+
+/* Manually-opened positions, at the bottom of the Trade page (2026-09-20 request) — its own
+   background/padding, same as every other block inside .trade-page's 1px-border-gap grid, so it
+   reads as one more section of the page rather than a bare table sitting on the border color. */
+.trade-manual-positions { background: var(--bg-panel); padding: 10px 16px 16px; }
+.trade-manual-positions h2 { margin: 0 0 10px; font-size: 1rem; }
 
 /* Chart panel owns its own toolbar (timeframes live INSIDE the chart card, never as a page-level
    control floating above it — explicit correction after an earlier pass got this wrong). */
@@ -2125,16 +2200,38 @@ input[type='number'] {
 .orderbook-ladder { display: flex; flex-direction: column; gap: 6px; min-height: 0; flex: 1; }
 .ob-head { display: flex; align-items: center; justify-content: space-between; }
 .ob-head-title { font-size: 13px; font-weight: 600; }
-.ob-grouping { display: flex; gap: 2px; }
-.ob-group-btn {
-  padding: 2px 7px;
-  font-size: 11px;
-  border: 1px solid var(--border);
+/* Both-sides / bids-only / asks-only mode toggle (explicit operator request, matching the
+   reference screenshot's own icon row next to "Order Book"). */
+.ob-mode { display: flex; gap: 2px; }
+.ob-mode-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid transparent;
   border-radius: 3px;
-  background: var(--bg);
+  background: none;
   color: var(--text-dim);
 }
-.ob-group-btn.active { border-color: var(--accent); color: var(--text); }
+.ob-mode-btn:hover { border-color: var(--border); }
+.ob-mode-btn.active { border-color: var(--accent); color: var(--text); }
+/* Grouping controls now render as a footer row below the book (matches the reference exchange
+   layout), not in the header — margin-top pushes it to the bottom of the flex column even though
+   the book's own row count varies. */
+.ob-grouping { display: flex; margin-top: auto; padding-top: 6px; border-top: 1px solid var(--border); }
+/* A single dropdown, not a row of toggle buttons — matches the reference screenshot's own
+   <select>-style grouping control rather than a per-step button. */
+.ob-group-select {
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+}
 
 .ob-col-head {
   display: grid;
@@ -2195,7 +2292,44 @@ input[type='number'] {
   background: var(--bg);
   font-size: 12px;
   font-weight: 600;
+  color: var(--text);
 }
+
+/* Editable pills (margin mode, leverage, position mode) — all three are real click targets now
+   (2026-09-19 fix, replacing static badges). */
+.ot-pill-editable { position: relative; }
+.ot-pill-btn { cursor: pointer; }
+.ot-pill-btn:hover { border-color: var(--accent); }
+.ot-pill-input { width: 64px; text-align: center; }
+.ot-pill-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 30;
+  margin-top: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 90px;
+}
+.ot-pill-menu-wide { min-width: 200px; }
+.ot-pill-menu-item {
+  text-align: left;
+  padding: 6px 8px;
+  background: none;
+  border: none;
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 12px;
+}
+.ot-pill-menu-item:hover:not(:disabled) { background: var(--border); }
+.ot-pill-menu-item.active { color: var(--accent); font-weight: 600; }
+.ot-pill-menu-item:disabled { color: var(--text-dim); cursor: not-allowed; }
+.ot-pill-menu-error { margin: 4px 0 0; font-size: 11px; }
 
 .ot-type { display: flex; gap: 16px; border-bottom: 1px solid var(--border); }
 .ot-type-tab {

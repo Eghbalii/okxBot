@@ -19,15 +19,28 @@ import (
 // minimal and focused on the handlers it actually tests.
 type positionsStubRepo struct {
 	port.Repository
-	paperPositions        []port.PaperOrder
-	realPositions         []port.BotOrder
-	requestManualClose    []int64
-	requestBotManualClose []int64
-	botManualCloseErr     error
+	paperPositions          []port.PaperOrder
+	realPositions           []port.BotOrder
+	manualOrders            []port.ManualOrder
+	requestManualClose      []int64
+	requestBotManualClose   []int64
+	requestManualOrderClose []int64
+	botManualCloseErr       error
 	// realOrder backs GetBotOrder, which handleClosePosition consults when a close is refused so
 	// it can say WHY (already closed, and by what) instead of only "not open".
 	realOrder    port.BotOrder
 	realOrderErr error
+}
+
+func (r *positionsStubRepo) ListManualOrders(ctx context.Context, f port.PositionFilter) ([]port.ManualOrder, error) {
+	return r.manualOrders, nil
+}
+func (r *positionsStubRepo) CountManualOrders(ctx context.Context, f port.PositionFilter) (int, error) {
+	return len(r.manualOrders), nil
+}
+func (r *positionsStubRepo) RequestManualOrderClose(ctx context.Context, id int64) error {
+	r.requestManualOrderClose = append(r.requestManualOrderClose, id)
+	return nil
 }
 
 func (r *positionsStubRepo) GetBotOrder(ctx context.Context, id int64) (port.BotOrder, error) {
@@ -109,6 +122,33 @@ func TestHandleListPositions_PaperModeRoutesToPaperTable(t *testing.T) {
 	}
 }
 
+// TestHandleListPositions_ManualModeRoutesToManualTable confirms mode=manual reads manual_orders
+// (via ListManualOrders), not paper_orders or bot_orders — the /trade page's own discretionary
+// orders shown on the Positions page (2026-09-19).
+func TestHandleListPositions_ManualModeRoutesToManualTable(t *testing.T) {
+	repo := &positionsStubRepo{
+		paperPositions: []port.PaperOrder{{ID: 1, InstID: "paper-should-not-appear"}},
+		realPositions:  []port.BotOrder{{ID: 2, InstID: "bot-should-not-appear"}},
+		manualOrders:   []port.ManualOrder{{ID: 3, InstID: "BTC", Side: "buy", Status: "filled"}},
+	}
+	srv := &Server{Repo: repo}
+
+	req := httptest.NewRequest("GET", "/api/positions?mode=manual", nil)
+	rec := httptest.NewRecorder()
+	srv.handleListPositions(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"ID":3`) {
+		t.Errorf("expected the manual order (id=3) in the response, got %s", body)
+	}
+	if strings.Contains(body, `"ID":1`) || strings.Contains(body, `"ID":2`) {
+		t.Errorf("expected only the manual order to appear for mode=manual, got %s", body)
+	}
+}
+
 // TestHandleListPositions_InvalidModeRejected confirms a typo'd mode 400s instead of silently
 // returning zero rows.
 func TestHandleListPositions_InvalidModeRejected(t *testing.T) {
@@ -140,6 +180,30 @@ func TestHandleClosePosition_BotModeCallsRequestBotManualClose(t *testing.T) {
 	}
 	if len(repo.requestManualClose) != 0 {
 		t.Errorf("expected no call to the paper-mode RequestManualClose, got %v", repo.requestManualClose)
+	}
+}
+
+// TestHandleClosePosition_ManualModeCallsRequestManualOrderClose confirms ?mode=manual routes to
+// manual_orders' own close-intent path (the same one the /trade page's ticket already uses),
+// never the paper or bot-order ones.
+func TestHandleClosePosition_ManualModeCallsRequestManualOrderClose(t *testing.T) {
+	repo := &positionsStubRepo{}
+	srv := &Server{Repo: repo}
+
+	req := httptest.NewRequest("POST", "/api/positions/7/close?mode=manual", nil)
+	req.SetPathValue("id", "7")
+	rec := httptest.NewRecorder()
+	srv.handleClosePosition(rec, req)
+
+	if rec.Code != 202 {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(repo.requestManualOrderClose) != 1 || repo.requestManualOrderClose[0] != 7 {
+		t.Errorf("expected RequestManualOrderClose(7), got %v", repo.requestManualOrderClose)
+	}
+	if len(repo.requestManualClose) != 0 || len(repo.requestBotManualClose) != 0 {
+		t.Errorf("expected no call to the paper- or bot-mode close paths, got paper=%v bot=%v",
+			repo.requestManualClose, repo.requestBotManualClose)
 	}
 }
 

@@ -451,16 +451,17 @@ func runBotTrader(
 	// unlike BotTrader which is one-per-configured-instrument — a manual order can be placed on
 	// ANY token the operator picks from a live search, not just the pre-configured roster.
 	manualTrader := &usecase.ManualTrader{
-		Repo:          repo,
-		Exchange:      exchangeClient,
-		Logger:        logger,
-		ExecInstType:  cfg.Trading.ExecInstType,
-		SettleCcy:     cfg.Trading.ExecSettleCcy,
-		TdMode:        cfg.Trading.TdMode,
-		PosMode:       cfg.Trading.PosMode,
-		ExecInstIDFor: okx.SymbolMap(cfg.Trading.SymbolMap).Resolve,
-		FillTimeout:   time.Duration(cfg.FillTimeout.OrderFillTimeoutSec) * time.Second,
-		OrderEvents:   orderEventsPub,
+		Repo:              repo,
+		Exchange:          exchangeClient,
+		Logger:            logger,
+		ExecInstType:      cfg.Trading.ExecInstType,
+		SettleCcy:         cfg.Trading.ExecSettleCcy,
+		TdMode:            cfg.Trading.TdMode,
+		PosMode:           cfg.Trading.PosMode,
+		ExecInstIDFor:     okx.SymbolMap(cfg.Trading.SymbolMap).Resolve,
+		FillTimeout:       time.Duration(cfg.FillTimeout.OrderFillTimeoutSec) * time.Second,
+		OrderEvents:       orderEventsPub,
+		AccountInitialUSD: cfg.Account.InitialUSD,
 		// §8.4: a manual order and a strategy position can share ONE net exchange position, and
 		// OKX's conditional orders for a position don't stack cleanly — so before placing its own
 		// protective order, ManualTrader checks whether BotTrader already holds a live one on this
@@ -488,6 +489,26 @@ func runBotTrader(
 	}
 	go func() {
 		errCh <- manualTrader.Run(ctx)
+	}()
+
+	// Keeps ManualTrader's position-mode honest with the account's ACTUAL current mode (2026-09-19
+	// Trade page fixes: POST /api/manual/account-mode can switch it live from the panel), on a slow
+	// cadence independent of Run's own fast intent-polling loop — position mode rarely changes, and
+	// polling it every 1-2s alongside intents would waste rate-limit budget on a value that's almost
+	// always unchanged. An initial call before the ticker starts means a fresh process picks up
+	// whatever the account's mode already is rather than waiting up to a full interval.
+	manualTrader.RefreshPosMode(ctx)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				manualTrader.RefreshPosMode(ctx)
+			}
+		}
 	}()
 
 	// Keeps the active roster in step with what the account can actually afford (2026-09-08
@@ -534,11 +555,12 @@ func runBotTrader(
 	// Per-position work (verifying each protective order via GetAlgoOrder) is genuinely
 	// per-instrument and still runs inside each engine.
 	reconcileDriver := &usecase.ReconcileDriver{
-		Engines:   engines,
-		Exchange:  exchangeClient,
-		Logger:    logger,
-		InstType:  cfg.Trading.ExecInstType,
-		SettleCcy: cfg.Trading.ExecSettleCcy,
+		Engines:      engines,
+		ManualTrader: manualTrader,
+		Exchange:     exchangeClient,
+		Logger:       logger,
+		InstType:     cfg.Trading.ExecInstType,
+		SettleCcy:    cfg.Trading.ExecSettleCcy,
 	}
 	go func() { errCh <- reconcileDriver.Run(ctx) }()
 

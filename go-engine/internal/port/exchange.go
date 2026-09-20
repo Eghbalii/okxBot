@@ -50,4 +50,13 @@ type ExchangeClient interface {
 	// 2026-09-06) — an unauthenticated public endpoint, but routed through the same client/gateway
 	// path as every other OKX call for consistency. Oldest-first.
 	GetFundingRateHistory(instID string, limit int) ([]domain.FundingRate, error)
+	// GetAccountConfig reads account-wide settings — today just position mode (net vs. hedge).
+	// Unlike TdMode/PosSide, which every order/leverage call already carries per-request, position
+	// mode is genuinely account-wide on OKX, so it needs its own read/write pair rather than being
+	// folded into an order request (2026-09-19, manual trading panel's live mode-switching work).
+	GetAccountConfig() (domain.AccountConfig, error)
+	// SetPositionMode switches the account between net mode and hedge mode. OKX only allows this
+	// when the account has zero open positions and zero pending orders — the caller checks that
+	// before calling, since the exchange's own rejection error is not especially friendly.
+	SetPositionMode(posMode string) error
 }

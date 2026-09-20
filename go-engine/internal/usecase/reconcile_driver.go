@@ -22,6 +22,12 @@ type ReconcileDriver struct {
 	// Engines is keyed by short symbol, matching cmd/trader's own engines map.
 	Engines map[string]*BotTrader
 
+	// ManualTrader records its own slice of the same account-wide balance snapshot into the
+	// "manual" mode's account_equity row (2026-09-20 request: manual trading gets its own trading
+	// cap alongside bot's). Optional — nil skips it, so a deployment without manual trading wired
+	// up (ManualTrade == nil, cmd/api's own convention) behaves exactly as before this field existed.
+	ManualTrader *ManualTrader
+
 	Exchange port.ExchangeClient
 	Logger   *slog.Logger
 
@@ -119,10 +125,15 @@ func (d *ReconcileDriver) ReconcileInstrument(ctx context.Context, instID string
 
 // recordEquityOnce writes the equity timeline through any one engine — the write targets a shared
 // account row and takes no per-instrument state, so which engine carries the call does not matter;
-// that it happens exactly once per snapshot does.
+// that it happens exactly once per snapshot does. ManualTrader's own "manual"-mode row is a
+// SEPARATE row (its own trading cap, its own reserve), so it is always recorded alongside the bot
+// engines' shared row rather than being an alternative to it.
 func (d *ReconcileDriver) recordEquityOnce(ctx context.Context, snap AccountSnapshot, logger *slog.Logger) {
 	for _, engine := range d.Engines {
 		engine.RecordEquity(ctx, snap, logger)
-		return
+		break
+	}
+	if d.ManualTrader != nil {
+		d.ManualTrader.RecordEquity(ctx, snap, logger)
 	}
 }

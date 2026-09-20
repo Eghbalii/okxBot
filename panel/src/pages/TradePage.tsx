@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api } from '../api/client'
-import type { ManualOrder, MarketToken, Position } from '../api/types'
+import type { ManualInstrument, ManualOrder, MarketToken, Position } from '../api/types'
 import { useCachedResource } from '../hooks/useCachedResource'
 import { useLiveCandles } from '../hooks/useLiveCandles'
 import { usePriceStream } from '../hooks/usePriceStream'
 import { useOrderbook } from '../hooks/useOrderbook'
 import { usePolling } from '../hooks/usePolling'
+import { useTradeDefaults, type TdMode } from '../hooks/useTradeDefaults'
+import { useFavoriteTokens } from '../hooks/useFavoriteTokens'
 import { CandleChart } from '../components/CandleChart'
 import OrderbookLadder from '../components/OrderbookLadder'
+import PositionsTable from '../components/PositionsTable'
 import TokenIcon from '../components/TokenIcon'
 import { fmtPctLabel } from '../components/ChartAdjustPanel'
 import { pctOnMargin } from '../components/PositionZones'
@@ -104,6 +107,15 @@ export default function TradePage() {
   const lastPrice = livePrices[symbol]
   const book = useOrderbook(symbol)
 
+  // The instrument's real exchange tick size — the only correct anchor for the order book's
+  // grouping steps (OrderbookLadder's own doc comment: a price-derived guess cannot match every
+  // instrument's real tick, confirmed directly with the operator after two wrong attempts).
+  const { data: instrument } = useCachedResource(
+    `manual-instrument:${symbol}`,
+    () => api.manualInstrument(symbol),
+    { maxAgeMs: 60_000 },
+  )
+
   // 24h stats for the header row (high/low/volume/change) — the same market-scan data the Home
   // page's table already reads, just filtered to this one symbol.
   const { data: marketResp } = useCachedResource(
@@ -138,6 +150,15 @@ export default function TradePage() {
     { maxAgeMs: 4_000, refetchMs: 5_000 },
   )
 
+  // Manual trading's own trading cap/margin (2026-09-20 Account page) — the order ticket shows how
+  // much of it is actually free before the operator sizes a new position, rather than only showing
+  // the cap itself (which ignores what's already committed to other open manual positions).
+  const { data: manualAccountStats, refresh: revalidateManualStats } = useCachedResource(
+    'manual-account-stats',
+    () => api.paperTradingStats('manual'),
+    { maxAgeMs: 10_000, refetchMs: 15_000 },
+  )
+
   const openOrders = openOrdersCached?.items ?? []
   const tokenOrder = useMemo(() => openOrders.find((o) => o.InstID === symbol), [openOrders, symbol])
 
@@ -146,34 +167,9 @@ export default function TradePage() {
     [openOrders, symbol],
   )
 
-  // Token search — resolves against the existing roster first (fast, matches most cases), falling
-  // through to a live GetInstrument lookup for anything not yet in it (§8.3: manual trading is not
-  // limited to the pre-scanned roster).
-  const { data: rosterResp } = useCachedResource(
-    'instruments:all',
-    () => api.instruments({}),
-    { maxAgeMs: 60_000 },
-  )
-  const roster = rosterResp?.items ?? []
-  const searchResults = useMemo(() => {
-    const q = search.trim().toUpperCase()
-    if (!q) return []
-    // One row per SYMBOL, not per (symbol, exchange) roster row — the same token can be listed by
-    // several exchanges (CLAUDE.md §53.6's "one row per token" precedent), and the picker is
-    // choosing a token to trade, not an exchange listing.
-    const seen = new Set<string>()
-    const out: string[] = []
-    for (const i of roster) {
-      if (!i.symbol.includes(q) || seen.has(i.symbol)) continue
-      seen.add(i.symbol)
-      out.push(i.symbol)
-      if (out.length >= 8) break
-    }
-    return out
-  }, [roster, search])
-
   function selectSymbol(sym: string) {
     setSearch('')
+    setSearchFocused(false)
     navigate(`/trade/${sym.toUpperCase()}`)
   }
 
@@ -182,7 +178,20 @@ export default function TradePage() {
       {/* Full-width symbol/stats header, above the 3-column workspace — the token picker, current
           price and 24h stats belong to the WHOLE page, not to any one column beneath it. */}
       <div className="trade-topbar">
-        <div className="trade-token-picker">
+        {/* onBlur on the CONTAINER, checking relatedTarget, rather than a fixed setTimeout on the
+            search input — a setTimeout-based close raced real clicks inside the popover (tab
+            buttons, exchange filters) and closed it before the click landed, which is exactly what
+            made the token list look empty: the popover was gone before Playwright's (and a fast
+            real click's) click event ever reached a row. relatedTarget tells us whether the NEW
+            focus target is still inside this container; only close when it genuinely isn't. */}
+        <div
+          className="trade-token-picker"
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+              setSearchFocused(false)
+            }
+          }}
+        >
           <button type="button" className="trade-symbol-btn" onClick={() => setSearchFocused(true)}>
             <TokenIcon symbol={symbol} size={22} />
             <span className="trade-symbol">{tokenSymbol(symbol)}</span>
@@ -190,27 +199,12 @@ export default function TradePage() {
             <span className="trade-symbol-caret">▾</span>
           </button>
           {searchFocused && (
-            <div className="trade-search-popover">
-              <input
-                autoFocus
-                className="trade-search"
-                placeholder="Search token…"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                onBlur={() => window.setTimeout(() => setSearchFocused(false), 150)}
-              />
-              {searchResults.length > 0 && (
-                <ul className="trade-search-results">
-                  {searchResults.map((sym) => (
-                    <li key={sym}>
-                      <button type="button" onClick={() => selectSymbol(sym)}>
-                        {sym}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
+            <TokenPicker
+              search={search}
+              onSearchChange={setSearch}
+              onSelect={selectSymbol}
+              marketTokens={marketResp ?? []}
+            />
           )}
         </div>
 
@@ -259,16 +253,19 @@ export default function TradePage() {
             </div>
           </div>
           <div className="trade-chart-body">
+            {/* Reduced from 560 — with the two side columns narrowed to 240px and the order book
+                capped at TOTAL_ROWS=16 rows, a shorter chart height reads proportionate to them
+                instead of towering over two narrow columns (explicit operator feedback). */}
             {candlesLoading && !candles ? (
               <p className="text-dim">Loading candles…</p>
             ) : (
-              <CandleChart candles={candles ?? []} positions={chartPositions} frameKey={`${symbol}:${bar}`} height={560} />
+              <CandleChart candles={candles ?? []} positions={chartPositions} frameKey={`${symbol}:${bar}`} height={460} />
             )}
           </div>
         </div>
 
         <div className="trade-col trade-col-book">
-          <OrderbookLadder book={book} lastPrice={lastPrice} />
+          <OrderbookLadder book={book} lastPrice={lastPrice} tickSz={instrument?.tickSz} />
         </div>
 
         <div className="trade-col trade-col-ticket">
@@ -277,14 +274,163 @@ export default function TradePage() {
             lastPrice={lastPrice}
             openOrder={tokenOrder}
             hasStrategyPosition={false}
-            onOrderChanged={() => revalidateOrders()}
+            instrument={instrument ?? undefined}
+            availableMarginUsd={manualAccountStats?.availableMarginUsd}
+            onOrderChanged={() => {
+              revalidateOrders()
+              revalidateManualStats()
+            }}
           />
         </div>
+      </div>
+
+      {/* Manually-opened positions, at the bottom of the page they're opened from (2026-09-20
+          request) — this is the exact same table Bot Trader/Paper use on the Positions tab
+          (components/PositionsTable), filtered to mode="manual" server-side. It used to live as a
+          third /positions/:mode tab, which was the wrong place: these orders are placed here, on
+          Trade, so reviewing them here is where an operator actually looks for them. */}
+      <div className="trade-manual-positions">
+        <h2>Your manual positions</h2>
+        <PositionsTable mode="manual" />
       </div>
     </div>
   )
 }
 
+type PickerTab = 'favorites' | 'top'
+
+// dedupeBySymbol collapses a MarketToken[] (one row per (exchange,symbol), CLAUDE.md §53.6) down
+// to one row per SYMBOL — the picker chooses a TOKEN to trade, not an exchange listing, and the
+// same token can appear from several exchanges. Keeps the highest-score row per symbol (the same
+// "best venue" reasoning the Home page's own market table already applies to price display).
+function dedupeBySymbol(tokens: MarketToken[]): MarketToken[] {
+  const bySymbol = new Map<string, MarketToken>()
+  for (const t of tokens) {
+    const existing = bySymbol.get(t.symbol)
+    if (!existing || Number(t.score) > Number(existing.score)) bySymbol.set(t.symbol, t)
+  }
+  return [...bySymbol.values()]
+}
+
+/**
+ * Token picker popover: a search box (always visible, filters whichever tab is active), a
+ * Favorites/Top tab pair (Favorites first, per explicit request), and a dynamic per-exchange
+ * filter derived from whatever exchanges are actually present in the scanned market data — never
+ * a hardcoded list (explicit operator requirement), so a newly onboarded exchange appears here
+ * with no panel code change.
+ */
+function TokenPicker({
+  search,
+  onSearchChange,
+  onSelect,
+  marketTokens,
+}: {
+  search: string
+  onSearchChange: (v: string) => void
+  onSelect: (symbol: string) => void
+  marketTokens: MarketToken[]
+}) {
+  const [tab, setTab] = useState<PickerTab>('favorites')
+  const [exchangeFilter, setExchangeFilter] = useState<string>('all')
+  const { favorites, toggle, isFavorite } = useFavoriteTokens()
+
+  const exchanges = useMemo(
+    () => [...new Set(marketTokens.map((t) => t.exchange))].sort(),
+    [marketTokens],
+  )
+
+  const byExchange = useMemo(
+    () => (exchangeFilter === 'all' ? marketTokens : marketTokens.filter((t) => t.exchange === exchangeFilter)),
+    [marketTokens, exchangeFilter],
+  )
+
+  const deduped = useMemo(() => dedupeBySymbol(byExchange), [byExchange])
+
+  const query = search.trim().toUpperCase()
+
+  const topRows = useMemo(() => {
+    const sorted = [...deduped].sort((a, b) => Number(b.score) - Number(a.score))
+    const filtered = query ? sorted.filter((t) => t.symbol.includes(query)) : sorted
+    return filtered.slice(0, 20)
+  }, [deduped, query])
+
+  const favoriteRows = useMemo(() => {
+    const rows = deduped.filter((t) => favorites.has(t.symbol))
+    return query ? rows.filter((t) => t.symbol.includes(query)) : rows
+  }, [deduped, favorites, query])
+
+  const rows = tab === 'favorites' ? favoriteRows : topRows
+
+  return (
+    <div className="trade-search-popover">
+      <input
+        autoFocus
+        className="trade-search"
+        placeholder="Search token…"
+        value={search}
+        onChange={(e) => onSearchChange(e.target.value)}
+      />
+
+      <div className="picker-tabs" role="tablist">
+        <button
+          type="button"
+          className={'picker-tab' + (tab === 'favorites' ? ' active' : '')}
+          onClick={() => setTab('favorites')}
+        >
+          Favorites
+        </button>
+        <button type="button" className={'picker-tab' + (tab === 'top' ? ' active' : '')} onClick={() => setTab('top')}>
+          Top
+        </button>
+      </div>
+
+      {exchanges.length > 1 && (
+        <div className="picker-exchanges" role="group">
+          <button
+            type="button"
+            className={'picker-exchange-btn' + (exchangeFilter === 'all' ? ' active' : '')}
+            onClick={() => setExchangeFilter('all')}
+          >
+            All
+          </button>
+          {exchanges.map((ex) => (
+            <button
+              key={ex}
+              type="button"
+              className={'picker-exchange-btn' + (exchangeFilter === ex ? ' active' : '')}
+              onClick={() => setExchangeFilter(ex)}
+            >
+              {ex}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <ul className="trade-search-results picker-results">
+        {rows.length === 0 && (
+          <li className="picker-empty text-dim">
+            {tab === 'favorites' ? 'No favorites yet — star a token to add one.' : 'No tokens found.'}
+          </li>
+        )}
+        {rows.map((t) => (
+          <li key={t.symbol} className="picker-row">
+            <button type="button" className="picker-row-star" onClick={() => toggle(t.symbol)}>
+              {isFavorite(t.symbol) ? '★' : '☆'}
+            </button>
+            <button type="button" className="picker-row-select" onClick={() => onSelect(t.symbol)}>
+              <TokenIcon symbol={t.symbol} size={18} />
+              <span className="picker-row-symbol">{tokenSymbol(t.symbol)}</span>
+              <span className="picker-row-exchange">{t.exchange}</span>
+              <span className={'mono picker-row-change ' + (Number(t.change24hPct) >= 0 ? 'text-green' : 'text-red')}>
+                {Number.isFinite(Number(t.change24hPct)) ? `${Number(t.change24hPct) >= 0 ? '+' : ''}${Number(t.change24hPct).toFixed(2)}%` : '—'}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
 
 type LevelMode = 'price' | 'pct'
 
@@ -293,12 +439,16 @@ function OrderTicket({
   lastPrice,
   openOrder,
   hasStrategyPosition,
+  instrument,
+  availableMarginUsd,
   onOrderChanged,
 }: {
   symbol: string
   lastPrice?: string
   openOrder?: ManualOrder
   hasStrategyPosition: boolean
+  instrument?: ManualInstrument
+  availableMarginUsd?: string
   onOrderChanged: () => void
 }) {
   if (openOrder && (openOrder.Status === 'filled' || openOrder.Status === 'partial')) {
@@ -314,6 +464,8 @@ function OrderTicket({
       symbol={symbol}
       lastPrice={lastPrice}
       hasStrategyPosition={hasStrategyPosition}
+      instrument={instrument}
+      availableMarginUsd={availableMarginUsd}
       onOrderChanged={onOrderChanged}
     />
   )
@@ -323,18 +475,22 @@ function NewOrderTicket({
   symbol,
   lastPrice,
   hasStrategyPosition,
+  instrument,
+  availableMarginUsd,
   onOrderChanged,
 }: {
   symbol: string
   lastPrice?: string
   hasStrategyPosition: boolean
+  instrument?: ManualInstrument
+  availableMarginUsd?: string
   onOrderChanged: () => void
 }) {
   const [side, setSide] = useState<'buy' | 'sell'>('buy')
   const [orderType, setOrderType] = useState<'market' | 'limit'>('market')
   const [limitPx, setLimitPx] = useState('')
   const [sizeUsd, setSizeUsd] = useState('')
-  const [leverage, setLeverage] = useState('10')
+  const { tdMode, leverage, setTdMode, setLeverage } = useTradeDefaults()
   const [levelMode, setLevelMode] = useState<LevelMode>('pct')
   const [slText, setSlText] = useState('')
   const [tpText, setTpText] = useState('')
@@ -345,6 +501,13 @@ function NewOrderTicket({
   const refPx = orderType === 'limit' ? Number(limitPx) : Number(lastPrice ?? 0)
 
   async function handleSubmit() {
+    // Caught here rather than only relying on the backend's own rejection (usecase.ManualTrader's
+    // MinSz check) so the operator sees a clear reason immediately, without waiting on the
+    // ~1-2s intent-processing round trip just to learn the order was always going to be refused.
+    if (belowMinimum && instrument) {
+      setError(`Order size is below ${symbol}'s minimum of ${instrument.minSz} contracts.`)
+      return
+    }
     setSubmitting(true)
     setError(null)
     try {
@@ -354,6 +517,7 @@ function NewOrderTicket({
         orderType,
         sizeUsd,
         leverage,
+        tdMode,
       }
       if (orderType === 'limit') body.limitPx = limitPx
       if (slText.trim() !== '') {
@@ -390,16 +554,46 @@ function NewOrderTicket({
 
   const sizeNum = Number(sizeUsd) || 0
   const levNum = Number(leverage) || 1
-  const ctVal = refPx > 0 ? ((sizeNum * levNum) / refPx).toFixed(6) : null
+  // Raw contract count before OKX's own rounding rules — shown as "≈ N contracts" for a sense of
+  // scale even before the instrument's own metadata has loaded (instrument is fetched separately
+  // and can arrive after the operator has already started typing).
+  const rawContracts = refPx > 0 ? (sizeNum * levNum) / refPx : null
+
+  // OKX trades in whole CONTRACTS, not raw USD (2026-09-20 request): a contract's value (ctVal),
+  // the minimum order size (minSz), and the required increment (lotSz) are all instrument-specific
+  // and easy to miss — the backend already floors to the nearest lot (usecase.sizeToContracts) and
+  // rejects a sized order below the minimum, but silently rounding what the operator asked for
+  // without telling them is a bad experience even when it's technically safe. This mirrors that
+  // same math client-side purely for the hint/warning below; the backend's own check is still what
+  // actually protects the order — this can never be more permissive than that.
+  let actualContracts: number | null = null
+  let belowMinimum = false
+  if (instrument && rawContracts !== null && rawContracts > 0) {
+    const ctVal = Number(instrument.ctVal) || 1
+    const lotSz = Number(instrument.lotSz) || 0
+    const minSz = Number(instrument.minSz) || 0
+    const baseUnits = rawContracts // sizeUsd*leverage/refPx already IS base-currency units here
+    let contracts = baseUnits / ctVal
+    if (lotSz > 0) contracts = Math.floor(contracts / lotSz) * lotSz
+    actualContracts = contracts
+    belowMinimum = minSz > 0 && contracts < minSz
+  }
+
+  const availableMarginNum = availableMarginUsd !== undefined ? Number(availableMarginUsd) : null
+  const exceedsAvailableMargin = availableMarginNum !== null && sizeNum > availableMarginNum
 
   return (
     <div className="order-ticket">
-      {/* Margin-mode / leverage pills, matching an exchange's own ticket header (explicit
-          reference) — this account is always cross-margin/manual leverage, so these are read-only
-          badges rather than switches; leverage itself is the actual input further down. */}
+      {/* Margin-mode / leverage / position-mode pills, matching an exchange's own ticket header
+          (explicit reference) — all three are genuinely editable now (2026-09-19 fix): TdMode and
+          leverage are per-request fields OKX already accepts on every order, so no exchange call is
+          needed to change them here, just the panel's own persisted default (useTradeDefaults).
+          Position mode (net/hedge) IS a real account-wide exchange setting, so it lives in its own
+          component making its own live GetAccountConfig/SetPositionMode calls. */}
       <div className="ot-pills">
-        <span className="ot-pill">Cross</span>
-        <span className="ot-pill">{leverage || '10'}x</span>
+        <MarginModePill tdMode={tdMode} onChange={setTdMode} />
+        <LeveragePill leverage={leverage} onChange={setLeverage} />
+        <PositionModePill />
       </div>
 
       <div className="ot-type" role="group">
@@ -444,17 +638,46 @@ function NewOrderTicket({
       )}
 
       <label className="ot-field">
-        <span>Size (USD)</span>
+        <span
+          title={
+            instrument
+              ? `Minimum order: ${instrument.minSz} contract${Number(instrument.minSz) === 1 ? '' : 's'} · ` +
+                `orders must be a multiple of ${instrument.lotSz} contract${Number(instrument.lotSz) === 1 ? '' : 's'} · ` +
+                `1 contract = ${instrument.ctVal} ${symbol}`
+              : undefined
+          }
+        >
+          Size (USD) {instrument && 'ⓘ'}
+        </span>
         <input value={sizeUsd} onChange={(e) => setSizeUsd(e.target.value)} type="number" step="any" />
       </label>
 
-      <label className="ot-field">
-        <span>Leverage</span>
-        <input value={leverage} onChange={(e) => setLeverage(e.target.value)} type="number" step="any" />
-      </label>
+      {availableMarginNum !== null && (
+        <p className={'text-dim ot-contracts' + (exceedsAvailableMargin ? ' error' : '')}>
+          Available to trade with: {availableMarginNum.toFixed(2)} USD
+        </p>
+      )}
+      {exceedsAvailableMargin && (
+        <p className="ot-warning">
+          This is more than your available manual trading margin ({availableMarginNum!.toFixed(2)} USD).
+          Set a larger trading cap on the Account page, or reduce this order's size.
+        </p>
+      )}
 
-      {ctVal && (
-        <p className="text-dim ot-contracts">≈ {ctVal} contracts at {trimPrice(refPx)}</p>
+      {rawContracts !== null && (
+        <p className="text-dim ot-contracts">
+          {actualContracts !== null ? (
+            <>≈ {actualContracts} contracts at {trimPrice(refPx)}</>
+          ) : (
+            <>≈ {rawContracts.toFixed(6)} contracts at {trimPrice(refPx)}</>
+          )}
+        </p>
+      )}
+      {belowMinimum && instrument && (
+        <p className="ot-warning">
+          This is below {symbol}'s minimum order size ({instrument.minSz} contracts) — the exchange
+          will reject it. Increase the size or leverage.
+        </p>
       )}
 
       <div className="ot-mode" role="group">
@@ -494,6 +717,156 @@ function NewOrderTicket({
       >
         {submitting ? 'Submitting…' : side === 'buy' ? 'Buy / Long' : 'Sell / Short'}
       </button>
+    </div>
+  )
+}
+
+/** Editable margin-mode pill — click to open a Cross/Isolated toggle, closes on selection. */
+function MarginModePill({ tdMode, onChange }: { tdMode: TdMode; onChange: (v: TdMode) => void }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="ot-pill-editable">
+      <button type="button" className="ot-pill ot-pill-btn" onClick={() => setOpen((v) => !v)}>
+        {tdMode === 'isolated' ? 'Isolated' : 'Cross'}
+      </button>
+      {open && (
+        <div className="ot-pill-menu">
+          {(['cross', 'isolated'] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              className={'ot-pill-menu-item' + (tdMode === m ? ' active' : '')}
+              onClick={() => {
+                onChange(m)
+                setOpen(false)
+              }}
+            >
+              {m === 'cross' ? 'Cross' : 'Isolated'}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Editable leverage pill — click to reveal a number input, Enter/blur confirms. */
+function LeveragePill({ leverage, onChange }: { leverage: string; onChange: (v: string) => void }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(leverage)
+
+  function commit() {
+    const n = Number(draft)
+    if (Number.isFinite(n) && n > 0) onChange(draft)
+    else setDraft(leverage) // reject a bad value, revert to the last good one
+    setEditing(false)
+  }
+
+  if (editing) {
+    return (
+      <input
+        autoFocus
+        className="ot-pill ot-pill-input"
+        type="number"
+        step="any"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commit()
+          if (e.key === 'Escape') {
+            setDraft(leverage)
+            setEditing(false)
+          }
+        }}
+      />
+    )
+  }
+  return (
+    <button
+      type="button"
+      className="ot-pill ot-pill-btn"
+      onClick={() => {
+        setDraft(leverage)
+        setEditing(true)
+      }}
+    >
+      {leverage || '10'}x
+    </button>
+  )
+}
+
+/**
+ * Position-mode pill (One-way / Hedge) — the one pill backed by a REAL account-wide exchange
+ * setting (OKX's set-position-mode), unlike the other two which are per-request fields
+ * (docs/MANUAL_TRADE_PLAN.md-adjacent, 2026-09-19 Trade page fixes). Reads the account's current
+ * mode plus whether switching to hedge is currently possible (zero open positions) from
+ * GET /api/manual/account-mode, disables the Hedge option with an explanatory tooltip when it
+ * isn't, and calls POST /api/manual/account-mode on selection — the exchange's own rejection is
+ * still authoritative if a position opened in the brief window since this last polled.
+ */
+function PositionModePill() {
+  const [open, setOpen] = useState(false)
+  const [switching, setSwitching] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const { data: mode, refresh } = useCachedResource(
+    'manual-account-mode',
+    () => api.manualAccountMode(),
+    { maxAgeMs: 5_000, refetchMs: 15_000 },
+  )
+
+  async function selectMode(next: 'net' | 'hedge') {
+    if (!mode || mode.posMode === next) {
+      setOpen(false)
+      return
+    }
+    setSwitching(true)
+    setError(null)
+    try {
+      await api.setManualAccountMode(next)
+      await refresh()
+      setOpen(false)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSwitching(false)
+    }
+  }
+
+  const label = mode?.posMode === 'hedge' ? 'Hedge' : 'One-way'
+
+  return (
+    <div className="ot-pill-editable">
+      <button type="button" className="ot-pill ot-pill-btn" onClick={() => setOpen((v) => !v)}>
+        {label}
+      </button>
+      {open && (
+        <div className="ot-pill-menu ot-pill-menu-wide">
+          <button
+            type="button"
+            className={'ot-pill-menu-item' + (mode?.posMode === 'net' ? ' active' : '')}
+            disabled={switching}
+            onClick={() => selectMode('net')}
+          >
+            One-way
+          </button>
+          <button
+            type="button"
+            className={'ot-pill-menu-item' + (mode?.posMode === 'hedge' ? ' active' : '')}
+            disabled={switching || (mode ? !mode.canSwitchToHedge && mode.posMode !== 'hedge' : false)}
+            title={
+              mode && !mode.canSwitchToHedge && mode.posMode !== 'hedge'
+                ? `Close every open position first (${mode.openPositionCount} open)`
+                : undefined
+            }
+            onClick={() => selectMode('hedge')}
+          >
+            Hedge
+          </button>
+          {error && <p className="error ot-pill-menu-error">{error}</p>}
+        </div>
+      )}
     </div>
   )
 }

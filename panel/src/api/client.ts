@@ -14,6 +14,7 @@ import type {
   StrategyConfig,
   StrategyStats,
   CleanupResult,
+  CleanupCandidate,
   ExchangeOrderRaw,
   TokenAffordability,
   TokenStats,
@@ -277,9 +278,21 @@ export const api = {
   // min-size column and auto-disabled tag (2026-09-08). Empty in paper mode by design.
   // OKX's own untouched record for both legs of a real position, fetched live rather than served
   // from stored columns — the stored fields are a chosen few, this is everything the exchange knows.
-  // Reclaims the Docker build cache. Build cache only — see the endpoint's own doc comment for
-  // why images/volumes are deliberately not touched.
+  // Automatic Docker cleanup (build cache, stopped containers, unused images) — safe by Docker's
+  // own construction, no confirmation needed. See the endpoint's own doc comment for why
+  // volumes/the RL model are still deliberately never touched.
   cleanupDisk: () => request<CleanupResult>('/system/cleanup', { method: 'POST' }),
+  // Files/directories a person can choose to delete, each with a plain-language description —
+  // never deleted without an explicit per-item confirmation (2026-09-20).
+  cleanupCandidates: () =>
+    request<{ candidates: CleanupCandidate[] | null }>('/system/cleanup-candidates').then(
+      (r) => r.candidates ?? [],
+    ),
+  deleteCleanupCandidate: (id: string) =>
+    request<{ deleted: string; sizeBytes: number }>('/system/cleanup-candidates/delete', {
+      method: 'POST',
+      body: JSON.stringify({ id }),
+    }),
   exchangeOrderRaw: (id: number) =>
     request<ExchangeOrderRaw>(`/positions/${id}/exchange-order`),
   tokenAffordability: (mode: PositionMode) =>
@@ -347,7 +360,17 @@ export const api = {
     slPct?: number
     tpPx?: string
     tpPct?: number
+    tdMode?: 'cross' | 'isolated'
   }) => request<{ intentId: number }>('/manual/orders', { method: 'POST', body: JSON.stringify(body) }),
+  // Account-wide position mode (net vs. hedge) — a genuine exchange-side account setting, unlike
+  // margin mode/leverage which are per-order fields sent directly on createManualOrder/
+  // setManualLeverage (2026-09-19 Trade page fixes).
+  manualAccountMode: () =>
+    request<{ posMode: 'net' | 'hedge'; openPositionCount: number; canSwitchToHedge: boolean }>(
+      '/manual/account-mode',
+    ),
+  setManualAccountMode: (posMode: 'net' | 'hedge') =>
+    request<{ ok: boolean }>('/manual/account-mode', { method: 'POST', body: JSON.stringify({ posMode }) }),
   manualOrderIntent: (id: number) => request<ManualOrderIntent>(`/manual/order-intents/${id}`),
   listManualOrders: (opts?: { instId?: string; open?: boolean }) => {
     const params = new URLSearchParams()

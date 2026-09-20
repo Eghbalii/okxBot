@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/shopspring/decimal"
@@ -72,6 +73,114 @@ func (s *Server) handleManualSetLeverage(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// manualAccountModeResponse is GET /api/manual/account-mode's shape — reports the account's
+// CURRENT position mode plus whether the precondition for switching TO hedge mode holds right now
+// (zero open positions), so the panel can preemptively disable that option with an accurate reason
+// rather than only discovering it's blocked after a rejected exchange call.
+type manualAccountModeResponse struct {
+	PosMode           string `json:"posMode"` // "net" or "hedge" — this codebase's own short form
+	OpenPositionCount int    `json:"openPositionCount"`
+	CanSwitchToHedge  bool   `json:"canSwitchToHedge"`
+}
+
+// posModeFromOKX/posModeToOKX translate between OKX's own wire values ("net_mode"/
+// "long_short_mode") and this codebase's shorter "net"/"hedge" convention used everywhere else
+// (config.Trading.PosMode uses "net"/"long_short" — yet another spelling; the panel gets the
+// shortest, clearest one rather than propagating either exchange-specific string to the UI).
+func posModeFromOKX(wire string) string {
+	if wire == "long_short_mode" {
+		return "hedge"
+	}
+	return "net"
+}
+
+func posModeToOKX(short string) (string, error) {
+	switch short {
+	case "hedge":
+		return "long_short_mode", nil
+	case "net":
+		return "net_mode", nil
+	default:
+		return "", fmt.Errorf("posMode must be net or hedge, got %q", short)
+	}
+}
+
+// handleGetManualAccountMode answers GET /api/manual/account-mode.
+func (s *Server) handleGetManualAccountMode(w http.ResponseWriter, r *http.Request) {
+	if s.ManualTrade == nil {
+		writeError(w, http.StatusServiceUnavailable, "manual trading is not configured on this deployment")
+		return
+	}
+	cfg, err := s.ManualTrade.GetAccountConfig()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "could not read account config: "+err.Error())
+		return
+	}
+	positions, err := s.ManualTrade.GetPositions(s.ExecInstType)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "could not read positions: "+err.Error())
+		return
+	}
+	open := 0
+	for _, p := range positions {
+		if !p.Pos.IsZero() {
+			open++
+		}
+	}
+	writeJSON(w, http.StatusOK, manualAccountModeResponse{
+		PosMode:           posModeFromOKX(cfg.PosMode),
+		OpenPositionCount: open,
+		CanSwitchToHedge:  open == 0,
+	})
+}
+
+// manualSetAccountModeRequest is POST /api/manual/account-mode's body.
+type manualSetAccountModeRequest struct {
+	PosMode string `json:"posMode"` // "net" or "hedge"
+}
+
+// handleSetManualAccountMode answers POST /api/manual/account-mode — switches the account's
+// position mode. Real-money account-wide exchange call, so this pre-checks the same zero-open-
+// positions precondition OKX itself enforces (CLAUDE.md §27.6/§49.2's "ask the exchange, don't
+// just trust local state" — the pre-check reads live positions rather than any local cache) before
+// ever sending the request, so a blocked switch fails with a clear reason instead of a bare
+// exchange rejection. The exchange's own answer stays authoritative either way: a race between this
+// check and a position opening a moment later still surfaces as the exchange's own error.
+func (s *Server) handleSetManualAccountMode(w http.ResponseWriter, r *http.Request) {
+	if s.ManualTrade == nil {
+		writeError(w, http.StatusServiceUnavailable, "manual trading is not configured on this deployment")
+		return
+	}
+	var req manualSetAccountModeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	wireMode, err := posModeToOKX(req.PosMode)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.PosMode == "hedge" {
+		positions, err := s.ManualTrade.GetPositions(s.ExecInstType)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "could not read positions: "+err.Error())
+			return
+		}
+		for _, p := range positions {
+			if !p.Pos.IsZero() {
+				writeError(w, http.StatusConflict, "cannot switch to hedge mode while any position is open — close every position first")
+				return
+			}
+		}
+	}
+	if err := s.ManualTrade.SetPositionMode(wireMode); err != nil {
+		writeError(w, http.StatusBadGateway, "the exchange rejected the position-mode change: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // manualPosSideFor mirrors usecase's own posSideFor/signedNotionalForSide (unexported there, not
 // reachable from this package) for the one hedge-mode decision this file needs to make on its own:
 // a buy opens/adds to "long", a sell opens/adds to "short". Every actual order placement still
@@ -101,6 +210,10 @@ type manualOrderRequest struct {
 	SLPct     *float64         `json:"slPct"`
 	TPPx      *decimal.Decimal `json:"tpPx"`
 	TPPct     *float64         `json:"tpPct"`
+	// TdMode is a per-order margin-mode choice ("cross" or "isolated") — OKX already accepts this
+	// per-request on every order/leverage call (domain.OrderRequest.TdMode), so this needs no
+	// account-wide exchange call the way position mode does. Empty defaults to "cross".
+	TdMode string `json:"tdMode"`
 }
 
 // resolveLevel converts a manual order request's price-or-percent SL/TP field into a single price,
@@ -179,6 +292,14 @@ func (s *Server) handleCreateManualOrder(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "leverage must be a positive number")
 		return
 	}
+	tdMode := req.TdMode
+	if tdMode == "" {
+		tdMode = "cross"
+	}
+	if tdMode != "cross" && tdMode != "isolated" {
+		writeError(w, http.StatusBadRequest, "tdMode must be cross or isolated")
+		return
+	}
 
 	instID, err := s.execInstID(req.Symbol)
 	if err != nil {
@@ -222,6 +343,7 @@ func (s *Server) handleCreateManualOrder(w http.ResponseWriter, r *http.Request)
 		Leverage:  req.Leverage,
 		SLPx:      slPx,
 		TPPx:      tpPx,
+		TdMode:    tdMode,
 	}
 	id, err := s.Repo.CreateManualOrderIntent(r.Context(), intent)
 	if err != nil {

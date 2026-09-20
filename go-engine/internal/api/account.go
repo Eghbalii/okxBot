@@ -15,10 +15,17 @@ import (
 // can't return an unbounded row count to the panel's chart. The panel can ask for more explicitly.
 const defaultEquityHistoryLimit = 1000
 
-// validModes are the trading modes an account balance is tracked for (CLAUDE.md §15.6). Validated
-// here rather than passed through, so a typo'd mode is a 400 instead of silently seeding a new
-// account row for a mode nothing ever trades against.
-var validModes = map[string]bool{"paper": true, "bot": true}
+// validModes are the trading modes an account balance is tracked for (CLAUDE.md §15.6). "manual"
+// added 2026-09-20 (Account page): manual/discretionary trading gets its own trading-cap
+// bookkeeping alongside bot trading, both slices of the same real exchange balance. Validated here
+// rather than passed through, so a typo'd mode is a 400 instead of silently seeding a new account
+// row for a mode nothing ever trades against.
+var validModes = map[string]bool{"paper": true, "bot": true, "manual": true}
+
+// realMoneyModes mirrors internal/postgres's own list — every mode with a live exchange balance
+// behind it, as opposed to "paper"'s fictional one. Used to route requests to the operation each
+// mode actually needs (SetTradingCap vs. SetAccountCap, see handleSetAccountCap's own doc comment).
+var realMoneyModes = map[string]bool{"bot": true, "manual": true}
 
 // queryMode resolves the ?mode= parameter, defaulting to "paper" (the only mode with a live writer
 // today, CLAUDE.md §11.4). Reports false after writing a 400 if the mode isn't recognized.
@@ -28,7 +35,7 @@ func queryMode(w http.ResponseWriter, r *http.Request) (string, bool) {
 		return "paper", true
 	}
 	if !validModes[mode] {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot): "+mode)
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper, bot, or manual): "+mode)
 		return "", false
 	}
 	return mode, true
@@ -86,7 +93,7 @@ func (s *Server) handleSetAccountCap(w http.ResponseWriter, r *http.Request) {
 		mode = "paper"
 	}
 	if !validModes[mode] {
-		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot): "+mode)
+		writeError(w, http.StatusBadRequest, "invalid mode (want paper, bot, or manual): "+mode)
 		return
 	}
 	if !req.NewCapUSD.IsPositive() {
@@ -97,16 +104,20 @@ func (s *Server) handleSetAccountCap(w http.ResponseWriter, r *http.Request) {
 	// Real and paper mean genuinely different things by "set a cap", so this routes to two
 	// different repository operations rather than one with a mode branch inside it (2026-09-08):
 	//
-	//   paper — there is no exchange, so AccountBalanceUSD is bookkeeping this system owns and a
-	//           cap is a re-baselining of the whole account. Unchanged (CLAUDE.md §32.3).
-	//   real  — AccountBalanceUSD mirrors the exchange's own reported balance and is
-	//           RecordExchangeBalance's reconciliation anchor, so it must NEVER be overwritten
-	//           with a chosen number: the next poll would report the difference as realized PnL
-	//           that never happened. The cap instead names the tradable slice of that balance,
-	//           and the untraded remainder is a derived reserve.
+	//   paper        — there is no exchange, so AccountBalanceUSD is bookkeeping this system owns
+	//                  and a cap is a re-baselining of the whole account. Unchanged (CLAUDE.md
+	//                  §32.3).
+	//   bot / manual — AccountBalanceUSD mirrors the exchange's own reported balance and is
+	//                  RecordExchangeBalance's reconciliation anchor, so it must NEVER be
+	//                  overwritten with a chosen number: the next poll would report the
+	//                  difference as realized PnL that never happened. The cap instead names the
+	//                  tradable slice of that balance, and the untraded remainder is a derived
+	//                  reserve. "manual" added 2026-09-20 — it shares the SAME real balance as
+	//                  "bot" (Repository.SetTradingCap's own doc comment covers how the two caps
+	//                  are bounded against each other so they can never jointly exceed it).
 	var account port.AccountEquity
 	var err error
-	if mode == "bot" {
+	if realMoneyModes[mode] {
 		account, err = s.Repo.SetTradingCap(r.Context(), mode, req.NewCapUSD)
 	} else {
 		account, err = s.Repo.SetAccountCap(r.Context(), mode, req.NewCapUSD)

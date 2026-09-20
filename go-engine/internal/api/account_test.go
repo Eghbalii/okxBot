@@ -164,6 +164,28 @@ func TestHandleSetAccountCap_BotModeRoutesToSetTradingCap(t *testing.T) {
 	}
 }
 
+// manual mode shares bot's routing: it too mirrors a real exchange balance (the SAME real balance
+// bot draws from, Repository.SetTradingCap's own doc comment), so overwriting AccountBalanceUSD
+// with a chosen number would be exactly as wrong here as it would for bot (2026-09-20, Account
+// page). This is the regression this test guards: manual defaulting to SetAccountCap (the "else"
+// branch before manual was added to realMoneyModes) would corrupt the reconciliation anchor the
+// same way it would have for bot before that routing existed.
+func TestHandleSetAccountCap_ManualModeRoutesToSetTradingCap(t *testing.T) {
+	repo := &accountStubRepo{setCapResult: port.AccountEquity{Mode: "manual", EquityUSD: dec("20")}}
+	srv := newTestServer2(repo)
+
+	rec := doSetAccountCap(srv, map[string]any{"mode": "manual", "newCapUsd": 20})
+	if rec.Code != 200 {
+		t.Fatalf("expected 200 for mode=manual, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(repo.tradingCapCalls) != 1 || repo.tradingCapCalls[0].mode != "manual" {
+		t.Fatalf("expected one SetTradingCap call for mode=manual, got %+v", repo.tradingCapCalls)
+	}
+	if len(repo.setCapCalls) != 0 {
+		t.Fatalf("manual mode must NOT call SetAccountCap (it would overwrite the exchange balance anchor), got %+v", repo.setCapCalls)
+	}
+}
+
 // The paper side of the same routing: paper has no exchange, so AccountBalanceUSD is bookkeeping
 // this system owns and a cap legitimately re-baselines the whole account (CLAUDE.md §32.3).
 func TestHandleSetAccountCap_PaperModeRoutesToSetAccountCap(t *testing.T) {

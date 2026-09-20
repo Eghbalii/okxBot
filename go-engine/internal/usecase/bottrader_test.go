@@ -1839,3 +1839,86 @@ func TestMonitorOpenPositions_ManualCloseIsNotDeferredToTheExchange(t *testing.T
 		t.Error("a manual close must always send its own flatten")
 	}
 }
+
+// The cross-margin cap guard must tighten a real bot position's stop-loss so a touch can never
+// realize more than the mode's trading cap — the same scenario reported 2026-09-20 for manual
+// trading, applied here to BotTrader's own open path (openBot).
+//
+// The pre-existing MaxLossPct clamp (newTestBotTrader's own RLClamps) already tightens the model's
+// proposed 50 to 95 (5% distance, MaxLossPct=0.5/leverage=10) regardless of margin mode — measured
+// directly before writing this test (margin sizes to $500 here — MaxPositionPct=0.5 of the $1000
+// raw exchange balance the observation reads, independent of the $1 trading cap below, which only
+// bounds SIZING'S OWN equity input, not this clamp), since a value that assumed the model's raw
+// proposal survives unclamped into the new guard would test nothing real. The $1 trading cap is
+// chosen deliberately far tighter than what MaxLossPct alone would produce, so this test exercises
+// the NEW guard specifically: without it, this would read 95, not the cap-safe 99.98.
+func TestOpenBot_CrossMarginGuardTightensAnOverWideStop(t *testing.T) {
+	repo := newFakeRepository()
+	repo.accounts["bot"] = port.AccountEquity{
+		Mode: "bot", EquityUSD: dec("1000"), AccountBalanceUSD: dec("1000"),
+		TradingCapUSD: func() *decimal.Decimal { d := dec("1"); return &d }(),
+	}
+	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}}
+	model := &fakeModelClient{action: domain.Action{
+		Action: domain.ActionOpen, SizePct: dec("1.0"), LeverageFrac: dec("1.0"), SLPx: dec("50"),
+	}}
+	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
+	rt := newTestBotTrader(repo, exchange, model, strategies)
+	rt.TdMode = "cross"
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
+
+	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, err := rt.openPositions(context.Background())
+	if err != nil {
+		t.Fatalf("openPositions: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("expected 1 persisted open real position, got %d", len(open))
+	}
+	if open[0].SLPx == nil {
+		t.Fatal("expected a non-nil stop-loss")
+	}
+	// Margin=$500, Leverage=10 (measured directly): cap-safe distance = 1/(500*10) = 0.02% of
+	// entry, i.e. 99.98 for a long — strictly tighter than the pre-existing clamp's own 95.
+	if !open[0].SLPx.Equal(dec("99.98")) {
+		t.Fatalf("SLPx = %s, want 99.98 (the $1-cap-safe distance, tighter than the pre-existing clamp's own 95)", open[0].SLPx)
+	}
+}
+
+// Under isolated margin, BotTrader's cross-margin guard must not apply — mirrors
+// TestManualTrader_CrossMarginGuardDoesNotApplyUnderIsolatedMargin for the real-order open path.
+// Uses the SAME tiny $1 cap as the cross-margin test above: if the guard incorrectly applied under
+// isolated margin too, this would also read 99.98, not the pre-existing clamp's own 95.
+func TestOpenBot_CrossMarginGuardDoesNotApplyUnderIsolatedMargin(t *testing.T) {
+	repo := newFakeRepository()
+	repo.accounts["bot"] = port.AccountEquity{
+		Mode: "bot", EquityUSD: dec("1000"), AccountBalanceUSD: dec("1000"),
+		TradingCapUSD: func() *decimal.Decimal { d := dec("1"); return &d }(),
+	}
+	exchange := &fakeExchangeClient{balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}}}
+	model := &fakeModelClient{action: domain.Action{
+		Action: domain.ActionOpen, SizePct: dec("1.0"), LeverageFrac: dec("1.0"), SLPx: dec("50"),
+	}}
+	strategies := []StrategyAssignment{{Bar: "1m", Strategy: &stubStrategy{signal: buySignal()}, StrategyID: 1, Kind: "stub"}}
+	rt := newTestBotTrader(repo, exchange, model, strategies)
+	rt.TdMode = "isolated"
+	rt.candles = map[string][]domain.Candle{"1m": realTraderWindow("100")}
+
+	if err := rt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
+		t.Fatalf("evaluateStrategies returned error: %v", err)
+	}
+
+	open, err := rt.openPositions(context.Background())
+	if err != nil {
+		t.Fatalf("openPositions: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("expected 1 persisted open real position, got %d", len(open))
+	}
+	if open[0].SLPx == nil || !open[0].SLPx.Equal(dec("95")) {
+		t.Fatalf("SLPx = %v, want unchanged 95 (the pre-existing clamp's own result — isolated margin has no cross-cap risk to guard against on top of it)", open[0].SLPx)
+	}
+}

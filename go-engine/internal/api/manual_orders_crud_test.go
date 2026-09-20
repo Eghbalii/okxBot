@@ -106,6 +106,13 @@ type stubManualExchange struct {
 	tickerErr   error
 	leverageErr error
 	leverageSet []domain.LeverageChange
+
+	accountConfig    domain.AccountConfig
+	accountConfigErr error
+	positions        []domain.Position
+	positionsErr     error
+	setPosModeErr    error
+	setPosModeCalls  []string
 }
 
 func (s *stubManualExchange) GetInstrument(instType, instID string) (domain.Instrument, error) {
@@ -128,6 +135,16 @@ func (s *stubManualExchange) PlaceAlgoOrder(req domain.AlgoOrderRequest) (string
 func (s *stubManualExchange) CancelAlgoOrder(instID, algoID string) error { return nil }
 func (s *stubManualExchange) GetTicker(instID string) (domain.Ticker, error) {
 	return s.ticker, s.tickerErr
+}
+func (s *stubManualExchange) GetAccountConfig() (domain.AccountConfig, error) {
+	return s.accountConfig, s.accountConfigErr
+}
+func (s *stubManualExchange) SetPositionMode(posMode string) error {
+	s.setPosModeCalls = append(s.setPosModeCalls, posMode)
+	return s.setPosModeErr
+}
+func (s *stubManualExchange) GetPositions(instType string) ([]domain.Position, error) {
+	return s.positions, s.positionsErr
 }
 
 func newManualTestServer(repo *stubManualRepo, exchange *stubManualExchange) *Server {
@@ -280,6 +297,83 @@ func TestHandleManualSetLeverage_HedgeModeRequiresSide(t *testing.T) {
 	}
 	if len(exchange.leverageSet) != 1 || exchange.leverageSet[0].PosSide != "short" {
 		t.Fatalf("expected PosSide=short for a sell in hedge mode, got %+v", exchange.leverageSet)
+	}
+}
+
+func TestHandleGetManualAccountMode_ReportsModeAndSwitchability(t *testing.T) {
+	repo := &stubManualRepo{}
+	exchange := &stubManualExchange{
+		accountConfig: domain.AccountConfig{PosMode: "net_mode"},
+		positions:     []domain.Position{{InstID: "BTC", Pos: dec("1")}},
+	}
+	srv := newManualTestServer(repo, exchange)
+
+	req := httptest.NewRequest("GET", "/api/manual/account-mode", nil)
+	rec := httptest.NewRecorder()
+	srv.handleGetManualAccountMode(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got manualAccountModeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.PosMode != "net" || got.OpenPositionCount != 1 || got.CanSwitchToHedge {
+		t.Fatalf("unexpected response: %+v", got)
+	}
+}
+
+func TestHandleSetManualAccountMode_RefusesHedgeSwitchWithOpenPositions(t *testing.T) {
+	repo := &stubManualRepo{}
+	exchange := &stubManualExchange{
+		positions: []domain.Position{{InstID: "BTC", Pos: dec("1")}},
+	}
+	srv := newManualTestServer(repo, exchange)
+
+	body, _ := json.Marshal(manualSetAccountModeRequest{PosMode: "hedge"})
+	req := httptest.NewRequest("POST", "/api/manual/account-mode", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.handleSetManualAccountMode(rec, req)
+
+	if rec.Code != 409 {
+		t.Fatalf("expected 409 with an open position, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(exchange.setPosModeCalls) != 0 {
+		t.Fatalf("must not call the exchange when the precondition fails, got %v", exchange.setPosModeCalls)
+	}
+}
+
+func TestHandleSetManualAccountMode_SwitchesWhenFlat(t *testing.T) {
+	repo := &stubManualRepo{}
+	exchange := &stubManualExchange{}
+	srv := newManualTestServer(repo, exchange)
+
+	body, _ := json.Marshal(manualSetAccountModeRequest{PosMode: "hedge"})
+	req := httptest.NewRequest("POST", "/api/manual/account-mode", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.handleSetManualAccountMode(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(exchange.setPosModeCalls) != 1 || exchange.setPosModeCalls[0] != "long_short_mode" {
+		t.Fatalf("expected exactly one SetPositionMode(long_short_mode) call, got %v", exchange.setPosModeCalls)
+	}
+}
+
+func TestHandleSetManualAccountMode_RejectsUnknownMode(t *testing.T) {
+	repo := &stubManualRepo{}
+	exchange := &stubManualExchange{}
+	srv := newManualTestServer(repo, exchange)
+
+	body, _ := json.Marshal(manualSetAccountModeRequest{PosMode: "dual"})
+	req := httptest.NewRequest("POST", "/api/manual/account-mode", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.handleSetManualAccountMode(rec, req)
+
+	if rec.Code != 400 {
+		t.Fatalf("expected 400 for an unrecognized posMode, got %d", rec.Code)
 	}
 }
 

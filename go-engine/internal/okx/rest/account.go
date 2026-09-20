@@ -129,6 +129,30 @@ func (c *Client) GetFundingRateHistory(instID string, limit int) ([]domain.Fundi
 	return out, nil
 }
 
+// GetAccountConfig fetches account-wide settings via GET /api/v5/account/config — today only
+// PosMode ("net_mode" or "long_short_mode") is read, the one setting genuinely account-wide rather
+// than per-order (domain.AccountConfig's own doc comment).
+func (c *Client) GetAccountConfig() (domain.AccountConfig, error) {
+	var configs []okx.AccountConfig
+	if err := c.do("GET", "/api/v5/account/config", nil, &configs); err != nil {
+		return domain.AccountConfig{}, err
+	}
+	if len(configs) == 0 {
+		return domain.AccountConfig{}, fmt.Errorf("no account config returned")
+	}
+	return configs[0].ToDomain(), nil
+}
+
+// SetPositionMode switches the account between net mode and hedge (long/short) mode via
+// POST /api/v5/account/set-position-mode. OKX itself rejects this call when the account has any
+// open position or pending order — this method does not pre-check that (the caller does, for a
+// friendlier error message before ever reaching the exchange; CLAUDE.md §27.6/§49.2's "ask the
+// exchange, don't just trust local state" precedent still applies to the exchange's own rejection
+// being authoritative either way).
+func (c *Client) SetPositionMode(posMode string) error {
+	return c.do("POST", "/api/v5/account/set-position-mode", okx.SetPositionModeRequest{PosMode: posMode}, nil)
+}
+
 // GetInstrument fetches one instId's contract-shape metadata via
 // GET /api/v5/public/instruments — an unauthenticated, unsigned endpoint (no OK-ACCESS-* headers
 // needed for /public/*), but routed through the same signed do() as every other call for

@@ -206,6 +206,13 @@ func main() {
 		ExchangeBalances: buildBalanceSources(cfg),
 		Scanner:          scannerAdapter{inner: scanner},
 		PerTokenCapUSD:   cfg.Scan.PerTokenCapUSD,
+
+		// Disk cleanup's confirm-per-file candidates (2026-09-20): the repo root as bind-mounted
+		// read-write at /host/repo (docker-compose.yml), separate from the existing read-only
+		// /app/configs mount. Empty when HOST_ROOT_DIR is unset, which cleanly disables the
+		// feature rather than scanning a path that doesn't exist — this is optional precisely so a
+		// deployment that hasn't added the mount yet doesn't crash on startup.
+		HostRootDir: os.Getenv("HOST_ROOT_DIR"),
 	}
 	routes := srv.Routes() // must be called before Hub() usage below so the same *wsHub backs both
 

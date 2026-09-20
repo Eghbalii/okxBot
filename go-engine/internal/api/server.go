@@ -98,6 +98,13 @@ type Server struct {
 	// two paths added it. Zero disables the top-up, same as the scanner's own zero-value meaning.
 	PerTokenCapUSD decimal.Decimal
 
+	// HostRootDir is the repository root as seen from INSIDE this container (docker-compose.yml
+	// mounts it read-write at a dedicated path, separate from the existing read-only configs
+	// mount) — backs the disk-cleanup "confirm before deleting" file candidates (diskfiles.go,
+	// 2026-09-20). Empty disables that feature with a clear error rather than scanning a path that
+	// doesn't exist, matching every other optional Server field's own nil/empty convention.
+	HostRootDir string
+
 	// hub fans out real-time paper-order open/close events to connected panel WebSocket clients
 	// (CLAUDE.md §11.4). Lazily initialized by Routes/Hub so callers never need to construct it
 	// themselves.
@@ -147,6 +154,8 @@ func (s *Server) Routes() http.Handler {
 	// limited to the pre-scanned roster.
 	mux.HandleFunc("GET /api/manual/instruments", s.handleManualInstrumentLookup)
 	mux.HandleFunc("POST /api/manual/leverage", s.handleManualSetLeverage)
+	mux.HandleFunc("GET /api/manual/account-mode", s.handleGetManualAccountMode)
+	mux.HandleFunc("POST /api/manual/account-mode", s.handleSetManualAccountMode)
 	mux.HandleFunc("POST /api/manual/orders", s.handleCreateManualOrder)
 	mux.HandleFunc("GET /api/manual/orders", s.handleListManualOrders)
 	mux.HandleFunc("GET /api/manual/order-intents/{id}", s.handleGetManualOrderIntent)
@@ -227,6 +236,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/paper-trading/affordability", s.handleTokenAffordability)
 	mux.HandleFunc("GET /api/positions/{id}/exchange-order", s.handleOrderExchangeRaw)
 	mux.HandleFunc("POST /api/system/cleanup", s.handleDiskCleanup)
+	mux.HandleFunc("GET /api/system/cleanup-candidates", s.handleListCleanupCandidates)
+	mux.HandleFunc("POST /api/system/cleanup-candidates/delete", s.handleDeleteCleanupCandidate)
 	mux.HandleFunc("GET /api/paper-trading/config", s.handleGetPaperTradingConfig)
 	mux.HandleFunc("PUT /api/paper-trading/config", s.handleSavePaperTradingConfig)
 	mux.HandleFunc("POST /api/paper-trading/restart", s.handleRestartTrading)
@@ -607,13 +618,56 @@ func botOrderToPosition(o port.BotOrder) port.PaperOrder {
 	}
 }
 
+// manualOrderToPosition mirrors botOrderToPosition, for the positions panel's manual-mode view
+// (2026-09-19: the operator's own request — "exactly like bot positions, just a different
+// database"). manual_orders has no StrategyID/Bar/FeaturesJSON/PnLMax/PnLMin/Variant columns
+// (§2.1's own reasoning: a manual order has no strategy signal at all), so those fields stay at
+// their zero value — the panel's existing Position-rendering code already treats a nil
+// StrategyID/empty Bar as "no strategy," which is exactly true here.
+func manualOrderToPosition(o port.ManualOrder) port.PaperOrder {
+	status := o.Status
+	var entryPx decimal.Decimal
+	if o.EntryPx != nil {
+		entryPx = *o.EntryPx
+	}
+	var openedAt time.Time
+	if o.OpenedAt != nil {
+		openedAt = *o.OpenedAt
+	}
+	return port.PaperOrder{
+		ID:                   o.ID,
+		InstID:               o.InstID,
+		Side:                 o.Side,
+		EntryPx:              entryPx,
+		SLPx:                 o.SLPx,
+		TPPx:                 o.TPPx,
+		Size:                 o.Size,
+		Leverage:             o.Leverage,
+		OpenedAt:             openedAt,
+		ClosedAt:             o.ClosedAt,
+		CloseReason:          o.CloseReason,
+		ClosePx:              o.ClosePx,
+		RealizedPnL:          o.RealizedPnL,
+		Mode:                 "manual",
+		Variant:              "baseline",
+		ManualCloseRequested: o.ManualCloseRequested,
+		ExchangeOrderID:      o.ExchangeOrderID,
+		ExchangeAlgoOrderID:  o.ExchangeAlgoOrderID,
+		Status:               &status,
+		ExchangeCloseOrderID: o.ExchangeCloseOrderID,
+		ExchangeFee:          o.ExchangeFee,
+		LastError:            o.LastError,
+		LastErrorAt:          o.LastErrorAt,
+	}
+}
+
 // positionsMode validates the ?mode= query param against the full paper/demo/real enum
 // handleListPositions accepts (unlike assignmentMode/statsMode, "" here means "all modes" for
 // backward compatibility with any caller that still wants a cross-mode view) — CLAUDE.md
 // real-trading readiness plan, 2026-09-04: closes the "typo'd mode silently returns 0 rows" gap.
 func positionsMode(raw string) (string, bool) {
 	switch raw {
-	case "", "paper", "demo", "bot":
+	case "", "paper", "demo", "bot", "manual":
 		return raw, true
 	default:
 		return "", false
@@ -681,6 +735,25 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if mode == "manual" {
+		manualList, err := s.Repo.ListManualOrders(r.Context(), filter)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		total, err := s.Repo.CountManualOrders(r.Context(), filter)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		list := make([]port.PaperOrder, len(manualList))
+		for i, o := range manualList {
+			list[i] = manualOrderToPosition(o)
+		}
+		writeJSON(w, http.StatusOK, positionsListResponse{Items: list, Total: total})
+		return
+	}
+
 	list, err := s.Repo.ListPositions(r.Context(), filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -702,7 +775,7 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 // the wrong table for whichever mode isn't the default.
 func idMode(raw string) (string, bool) {
 	switch raw {
-	case "paper", "bot":
+	case "paper", "bot", "manual":
 		return raw, true
 	default:
 		return "", false
@@ -723,7 +796,15 @@ func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
 	}
 	mode, ok := idMode(r.URL.Query().Get("mode"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "mode query param is required (want paper or bot)")
+		writeError(w, http.StatusBadRequest, "mode query param is required (want paper, bot, or manual)")
+		return
+	}
+	if mode == "manual" {
+		if err := s.Repo.RequestManualOrderClose(r.Context(), id); err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 		return
 	}
 	if mode == "bot" {

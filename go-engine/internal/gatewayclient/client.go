@@ -234,3 +234,16 @@ func (c *Client) GetAlgoOrder(instID, algoID string) (domain.AlgoOrderStatus, er
 	err := c.do(context.Background(), http.MethodGet, path, nil, &out)
 	return out, err
 }
+
+// GetAccountConfig reads account-wide settings (today just position mode) through the gateway.
+func (c *Client) GetAccountConfig() (domain.AccountConfig, error) {
+	var out domain.AccountConfig
+	err := c.do(context.Background(), http.MethodGet, "/account/config", nil, &out)
+	return out, err
+}
+
+// SetPositionMode switches the account between net and hedge mode through the gateway.
+func (c *Client) SetPositionMode(posMode string) error {
+	body := map[string]string{"posMode": posMode}
+	return c.do(context.Background(), http.MethodPost, "/account/position-mode", body, nil)
+}

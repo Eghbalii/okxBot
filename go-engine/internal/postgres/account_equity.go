@@ -309,16 +309,27 @@ func (r *Repository) AdjustAccountCap(ctx context.Context, mode string, deltaUSD
 	return ae, nil
 }
 
+// realMoneyModes are every mode that shares ONE real exchange balance (Account page, 2026-09-20
+// request: bot trading and manual trading are two separate slices of the same OKX account, not
+// two independent pools) — used by SetTradingCap to bound one mode's cap against what the OTHER
+// real mode has already claimed, so their caps can never jointly exceed the real balance. "paper"
+// is deliberately excluded: it has its own fictional balance with nothing to reconcile against.
+var realMoneyModes = []string{"bot", "manual"}
+
 // SetTradingCap sets how much of the REAL balance this engine may trade with, without ever
 // touching AccountBalanceUSD — see the port interface's doc comment for why that separation is
 // mandatory in real mode (AccountBalanceUSD is RecordExchangeBalance's reconciliation anchor
 // against the exchange's own reported number; overwriting it makes the next poll report the
 // difference as realized PnL that never happened).
 //
-// EquityUSD becomes the cap, bounded above by the real balance — a cap larger than the account
-// actually holds cannot be honored, and silently sizing against money that isn't there is worse
-// than clamping. The untraded remainder (balance - cap) is the reserve, derived rather than
-// stored, so it can never drift out of agreement with the two numbers it sits between.
+// EquityUSD becomes the cap, bounded above by (real balance - whatever the OTHER real-money mode
+// has already claimed) — a cap larger than what's actually left cannot be honored. Two independent
+// per-mode bounds against the full balance alone would let bot and manual each believe they own the
+// whole account: a $40 balance with bot capped at $30 must leave manual capped at $10, not another
+// $30, even though $30 alone is <= the $40 balance either mode would check against on its own
+// (2026-09-20 request: bot and manual are two slices of ONE real account, not two accounts). The
+// untraded remainder (balance - cap - sibling's cap) is the reserve, derived rather than stored, so
+// it can never drift out of agreement with the numbers it sits between.
 func (r *Repository) SetTradingCap(ctx context.Context, mode string, capUSD decimal.Decimal) (port.AccountEquity, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -331,18 +342,37 @@ func (r *Repository) SetTradingCap(ctx context.Context, mode string, capUSD deci
 		return port.AccountEquity{}, fmt.Errorf("set trading cap for mode %s: no existing row (call GetAccountEquity first): %w", mode, err)
 	}
 
+	// The sibling real-money mode's currently-claimed slice (its own equity_usd, which IS its
+	// current cap once one has been set — see SetTradingCap's own effect on equity_usd below), read
+	// inside this same transaction so it can't be changed by a concurrent SetTradingCap call on the
+	// sibling between this read and the UPDATE. A missing sibling row (never seeded, e.g. manual
+	// trading has never been used) claims nothing.
+	var siblingClaimed decimal.Decimal
+	for _, sibling := range realMoneyModes {
+		if sibling == mode {
+			continue
+		}
+		var claimed decimal.Decimal
+		if err := tx.QueryRow(ctx, `SELECT equity_usd FROM account_equity WHERE mode = $1`, sibling).Scan(&claimed); err == nil {
+			siblingClaimed = siblingClaimed.Add(claimed)
+		}
+	}
+
 	var ae port.AccountEquity
-	// LEAST() applies the "cap cannot exceed the real balance" bound in SQL rather than in Go, so
-	// the stored cap and the derived equity are decided by one expression against one snapshot of
-	// the balance — a read-then-write in Go could interleave with a concurrent RecordExchangeBalance
-	// and store a cap that was valid against a balance no longer current.
+	// LEAST() applies both bounds — the real balance, and the balance minus whatever the sibling
+	// mode already claimed — in SQL rather than in Go, so the stored cap and the derived equity are
+	// decided by one expression against one snapshot of the balance: a read-then-write in Go could
+	// interleave with a concurrent RecordExchangeBalance/sibling SetTradingCap and store a cap that
+	// was valid against numbers no longer current. GREATEST(..., 0) floors the sibling-aware bound
+	// at zero rather than letting it go negative when the sibling alone already claims the whole
+	// balance, which LEAST() would otherwise happily propagate into a negative cap.
 	row := tx.QueryRow(ctx, `
 		UPDATE account_equity
 		SET trading_cap_usd = $2,
-			equity_usd = LEAST($2, account_balance_usd),
+			equity_usd = LEAST($2, account_balance_usd, GREATEST(account_balance_usd - $3, 0)),
 			updated_at = now()
 		WHERE mode = $1
-		RETURNING `+accountEquityCols, mode, capUSD)
+		RETURNING `+accountEquityCols, mode, capUSD, siblingClaimed)
 	if err := scanAccountEquity(row, &ae); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("set trading cap for mode %s: %w", mode, err)
 	}

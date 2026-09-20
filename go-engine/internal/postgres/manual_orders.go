@@ -16,12 +16,16 @@ func (r *Repository) CreateManualOrderIntent(ctx context.Context, in port.Manual
 	if orderType == "" {
 		orderType = "market"
 	}
+	tdMode := in.TdMode
+	if tdMode == "" {
+		tdMode = "cross"
+	}
 	var id int64
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO manual_order_intents (inst_id, side, order_type, limit_px, size_usd, leverage, sl_px, tp_px)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO manual_order_intents (inst_id, side, order_type, limit_px, size_usd, leverage, sl_px, tp_px, td_mode)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id
-	`, in.InstID, in.Side, orderType, in.LimitPx, in.SizeUSD, in.Leverage, in.SLPx, in.TPPx).Scan(&id)
+	`, in.InstID, in.Side, orderType, in.LimitPx, in.SizeUSD, in.Leverage, in.SLPx, in.TPPx, tdMode).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("create manual order intent for %s: %w", in.InstID, err)
 	}
@@ -41,7 +45,7 @@ func (r *Repository) ClaimPendingManualOrderIntents(ctx context.Context) ([]port
 			SELECT id FROM manual_order_intents WHERE status = 'pending' ORDER BY requested_at FOR UPDATE SKIP LOCKED
 		)
 		RETURNING id, requested_at, inst_id, side, order_type, limit_px, size_usd, leverage, sl_px, tp_px,
-			status, manual_order_id, error, claimed_at
+			td_mode, status, manual_order_id, error, claimed_at
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("claim pending manual order intents: %w", err)
@@ -52,7 +56,7 @@ func (r *Repository) ClaimPendingManualOrderIntents(ctx context.Context) ([]port
 	for rows.Next() {
 		var in port.ManualOrderIntent
 		if err := rows.Scan(&in.ID, &in.RequestedAt, &in.InstID, &in.Side, &in.OrderType, &in.LimitPx,
-			&in.SizeUSD, &in.Leverage, &in.SLPx, &in.TPPx, &in.Status, &in.ManualOrderID, &in.Error, &in.ClaimedAt); err != nil {
+			&in.SizeUSD, &in.Leverage, &in.SLPx, &in.TPPx, &in.TdMode, &in.Status, &in.ManualOrderID, &in.Error, &in.ClaimedAt); err != nil {
 			return nil, fmt.Errorf("scan manual order intent: %w", err)
 		}
 		out = append(out, in)
@@ -82,10 +86,10 @@ func (r *Repository) GetManualOrderIntent(ctx context.Context, id int64) (port.M
 	var in port.ManualOrderIntent
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, requested_at, inst_id, side, order_type, limit_px, size_usd, leverage, sl_px, tp_px,
-			status, manual_order_id, error, claimed_at
+			td_mode, status, manual_order_id, error, claimed_at
 		FROM manual_order_intents WHERE id = $1
 	`, id).Scan(&in.ID, &in.RequestedAt, &in.InstID, &in.Side, &in.OrderType, &in.LimitPx,
-		&in.SizeUSD, &in.Leverage, &in.SLPx, &in.TPPx, &in.Status, &in.ManualOrderID, &in.Error, &in.ClaimedAt)
+		&in.SizeUSD, &in.Leverage, &in.SLPx, &in.TPPx, &in.TdMode, &in.Status, &in.ManualOrderID, &in.Error, &in.ClaimedAt)
 	if err != nil {
 		return port.ManualOrderIntent{}, fmt.Errorf("get manual order intent %d: %w", id, err)
 	}
@@ -100,12 +104,16 @@ func (r *Repository) OpenManualOrder(ctx context.Context, o port.ManualOrder) (i
 	if status == "" {
 		status = "pending"
 	}
+	tdMode := o.TdMode
+	if tdMode == "" {
+		tdMode = "cross"
+	}
 	var id int64
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO manual_orders (inst_id, exec_inst_id, side, order_type, limit_px, status, entry_px, sl_px, tp_px, size, leverage, exchange_order_id, contracts)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		INSERT INTO manual_orders (inst_id, exec_inst_id, side, order_type, limit_px, status, entry_px, sl_px, tp_px, size, leverage, exchange_order_id, contracts, td_mode)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING id
-	`, o.InstID, o.ExecInstID, o.Side, o.OrderType, o.LimitPx, status, o.EntryPx, o.SLPx, o.TPPx, o.Size, o.Leverage, o.ExchangeOrderID, o.Contracts).Scan(&id)
+	`, o.InstID, o.ExecInstID, o.Side, o.OrderType, o.LimitPx, status, o.EntryPx, o.SLPx, o.TPPx, o.Size, o.Leverage, o.ExchangeOrderID, o.Contracts, tdMode).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("open manual order for %s: %w", o.InstID, err)
 	}
@@ -119,13 +127,13 @@ func (r *Repository) GetManualOrder(ctx context.Context, id int64) (port.ManualO
 		SELECT id, inst_id, exec_inst_id, side, order_type, limit_px, status, entry_px, sl_px, tp_px,
 			size, leverage, contracts, protected_by_strategy, opened_at, closed_at, close_reason,
 			close_px, realized_pnl, exchange_order_id, exchange_algo_order_id, exchange_close_order_id,
-			exchange_fee, manual_close_requested, last_error, last_error_at, created_at
+			exchange_fee, manual_close_requested, last_error, last_error_at, created_at, td_mode
 		FROM manual_orders WHERE id = $1
 	`, id).Scan(&o.ID, &o.InstID, &o.ExecInstID, &o.Side, &o.OrderType, &o.LimitPx, &o.Status,
 		&o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.Contracts, &o.ProtectedByStrategy,
 		&o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx, &o.RealizedPnL,
 		&o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.ExchangeCloseOrderID, &o.ExchangeFee,
-		&o.ManualCloseRequested, &o.LastError, &o.LastErrorAt, &o.CreatedAt)
+		&o.ManualCloseRequested, &o.LastError, &o.LastErrorAt, &o.CreatedAt, &o.TdMode)
 	if err != nil {
 		return port.ManualOrder{}, fmt.Errorf("get manual order %d: %w", id, err)
 	}
@@ -149,6 +157,23 @@ func (r *Repository) UpdateManualOrderStatus(ctx context.Context, id int64, stat
 	`, id, status, entryPx, size, contracts)
 	if err != nil {
 		return fmt.Errorf("update manual order %d status: %w", id, err)
+	}
+	return nil
+}
+
+// UpdateManualOrderSLTP overwrites a manual order's stored SL/TP — used by the cross-margin cap
+// guard (ManualTrader.finishOpen, 2026-09-20) to persist a tightened stop before it's sent to the
+// exchange, so what the panel shows never disagrees with what was actually placed as protection.
+// Restricted to still-open orders, mirroring UpdateBotOrderSLTP's own guard: a closed order's
+// levels are historical record and must not be rewritten by a guard that only ever runs at open time
+// anyway (this method has no other caller), but the WHERE clause is the same belt-and-suspenders
+// posture the rest of this codebase applies to every order mutation.
+func (r *Repository) UpdateManualOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE manual_orders SET sl_px = $2, tp_px = $3 WHERE id = $1 AND closed_at IS NULL
+	`, id, slPx, tpPx)
+	if err != nil {
+		return fmt.Errorf("update manual order %d SL/TP: %w", id, err)
 	}
 	return nil
 }
@@ -300,7 +325,7 @@ func (r *Repository) ListManualOrders(ctx context.Context, f port.PositionFilter
 		SELECT id, inst_id, exec_inst_id, side, order_type, limit_px, status, entry_px, sl_px, tp_px,
 			size, leverage, contracts, protected_by_strategy, opened_at, closed_at, close_reason,
 			close_px, realized_pnl, exchange_order_id, exchange_algo_order_id, exchange_close_order_id,
-			exchange_fee, manual_close_requested, last_error, last_error_at, created_at
+			exchange_fee, manual_close_requested, last_error, last_error_at, created_at, td_mode
 		FROM manual_orders
 		WHERE ($1 = '' OR inst_id = $1)
 			AND ($2::boolean IS NULL OR (closed_at IS NULL AND (NOT $2 OR status IN ('filled','partial'))) = $2)
@@ -325,10 +350,25 @@ func (r *Repository) ListManualOrders(ctx context.Context, f port.PositionFilter
 			&o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.Contracts, &o.ProtectedByStrategy,
 			&o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx, &o.RealizedPnL,
 			&o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.ExchangeCloseOrderID, &o.ExchangeFee,
-			&o.ManualCloseRequested, &o.LastError, &o.LastErrorAt, &o.CreatedAt); err != nil {
+			&o.ManualCloseRequested, &o.LastError, &o.LastErrorAt, &o.CreatedAt, &o.TdMode); err != nil {
 			return nil, fmt.Errorf("scan manual order: %w", err)
 		}
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// CountManualOrders mirrors CountBotPositions, for the positions panel's manual-mode pagination.
+func (r *Repository) CountManualOrders(ctx context.Context, f port.PositionFilter) (int, error) {
+	var count int
+	err := r.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM manual_orders
+		WHERE ($1 = '' OR inst_id = $1)
+			AND ($2::boolean IS NULL OR (closed_at IS NULL AND (NOT $2 OR status IN ('filled','partial'))) = $2)
+	`, f.InstID, f.Open).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count manual orders: %w", err)
+	}
+	return count, nil
 }

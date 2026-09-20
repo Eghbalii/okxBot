@@ -185,6 +185,22 @@ func SetLeverageRequestFromDomain(req domain.LeverageChange) SetLeverageRequest 
 	return SetLeverageRequest{InstID: req.InstID, Lever: req.Lever, MgnMode: req.MgnMode, PosSide: req.PosSide}
 }
 
+// AccountConfig mirrors one entry of GET /api/v5/account/config's response data array (only the
+// field this codebase needs today — OKX returns many more).
+type AccountConfig struct {
+	PosMode string `json:"posMode"`
+}
+
+// ToDomain converts an AccountConfig to its domain representation.
+func (a AccountConfig) ToDomain() domain.AccountConfig {
+	return domain.AccountConfig{PosMode: a.PosMode}
+}
+
+// SetPositionModeRequest is POST /api/v5/account/set-position-mode's body.
+type SetPositionModeRequest struct {
+	PosMode string `json:"posMode"`
+}
+
 // Instrument mirrors a single entry of the GET /api/v5/public/instruments response data array
 // (only the fields this codebase needs for order-sizing conversion, CLAUDE.md §14/§27).
 type Instrument struct {

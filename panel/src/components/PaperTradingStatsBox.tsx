@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { usePolling } from '../hooks/usePolling'
 import { api } from '../api/client'
 import { formatUsd, pnlClass } from '../utils/format'
@@ -45,106 +45,20 @@ function StatTile({
   )
 }
 
-// Trading-cap control, inline in its own tile alongside the other stat tiles: "I've decided to
-// trade with $X from now on." What that means depends on the mode, because the two modes disagree
-// about what Account Balance IS:
-//
-//   paper — no exchange exists, so Account Balance is bookkeeping this system owns and a cap moves
-//           BOTH numbers to the chosen value together (CLAUDE.md §31.2/§31.3).
-//   real  — Account Balance mirrors the exchange's own reported total and must never be
-//           overwritten with a chosen number (it is what realized PnL is reconciled against). The
-//           cap names the tradable SLICE of it instead; the remainder becomes the Reserve tile,
-//           and profit/loss accrues to the slice while the reserve stays put.
-//
-// The slider's upper bound is the account's REAL Account Balance, not an arbitrary ceiling: a cap
-// above what the account actually holds would be claiming a deposit the panel cannot make. The
-// direct number input is deliberately kept and left UNBOUNDED — an operator who really has
-// deposited more on the exchange needs to be able to say so, and the backend is the authority on
-// what is valid, not this control. The slider is the convenience, the input is the escape hatch.
-function TradingCapTile({
-  mode,
-  maxAvailable,
-  current,
-  onSaved,
-}: {
-  mode: PositionMode
-  maxAvailable: number
-  current: number
-  onSaved: () => void
-}) {
-  const [value, setValue] = useState('')
-  const [saving, setSaving] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  // Seed the control from the account's own current balance so the slider starts somewhere
-  // meaningful rather than at zero, and re-seed if the account moves while the field is untouched.
-  useEffect(() => {
-    if (value === '' && current > 0) setValue(current.toFixed(2))
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current])
-
-  const num = Number(value)
-  // The slider can only express [0, maxAvailable]; a typed value above that is still valid (see
-  // the note above), it just pins the thumb to the far end rather than rescaling the track.
-  const sliderMax = maxAvailable > 0 ? maxAvailable : 100
-  const sliderValue = Number.isFinite(num) ? Math.min(Math.max(num, 0), sliderMax) : 0
-  const step = sliderMax >= 100 ? 1 : sliderMax >= 10 ? 0.1 : 0.01
-
-  async function save() {
-    if (!Number.isFinite(num) || num <= 0) {
-      setError('enter a positive number')
-      return
-    }
-    setSaving(true)
-    setError(null)
-    try {
-      await api.setAccountCap(String(num), mode)
-      onSaved()
-    } catch (err) {
-      setError((err as Error).message)
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  return (
-    <div className="stat-tile cap-tile">
-      <div className="stat-label">Set Trading Cap</div>
-      <div className="cap-row">
-        <input
-          type="range"
-          min={0}
-          max={sliderMax}
-          step={step}
-          value={sliderValue}
-          onChange={(e) => setValue(e.target.value)}
-          className="cap-slider"
-          title={`Max available: $${sliderMax.toFixed(2)}`}
-        />
-        <input
-          type="number"
-          placeholder="e.g. 40"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          className="cap-input"
-        />
-        <button className="btn-primary" onClick={save} disabled={saving}>
-          {saving ? '…' : 'Set'}
-        </button>
-      </div>
-      <div className="text-dim cap-hint">
-        {mode === 'bot' ? `of $${sliderMax.toFixed(2)} on the exchange` : `max $${sliderMax.toFixed(2)}`}
-      </div>
-      {error && <div className="cap-error">{error}</div>}
-    </div>
-  )
-}
-
 // Stats box above the Positions table: open order count, Account Balance, Total Equity, and
-// 24h/1w/1month realized PnL, plus the Set Trading Cap control. Polls at a slower interval than
-// the position table's own 5s poll — this data doesn't need that freshness.
+// 24h/1w/1month realized PnL. The Set Trading Cap control moved to its own Account page
+// (2026-09-20 request: capital allocation is a whole-account decision, not something to bury in a
+// per-mode positions stats box) — this box links there instead of embedding the control, and Bot
+// Trader's own row gains a Reserve tile since bot's cap now interacts with manual's on the SAME
+// real balance (see AccountPage). Polls at a slower interval than the position table's own 5s
+// poll — this data doesn't need that freshness.
 export default function PaperTradingStatsBox({ mode }: { mode: PositionMode }) {
-  const [refreshSignal, setRefreshSignal] = useState(0)
+  // Was previously bumped by the Set Trading Cap control's onSaved callback to force an immediate
+  // re-poll after the operator changed the cap — that control moved to the Account page
+  // (2026-09-20), so nothing in this component changes the cap anymore and refreshSignal now only
+  // exists to satisfy BalanceChart's prop contract (its own doc comment: deliberately NOT part of
+  // its cache key, see CLAUDE.md §14/§50.2b's history with this exact prop).
+  const refreshSignal = 0
   const { data, error } = usePolling(() => api.paperTradingStats(mode), 15_000, [mode], refreshSignal)
 
   return (
@@ -194,15 +108,17 @@ export default function PaperTradingStatsBox({ mode }: { mode: PositionMode }) {
               )}
             </div>
 
-            {/* Row 3 — the one control, given its own full-width row so its slider has room. */}
-            <div className="stats-row">
-              <TradingCapTile
-                mode={mode}
-                maxAvailable={Number(data.accountBalanceUsd)}
-                current={Number(data.totalEquityUsd)}
-                onSaved={() => setRefreshSignal((n) => n + 1)}
-              />
-            </div>
+            {/* The Set Trading Cap control itself now lives on the Account page (2026-09-20) —
+                capital allocation between bot and manual trading is a whole-account decision, and
+                showing it here would mean showing half of that decision (this mode's own cap)
+                with no visibility into the OTHER mode's claim on the same real balance. */}
+            {(mode === 'bot' || mode === 'manual') && (
+              <div className="stats-row">
+                <Link to="/account" className="text-dim">
+                  Manage trading cap on the Account page →
+                </Link>
+              </div>
+            )}
           </div>
 
           <div className="stats-chart">

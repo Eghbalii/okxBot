@@ -331,6 +331,10 @@ type ManualOrder struct {
 	Size        decimal.Decimal // USD notional requested (§8.2)
 	Leverage    decimal.Decimal
 	Contracts   *decimal.Decimal
+	// TdMode is the margin mode this order actually used ("cross" or "isolated") — recorded on the
+	// order itself, not just the intent, so the panel/audit trail shows what was really sent rather
+	// than assuming every order used whatever the current default happens to be now.
+	TdMode string
 
 	// ProtectedByStrategy is true when BotTrader already held a protective algo order on this
 	// token at open time, so ManualTrader deliberately did not place a second one (§8.4: a manual
@@ -378,16 +382,21 @@ type ManualOrderAdjustment struct {
 // exchange position (CLAUDE.md §48) — ManualTrader knows about its own order from the moment it
 // claims the intent, before it ever reaches the exchange.
 type ManualOrderIntent struct {
-	ID            int64
-	RequestedAt   time.Time
-	InstID        string
-	Side          string
-	OrderType     string
-	LimitPx       *decimal.Decimal
-	SizeUSD       decimal.Decimal
-	Leverage      decimal.Decimal
-	SLPx          *decimal.Decimal
-	TPPx          *decimal.Decimal
+	ID          int64
+	RequestedAt time.Time
+	InstID      string
+	Side        string
+	OrderType   string
+	LimitPx     *decimal.Decimal
+	SizeUSD     decimal.Decimal
+	Leverage    decimal.Decimal
+	SLPx        *decimal.Decimal
+	TPPx        *decimal.Decimal
+	// TdMode is the margin mode ("cross" or "isolated") THIS order should use — a per-request
+	// choice OKX already accepts on every order/leverage call, not an account-wide exchange
+	// setting (domain.OrderRequest.TdMode's own doc comment; unlike position mode, which is
+	// genuinely account-wide, see domain.AccountConfig). Defaults to "cross" when empty.
+	TdMode        string
 	Status        string // "pending", "claimed", "done", "failed"
 	ManualOrderID *int64
 	Error         *string
@@ -806,6 +815,10 @@ type Repository interface {
 	// nil-able the same way: non-nil for a "filled"/"partial" transition (corrected to the
 	// exchange-confirmed values), nil for "resting"/"canceled" (nothing to correct yet, or ever).
 	UpdateManualOrderStatus(ctx context.Context, id int64, status string, entryPx, size, contracts *decimal.Decimal) error
+	// UpdateManualOrderSLTP overwrites a manual order's stored SL/TP — used by the cross-margin cap
+	// guard (ManualTrader.finishOpen, 2026-09-20) to persist a stop tightened after the real fill
+	// price/size are known, before it's sent to the exchange as protection.
+	UpdateManualOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error
 	// SetManualOrderProtection records the outcome of ManualTrader's post-fill protection step
 	// (§8.4/§4): either algoOrderID is set (a fresh protective order was placed) or
 	// protectedByStrategy is true (BotTrader already had one on this token, so none was placed) —
@@ -833,6 +846,10 @@ type Repository interface {
 	// ListManualOrders lists manual orders for the panel, filtered/sorted/paged per f (f.Mode is
 	// ignored — every row is real by construction, matching ListBotPositions).
 	ListManualOrders(ctx context.Context, f PositionFilter) ([]ManualOrder, error)
+	// CountManualOrders mirrors CountBotPositions, for the positions panel's manual-mode pagination
+	// (2026-09-19: the /trade page's own open manual positions surfaced on the Positions page too,
+	// same table as ListManualOrders reads).
+	CountManualOrders(ctx context.Context, f PositionFilter) (int, error)
 	// RecordManualOrderAdjustment / ListManualOrderAdjustments mirror the bot_order_adjustments
 	// equivalents, minus a Source column (every adjustment here is manual by construction).
 	RecordManualOrderAdjustment(ctx context.Context, orderID int64, field string, oldValue, newValue *decimal.Decimal) error

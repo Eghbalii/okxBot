@@ -204,6 +204,50 @@ func clampRange(v, min, max decimal.Decimal) decimal.Decimal {
 	return v
 }
 
+// ClampSLToCapUSD tightens sl so that touching it can never realize more than capUSD of loss on a
+// position sized at marginUSD*leverage — the cross-margin counterpart to MaxLossPct, which only
+// bounds loss as a fraction of the POSITION's own margin (correct under isolated margin, where a
+// liquidation can only ever draw down that position's own margin). Under CROSS margin, the
+// exchange draws on the WHOLE linked balance to keep a losing position open, so a position sized
+// well within MaxLossPct of its own margin can still realize a loss up to the entire trading cap if
+// nothing stops it first — the scenario this exists for (2026-09-20 request): $20 cap, cross mode,
+// no meaningful SL, one bad move draining the full account rather than the $20 the operator
+// actually intended to risk.
+//
+// Returns sl unchanged when capUSD or marginUSD is non-positive (no cap configured, or a
+// zero-margin position nothing can be computed against), when leverage is non-positive (treated as
+// 1x is meaningless here — a genuinely unknown leverage means the dollar-loss math cannot be
+// trusted at all, unlike MaxLossPct's own fallback), or when sl is nil (nothing to clamp; the
+// caller's EnsureStop pass is what SUPPLIES a level in that case, using its own existing bound —
+// this function only tightens a level that already exists).
+//
+// tightened reports whether sl was actually moved, so a caller can decide whether to tell the
+// operator their stop was adjusted — CLAUDE.md's own precedent (the 15% loss cap incident, §23)
+// is that a silent tightening is a bug waiting to be found the hard way, not a UX nicety to skip.
+func ClampSLToCapUSD(side string, entryPx, marginUSD, leverage, capUSD decimal.Decimal, sl *decimal.Decimal) (clamped *decimal.Decimal, tightened bool) {
+	if sl == nil || !entryPx.IsPositive() || !marginUSD.IsPositive() || !leverage.IsPositive() || !capUSD.IsPositive() {
+		return sl, false
+	}
+	long := side != "sell"
+	dist := signedDist(long, entryPx, *sl, true)
+	if !dist.IsPositive() {
+		// Already on the wrong side of entry — not this function's job to fix (Apply's own
+		// wrong-side-drop already covers that); nothing to tighten here.
+		return sl, false
+	}
+
+	// The price-move fraction at which this position's loss reaches exactly capUSD:
+	// loss_usd = marginUSD * leverage * priceMovePct, solved for priceMovePct.
+	maxDistPct := capUSD.Div(marginUSD.Mul(leverage))
+	maxDist := maxDistPct.Mul(entryPx)
+	if dist.LessThanOrEqual(maxDist) {
+		return sl, false
+	}
+
+	tightPx := offsetFrom(long, entryPx, maxDist, true)
+	return &tightPx, true
+}
+
 // EnsureTarget supplies a take-profit when none is set, derived from the stop's own distance at
 // MinTPSLRatio — the same risk:reward bound Apply enforces when both levels are present, so a
 // filled-in target is never more aggressive than a supplied one would have been allowed to be.

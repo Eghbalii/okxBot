@@ -50,10 +50,27 @@ func (h *wsHub) handleWS(w http.ResponseWriter, r *http.Request) {
 	h.clients[conn] = send
 	h.mu.Unlock()
 
-	defer func() {
+	// unregister removes conn from the client map AND closes its send channel under the SAME lock
+	// acquisition — the fix for a real production panic (2026-09-19, "panic: send on closed
+	// channel", crashed cmd/api under real orderbook broadcast volume). The previous version
+	// closed send here but only removed conn from h.clients in a separate deferred block below,
+	// with no lock spanning both: between close(send) and the deferred delete, conn was still
+	// present in h.clients with an already-closed channel, so a broadcast() landing in that exact
+	// window sent on a closed channel and crashed the whole process — not merely one connection.
+	// Making close-and-delete one atomic step under h.mu removes that window entirely: broadcast()
+	// (which also holds h.mu while ranging clients) can never observe a client whose channel is
+	// closed but not yet removed.
+	unregister := func() {
 		h.mu.Lock()
+		defer h.mu.Unlock()
+		if _, ok := h.clients[conn]; !ok {
+			return // already unregistered — guards against a second call (e.g. shutdown racing disconnect)
+		}
 		delete(h.clients, conn)
-		h.mu.Unlock()
+		close(send)
+	}
+	defer func() {
+		unregister()
 		conn.Close()
 	}()
 
@@ -76,12 +93,16 @@ func (h *wsHub) handleWS(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	close(send)
+	unregister()
 	<-done
 }
 
 // broadcast sends msg to every currently-connected client. Non-blocking per client: a slow/stuck
 // client's full buffer drops the message rather than stalling every other client's delivery.
+//
+// Holding h.mu for the whole ranging loop (not just the map read) is what makes this safe against
+// handleWS's unregister: close(send) only ever happens while holding the same lock, so broadcast
+// can never observe a channel that is present in the map but already closed.
 func (h *wsHub) broadcast(msg []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

@@ -398,11 +398,17 @@ services:
       OKX_GATEWAY_URL: http://okx-gateway:8094
       API_ADDR: "0.0.0.0:8090" # container-internal bind; only reachable via the OpenVPN network in prod, see CLAUDE.md §11
       API_PROCESS_MANAGER: docker
+      # Disk cleanup's confirm-per-file candidates (CLAUDE.md, 2026-09-20): a read-write mount of
+      # the whole repo root, separate from the read-only ./go-engine/configs mount below. cmd/api
+      # only ever touches paths matching its own hardcoded allowlist (internal/api/diskfiles.go) —
+      # this mount grants filesystem ACCESS, the allowlist is what bounds what's actually reachable.
+      HOST_ROOT_DIR: /host/repo
     ports:
       - "8090:8090"
     volumes:
       - ./go-engine/configs:/app/configs
       - /var/run/docker.sock:/var/run/docker.sock:ro # lets cmd/api call `docker inspect`/`docker logs` for RL model status, CLAUDE.md §11.2
+      - .:/host/repo # see HOST_ROOT_DIR above
     depends_on:
       kafka:
         condition: service_healthy

@@ -186,6 +186,21 @@ func (s *ZigZagPA) Evaluate(candles []Candle) (Signal, error) {
 			if sl.GreaterThanOrEqual(d) {
 				continue
 			}
+			// The order that actually opens fills at the LIVE price, not at d (buildPaperOrder has
+			// no limit-order mechanism, CLAUDE.md §16.9's "no fabricated fills" precedent) — so a
+			// signal is only actionable while the live price hasn't already reached tp. d can be
+			// several candles stale by the time the 5-pivot pattern confirms (this file's own
+			// long-standing note above), and on order 1127 (DOGE, 2026-09-19) price had already
+			// dropped straight through a bearish tp before the order opened: Clamps.Apply then saw
+			// a target on the wrong side of the LIVE entry and silently dropped it, leaving the
+			// position with no take-profit at all. Checking against the live close here, at the
+			// only point that knows both d and the current price, is what keeps the emitted signal
+			// coherent with the order it will actually become — TestPortedKinds_EmitCoherentLevels
+			// only checked coherence against d, which d is always coherent with by construction.
+			liveClose := candles[len(candles)-1].Close
+			if liveClose.GreaterThanOrEqual(tp) {
+				continue
+			}
 			s.tradedDPrice, s.hasTraded = dPivot.Price, true
 			// Entry is the D pivot price itself, not the live close: the source's own
 			// `target01_ew_rate` gates entry to within a Fib window OF D, and every SL/TP level is
@@ -207,6 +222,13 @@ func (s *ZigZagPA) Evaluate(candles []Candle) (Signal, error) {
 		tp := d.Sub(fibRange.Mul(f(0.618)))
 		sl := d.Sub(fibRange.Mul(f(-0.236)))
 		if sl.LessThanOrEqual(d) {
+			continue
+		}
+		// Mirror of the bullish check above: a short's take-profit sits below entry, so it's stale
+		// once the live price has already fallen to or through it (order 1127's exact case: tp
+		// computed as 0.09042862 while live price had already dropped to 0.08981).
+		liveClose := candles[len(candles)-1].Close
+		if liveClose.LessThanOrEqual(tp) {
 			continue
 		}
 		s.tradedDPrice, s.hasTraded = dPivot.Price, true

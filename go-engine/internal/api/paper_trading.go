@@ -23,22 +23,31 @@ type paperTradingStatsView struct {
 	// happens for this mode, then diverge.
 	TotalEquityUSD    string `json:"totalEquityUsd"`
 	AccountBalanceUSD string `json:"accountBalanceUsd"`
-	PnL24hUSD         string `json:"pnl24hUsd"`
-	PnL24hPct         string `json:"pnl24hPct"`
-	PnL7dUSD          string `json:"pnl7dUsd"`
-	PnL7dPct          string `json:"pnl7dPct"`
-	PnL30dUSD         string `json:"pnl30dUsd"`
-	PnL30dPct         string `json:"pnl30dPct"`
+	// UsedMarginUSD is the sum of every currently-OPEN position's margin (Size) in this mode —
+	// AvailableMarginUSD is TotalEquityUSD minus that, floored at zero. Added 2026-09-20 for the
+	// Trade page's order ticket, which needs to show how much of the trading cap is actually free
+	// to size a new manual position against, not just the cap itself (which ignores what's already
+	// committed to open positions).
+	UsedMarginUSD      string `json:"usedMarginUsd"`
+	AvailableMarginUSD string `json:"availableMarginUsd"`
+	PnL24hUSD          string `json:"pnl24hUsd"`
+	PnL24hPct          string `json:"pnl24hPct"`
+	PnL7dUSD           string `json:"pnl7dUsd"`
+	PnL7dPct           string `json:"pnl7dPct"`
+	PnL30dUSD          string `json:"pnl30dUsd"`
+	PnL30dPct          string `json:"pnl30dPct"`
 }
 
-// statsMode resolves the mode query param to "paper" or "bot" — CLAUDE.md real-trading readiness
-// plan, 2026-09-04: stats/config now serve both tabs from one handler rather than a hardcoded
-// "paper". Defaults to "paper" (every caller before this change implicitly meant paper trading).
+// statsMode resolves the mode query param to "paper", "bot", or "manual" — CLAUDE.md real-trading
+// readiness plan, 2026-09-04: stats/config now serve both tabs from one handler rather than a
+// hardcoded "paper". "manual" added 2026-09-20 (Account page): manual trading's own trading-cap
+// row needs the same open-count/PnL-history stats bot's does. Defaults to "paper" (every caller
+// before this change implicitly meant paper trading).
 func statsMode(raw string) (string, bool) {
 	switch raw {
 	case "":
 		return "paper", true
-	case "paper", "bot":
+	case "paper", "bot", "manual":
 		return raw, true
 	default:
 		return "", false
@@ -55,20 +64,42 @@ func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request)
 
 	open := true
 	var openCount int
-	if mode == "bot" {
+	var usedMarginUSD decimal.Decimal
+	switch mode {
+	case "bot":
 		positions, err := s.Repo.ListBotPositions(ctx, port.PositionFilter{Open: &open})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		openCount = len(positions)
-	} else {
+		for _, p := range positions {
+			usedMarginUSD = usedMarginUSD.Add(p.Size)
+		}
+	case "manual":
+		// manual_orders is its own table, not paper_orders (CLAUDE.md real-trading readiness plan)
+		// — mirrors handleListPositions' own mode branch rather than reading a table this mode's
+		// orders were never written to. ListManualOrders rather than the narrower
+		// CountManualOrders: UsedMarginUSD (2026-09-20) needs each row's own Size, not just a count.
+		positions, err := s.Repo.ListManualOrders(ctx, port.PositionFilter{Open: &open})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		openCount = len(positions)
+		for _, p := range positions {
+			usedMarginUSD = usedMarginUSD.Add(p.Size)
+		}
+	default:
 		positions, err := s.Repo.ListPositions(ctx, port.PositionFilter{Mode: mode, Open: &open})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		openCount = len(positions)
+		for _, p := range positions {
+			usedMarginUSD = usedMarginUSD.Add(p.Size)
+		}
 	}
 
 	account, err := s.Repo.GetAccountEquity(ctx, mode, s.AccountInitialUSD)
@@ -90,16 +121,27 @@ func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request)
 	pnl7dUSD, pnl7dPct := realizedPnLOverWindow(history, now.Add(-7*24*time.Hour))
 	pnl30dUSD, pnl30dPct := realizedPnLOverWindow(history, now.Add(-30*24*time.Hour))
 
+	// Floored at zero rather than going negative: if open margin somehow exceeds the current cap
+	// (e.g. the cap was just lowered below what's already committed), "available" reads as none
+	// left, which is the honest answer, rather than a negative number a sizing UI would have to
+	// special-case.
+	availableMarginUSD := account.EquityUSD.Sub(usedMarginUSD)
+	if availableMarginUSD.IsNegative() {
+		availableMarginUSD = decimal.Zero
+	}
+
 	writeJSON(w, http.StatusOK, paperTradingStatsView{
-		OpenCount:         openCount,
-		TotalEquityUSD:    account.EquityUSD.String(),
-		AccountBalanceUSD: account.AccountBalanceUSD.String(),
-		PnL24hUSD:         pnl24hUSD.String(),
-		PnL24hPct:         pnl24hPct.String(),
-		PnL7dUSD:          pnl7dUSD.String(),
-		PnL7dPct:          pnl7dPct.String(),
-		PnL30dUSD:         pnl30dUSD.String(),
-		PnL30dPct:         pnl30dPct.String(),
+		OpenCount:          openCount,
+		TotalEquityUSD:     account.EquityUSD.String(),
+		AccountBalanceUSD:  account.AccountBalanceUSD.String(),
+		UsedMarginUSD:      usedMarginUSD.String(),
+		AvailableMarginUSD: availableMarginUSD.String(),
+		PnL24hUSD:          pnl24hUSD.String(),
+		PnL24hPct:          pnl24hPct.String(),
+		PnL7dUSD:           pnl7dUSD.String(),
+		PnL7dPct:           pnl7dPct.String(),
+		PnL30dUSD:          pnl30dUSD.String(),
+		PnL30dPct:          pnl30dPct.String(),
 	})
 }
 

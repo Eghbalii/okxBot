@@ -19,6 +19,12 @@ type Message struct {
 	Event string          `json:"event"` // "subscribe"/"unsubscribe"/"error" for ack/event frames, "" for data pushes
 	Arg   Arg             `json:"arg"`
 	Data  json.RawMessage `json:"data"`
+	// Action is only ever populated by the `books` channel ("snapshot" or "update") — every other
+	// channel this codebase subscribes to (tickers, candles, books5) omits it entirely, so it's
+	// simply "" and unused for them. Decoding it here rather than in a per-channel wrapper keeps
+	// this one struct as the single decode point for every OKX public push (Message's own doc
+	// comment), matching how Arg is already shared across channels that do/don't use InstID.
+	Action string `json:"action"`
 }
 
 // isDataPush reports whether msg is an actual channel data push (has a "data" field to decode),
