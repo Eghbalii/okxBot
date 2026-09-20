@@ -117,17 +117,31 @@ func TestHandleSetAccountCap_DefaultsToPaperMode(t *testing.T) {
 	}
 }
 
-func TestHandleSetAccountCap_RejectsNonPositiveCap(t *testing.T) {
-	for _, v := range []float64{0, -5} {
-		repo := &accountStubRepo{}
-		srv := newTestServer2(repo)
-		rec := doSetAccountCap(srv, map[string]any{"newCapUsd": v})
-		if rec.Code != 400 {
-			t.Errorf("cap=%v: expected 400, got %d: %s", v, rec.Code, rec.Body.String())
-		}
-		if len(repo.setCapCalls) != 0 {
-			t.Errorf("cap=%v: expected no repository call for a rejected request", v)
-		}
+// A cap of exactly 0 is a legitimate, explicit choice ("give this mode nothing of the shared
+// balance"), not an error — was rejected until 2026-09-20, when an operator correctly pointed out
+// that reducing a mode's cap back to 0 is a real action, not invalid input. Only a NEGATIVE
+// request is rejected now.
+func TestHandleSetAccountCap_AcceptsZeroCap(t *testing.T) {
+	repo := &accountStubRepo{}
+	srv := newTestServer2(repo)
+	rec := doSetAccountCap(srv, map[string]any{"newCapUsd": 0})
+	if rec.Code != 200 {
+		t.Fatalf("cap=0: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(repo.setCapCalls) != 1 {
+		t.Fatalf("cap=0: expected exactly one repository call, got %d", len(repo.setCapCalls))
+	}
+}
+
+func TestHandleSetAccountCap_RejectsNegativeCap(t *testing.T) {
+	repo := &accountStubRepo{}
+	srv := newTestServer2(repo)
+	rec := doSetAccountCap(srv, map[string]any{"newCapUsd": -5})
+	if rec.Code != 400 {
+		t.Errorf("cap=-5: expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(repo.setCapCalls) != 0 {
+		t.Errorf("cap=-5: expected no repository call for a rejected request")
 	}
 }
 

@@ -96,8 +96,12 @@ func (s *Server) handleSetAccountCap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid mode (want paper, bot, or manual): "+mode)
 		return
 	}
-	if !req.NewCapUSD.IsPositive() {
-		writeError(w, http.StatusBadRequest, "newCapUsd must be positive")
+	// 0 is a legitimate, explicit cap ("give this mode nothing of the shared balance") — only a
+	// negative request is rejected. Was IsPositive() (rejecting 0 too) until 2026-09-20, when an
+	// operator correctly pointed out that reducing a mode's cap back to 0 is a real, valid action
+	// (e.g. "manual gets nothing for now"), not an error.
+	if req.NewCapUSD.IsNegative() {
+		writeError(w, http.StatusBadRequest, "newCapUsd must not be negative")
 		return
 	}
 
