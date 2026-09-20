@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/shopspring/decimal"
+
+	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
 // SetTradingCap must bound one real-money mode's cap against what the OTHER real-money mode has
@@ -29,35 +31,43 @@ func TestSetTradingCap_BoundsAgainstSiblingModesClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read manual account: %v", err)
 	}
+	// Restored via direct SQL, not SetTradingCap: the public API has no way to express "no cap at
+	// all" (SetTradingCap always sets one), so going through it here would leave an originally-
+	// uncapped row with a cap this test invented — corrupting the NEXT test's own "before" state
+	// exactly the way TestSetTradingCap_SiblingReleasingClaimFreesRoomOnNextCall was found to fail
+	// when run after this one (both real bugs this test's cleanup was masking, not introducing).
+	restore := func(mode string, before port.AccountEquity) {
+		if _, err := repo.pool.Exec(ctx, `
+			UPDATE account_equity SET equity_usd = $2, account_balance_usd = $3, trading_cap_usd = $4 WHERE mode = $1
+		`, mode, before.EquityUSD, before.AccountBalanceUSD, before.TradingCapUSD); err != nil {
+			t.Logf("cleanup: failed to restore %s account_equity row: %v", mode, err)
+		}
+	}
 	t.Cleanup(func() {
-		if _, err := repo.SetTradingCap(ctx, "bot", botBefore.AccountBalanceUSD); err != nil {
-			t.Logf("cleanup: failed to restore bot cap: %v", err)
-		}
-		if botBefore.TradingCapUSD != nil {
-			if _, err := repo.SetTradingCap(ctx, "bot", *botBefore.TradingCapUSD); err != nil {
-				t.Logf("cleanup: failed to restore bot cap: %v", err)
-			}
-		}
-		if _, err := repo.SetTradingCap(ctx, "manual", manualBefore.AccountBalanceUSD); err != nil {
-			t.Logf("cleanup: failed to restore manual cap: %v", err)
-		}
-		if manualBefore.TradingCapUSD != nil {
-			if _, err := repo.SetTradingCap(ctx, "manual", *manualBefore.TradingCapUSD); err != nil {
-				t.Logf("cleanup: failed to restore manual cap: %v", err)
-			}
-		}
+		restore("bot", botBefore)
+		restore("manual", manualBefore)
 	})
 
-	// Establish a known real balance on both rows via SetAccountCap-shaped behavior: SetTradingCap
-	// itself never touches AccountBalanceUSD (by design, see its own doc comment), so a fresh
-	// balance must be set first through RecordExchangeBalance the same way a real reconciliation
-	// poll would — passing a raw balance with no reserve so equity starts equal to it.
+	// Establish a known real balance on both rows via RecordExchangeBalance, the same way a real
+	// reconciliation poll would. Neither mode has a cap yet, so EquityUSD stays at ZERO on both
+	// (2026-09-20 fix) even though AccountBalanceUSD is now 40 — an uncapped real-money mode claims
+	// nothing until the operator explicitly sets a cap, which is exactly the property this test's
+	// own sibling-bound scenario below depends on: SetTradingCap("bot", 30) must succeed with the
+	// FULL $30 (not clamped), because "manual" hasn't claimed any of the $40 yet.
 	balance := decimal.NewFromInt(40)
-	if _, err := repo.RecordExchangeBalance(ctx, "bot", balance, decimal.Zero, ""); err != nil {
+	botSeeded, err := repo.RecordExchangeBalance(ctx, "bot", balance, decimal.Zero, "")
+	if err != nil {
 		t.Fatalf("seed bot balance: %v", err)
 	}
-	if _, err := repo.RecordExchangeBalance(ctx, "manual", balance, decimal.Zero, ""); err != nil {
+	if !botSeeded.EquityUSD.IsZero() {
+		t.Fatalf("bot equity after seeding with no cap = %s, want 0 (an uncapped real-money mode claims nothing)", botSeeded.EquityUSD)
+	}
+	manualSeeded, err := repo.RecordExchangeBalance(ctx, "manual", balance, decimal.Zero, "")
+	if err != nil {
 		t.Fatalf("seed manual balance: %v", err)
+	}
+	if !manualSeeded.EquityUSD.IsZero() {
+		t.Fatalf("manual equity after seeding with no cap = %s, want 0 (an uncapped real-money mode claims nothing)", manualSeeded.EquityUSD)
 	}
 
 	// Bot claims $30 of the shared $40 balance.

@@ -21,6 +21,8 @@ import TradingCapControl from '../components/TradingCapControl'
 //   - Capital allocation moved from two bare sliders to a donut chart (Bot / Manual / Reserve),
 //     which is the thing the operator actually wants a felt sense of at a glance: not two numbers
 //     to compare, but one balance and how it's currently carved up.
+//   - Both sliders and the donut now stay LIVE-SYNCED while dragging, before either is saved
+//     (2026-09-20 follow-up request) — see the draft-state block below.
 //
 // CAPITAL ALLOCATION IS PER-EXCHANGE, NOT ACROSS EXCHANGES: bot/manual trading's shared balance
 // (Repository.SetTradingCap's own "realMoneyModes" bound) is tied to ONE exchange today — there is
@@ -31,6 +33,15 @@ import TradingCapControl from '../components/TradingCapControl'
 // (never a hardcoded exchange name), filtered to configured ones — so a newly-configured exchange
 // appears here with zero code changes, and one with no credentials is correctly absent rather than
 // shown with invented numbers.
+//
+// ZERO IS THE DEFAULT, NOT "SHARED" (2026-09-20 backend fix, same request): a mode that has never
+// had a cap explicitly set now claims NOTHING of the shared balance, not the whole thing. Before
+// that fix, an uncapped mode silently mirrored the full balance, which is exactly what made the
+// FIRST cap ever set on either mode compute against an uncapped sibling that looked like it already
+// owned everything — clamping that first cap down to almost nothing regardless of what was
+// requested (the "moved the manual slider and got a weird number" bug). There is deliberately no
+// "reset to shared" button: with the zero default, there is no dangerous shared state to escape
+// from — an operator who wants to give a mode more capital just raises its own cap.
 function fmtUsd0(n: number): string {
   if (!Number.isFinite(n)) return '—'
   return `$${n.toFixed(2)}`
@@ -85,23 +96,66 @@ export default function AccountPage() {
   const sharedBalanceUsd = Number(botStats?.accountBalanceUsd ?? manualStats?.accountBalanceUsd ?? 0)
   const botEquity = Number(botStats?.totalEquityUsd ?? 0)
   const manualEquity = Number(manualStats?.totalEquityUsd ?? 0)
-  const reserveUsd = Math.max(0, sharedBalanceUsd - botEquity - manualEquity)
+
+  // Draft state, LIVE-SYNCED across both sliders and the donut while dragging, before either is
+  // saved (2026-09-20 request). Seeded from the server's own saved equity once it loads, then
+  // reconciled to the server's numbers again after a save (via `refreshSignal`) or whenever the
+  // shared balance itself moves (a reconcile poll, a real trade) — but NOT on every 15s stats poll
+  // while the operator is actively dragging, or a slider would visibly snap back mid-drag.
+  const [botDraft, setBotDraft] = useState(0)
+  const [manualDraft, setManualDraft] = useState(0)
+  const [dirty, setDirty] = useState(false)
+
+  useEffect(() => {
+    if (dirty) return
+    setBotDraft(botEquity)
+    setManualDraft(manualEquity)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [botEquity, manualEquity, dirty])
+
+  // Each slider's ceiling is the shared balance minus the OTHER slider's CURRENT DRAFT (not its
+  // last-saved value) — this is what makes dragging one slider instantly shrink the other's
+  // available range and the donut's reserve slice, all before anything is saved. Moving bot to $18
+  // out of a $40 balance makes manual's own ceiling $22 immediately, matching the request exactly.
+  //
+  // Both the ceiling AND the sibling's OWN draft are re-clamped synchronously during render (never
+  // via a useEffect, which would show one stale frame first) — if manual's draft is $30 and bot
+  // moves up to $20 out of a $40 balance, manual's ceiling drops to $20 and manual's own draft is
+  // pulled down to $20 too, in the SAME render, so the donut never has a moment where the two
+  // drafts sum past the shared balance.
+  const manualMaxRaw = Math.max(0, sharedBalanceUsd - botDraft)
+  const manualDraftClamped = Math.min(manualDraft, manualMaxRaw)
+  // Recompute bot's own ceiling against manual's just-clamped draft, not its pre-clamp one, so
+  // bot's slider never offers headroom that was only ever available because manual's draft hadn't
+  // been pulled down yet.
+  const botMaxFinal = Math.max(0, sharedBalanceUsd - manualDraftClamped)
+  const botDraftClamped = Math.min(botDraft, botMaxFinal)
+  const manualMax = Math.max(0, sharedBalanceUsd - botDraftClamped)
+
+  const reserveUsd = Math.max(0, sharedBalanceUsd - botDraftClamped - manualDraftClamped)
 
   const donutSlices: DonutSlice[] = [
-    { label: 'Bot Trader', usd: botEquity, color: 'var(--accent)' },
-    { label: 'Manual trading', usd: manualEquity, color: 'var(--yellow)' },
+    { label: 'Bot Trader', usd: botDraftClamped, color: 'var(--accent)' },
+    { label: 'Manual trading', usd: manualDraftClamped, color: 'var(--yellow)' },
     { label: 'Reserve (unallocated)', usd: reserveUsd, color: 'var(--border)' },
   ]
 
-  // Each control's own upper bound is what's left for THAT mode once the other's current claim
-  // (its own totalEquityUsd, which IS its cap once one is set) is set aside — mirrors exactly what
-  // the backend's SetTradingCap enforces server-side.
-  const botMax = Math.max(0, sharedBalanceUsd - manualEquity)
-  const manualMax = Math.max(0, sharedBalanceUsd - botEquity)
+  async function saveBotCap(v: number) {
+    setDirty(true)
+    setBotDraft(v)
+    await api.setAccountCap(String(v), 'bot')
+    setRefreshSignal((n) => n + 1)
+    setDirty(false)
+  }
+  async function saveManualCap(v: number) {
+    setDirty(true)
+    setManualDraft(v)
+    await api.setAccountCap(String(v), 'manual')
+    setRefreshSignal((n) => n + 1)
+    setDirty(false)
+  }
 
-  const noCapSet = botStats && manualStats && sharedBalanceUsd > 0 &&
-    Number(botStats.totalEquityUsd) === sharedBalanceUsd &&
-    Number(manualStats.totalEquityUsd) === sharedBalanceUsd
+  const noCapSet = botStats && manualStats && sharedBalanceUsd > 0 && botEquity === 0 && manualEquity === 0
 
   return (
     <div className="account-page">
@@ -149,9 +203,8 @@ export default function AccountPage() {
           <>
             {noCapSet && (
               <div className="alloc-warning">
-                No cap has been set for either mode yet — both are currently reading the FULL shared
-                balance as "available," which means they can jointly over-commit it if both trade at
-                once. Set a cap below for at least one mode to split the balance for real.
+                Neither mode has a cap set yet — both are currently allocated $0 of the shared
+                balance, so nothing can be opened in bot or manual mode until you set a cap below.
               </div>
             )}
 
@@ -164,9 +217,10 @@ export default function AccountPage() {
                   <TradingCapControl
                     mode="bot"
                     label="Bot Trader cap"
-                    maxAvailable={botMax}
-                    current={botEquity}
-                    onSaved={() => setRefreshSignal((n) => n + 1)}
+                    maxAvailable={botMaxFinal}
+                    draft={botDraftClamped}
+                    onDraftChange={setBotDraft}
+                    onSave={saveBotCap}
                   />
                   {botStats && (
                     <p className="text-dim" style={{ marginTop: '0.4rem' }}>
@@ -181,8 +235,9 @@ export default function AccountPage() {
                     mode="manual"
                     label="Manual trading cap"
                     maxAvailable={manualMax}
-                    current={manualEquity}
-                    onSaved={() => setRefreshSignal((n) => n + 1)}
+                    draft={manualDraftClamped}
+                    onDraftChange={setManualDraft}
+                    onSave={saveManualCap}
                   />
                   {manualStats && (
                     <p className="text-dim" style={{ marginTop: '0.4rem' }}>

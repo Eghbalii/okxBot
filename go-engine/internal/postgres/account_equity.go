@@ -18,22 +18,39 @@ func scanAccountEquity(row interface {
 	return row.Scan(&ae.Mode, &ae.InitialUSD, &ae.EquityUSD, &ae.AccountBalanceUSD, &ae.TradingCapUSD, &ae.ResetCount, &ae.LastResetAt, &ae.UpdatedAt)
 }
 
-// GetAccountEquity returns mode's current balance row, seeding it at initialUSD (plus a "seed"
-// history point) if it doesn't exist yet — CLAUDE.md §15.6. AccountBalanceUSD is seeded at the
-// same initialUSD as EquityUSD; the two only diverge once SetAccountCap re-baselines EquityUSD
-// without touching AccountBalanceUSD (CLAUDE.md §31.2).
+// GetAccountEquity returns mode's current balance row, seeding it (plus a "seed" history point)
+// if it doesn't exist yet — CLAUDE.md §15.6.
+//
+// For "paper" (and any future non-real-money mode), EquityUSD and AccountBalanceUSD both seed at
+// initialUSD, unchanged from the original design: paper has no real exchange balance to divide, so
+// there's nothing to hold back.
+//
+// For "bot"/"manual" (isRealMoneyMode), AccountBalanceUSD still seeds at initialUSD — the real
+// balance genuinely exists the moment either mode first reads it — but EquityUSD seeds at ZERO
+// (2026-09-20 fix; see RecordExchangeBalance's identical reasoning). The two real-money modes
+// share one exchange balance and start with NEITHER claiming any of it: an operator who never
+// explicitly sets a cap gets a mode that can open nothing, not one that silently owns the whole
+// balance by default. The previous default (EquityUSD = initialUSD, i.e. "claims everything until
+// told otherwise") is what let an uncapped mode's sibling-bound check in SetTradingCap clamp the
+// OTHER mode's very first cap down to a few cents — the sibling still "claimed" the full balance at
+// that moment, so almost nothing was left. Seeding at zero means an unconfigured mode claims
+// nothing, so the sibling bound has real room until the operator actually allocates some.
 func (r *Repository) GetAccountEquity(ctx context.Context, mode string, initialUSD decimal.Decimal) (port.AccountEquity, error) {
 	var ae port.AccountEquity
+	seedEquity := initialUSD
+	if isRealMoneyMode(mode) {
+		seedEquity = decimal.Zero
+	}
 	// xmax = 0 identifies a row this statement actually inserted, as opposed to one the no-op
 	// DO UPDATE just returned — that's what tells us whether to write the seed history point,
 	// without a second round trip to check for existence first.
 	var inserted bool
 	row := r.pool.QueryRow(ctx, `
 		INSERT INTO account_equity (mode, initial_usd, equity_usd, account_balance_usd)
-		VALUES ($1, $2, $2, $2)
+		VALUES ($1, $2, $3, $2)
 		ON CONFLICT (mode) DO UPDATE SET mode = account_equity.mode
 		RETURNING `+accountEquityCols+`, (xmax = 0)
-	`, mode, initialUSD)
+	`, mode, initialUSD, seedEquity)
 	if err := row.Scan(&ae.Mode, &ae.InitialUSD, &ae.EquityUSD, &ae.AccountBalanceUSD, &ae.TradingCapUSD, &ae.ResetCount, &ae.LastResetAt, &ae.UpdatedAt, &inserted); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("get account equity for mode %s: %w", mode, err)
 	}
@@ -168,13 +185,22 @@ func (r *Repository) RecordExchangeBalance(ctx context.Context, mode string, raw
 	// tradable equity at $20 forever and quietly discard every gain; deriving it as
 	// "balance - reserve" is the same arithmetic stated in terms that survive the balance moving.
 	//
-	// Without a cap: fall back to SafeMoneyUSD's fixed reserve, preserving existing behavior for
-	// any account that never sets one (and for paper, which has no exchange balance to split).
+	// Without a cap: a real-money mode (bot/manual) that has never been given a cap claims NOTHING
+	// of the shared balance (2026-09-20 fix) — it must not default to claiming the whole thing, or
+	// the very first cap set on its sibling would see this mode's uncapped equity as already
+	// claiming 100% of the balance and clamp the sibling's cap down to almost zero (the exact bug
+	// this fixes: setting "manual" to $20 while "bot" had never had a cap computed a sibling-bound
+	// of balance-minus-bot's-full-mirrored-equity, leaving manual capped at a few cents no matter
+	// what was requested). "paper" keeps the original SafeMoneyUSD-reserve fallback, since it has
+	// no sibling and no real balance being divided — there's nothing to protect it from.
 	var tradable decimal.Decimal
-	if previousCap != nil {
+	switch {
+	case previousCap != nil:
 		reserve := previousBalance.Sub(previousEquity)
 		tradable = rawBalanceUSD.Sub(reserve)
-	} else {
+	case isRealMoneyMode(mode):
+		tradable = decimal.Zero
+	default:
 		tradable = rawBalanceUSD.Sub(safeMoneyUSD)
 	}
 	if tradable.IsNegative() {
@@ -315,6 +341,17 @@ func (r *Repository) AdjustAccountCap(ctx context.Context, mode string, deltaUSD
 // real mode has already claimed, so their caps can never jointly exceed the real balance. "paper"
 // is deliberately excluded: it has its own fictional balance with nothing to reconcile against.
 var realMoneyModes = []string{"bot", "manual"}
+
+// isRealMoneyMode reports whether mode is one of the slices sharing the one real exchange balance
+// (as opposed to "paper", which has no real balance to divide at all).
+func isRealMoneyMode(mode string) bool {
+	for _, m := range realMoneyModes {
+		if m == mode {
+			return true
+		}
+	}
+	return false
+}
 
 // SetTradingCap sets how much of the REAL balance this engine may trade with, without ever
 // touching AccountBalanceUSD — see the port interface's doc comment for why that separation is

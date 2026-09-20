@@ -1,5 +1,4 @@
-import { useEffect, useState } from 'react'
-import { api } from '../api/client'
+import { useState } from 'react'
 import type { PositionMode } from '../api/types'
 
 // Trading-cap control: "I've decided to trade with $X from now on." What that means depends on
@@ -13,60 +12,61 @@ import type { PositionMode } from '../api/types'
 //                   becomes the Reserve figure, and profit/loss accrues to the slice while the
 //                   reserve stays put. Bot and manual share the SAME real exchange balance
 //                   (2026-09-20 Account page) — the backend bounds each cap against what the
-//                   OTHER mode has already claimed, so this control's own maxAvailable prop is
-//                   the caller's job to compute correctly (see AccountPage's own reasoning).
+//                   OTHER mode has already claimed.
 //
-// Moved here from PaperTradingStatsBox (2026-09-20 request): capital allocation is a decision
-// about the whole account, not something that belongs buried in a per-mode positions-page stats
-// box — it now lives on its own Account page, used once for bot and once for manual.
+// CONTROLLED, not self-contained (2026-09-20 redesign, direct request): the draft value now lives
+// in AccountPage, not here, so bot's slider, manual's slider, and the donut chart can all move
+// together the instant either slider is dragged — before either is actually saved. This control is
+// now "dumb": it renders whatever draft/onDraftChange it's given and calls onSave on click. Every
+// other line of reasoning below (why the slider is bounded and the input is too) is unchanged.
 //
-// The slider's upper bound is the account's REAL Account Balance (or less, once a sibling mode's
-// own claim is accounted for), not an arbitrary ceiling: a cap above what's actually available
-// would be claiming a deposit the panel cannot make. The direct number input is deliberately kept
-// and left UNBOUNDED — an operator who really has deposited more on the exchange needs to be able
-// to say so, and the backend is the authority on what is valid, not this control. The slider is
-// the convenience, the input is the escape hatch.
+// The number input is now BOUNDED to [0, maxAvailable] and clamped as the user types (2026-09-20
+// request: "handle the error so it can't enter more than what's allowed") — this reverses the
+// original design's "the input is the escape hatch, the backend is the authority" stance. That
+// stance assumed a slider ceiling was just a convenience; the two-mode sync this control now
+// participates in means an out-of-range draft would show the OTHER mode's slider/max and the donut
+// a number the backend could never actually honor, which is a worse experience than just not
+// allowing it client-side. The backend's own bound (SetTradingCap's sibling-aware LEAST/GREATEST)
+// is still the actual authority and is re-validated on save regardless.
 export default function TradingCapControl({
   mode,
   label,
   maxAvailable,
-  current,
-  onSaved,
+  draft,
+  onDraftChange,
+  onSave,
 }: {
   mode: PositionMode
   label: string
   maxAvailable: number
-  current: number
-  onSaved: () => void
+  draft: number
+  onDraftChange: (v: number) => void
+  onSave: (v: number) => Promise<void>
 }) {
-  const [value, setValue] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Seed the control from the account's own current balance so the slider starts somewhere
-  // meaningful rather than at zero, and re-seed if the account moves while the field is untouched.
-  useEffect(() => {
-    if (value === '' && current > 0) setValue(current.toFixed(2))
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current])
-
-  const num = Number(value)
-  // The slider can only express [0, maxAvailable]; a typed value above that is still valid (see
-  // the note above), it just pins the thumb to the far end rather than rescaling the track.
-  const sliderMax = maxAvailable > 0 ? maxAvailable : 100
-  const sliderValue = Number.isFinite(num) ? Math.min(Math.max(num, 0), sliderMax) : 0
+  const sliderMax = maxAvailable > 0 ? maxAvailable : 0
+  const clamped = Math.min(Math.max(draft, 0), sliderMax)
   const step = sliderMax >= 100 ? 1 : sliderMax >= 10 ? 0.1 : 0.01
 
+  function setClamped(raw: number) {
+    if (!Number.isFinite(raw)) {
+      onDraftChange(0)
+      return
+    }
+    onDraftChange(Math.min(Math.max(raw, 0), sliderMax))
+  }
+
   async function save() {
-    if (!Number.isFinite(num) || num <= 0) {
+    if (!Number.isFinite(clamped) || clamped <= 0) {
       setError('enter a positive number')
       return
     }
     setSaving(true)
     setError(null)
     try {
-      await api.setAccountCap(String(num), mode)
-      onSaved()
+      await onSave(clamped)
     } catch (err) {
       setError((err as Error).message)
     } finally {
@@ -83,16 +83,21 @@ export default function TradingCapControl({
           min={0}
           max={sliderMax}
           step={step}
-          value={sliderValue}
-          onChange={(e) => setValue(e.target.value)}
+          value={clamped}
+          onChange={(e) => setClamped(Number(e.target.value))}
           className="cap-slider"
           title={`Max available: $${sliderMax.toFixed(2)}`}
         />
         <input
           type="number"
           placeholder="e.g. 40"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
+          min={0}
+          max={sliderMax}
+          value={Number.isFinite(draft) ? draft : ''}
+          onChange={(e) => {
+            const raw = e.target.value === '' ? NaN : Number(e.target.value)
+            setClamped(raw)
+          }}
           className="cap-input"
         />
         <button className="btn-primary" onClick={save} disabled={saving}>
