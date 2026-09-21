@@ -33,10 +33,13 @@ import type { PositionMode } from '../api/types'
 //      input had just caused itself. Clearing the field set text="" and draft=0; the next render's
 //      effect saw draft change to 0 and immediately reset text back to a number, so a field cleared
 //      and then typed into (e.g. "0" then "2" then "3") had its own first keystroke erased before
-//      the second could land. Fixed by tracking the LAST VALUE THIS INPUT ITSELF PUSHED
-//      (`lastPushedDraft`) and only re-syncing `text` from `draft` when the incoming value did NOT
-//      come from this input's own last edit — i.e. only for genuinely external changes (the slider
-//      being dragged, the sibling control's save reshaping this one's ceiling).
+//      the second could land. Fixed by tracking the LAST VALUE THIS TEXT FIELD ITSELF PUSHED
+//      (`lastPushedFromText`) and only SKIPPING the resync when the incoming draft matches that —
+//      i.e. only when the change is an echo of this field's own last edit. A slider drag is a
+//      DIFFERENT origin (its handler never touches `lastPushedFromText`), so it always resyncs the
+//      text field — otherwise dragging the slider would silently leave the number field stale,
+//      which is exactly the regression a first version of this fix introduced by having the
+//      slider's own handler also set the "last pushed" marker.
 //   3. save() rejected a value of exactly 0 as "not a positive number" — but 0 is a legitimate,
 //      explicit choice ("give this mode nothing"), not an error. Only NaN/negative is now rejected,
 //      matching the same relaxation made server-side in handleSetAccountCap.
@@ -67,42 +70,45 @@ export default function TradingCapControl({
   const clamped = round(Math.min(Math.max(draft, 0), sliderMax))
   const step = sliderMax >= 100 ? 1 : sliderMax >= 10 ? 0.1 : 0.01
 
-  function pushClamped(raw: number) {
-    if (!Number.isFinite(raw)) {
-      lastPushed.current = 0
-      onDraftChange(0)
-      return
-    }
-    const v = round(Math.min(Math.max(raw, 0), sliderMax))
-    lastPushed.current = v
-    onDraftChange(v)
+  function clampToRange(raw: number): number {
+    if (!Number.isFinite(raw)) return 0
+    return round(Math.min(Math.max(raw, 0), sliderMax))
+  }
+
+  // Slider drags push straight through — no "last pushed" bookkeeping, so the resync effect below
+  // always treats a slider move as an external change and updates the text field to match.
+  function onSlider(raw: number) {
+    onDraftChange(clampToRange(raw))
   }
 
   // The input's own literal text, separate from the numeric `draft` it feeds — lets the field hold
   // "" or a leading-zero-in-progress edit ("0", then "02", then "023") without a controlled value
   // fighting back on every keystroke.
   const [text, setText] = useState(() => (draft > 0 ? String(clamped) : ''))
-  // The value this input itself last pushed upward via pushClamped — used to tell "draft changed
-  // because I just typed something" apart from "draft changed for an external reason (slider drag,
-  // sibling's save shrinking my ceiling)". Only the latter should overwrite the user's in-progress
-  // text.
-  const lastPushed = useRef<number | null>(null)
+  // The value the TEXT FIELD itself last pushed upward — used to tell "draft changed because I just
+  // typed something" apart from every other kind of draft change (a slider drag, the sibling
+  // control's save reshaping this one's ceiling), which must still resync `text`.
+  const lastPushedFromText = useRef<number | null>(null)
   useEffect(() => {
-    if (lastPushed.current !== null && round(draft) === lastPushed.current) return
+    if (lastPushedFromText.current !== null && round(draft) === lastPushedFromText.current) return
     setText(draft > 0 ? String(round(draft)) : draft === 0 ? '' : String(draft))
-    lastPushed.current = null
+    lastPushedFromText.current = null
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft])
 
   function onTextChange(raw: string) {
     setText(raw)
     if (raw === '') {
-      lastPushed.current = 0
+      lastPushedFromText.current = 0
       onDraftChange(0)
       return
     }
     const num = Number(raw)
-    if (Number.isFinite(num)) pushClamped(num)
+    if (Number.isFinite(num)) {
+      const v = clampToRange(num)
+      lastPushedFromText.current = v
+      onDraftChange(v)
+    }
   }
 
   async function save() {
@@ -132,7 +138,7 @@ export default function TradingCapControl({
           max={sliderMax}
           step={step}
           value={clamped}
-          onChange={(e) => pushClamped(Number(e.target.value))}
+          onChange={(e) => onSlider(Number(e.target.value))}
           className="cap-slider"
           title={`Max available: $${sliderMax.toFixed(1)}`}
         />

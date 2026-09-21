@@ -36,10 +36,12 @@ export default function CapitalDonut({
   totalUsd: number
   centerLabel: string
 }) {
-  const size = 180
+  // Shrunk from 180/78 (2026-09-21 request: "خیلی الکی بزرگن") — a donut this size next to a pair
+  // of compact slider tiles looked oversized for what it shows.
+  const size = 132
   const cx = size / 2
   const cy = size / 2
-  const r = 78
+  const r = 56
   const total = totalUsd > 0 ? totalUsd : 1 // avoid /0; an all-zero account renders as one full-circle "unallocated" wedge below
 
   let cursor = 0
@@ -71,7 +73,7 @@ export default function CapitalDonut({
         )}
         {/* Inner hole, punched out with the panel's own background so the ring reads as a donut
             rather than a filled pie — cheaper and simpler than a mask for a solid background. */}
-        <circle cx={cx} cy={cy} r={r - 22} fill="var(--bg-panel)" />
+        <circle cx={cx} cy={cy} r={r * 0.72} fill="var(--bg-panel)" />
         <text x={cx} y={cy - 6} textAnchor="middle" className="capital-donut-total">
           {fmtUsd(totalUsd)}
         </text>

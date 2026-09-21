@@ -610,24 +610,28 @@ th.sorted {
 .cap-slider {
   flex: 1 1 2rem;
   min-width: 1.5rem;
+  height: 1rem;
   accent-color: var(--accent, #4ea1ff);
   cursor: pointer;
 }
 
 /* Shrinkable rather than a fixed 4.5rem: it only ever holds a short dollar amount, and holding a
-   hard width here is what made the tile unable to fit its column. */
+   hard width here is what made the tile unable to fit its column. Padding/font tightened further
+   (2026-09-21) — the browser default input padding read as oversized for a field this narrow. */
 .cap-input {
-  width: 3.6rem;
+  width: 3.2rem;
   min-width: 0;
   flex: 0 1 auto;
+  padding: 0.2rem 0.35rem;
+  font-size: 0.8rem;
 }
 
 /* The Set button carries a 3-letter label, so it does not need the default button padding and is
    the cheapest place to reclaim the last few pixels. */
 .cap-row .btn-primary {
   flex: 0 0 auto;
-  padding-left: 0.5rem;
-  padding-right: 0.5rem;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.8rem;
 }
 
 .cap-hint {
@@ -1485,10 +1489,14 @@ th.sorted {
   font-variant-numeric: tabular-nums;
 }
 
-/* The control row fills its own row, so the slider finally has room to be usable. */
+/* The control row fills its own row, so the slider finally has room to be usable. Padding shrunk
+   from .stat-tile's default (2026-09-21 request) — this tile holds a slider/input/button row, not
+   a single stat, so the generous stat-tile padding just added unused whitespace around it. */
 .cap-tile {
-  gap: 0.4rem;
+  gap: 0.35rem;
+  padding: 0.35rem 0.5rem;
 }
+.cap-tile .stat-label { font-size: 0.62rem; }
 
 .stats-chart {
   min-width: 0;
@@ -2454,15 +2462,21 @@ input[type='number'] {
   font-size: 13px;
   margin-bottom: 12px;
 }
-.alloc-body { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
-.alloc-controls { flex: 1 1 380px; min-width: 300px; display: flex; flex-direction: column; gap: 16px; }
+/* Sized down (2026-09-21 request: "خیلی الکی بزرگن") — the donut + controls read as oversized for
+   what they show, so both shrank: a smaller donut (140px, was 180px via CapitalDonut's own prop),
+   tighter gaps throughout, and the per-mode "used / free" caption line below each slider dropped a
+   font size (0.75rem, matching .cap-hint's own scale rather than the page's default paragraph
+   size). */
+.alloc-body { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+.alloc-controls { flex: 1 1 320px; min-width: 260px; display: flex; flex-direction: column; gap: 10px; }
+.alloc-controls .text-dim { font-size: 0.75rem; margin-top: 0.25rem !important; }
 
-.capital-donut { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+.capital-donut { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .capital-donut-svg { flex-shrink: 0; }
-.capital-donut-total { fill: var(--text); font-size: 18px; font-weight: 700; }
-.capital-donut-caption { fill: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
-.capital-donut-legend { display: flex; flex-direction: column; gap: 8px; min-width: 160px; }
-.capital-donut-legend-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-.capital-donut-swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+.capital-donut-total { fill: var(--text); font-size: 15px; font-weight: 700; }
+.capital-donut-caption { fill: var(--text-dim); font-size: 9px; text-transform: uppercase; letter-spacing: 0.04em; }
+.capital-donut-legend { display: flex; flex-direction: column; gap: 5px; min-width: 140px; }
+.capital-donut-legend-row { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.capital-donut-swatch { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
 .capital-donut-legend-label { flex: 1; color: var(--text-dim); }
 .capital-donut-legend-value { font-family: monospace; }
