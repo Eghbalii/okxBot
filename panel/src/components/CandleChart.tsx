@@ -3,6 +3,7 @@ import {
   CandlestickSeries,
   createChart,
   createSeriesMarkers,
+  HistogramSeries,
   type IChartApi,
   type ISeriesApi,
   type ISeriesMarkersPluginApi,
@@ -136,6 +137,12 @@ export function CandleChart({
   const container = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick', Time> | null>(null)
+  // Volume histogram, drawn on its own overlay price scale pinned to the bottom of the same pane
+  // (2026-09-21 request — "we missed the volume chart... it's important and we have to have it in
+  // all charts"). A second pane was considered and rejected: this chart's height is already tight
+  // against the modal's own budget (availableChartHeight), and an overlay scale gets volume
+  // visible without shrinking the candles or adding a second scrollable region.
+  const volumeRef = useRef<ISeriesApi<'Histogram', Time> | null>(null)
   const zonesRef = useRef<PositionZones | null>(null)
   // ONE markers plugin for the chart's lifetime. createSeriesMarkers ATTACHES a new primitive each
   // time it is called and returns a handle to it — it is not an idempotent setter. Calling it per
@@ -201,6 +208,17 @@ export function CandleChart({
       wickDownColor: DOWN,
       borderVisible: false,
     })
+    // Overlay scale ('') rather than the right price scale: volume's own units (contracts) have
+    // nothing to do with price, so sharing an axis with candles would either swamp it or make bars
+    // unreadable. scaleMargins reserves the bottom ~18% of the pane for volume and leaves the top
+    // for candles, the same split TradingView's own charts use.
+    const volume = chart.addSeries(HistogramSeries, {
+      priceFormat: { type: 'volume' },
+      priceScaleId: '',
+      lastValueVisible: false,
+      priceLineVisible: false,
+    })
+    volume.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
     const zones = new PositionZones()
     series.attachPrimitive(zones)
     markersRef.current = createSeriesMarkers(series, [])
@@ -276,6 +294,7 @@ export function CandleChart({
 
     chartRef.current = chart
     seriesRef.current = series
+    volumeRef.current = volume
     zonesRef.current = zones
     return () => {
       el.removeEventListener('pointerdown', onDown, true)
@@ -284,6 +303,7 @@ export function CandleChart({
       chart.remove()
       chartRef.current = null
       seriesRef.current = null
+      volumeRef.current = null
       zonesRef.current = null
       markersRef.current = null
     }
@@ -321,6 +341,17 @@ export function CandleChart({
         high: Number(c.High),
         low: Number(c.Low),
         close: Number(c.Close),
+      })),
+    )
+
+    // Coloured by that bar's own direction, matching the candle it sits under rather than a flat
+    // neutral tone — the volume-vs-direction relationship is exactly what a trader reads this pane
+    // for (a volume spike on a down bar reads very differently from one on an up bar).
+    volumeRef.current?.setData(
+      candles.map((c) => ({
+        time: secs(c.Timestamp),
+        value: Number(c.Volume) || 0,
+        color: Number(c.Close) >= Number(c.Open) ? 'rgba(46,189,133,0.5)' : 'rgba(246,70,93,0.5)',
       })),
     )
 
@@ -437,7 +468,22 @@ export function CandleChart({
       low: Number(lastCandle.Low),
       close: Number(lastCandle.Close),
     })
-  }, [lastCandle?.Timestamp, lastCandle?.Open, lastCandle?.High, lastCandle?.Low, lastCandle?.Close])
+    volumeRef.current?.update({
+      time: secs(lastCandle.Timestamp),
+      value: Number(lastCandle.Volume) || 0,
+      color:
+        Number(lastCandle.Close) >= Number(lastCandle.Open)
+          ? 'rgba(46,189,133,0.5)'
+          : 'rgba(246,70,93,0.5)',
+    })
+  }, [
+    lastCandle?.Timestamp,
+    lastCandle?.Open,
+    lastCandle?.High,
+    lastCandle?.Low,
+    lastCandle?.Close,
+    lastCandle?.Volume,
+  ])
 
   return (
     <div className="candle-chart" style={{ position: 'relative' }}>

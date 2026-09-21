@@ -9,7 +9,7 @@ import { useOrderbook } from '../hooks/useOrderbook'
 import { usePolling } from '../hooks/usePolling'
 import { useTradeDefaults, type TdMode } from '../hooks/useTradeDefaults'
 import { useFavoriteTokens } from '../hooks/useFavoriteTokens'
-import { CandleChart } from '../components/CandleChart'
+import { CandleChart, ChartEngineToggle } from '../components/chart'
 import OrderbookLadder from '../components/OrderbookLadder'
 import PositionsTable from '../components/PositionsTable'
 import TokenIcon from '../components/TokenIcon'
@@ -251,6 +251,9 @@ export default function TradePage() {
                 </button>
               ))}
             </div>
+            {/* 2026-09-21: compare the TradingView and OpenAlgo chart engines live — see
+                components/chart/useChartEngine.ts. */}
+            <ChartEngineToggle />
           </div>
           <div className="trade-chart-body">
             {/* Reduced from 560 — with the two side columns narrowed to 240px and the order book

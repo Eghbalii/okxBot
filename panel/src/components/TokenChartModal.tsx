@@ -4,7 +4,7 @@ import { api } from '../api/client'
 import { useCachedResource } from '../hooks/useCachedResource'
 import type { Position, PositionMode } from '../api/types'
 import { useLiveCandles } from '../hooks/useLiveCandles'
-import { CandleChart } from './CandleChart'
+import { CandleChart, ChartEngineToggle, useActiveChartEngine } from './chart'
 import ChartAdjustPanel, { type LevelMode } from './ChartAdjustPanel'
 import { pctOnMargin } from './PositionZones'
 import { tokenSymbol } from '../utils/format'
@@ -72,6 +72,9 @@ export default function TokenChartModal({
   useEffect(() => setInstId(initialInstId), [initialInstId])
   const [bar, setBar] = useState<string>('5m')
   const [chartHeight, setChartHeight] = useState(() => availableChartHeight())
+  // Which engine the timeframe-tab overlay needs to clear (2026-09-21 fix, see chart/index.tsx's
+  // own doc comment on useActiveChartEngine).
+  const chartEngine = useActiveChartEngine()
 
   // Candles come from a stale-while-revalidate cache keyed by (instId, bar), so switching between
   // open positions shows an already-loaded series in the SAME frame instead of blanking to
@@ -107,12 +110,24 @@ export default function TokenChartModal({
   // signal, and hiding them meant switching to 1H made a position you actually hold disappear.
   // Its entry marker may sit a little off the exact bar on a coarser chart; that is a far smaller
   // problem than not seeing the position at all.
+  //
+  // ALSO gated on the candle series itself already being for `instId` (2026-09-21 fix). Switching
+  // tokens re-filters `positions` synchronously, but `candles` comes from a stale-while-revalidate
+  // cache (CLAUDE.md §50) and can briefly still hold the PREVIOUS token's rows while the new
+  // fetch is in flight — both engines' position-zone/marker overlay draw whatever `positions` and
+  // `candles` say in the SAME render, so for that one window it plotted the new token's real
+  // entry/SL/TP prices against the old token's still-loaded price/time axis (reported as "the
+  // highlight box floats in the wrong place" — a real, reproducible race, not a one-off screenshot
+  // glitch). Blanking `shown` until the candles agree is cheaper and more robust than trying to
+  // fix it inside each engine's own renderer, since neither engine can tell a mismatch from a
+  // legitimately fast price move without this.
+  const candlesMatchInstId = liveCandles === null || liveCandles.length === 0 || liveCandles[0].InstID === instId
   const shown = useMemo(
     () =>
-      positions.filter(
-        (p) => p.InstID === instId && (!p.ClosedAt || p.Bar === '' || p.Bar === bar),
-      ),
-    [positions, instId, bar],
+      !candlesMatchInstId
+        ? []
+        : positions.filter((p) => p.InstID === instId && (!p.ClosedAt || p.Bar === '' || p.Bar === bar)),
+    [positions, instId, bar, candlesMatchInstId],
   )
 
   // Every open position across ALL tokens, one entry per token with its live PnL. Aggregated by
@@ -329,6 +344,10 @@ export default function TokenChartModal({
             </div>
           )}
 
+          {/* 2026-09-21: lets the two chart engines be compared live without a rebuild — see
+              components/chart/useChartEngine.ts. One toggle for the whole modal, not per chart. */}
+          <ChartEngineToggle className="chart-engine-toggle-modal" />
+
           {/* Deep-links to the manual/discretionary trading page for the token currently showing
               (docs/MANUAL_TRADE_PLAN.md §5.3), not the strip's active one if they differ. */}
           <Link to={`/trade/${instId}`} className="btn-trade-link chart-trade-link" title={`Trade ${tokenSymbol(instId)}`}>
@@ -364,7 +383,12 @@ export default function TokenChartModal({
                 {/* Overlaid on the chart rather than sitting above it (2026-09-12 request): the
                     header is now about the position, and the timeframe belongs to the chart it
                     changes. Absolutely positioned so it costs the chart no vertical space. */}
-                <div className="chart-bar-tabs chart-bar-tabs-overlay">
+                <div
+                  className={
+                    'chart-bar-tabs chart-bar-tabs-overlay' +
+                    (chartEngine === 'openalgo' ? ' chart-bar-tabs-overlay-openalgo' : '')
+                  }
+                >
                   {BARS.map((b) => (
                     <button
                       key={b}
