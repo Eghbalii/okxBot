@@ -203,8 +203,24 @@ export function OpenAlgoCandleChart({
       topbar: false,
       indicators: true,
       rail: true,
-      statusline: true,
+      // The widget's own built-in status line duplicates this component's own OHLCV readout
+      // (2026-09-21 request — "the OHLC/time data shown at the bottom of the chart too, remove
+      // that") — one readout is enough, and the custom one is the one that already follows the
+      // hover-vs-latest-candle behavior asked for elsewhere in this same pass.
+      statusline: false,
       mobile: 'never',
+      // The engine's own default is the fixed zone 'Asia/Kolkata' — every bar/marker/zone is
+      // still stored and positioned in UTC seconds regardless of this option (confirmed against
+      // the engine's own doc comment: it only reaches the axis/crosshair LABEL text), but with no
+      // override every printed time on this chart read ~5.5h off from the browser's own clock and
+      // from the rest of this panel (CandleChart.tsx's own shortTime()/held() helpers format with
+      // `toLocaleString(undefined, ...)`, i.e. the browser's local zone). Reported as "the
+      // highlight box doesn't match the candle it's next to" (2026-09-21) — a real, confusing bug
+      // even though the underlying pixel math was already correct: a box drawn at the right x for
+      // its real UTC time reads as wrong when the axis underneath it is lying about what time that
+      // x actually is. Matches the browser's own zone so this chart's labels agree with the OS
+      // clock and with every other timestamp already shown elsewhere in this panel.
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     })
     widgetRef.current = widget
     const chart = widget.chart

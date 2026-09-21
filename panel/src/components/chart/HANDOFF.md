@@ -5,6 +5,33 @@ Written because this session ran low on context mid-fix. Read this before touchi
 attempted, so the next session doesn't re-derive it from scratch or re-report something already
 fixed as new.
 
+## CORRECTION (2026-09-21, same day, follow-up session) — the zone bug below is FIXED
+
+The "STILL BROKEN" section below was wrong about the cause. The operator found it, not this
+session: `createWidget`'s default `timezone` is the fixed IANA zone `'Asia/Kolkata'` (confirmed in
+the engine's own `dist/index.d.ts` doc comment — "Absent means the shipped default ('Asia/
+Kolkata')"), and nothing in the widget-creation call ever overrode it. Every axis/crosshair label
+this chart printed was ~5.5h off from the actual UTC time the bar/marker/zone were really drawn
+at — the box's own pixel math (already root-caused as correct earlier this session) was right the
+whole time; the LABEL next to it was lying, which is what made it look mismatched. Fixed with one
+line: `timezone: Intl.DateTimeFormat().resolvedOptions().timeZone` in the `createWidget` options
+(`OpenAlgoCandleChart.tsx`), matching the browser's own local zone the same way
+`CandleChart.tsx`'s `toLocaleString(undefined, ...)` helpers and the TV engine already do. Verified
+against a fresh live position (LTC #2307, opened 18:40:01) — the box's left edge now lines up with
+the entry marker and the axis correctly reads "06:40 PM".
+
+Also removed the widget's own built-in status line (`statusline: false`) per the same report — it
+duplicated this component's own OHLCV readout at the bottom of the chart in the exact same
+Asia/Kolkata-mislabeled way.
+
+The "plausibility filter" (`plausiblePositions` in `OpenAlgoCandleChart.tsx`) from earlier this
+session was NOT removed — it's an unrelated, still-valid guard against the separate
+`TokenChartModal` stale-candle race documented below, kept as defense-in-depth.
+
+The debugging section below is left as-is (per this project's own practice of appending
+corrections rather than rewriting history) but its root-cause guesses were superseded by the above
+— don't spend time re-investigating them.
+
 ## Deployment state
 
 Deployed to the server and running as of this session's last commit. `docker-compose.yml`'s panel
