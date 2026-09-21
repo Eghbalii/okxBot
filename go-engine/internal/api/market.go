@@ -181,12 +181,17 @@ type instrumentView struct {
 	ScanScore     string `json:"scanScore"`
 	UpdatedAt     string `json:"updatedAt"`
 	// Active is true only when this symbol has at least one ENABLED strategy_assignments row for
-	// activeMode (2026-09-17 request) — deliberately NOT the same thing as EnabledPaper/EnabledReal.
-	// A token can be enabled_paper=true and still never trade: MEXC tokens are enabled_paper on
-	// admission (the scan's own §53.1 rule) but paper-trader's roster load is hardcoded to the "okx"
-	// exchange only (no MEXC execution wiring yet, §46.6) — those rows are real and selectable, they
-	// are just not active. This is the field the Manage Tokens list uses to answer "is this token
-	// actually open for trading right now", which enabledPaper alone cannot.
+	// activeMode (2026-09-17 request) AND is not in that mode's per-token disabled list
+	// (paper_trading_config.disabled_inst_ids, §22) — deliberately NOT the same thing as
+	// EnabledPaper/EnabledReal. A token can be enabled_paper=true and still never trade: MEXC
+	// tokens are enabled_paper on admission (the scan's own §53.1 rule) but paper-trader's roster
+	// load is hardcoded to the "okx" exchange only (no MEXC execution wiring yet, §46.6) — those
+	// rows are real and selectable, they are just not active. Separately, a token per-token
+	// disabled from Manage Tokens keeps its assignment rows enabled by design (§22: the toggle
+	// only gates new opens, so re-enabling needs no re-assignment) — found 2026-09-22 as the
+	// reason every token read active=true and the "Active only" filter did nothing. This is the
+	// field the Manage Tokens list uses to answer "is this token actually open for trading right
+	// now", which enabledPaper alone cannot.
 	Active bool `json:"active"`
 }
 
@@ -252,6 +257,23 @@ func (s *Server) handleListInstruments(w http.ResponseWriter, r *http.Request) {
 	for _, a := range assignments {
 		activeSymbols[a.InstID] = true
 	}
+	// 2026-09-22 fix: an enabled strategy_assignments row alone is not enough. §22's per-token
+	// disable toggle (paper_trading_config.disabled_inst_ids) is a SEPARATE layer that gates new
+	// opens without ever touching strategy_assignments.enabled — a token turned off from Manage
+	// Tokens keeps its assignment rows enabled (they're the mechanism the toggle deliberately
+	// leaves alone so re-enabling needs no re-assignment). That made every token in the roster
+	// read active=true regardless of the toggle, so "Active only" filtered nothing. A token is
+	// only genuinely tradeable — and only genuinely "active" for this filter — when both layers
+	// agree: it has a live assignment AND it isn't per-token disabled.
+	ptCfg, err := s.Repo.GetPaperTradingConfig(r.Context(), activeMode)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	disabledSymbols := make(map[string]bool, len(ptCfg.DisabledInstIDs))
+	for _, id := range ptCfg.DisabledInstIDs {
+		disabledSymbols[id] = true
+	}
 
 	out := make([]instrumentView, 0, len(roster))
 	for _, in := range roster {
@@ -262,7 +284,7 @@ func (s *Server) handleListInstruments(w http.ResponseWriter, r *http.Request) {
 			Vol24hUSD: in.Vol24hUSD.String(), Change24hPct: in.Change24hPct.String(),
 			ScanScore: in.ScanScore.String(),
 			UpdatedAt: in.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z"),
-			Active:    activeSymbols[in.Symbol],
+			Active:    activeSymbols[in.Symbol] && !disabledSymbols[in.Symbol],
 		})
 	}
 

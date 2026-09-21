@@ -26,6 +26,10 @@ type marketStubRepo struct {
 	// handleListInstruments: a symbol has an enabled row here IFF it currently trades, distinct
 	// from EnabledPaper/EnabledReal which a roster row can carry without ever actually trading.
 	assignments []port.StrategyAssignment
+	// disabledInstIDs backs GetPaperTradingConfig, for the 2026-09-22 fix: a token can have a live
+	// enabled assignment AND be per-token disabled (§22) — Active must be false in that case, or
+	// the Manage Tokens "Active only" filter does nothing (found: every token read active=true).
+	disabledInstIDs []string
 
 	patches        map[int64]port.InstrumentPatch
 	upserted       []port.Instrument
@@ -35,6 +39,10 @@ type marketStubRepo struct {
 
 func (r *marketStubRepo) ListMarketTokens(context.Context, string, int) ([]port.MarketToken, error) {
 	return r.tokens, nil
+}
+
+func (r *marketStubRepo) GetPaperTradingConfig(context.Context, string) (port.PaperTradingConfig, error) {
+	return port.PaperTradingConfig{DisabledInstIDs: r.disabledInstIDs}, nil
 }
 
 func (r *marketStubRepo) ListInstruments(_ context.Context, f port.InstrumentFilter) ([]port.Instrument, error) {
@@ -219,6 +227,44 @@ func TestHandleListInstruments_DisabledAssignmentIsNotActive(t *testing.T) {
 	}
 	if len(resp.Items) != 1 || resp.Items[0].Active {
 		t.Errorf("ETH's only assignment is disabled — active must be false, got %+v", resp.Items)
+	}
+}
+
+// Regression for the 2026-09-22 bug: a token with a live ENABLED assignment that is ALSO
+// per-token disabled (paper_trading_config.disabled_inst_ids, §22) must read active=false. §22's
+// disable toggle deliberately never touches strategy_assignments.enabled, so before this fix every
+// per-token-disabled token still read active=true and "Active only" filtered nothing — reproduced
+// live: all 6 of the operator's disabled tokens (ENA, ETH, HYPE, TRUMP, XRP, ZAMA) still carried
+// enabled assignment rows.
+func TestHandleListInstruments_PerTokenDisabledIsNotActiveEvenWithEnabledAssignment(t *testing.T) {
+	repo := &marketStubRepo{
+		instruments: []port.Instrument{
+			{ID: 1, Symbol: "ZAMA", Exchange: "okx", EnabledPaper: true},
+			{ID: 2, Symbol: "BTC", Exchange: "okx", EnabledPaper: true},
+		},
+		assignments: []port.StrategyAssignment{
+			{ID: 1, StrategyID: 1, InstID: "ZAMA", Bar: "5m", Enabled: true, Mode: "paper"},
+			{ID: 2, StrategyID: 2, InstID: "BTC", Bar: "5m", Enabled: true, Mode: "paper"},
+		},
+		disabledInstIDs: []string{"ZAMA"},
+	}
+	rec := do(t, marketServer(repo), "GET", "/api/instruments", "")
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var resp instrumentListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, in := range resp.Items {
+		got[in.Symbol] = in.Active
+	}
+	if got["ZAMA"] {
+		t.Error("ZAMA has an enabled assignment but is per-token disabled — must report active=false")
+	}
+	if !got["BTC"] {
+		t.Error("BTC has an enabled assignment and is not disabled — must report active=true")
 	}
 }
 
