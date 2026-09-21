@@ -657,10 +657,13 @@ type Repository interface {
 	// unlike paper_orders' baseline/rl_adjusted split — every bot_orders row already counts).
 	StrategyStatsFor(ctx context.Context, strategyID int64, mode string) (StrategyStats, error)
 
-	// TokenStats24h computes each active token's last-24h activity (position count, PnL$, PnL%)
-	// for mode ("paper" or "bot") — backs the panel's "Manage tokens" modal, one row per inst_id
-	// that has at least one trade closed in the window for that mode.
-	TokenStats24h(ctx context.Context, mode string) ([]TokenStats, error)
+	// TokenStatsAllTime computes each active token's whole-history activity (position count, PnL$,
+	// PnL%) for mode ("paper" or "bot") — backs the panel's "Manage tokens" modal, one row per
+	// inst_id that has at least one closed trade for that mode. Renamed from TokenStats24h
+	// (2026-09-22 operator instruction): a 24h window hid most of a token's real track record,
+	// the same reason StrategyStatsFor (above) has never had a time window at all — the two now
+	// match.
+	TokenStatsAllTime(ctx context.Context, mode string) ([]TokenStats, error)
 
 	// OpenPaperOrder inserts o and returns its id. o.ExchangeOrderID is persisted when set (real
 	// trading, CLAUDE.md §27) — the algo order's ID is not known until after this call returns

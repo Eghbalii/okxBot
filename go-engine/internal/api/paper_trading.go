@@ -174,7 +174,8 @@ func realizedPnLOverWindow(history []port.EquityPoint, since time.Time) (usd, pc
 	return tradeSum, pct
 }
 
-// tokenStatsView is one row of the panel's "Manage tokens" 24h stats table (2026-09-04 request).
+// tokenStatsView is one row of the panel's "Manage tokens" all-time stats table (2026-09-04
+// request, widened from a 24h window to all-time 2026-09-22 per operator instruction).
 type tokenStatsView struct {
 	InstID        string `json:"instId"`
 	PositionCount int64  `json:"positionCount"`
@@ -182,13 +183,13 @@ type tokenStatsView struct {
 	PnLPct        string `json:"pnlPct"`
 }
 
-func (s *Server) handleTokenStats24h(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleTokenStatsAllTime(w http.ResponseWriter, r *http.Request) {
 	mode, ok := statsMode(r.URL.Query().Get("mode"))
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
-	stats, err := s.Repo.TokenStats24h(r.Context(), mode)
+	stats, err := s.Repo.TokenStatsAllTime(r.Context(), mode)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

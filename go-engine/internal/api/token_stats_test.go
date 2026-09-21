@@ -19,11 +19,11 @@ type tokenStatsStubRepo struct {
 	err   error
 }
 
-func (s *tokenStatsStubRepo) TokenStats24h(ctx context.Context, mode string) ([]port.TokenStats, error) {
+func (s *tokenStatsStubRepo) TokenStatsAllTime(ctx context.Context, mode string) ([]port.TokenStats, error) {
 	return s.stats, s.err
 }
 
-func TestHandleTokenStats24h_ReturnsPerTokenRows(t *testing.T) {
+func TestHandleTokenStatsAllTime_ReturnsPerTokenRows(t *testing.T) {
 	repo := &tokenStatsStubRepo{stats: []port.TokenStats{
 		{InstID: "BTC", PositionCount: 5, PnLUSD: decimal.RequireFromString("1.5"), PnLPct: decimal.RequireFromString("3.75")},
 		{InstID: "ETH", PositionCount: 2, PnLUSD: decimal.RequireFromString("-0.4"), PnLPct: decimal.RequireFromString("-2.1")},
@@ -32,7 +32,7 @@ func TestHandleTokenStats24h_ReturnsPerTokenRows(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/api/paper-trading/token-stats", nil)
 	rec := httptest.NewRecorder()
-	srv.handleTokenStats24h(rec, req)
+	srv.handleTokenStatsAllTime(rec, req)
 
 	if rec.Code != 200 {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
@@ -52,13 +52,13 @@ func TestHandleTokenStats24h_ReturnsPerTokenRows(t *testing.T) {
 	}
 }
 
-func TestHandleTokenStats24h_EmptyReturnsEmptyArray(t *testing.T) {
+func TestHandleTokenStatsAllTime_EmptyReturnsEmptyArray(t *testing.T) {
 	repo := &tokenStatsStubRepo{stats: nil}
 	srv := &Server{Repo: repo, Logger: slog.Default()}
 
 	req := httptest.NewRequest("GET", "/api/paper-trading/token-stats", nil)
 	rec := httptest.NewRecorder()
-	srv.handleTokenStats24h(rec, req)
+	srv.handleTokenStatsAllTime(rec, req)
 
 	if rec.Code != 200 {
 		t.Fatalf("expected 200, got %d", rec.Code)
@@ -69,13 +69,13 @@ func TestHandleTokenStats24h_EmptyReturnsEmptyArray(t *testing.T) {
 	}
 }
 
-func TestHandleTokenStats24h_RepoErrorReturns500(t *testing.T) {
+func TestHandleTokenStatsAllTime_RepoErrorReturns500(t *testing.T) {
 	repo := &tokenStatsStubRepo{err: context.DeadlineExceeded}
 	srv := &Server{Repo: repo, Logger: slog.Default()}
 
 	req := httptest.NewRequest("GET", "/api/paper-trading/token-stats", nil)
 	rec := httptest.NewRecorder()
-	srv.handleTokenStats24h(rec, req)
+	srv.handleTokenStatsAllTime(rec, req)
 
 	if rec.Code != 500 {
 		t.Fatalf("expected 500, got %d", rec.Code)
