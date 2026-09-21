@@ -36,7 +36,6 @@ const LABEL_GREEN = '#2ebd85'
 const LABEL_TEXT = '#ffffff'
 
 const MIN_BOX_W = 24
-const OPEN_BOX_OVERHANG = 56
 const HANDLE_R = 5
 export const GRAB_TOLERANCE_PX = 7
 const PENDING_EDGE = 'rgba(255,255,255,0.9)'
@@ -112,13 +111,22 @@ export class PositionZones implements IPrimitive {
     return Number.isFinite(min) && Number.isFinite(max) ? { min, max } : null
   }
 
-  // Time -> pixel goes through DataLayer.timeToIndexFloat (fractional logical index, extrapolating
-  // past either edge — needed for an OPEN position's box, whose right edge has no bar) followed by
-  // TimeScale.indexToX (index -> media px). TimeScale itself has no time-to-x method; only
-  // index-to-x. Chart exposes a convenience timeToCoordinate, but that is chart-level and not
-  // reachable from inside a primitive's draw(), which only receives the pane's own scales.
+  // Time -> pixel, via a logical index and then TimeScale.indexToX (index -> media px). TimeScale
+  // itself has no time-to-x method, only index-to-x; Chart exposes a convenience timeToCoordinate
+  // but that is chart-level and not reachable from inside a primitive's draw(), which only
+  // receives the pane's own scales.
+  //
+  // `timeToIndex` FIRST, `timeToIndexFloat` only as a fallback: the exact-bar lookup is what the
+  // engine's own SeriesMarkers renderer uses (`dataLayer.timeToIndex(marker.time)`), so resolving
+  // the same instant the same way is what keeps a position's entry marker and its zone box pinned
+  // to the same candle. The float version interpolates/extrapolates, which is right for a time
+  // between or beyond bars but would silently place the box a fraction of a bar away from its own
+  // marker for a time that does have a bar. Both are fed the same `snapToBar`-aligned timestamp
+  // from OpenAlgoCandleChart, so the exact lookup is expected to hit on every real position.
   private timeToX(rc: PrimitiveRenderContext, time: number): number {
-    return rc.timeScale.indexToX(rc.dataLayer.timeToIndexFloat(time))
+    const exact = rc.dataLayer.timeToIndex(time)
+    const index = exact !== undefined ? exact : rc.dataLayer.timeToIndexFloat(time)
+    return rc.timeScale.indexToX(index)
   }
 
   draw(ctx: CanvasRenderingContext2D, rc: PrimitiveRenderContext): void {
@@ -127,9 +135,22 @@ export class PositionZones implements IPrimitive {
 
     for (const p of this.positions) {
       const entryY = rc.priceScale.priceToY(p.entry)
-      const x1 = this.timeToX(rc, p.openTime)
-      const x2raw = p.closeTime === null ? null : this.timeToX(rc, p.closeTime)
-      const x2 = p.closeTime === null ? Math.min(x1 + Math.max(OPEN_BOX_OVERHANG, plotWidth), plotWidth) : x2raw!
+      const x1raw = this.timeToX(rc, p.openTime)
+      // An OPEN position's box runs to the right edge of the plot, full stop. It used to be
+      // `Math.min(x1 + Math.max(OPEN_BOX_OVERHANG, plotWidth), plotWidth)` — copied from the
+      // TradingView-engine PositionZones (where `OPEN_BOX_OVERHANG` still lives), and correct
+      // only there because lightweight-charts' `timeToCoordinate` returns NULL for a time outside
+      // the loaded range and that renderer skips the position entirely. This engine's
+      // `indexToX` instead EXTRAPOLATES, so a position
+      // that opened before the leftmost visible candle yields a large NEGATIVE x1, and
+      // `x1 + plotWidth` then lands somewhere in the middle of the chart: the box stopped early,
+      // nowhere near "now", while the trade was still open (reported 2026-09-21 with a STRK
+      // position opened 11:10 whose box died at ~16:15).
+      const x2 = p.closeTime === null ? plotWidth : this.timeToX(rc, p.closeTime)
+      // Clamped so a position older than the loaded window starts at the left edge rather than at
+      // an extrapolated off-screen coordinate — the fill is identical either way, but this keeps
+      // the dashed level lines and the labels (drawn at `left`/`left + width`) on screen.
+      const x1 = Math.max(x1raw, 0)
 
       const left = Math.min(x1, x2)
       const right = Math.max(x1, x2)

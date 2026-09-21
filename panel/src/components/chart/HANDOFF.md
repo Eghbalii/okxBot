@@ -5,7 +5,32 @@ Written because this session ran low on context mid-fix. Read this before touchi
 attempted, so the next session doesn't re-derive it from scratch or re-report something already
 fixed as new.
 
-## CORRECTION (2026-09-21, same day, follow-up session) — the zone bug below is FIXED
+## CORRECTION 2 (2026-09-21, third pass) — the zone bug had a SECOND, unrelated cause
+
+Correction 1 below (the `Asia/Kolkata` timezone default) was real and is fixed, but it was NOT the
+whole bug: the box still rendered wrong afterwards. The operator's screenshot of STRK #1978
+(opened 11:10 UTC, still open) showed a box spanning ~13:20→16:15 — ending mid-chart while the
+trade was open, and starting about an hour off from its own entry marker. Two genuine defects in
+`OpenAlgoZones.ts`, both now fixed and verified on that exact position:
+
+1. **An open position's right edge was computed as
+   `Math.min(x1 + Math.max(OPEN_BOX_OVERHANG, plotWidth), plotWidth)`** — copied verbatim from the
+   TradingView-engine `PositionZones.ts`, where it is only correct because lightweight-charts'
+   `timeToCoordinate` returns `null` for a time outside the loaded range and that renderer skips
+   the position entirely. This engine's `indexToX` **extrapolates** instead, so a position that
+   opened before the leftmost visible candle produces a large NEGATIVE `x1`, and `x1 + plotWidth`
+   then lands in the middle of the chart. Now simply `plotWidth` — an open position's box always
+   runs to the right edge — with `x1` clamped at 0 so the labels stay on screen.
+2. **The box and the entry marker resolved the same instant through different APIs.** The engine's
+   own `SeriesMarkers` renderer uses `dataLayer.timeToIndex(marker.time)` (exact-bar lookup), while
+   `timeToX` here used `timeToIndexFloat` (interpolating/extrapolating). `timeToX` now tries
+   `timeToIndex` first and falls back to the float version, so marker and box pin to the same
+   candle.
+
+`OPEN_BOX_OVERHANG` was removed from `OpenAlgoZones.ts` (now unused); it still exists in the TV
+engine's `PositionZones.ts`, where it is still correct.
+
+## CORRECTION (2026-09-21, same day, follow-up session) — partial fix, see CORRECTION 2 above
 
 The "STILL BROKEN" section below was wrong about the cause. The operator found it, not this
 session: `createWidget`'s default `timezone` is the fixed IANA zone `'Asia/Kolkata'` (confirmed in
