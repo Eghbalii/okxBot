@@ -971,6 +971,21 @@ th.sorted {
   overflow-y: auto;
 }
 
+/* The rail's bottom control block (magnet / lock / visibility / delete / undo / redo) ships as
+   `margin-top: auto; position: sticky; bottom: 0`, so it parks itself against the rail's bottom
+   edge and never moves. On a short chart it is 265px of a 588px rail — 41% of the height — which
+   left only a narrow strip of tool buttons able to scroll, reported as "only the top part of the
+   toolbar scrolls" (2026-09-21).
+
+   Unsticking it makes the rail one continuous scrollable column, so every item reaches the
+   viewport. The tradeoff is deliberate: those controls are no longer always-visible, but a
+   control you cannot scroll to is worse than one you scroll to, and the rail is already opened
+   on demand rather than always on screen. */
+.candle-chart .oac-rail .oac-rail__ctl {
+  position: static;
+  margin-top: 0;
+}
+
 .chart-tooltip-row {
   display: flex;
   justify-content: space-between;
