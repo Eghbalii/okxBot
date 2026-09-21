@@ -146,6 +146,31 @@ func decisionBarFor(explicit string, bars []string) string {
 	return shortest
 }
 
+// nextHigherBar picks the SMALLEST timeframe in `available` that is strictly longer than `bar` —
+// "one step up" from whatever the current decision timeframe happens to be, e.g. 5m -> 15m when
+// available is {5m, 15m, 1H}. Returns "" if `available` holds nothing longer (no step up exists
+// yet, e.g. only the decision bar itself is configured).
+//
+// Deliberately generic over `available` rather than hardcoding a timeframe name: the operator's
+// own instruction was that this must not need editing if the decision timeframe changes later (a
+// hardcoded "15m" would silently stop being "one step up" the day trading moves to 15m itself).
+// Callers pass the currently-maintained bar set (a MarketView's own Bars keys), so "one step up"
+// always tracks whatever is actually configured/running, never a value baked into this function.
+func nextHigherBar(bar string, available []string) string {
+	barLen := barSeconds(bar)
+	best := ""
+	for _, b := range available {
+		s := barSeconds(b)
+		if s <= barLen {
+			continue
+		}
+		if best == "" || s < barSeconds(best) {
+			best = b
+		}
+	}
+	return best
+}
+
 // tickEvent/candleEvent mirror OKX's tick/candle Kafka payload shape (CLAUDE.md §12) — shared
 // decode types so PaperTrader and BotTrader parse the exact same wire format identically.
 type tickEvent struct {

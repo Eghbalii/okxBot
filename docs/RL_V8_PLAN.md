@@ -64,6 +64,19 @@ Added:
   sent, even when the token IS BTC (duplicates harmlessly, keeps width fixed). The last return is
   the LIVE forming BTC candle, which is the "it just turned red" signal. Plus one correlation
   scalar — the model would otherwise have to infer it from two series, which 2084 trades cannot do.
+  - **Revised 2026-09-21**: correlation was originally measured over the SAME 10-bar window as the
+    rest of this block (the decision bar, e.g. 5m — under an hour of data), too short a window for
+    "does this token currently follow BTC" to mean much. Now measured one timeframe UP from the
+    decision bar instead (`usecase.nextHigherBar`/`btcCorrelationReturns`,
+    `internal/usecase/features.go`/`tickfeed.go`) — e.g. 5m decisions correlate against 15m returns
+    — while the rest of the BTC block (OHLC, swing, the live-forming-candle return) stays on the
+    decision bar, since freshness is the point there. Resolved dynamically against whatever bars
+    are actually configured/maintained (a MarketView's own `Bars` keys), never a hardcoded
+    timeframe name, so it keeps tracking "one step up" automatically if the decision timeframe
+    itself changes later. Falls back to the decision-bar series when no higher bar is configured or
+    its window hasn't filled yet (warm-up degrades the correlation's time horizon rather than
+    erroring the whole observation). Does not change `OBSERVATION_SCHEMA_VERSION` — the field's
+    shape/meaning to the model is unchanged, only what it's computed FROM.
 - **Terminal categories widened from 3 to 5 in meaning.** `timeout` (163 trades) and `manual` (37)
   were both forced under `closed_early` (§15.14, §20) because widening the one-hot meant a schema
   bump. 358 trades — a fifth of all closes — collapsed into one label covering three different

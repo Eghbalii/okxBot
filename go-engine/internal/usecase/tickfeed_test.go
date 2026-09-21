@@ -124,6 +124,42 @@ func TestDecisionBarFor_DefaultsToShortest(t *testing.T) {
 	}
 }
 
+// nextHigherBar drives the 2026-09-21 fix: BTC correlation is measured one timeframe up from the
+// decision bar, resolved dynamically against whatever bars are actually maintained — never a
+// hardcoded "15m".
+func TestNextHigherBar_PicksSmallestStrictlyLonger(t *testing.T) {
+	if got := nextHigherBar("5m", []string{"5m", "15m", "1H", "4H"}); got != "15m" {
+		t.Errorf("expected 15m (smallest bar strictly longer than 5m), got %q", got)
+	}
+}
+
+// The whole point of resolving this dynamically: if the decision timeframe itself moves to 15m,
+// "one step up" must automatically become 1H — no code change, no re-derivation of a constant.
+func TestNextHigherBar_TracksTheDecisionBarMovingUp(t *testing.T) {
+	if got := nextHigherBar("15m", []string{"5m", "15m", "1H", "4H"}); got != "1H" {
+		t.Errorf("expected 1H once the decision bar itself is 15m, got %q", got)
+	}
+}
+
+func TestNextHigherBar_NoBarLongerThanDecision_ReturnsEmpty(t *testing.T) {
+	if got := nextHigherBar("4H", []string{"5m", "15m", "1H", "4H"}); got != "" {
+		t.Errorf("expected no higher bar available, got %q", got)
+	}
+}
+
+func TestNextHigherBar_IgnoresBarsAtOrBelowDecision(t *testing.T) {
+	// 5m and 15m (== and < the decision bar) must never be selected, only 1H.
+	if got := nextHigherBar("15m", []string{"5m", "15m", "1H"}); got != "1H" {
+		t.Errorf("expected 1H, got %q (a bar at or below the decision bar was wrongly picked)", got)
+	}
+}
+
+func TestNextHigherBar_EmptyAvailableList(t *testing.T) {
+	if got := nextHigherBar("5m", nil); got != "" {
+		t.Errorf("expected empty result with no bars available, got %q", got)
+	}
+}
+
 func TestApplyCandle_TrimsToWindowLimit(t *testing.T) {
 	var mu sync.Mutex
 	candles := map[string][]domain.Candle{}

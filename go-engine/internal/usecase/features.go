@@ -228,9 +228,18 @@ func BuildReturns(window []domain.Candle) ([]decimal.Decimal, error) {
 
 // BuildBTCContext assembles the market-wide reference block from BTC's own candle window.
 //
-// tokenReturns is this token's return series over the same bar, used only for the correlation term;
-// pass nil to leave correlation at zero (a caller with no token window yet, or BTC itself).
-func BuildBTCContext(window []domain.Candle, tokenReturns []decimal.Decimal) (domain.BTCContext, error) {
+// window is BTC's DECISION-BAR window — everything except Correlation is built from it, because
+// "what is BTC doing right now" needs the freshest read (the last entry is the live forming
+// candle, CLAUDE.md's own reasoning for why this block exists at all).
+//
+// corrTokenReturns/corrBTCReturns are a SEPARATE pair of return series used only for the
+// correlation term (2026-09-21 change) — deliberately allowed to be on a DIFFERENT, longer
+// timeframe than `window`. 10 bars of a fast decision timeframe (e.g. 5m) is under an hour of data,
+// too short a window for "does this token currently follow BTC" to mean much; correlation is
+// measured one timeframe up instead (see nextHigherBar), while the rest of this block stays on the
+// live decision bar. Pass nil for either to leave Correlation at zero (no higher bar configured
+// yet, a token with no window yet, or BTC itself).
+func BuildBTCContext(window []domain.Candle, corrTokenReturns, corrBTCReturns []decimal.Decimal) (domain.BTCContext, error) {
 	rets, err := BuildReturns(window)
 	if err != nil {
 		return domain.BTCContext{}, fmt.Errorf("btc: %w", err)
@@ -257,7 +266,7 @@ func BuildBTCContext(window []domain.Candle, tokenReturns []decimal.Decimal) (do
 		ctx.DistToSwingLowPct = swingLow.Sub(live.Close).Div(live.Close)
 	}
 
-	ctx.Correlation = correlation(tokenReturns, rets)
+	ctx.Correlation = correlation(corrTokenReturns, corrBTCReturns)
 	return ctx, nil
 }
 
@@ -301,6 +310,59 @@ func correlation(a, b []decimal.Decimal) decimal.Decimal {
 		return decimal.Zero
 	}
 	return decimal.NewFromFloat(math.Max(-1, math.Min(1, r)))
+}
+
+// btcCorrelationReturns resolves the pair of return series BuildBTCContext's Correlation term is
+// measured over — deliberately ONE TIMEFRAME UP from `bar`, not `bar` itself (2026-09-21 operator
+// request). 10 bars of a 5m decision timeframe is under an hour of data, too short a window for
+// "does this token currently follow BTC" to mean anything; the same 10-bar window measured one step
+// up (e.g. 15m, or 1H if trading itself later moves to 15m) covers proportionally more real time
+// without needing a wider ReturnsWindow that every OTHER use of BuildReturns would then also carry.
+//
+// "One step up" is resolved dynamically via nextHigherBar against `available` — the bar set this
+// instrument is CURRENTLY maintaining (a MarketView's own Bars keys) — never a hardcoded timeframe
+// name. If the decision timeframe changes later, or a new higher bar is added to
+// paper_trading.bars/ingestion.bars, this tracks it automatically with no code change.
+//
+// Falls back to the decision-bar series themselves (today's pre-2026-09-21 behavior, passed in as
+// decisionTokenReturns/decisionBTCReturns) when no higher bar is configured or its window hasn't
+// filled yet — a warm-up/config gap should degrade the correlation's time horizon, not remove the
+// feature outright by erroring the whole observation.
+func btcCorrelationReturns(
+	bar string,
+	decisionTokenReturns, decisionBTCReturns []decimal.Decimal,
+	tokenBars map[string][]domain.Candle,
+	btcCandles func(string) ([]domain.Candle, bool),
+) (tokenReturns, btcReturns []decimal.Decimal) {
+	fallback := func() ([]decimal.Decimal, []decimal.Decimal) { return decisionTokenReturns, decisionBTCReturns }
+	if btcCandles == nil {
+		return fallback()
+	}
+	available := make([]string, 0, len(tokenBars))
+	for b := range tokenBars {
+		available = append(available, b)
+	}
+	higher := nextHigherBar(bar, available)
+	if higher == "" {
+		return fallback()
+	}
+	tokenWindow, ok := tokenBars[higher]
+	if !ok {
+		return fallback()
+	}
+	tokenRets, err := BuildReturns(tokenWindow)
+	if err != nil {
+		return fallback()
+	}
+	btcWindow, ok := btcCandles(higher)
+	if !ok || len(btcWindow) == 0 {
+		return fallback()
+	}
+	btcRets, err := BuildReturns(btcWindow)
+	if err != nil {
+		return fallback()
+	}
+	return tokenRets, btcRets
 }
 
 // skipModelCall records a decision where the model was deliberately NOT consulted because its

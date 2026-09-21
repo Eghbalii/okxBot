@@ -277,7 +277,16 @@ func (r *Runner) buildObservation(
 	if err != nil {
 		return domain.Observation{}, err
 	}
-	btc, err := usecase.BuildBTCContext(btcWindow, mb.ClosePctChanges)
+	// Correlation stays on the decision bar here (mb.ClosePctChanges for BOTH series — the "one
+	// timeframe up" resolution BotTrader/PaperTrader now do, 2026-09-21, needs a multi-bar
+	// MarketView this single-timeframe replay tool has no equivalent of). Extending the backtest
+	// runner to load and align a second timeframe's candle series is a real, separate change to its
+	// data pipeline, not something to fold into this fix — flagged rather than silently done.
+	btcRets, err := usecase.BuildReturns(btcWindow)
+	if err != nil {
+		return domain.Observation{}, err
+	}
+	btc, err := usecase.BuildBTCContext(btcWindow, mb.ClosePctChanges, btcRets)
 	if err != nil {
 		return domain.Observation{}, err
 	}

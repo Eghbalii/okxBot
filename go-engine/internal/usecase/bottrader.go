@@ -1805,7 +1805,7 @@ func (e *BotTrader) buildObservation(ctx context.Context, bar string, price deci
 		return domain.Observation{}, fmt.Errorf("market block: %w", err)
 	}
 
-	btc, err := e.btcContext(bar, mb.ClosePctChanges)
+	btc, err := e.btcContext(view, bar, mb.ClosePctChanges)
 	if err != nil {
 		return domain.Observation{}, err
 	}
@@ -1853,7 +1853,14 @@ func (e *BotTrader) buildObservation(ctx context.Context, bar string, price deci
 // btcContext builds the market-wide reference block from BTC's own candle window on the same bar.
 // See PaperTrader.btcContext — a zeroed block would read as "BTC is flat and uncorrelated", a
 // specific false claim rather than an absence of information.
-func (e *BotTrader) btcContext(bar string, tokenReturns []decimal.Decimal) (domain.BTCContext, error) {
+//
+// Correlation itself is measured one timeframe up from `bar` when that's available (see
+// btcCorrelationReturns) — view.Bars is this instrument's own currently-maintained bar set, used
+// to resolve "one step up" dynamically rather than against a hardcoded timeframe name. Falls back
+// to the decision-bar series (ctx.ClosePctChanges/decisionTokenReturns, the block BuildBTCContext
+// already computed for its OHLC/swing fields) when no higher bar has filled yet — reusing rather
+// than recomputing, so this never calls BuildReturns on the same window twice.
+func (e *BotTrader) btcContext(view strategy.MarketView, bar string, decisionTokenReturns []decimal.Decimal) (domain.BTCContext, error) {
 	if e.BTCCandles == nil {
 		return domain.BTCContext{}, fmt.Errorf("btc context: no reference feed wired")
 	}
@@ -1861,7 +1868,13 @@ func (e *BotTrader) btcContext(bar string, tokenReturns []decimal.Decimal) (doma
 	if !ok || len(window) == 0 {
 		return domain.BTCContext{}, fmt.Errorf("btc context: no %s window yet", bar)
 	}
-	return BuildBTCContext(window, tokenReturns)
+	ctx, err := BuildBTCContext(window, decisionTokenReturns, nil)
+	if err != nil {
+		return domain.BTCContext{}, err
+	}
+	tokenRets, btcRets := btcCorrelationReturns(bar, decisionTokenReturns, ctx.ClosePctChanges, view.Bars, e.BTCCandles)
+	ctx.Correlation = correlation(tokenRets, btcRets)
+	return ctx, nil
 }
 
 // tokenProfile describes what this instrument IS, replacing v7's identity one-hot. See

@@ -216,7 +216,7 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 		return domain.Observation{}, fmt.Errorf("market block: %w", err)
 	}
 
-	btc, err := e.btcContext(bar, mb.ClosePctChanges)
+	btc, err := e.btcContext(view, bar, mb.ClosePctChanges)
 	if err != nil {
 		return domain.Observation{}, err
 	}
@@ -269,7 +269,10 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 // A token with no BTC window available is an error rather than a zeroed block: zeros would read as
 // "BTC is perfectly flat and uncorrelated", which is a specific and false claim about the market,
 // not an absence of information.
-func (e *PaperTrader) btcContext(bar string, tokenReturns []decimal.Decimal) (domain.BTCContext, error) {
+//
+// Correlation itself is measured one timeframe up from `bar` when that's available — see
+// BotTrader.btcContext's identical reasoning and btcCorrelationReturns' own doc comment.
+func (e *PaperTrader) btcContext(view strategy.MarketView, bar string, decisionTokenReturns []decimal.Decimal) (domain.BTCContext, error) {
 	if e.BTCCandles == nil {
 		return domain.BTCContext{}, fmt.Errorf("btc context: no reference feed wired")
 	}
@@ -277,7 +280,13 @@ func (e *PaperTrader) btcContext(bar string, tokenReturns []decimal.Decimal) (do
 	if !ok || len(window) == 0 {
 		return domain.BTCContext{}, fmt.Errorf("btc context: no %s window yet", bar)
 	}
-	return BuildBTCContext(window, tokenReturns)
+	ctx, err := BuildBTCContext(window, decisionTokenReturns, nil)
+	if err != nil {
+		return domain.BTCContext{}, err
+	}
+	tokenRets, btcRets := btcCorrelationReturns(bar, decisionTokenReturns, ctx.ClosePctChanges, view.Bars, e.BTCCandles)
+	ctx.Correlation = correlation(tokenRets, btcRets)
+	return ctx, nil
 }
 
 // tokenProfile describes what this instrument IS, replacing v7's identity one-hot.
