@@ -30,9 +30,11 @@ function sortRows(rows: Instrument[], stats: Record<string, TokenStats>, sortBy:
 // untouched, so re-enabling has no data gap. The checkbox here is "enabled" (checked = trades),
 // inverted against the saved disabledInstIds list.
 //
-// 2026-09-04: gained a sortable 24h stats table (position count + PnL$/PnL% for trades CLOSED in
-// the last 24h, CLAUDE.md) above the checkboxes, mirroring the Strategies-kind modal's own table.
-// The min-size column, plus the tag explaining WHY a token is off (2026-09-08 request).
+// 2026-09-04: gained a sortable stats table (position count + PnL$/PnL% for trades CLOSED, CLAUDE.md)
+// above the checkboxes, mirroring the Strategies-kind modal's own table. Originally scoped to the
+// last 24h; widened to all-time 2026-09-22 per operator instruction (matching StrategyKindModal's
+// table, which never had a time window). The min-size column, plus the tag explaining WHY a token
+// is off (2026-09-08 request).
 //
 // 2026-09-17: reads the REAL roster (GET /api/instruments, database-backed) instead of the
 // config-file allInstIds prop this modal used to take, AND scoped to exchange=okx only — the
@@ -120,7 +122,7 @@ export default function TokenModal({
   useEffect(() => {
     setStatsLoading(true)
     api
-      .tokenStats24h(mode)
+      .tokenStatsAllTime(mode)
       .then((rows) => setStats(Object.fromEntries(rows.map((r) => [r.instId, r]))))
       .catch((err) => setError((err as Error).message))
       .finally(() => setStatsLoading(false))
@@ -241,13 +243,13 @@ export default function TokenModal({
                     Trading
                   </th>
                   <SortableTh field="positions" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                    Positions (24h)
+                    Positions
                   </SortableTh>
                   <SortableTh field="pnlUsd" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                    PnL $ (24h)
+                    PnL $
                   </SortableTh>
                   <SortableTh field="pnlPct" sortBy={sortBy} sortDesc={sortDesc} onSort={toggleSort}>
-                    PnL % (24h)
+                    PnL %
                   </SortableTh>
                   <th className="th-static" title="The exchange's smallest acceptable position for this instrument (contract value x price x min size), against the current per-token budget">
                     Min size

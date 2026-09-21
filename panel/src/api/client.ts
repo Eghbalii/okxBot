@@ -271,9 +271,9 @@ export const api = {
   // Paper-trading control box + stats box (2026-09-01 request, extended to real trading
   // 2026-09-04), above the Positions table — mode selects which tab's data this serves.
   paperTradingStats: (mode: PositionMode) => request<PaperTradingStats>(`/paper-trading/stats?mode=${mode}`),
-  // "Manage tokens" modal's per-token 24h stats table (2026-09-04 request) — paper-trading only,
-  // no mode param (TokenStats24h has no bot-trading equivalent yet).
-  tokenStats24h: (mode: PositionMode) => requestList<TokenStats>(`/paper-trading/token-stats?mode=${mode}`),
+  // "Manage tokens" modal's per-token all-time stats table (2026-09-04 request, widened from a
+  // 24h window 2026-09-22 per operator instruction — matches strategyStats, which never had one).
+  tokenStatsAllTime: (mode: PositionMode) => requestList<TokenStats>(`/paper-trading/token-stats?mode=${mode}`),
   // Per-token exchange minimums vs. the current per-token budget, for the Manage Tokens modal's
   // min-size column and auto-disabled tag (2026-09-08). Empty in paper mode by design.
   // OKX's own untouched record for both legs of a real position, fetched live rather than served
