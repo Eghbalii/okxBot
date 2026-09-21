@@ -147,9 +147,16 @@ export class PositionZones implements IPrimitive {
       // nowhere near "now", while the trade was still open (reported 2026-09-21 with a STRK
       // position opened 11:10 whose box died at ~16:15).
       const x2 = p.closeTime === null ? plotWidth : this.timeToX(rc, p.closeTime)
-      // Clamped so a position older than the loaded window starts at the left edge rather than at
-      // an extrapolated off-screen coordinate — the fill is identical either way, but this keeps
-      // the dashed level lines and the labels (drawn at `left`/`left + width`) on screen.
+      // Clamped so a position that opened before the leftmost visible bar starts at the plot's
+      // left edge rather than at an off-screen coordinate: the fill would be clipped identically
+      // either way, but the dashed level lines and the price labels are drawn relative to `left`,
+      // and without this they'd be placed off-canvas and simply vanish.
+      //
+      // Note this clamp also HIDES a wrong x1 (anything negative lands at 0), so when debugging a
+      // placement complaint, log `x1raw` — not the drawn edge. Measuring the rendered fill is
+      // worse still: the risk band is translucent red over a dark background, which a naive
+      // "first reddish pixel" scan cannot tell apart from an ordinary red candle body, and that
+      // mistake produced two bogus bug reports while chasing this.
       const x1 = Math.max(x1raw, 0)
 
       const left = Math.min(x1, x2)
