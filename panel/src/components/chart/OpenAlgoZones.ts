@@ -133,6 +133,22 @@ export class PositionZones implements IPrimitive {
     this.priceScale = rc.priceScale
     const { plotWidth, plotHeight } = rc
 
+    // The canvas context is in DEVICE pixels, while `priceScale.priceToY` and
+    // `timeScale.indexToX` both answer in CSS (media) pixels. The engine's own primitives bridge
+    // that by multiplying every single coordinate by `rc.dpr` (see the shipped PriceLine, which
+    // scales plotWidth, priceToY, line widths and even dash patterns by it). This one didn't,
+    // so on a dpr=1 display it looked perfect and on a retina/scaled display (dpr=2) every zone
+    // box was drawn at HALF its correct position and size — the box started in the wrong place
+    // and stopped mid-chart instead of reaching the live edge. That is the bug the operator kept
+    // reporting and that three of my own 1x screenshots failed to reproduce.
+    //
+    // Scaling the context once here, instead of peppering `* rc.dpr` through every call below,
+    // keeps all the geometry in one coordinate space; `restore()` at the end of the loop puts the
+    // context back exactly as the engine handed it over, since the same ctx is shared with
+    // whatever draws next.
+    ctx.save()
+    ctx.scale(rc.dpr, rc.dpr)
+
     for (const p of this.positions) {
       const entryY = rc.priceScale.priceToY(p.entry)
       const x1raw = this.timeToX(rc, p.openTime)
@@ -146,7 +162,19 @@ export class PositionZones implements IPrimitive {
       // `x1 + plotWidth` then lands somewhere in the middle of the chart: the box stopped early,
       // nowhere near "now", while the trade was still open (reported 2026-09-21 with a STRK
       // position opened 11:10 whose box died at ~16:15).
-      const x2 = p.closeTime === null ? plotWidth : this.timeToX(rc, p.closeTime)
+      // An OPEN position runs to "now", which is the RIGHT EDGE OF THE TIME AXIS — resolved
+      // through the time scale like every other coordinate here, not as a raw `plotWidth` pixel
+      // count. `plotWidth` is the pane's own layout width while the time axis is sized
+      // `chartWidth - rightAxisWidth - leftAxisWidth`; the two happen to be equal in the common
+      // single-right-axis case (measured: both 1180), which is exactly why using the wrong one
+      // went unnoticed — but they diverge the moment a pane gains a left axis (an indicator with
+      // its own scale), and then the box would run past where the axis actually ends.
+      //
+      // `visibleRange().to` is the rightmost logical index currently shown, including the
+      // `rightOffset` empty bars past the newest candle, so this tracks pans, zooms and window
+      // resizes for free rather than being recomputed against a pixel size.
+      const rightEdgeX = rc.timeScale.indexToX(rc.timeScale.visibleRange().to)
+      const x2 = p.closeTime === null ? rightEdgeX : this.timeToX(rc, p.closeTime)
       // Clamped so a position that opened before the leftmost visible bar starts at the plot's
       // left edge rather than at an off-screen coordinate: the fill would be clipped identically
       // either way, but the dashed level lines and the price labels are drawn relative to `left`,
@@ -228,6 +256,8 @@ export class PositionZones implements IPrimitive {
         handle(tpShown, LABEL_GREEN)
       }
     }
+
+    ctx.restore()
   }
 
   private label(
