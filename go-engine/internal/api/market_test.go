@@ -179,9 +179,14 @@ func TestListMarketTokens_KeepsExchangesSeparate(t *testing.T) {
 // was built for (2026-09-17 request): the discovery scan admits every token with enabled_paper set
 // (CLAUDE.md §53.1), but paper-trader's roster load is hardcoded to the "okx" exchange (no MEXC
 // execution wiring yet, §46.6), so a MEXC row is real, selectable, and enabled_paper — and never
-// actually opens a position. Active must reflect that: it is computed from a live, enabled
+// actually opens a position. HasAssignment must reflect that: it is computed from a live, enabled
 // strategy_assignments row, never from the enable flags alone.
-func TestHandleListInstruments_ActiveReflectsAssignmentsNotEnabledFlag(t *testing.T) {
+//
+// Renamed from ...ActiveReflectsAssignments... on 2026-09-22, same day: the field this test
+// checks stopped being called Active once the operator corrected Active's meaning to the
+// per-token checkbox alone (see instrumentView.Active's doc comment) — this test now checks the
+// field that kept the original, assignment-based meaning.
+func TestHandleListInstruments_HasAssignmentReflectsAssignmentsNotEnabledFlag(t *testing.T) {
 	repo := &marketStubRepo{
 		instruments: []port.Instrument{
 			{ID: 1, Symbol: "BTC", Exchange: "okx", EnabledPaper: true},
@@ -201,19 +206,20 @@ func TestHandleListInstruments_ActiveReflectsAssignmentsNotEnabledFlag(t *testin
 	}
 	got := map[string]bool{}
 	for _, in := range resp.Items {
-		got[in.Symbol] = in.Active
+		got[in.Symbol] = in.HasAssignment
 	}
 	if !got["BTC"] {
-		t.Error("BTC has a live assignment and must report active=true")
+		t.Error("BTC has a live assignment and must report hasAssignment=true")
 	}
 	if got["DOGE_MEXC"] {
-		t.Error("DOGE_MEXC is enabledPaper but has no assignment — must report active=false, not derived from the flag")
+		t.Error("DOGE_MEXC is enabledPaper but has no assignment — must report hasAssignment=false, not derived from the flag")
 	}
 }
 
 // A DISABLED assignment (the panel's per-token/per-timeframe toggle, CLAUDE.md §11.3) must not
-// count as active — enabledOnly=true is threaded through to ListAssignments for exactly this.
-func TestHandleListInstruments_DisabledAssignmentIsNotActive(t *testing.T) {
+// count toward hasAssignment — enabledOnly=true is threaded through to ListAssignments for
+// exactly this.
+func TestHandleListInstruments_DisabledAssignmentDoesNotCountAsHasAssignment(t *testing.T) {
 	repo := &marketStubRepo{
 		instruments: []port.Instrument{{ID: 1, Symbol: "ETH", Exchange: "okx", EnabledPaper: true}},
 		assignments: []port.StrategyAssignment{
@@ -225,22 +231,24 @@ func TestHandleListInstruments_DisabledAssignmentIsNotActive(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Items) != 1 || resp.Items[0].Active {
-		t.Errorf("ETH's only assignment is disabled — active must be false, got %+v", resp.Items)
+	if len(resp.Items) != 1 || resp.Items[0].HasAssignment {
+		t.Errorf("ETH's only assignment is disabled — hasAssignment must be false, got %+v", resp.Items)
 	}
 }
 
-// Regression for the 2026-09-22 bug: a token with a live ENABLED assignment that is ALSO
-// per-token disabled (paper_trading_config.disabled_inst_ids, §22) must read active=false. §22's
-// disable toggle deliberately never touches strategy_assignments.enabled, so before this fix every
-// per-token-disabled token still read active=true and "Active only" filtered nothing — reproduced
-// live: all 6 of the operator's disabled tokens (ENA, ETH, HYPE, TRUMP, XRP, ZAMA) still carried
-// enabled assignment rows.
-func TestHandleListInstruments_PerTokenDisabledIsNotActiveEvenWithEnabledAssignment(t *testing.T) {
+// Regression for the 2026-09-22 bug and its own same-day correction. The FIRST fix made Active
+// require BOTH a live assignment AND not-per-token-disabled — which broke bot/real mode entirely,
+// since that mode currently has zero assignments at all (nothing has been assigned there yet,
+// §34/§47): every bot-mode token read active=false regardless of the checkbox, a worse version of
+// the original bug. Per explicit operator correction, Active must track ONLY the per-token
+// checkbox (paper_trading_config.disabled_inst_ids) — whether a strategy happens to be assigned
+// is the separate HasAssignment fact, checked above.
+func TestHandleListInstruments_ActiveIsOnlyThePerTokenCheckbox(t *testing.T) {
 	repo := &marketStubRepo{
 		instruments: []port.Instrument{
-			{ID: 1, Symbol: "ZAMA", Exchange: "okx", EnabledPaper: true},
-			{ID: 2, Symbol: "BTC", Exchange: "okx", EnabledPaper: true},
+			{ID: 1, Symbol: "ZAMA", Exchange: "okx", EnabledPaper: true}, // disabled, but has an assignment
+			{ID: 2, Symbol: "BTC", Exchange: "okx", EnabledPaper: true},  // not disabled, has an assignment
+			{ID: 3, Symbol: "SOL", Exchange: "okx", EnabledPaper: true},  // not disabled, NO assignment (bot-mode shape)
 		},
 		assignments: []port.StrategyAssignment{
 			{ID: 1, StrategyID: 1, InstID: "ZAMA", Bar: "5m", Enabled: true, Mode: "paper"},
@@ -261,10 +269,14 @@ func TestHandleListInstruments_PerTokenDisabledIsNotActiveEvenWithEnabledAssignm
 		got[in.Symbol] = in.Active
 	}
 	if got["ZAMA"] {
-		t.Error("ZAMA has an enabled assignment but is per-token disabled — must report active=false")
+		t.Error("ZAMA is per-token disabled — must report active=false regardless of its assignment")
 	}
 	if !got["BTC"] {
-		t.Error("BTC has an enabled assignment and is not disabled — must report active=true")
+		t.Error("BTC is not disabled and has an assignment — must report active=true")
+	}
+	if !got["SOL"] {
+		t.Error("SOL is not disabled but has NO assignment — must still report active=true; " +
+			"Active tracks only the checkbox, not whether anything is assigned yet")
 	}
 }
 

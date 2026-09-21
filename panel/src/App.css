@@ -1869,7 +1869,21 @@ input[type='number'] {
 .filter-bar {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   margin-bottom: 0.6rem;
+}
+
+/* Enable all / Disable all (2026-09-22): bulk-set a modal's whole selection set at once, next to
+   the view-only filter toggle it sits beside — kept visually distinct (plain buttons, not the
+   filter's segmented-control look) since these ACT on the selection rather than merely viewing it. */
+.bulk-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.bulk-actions button {
+  font-size: 0.75rem;
+  padding: 0.25rem 0.6rem;
 }
 
 .filter-toggle {

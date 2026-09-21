@@ -41,9 +41,13 @@ function sortRows(rows: Instrument[], stats: Record<string, TokenStats>, sortBy:
 // would control nothing. Hiding them here is the honest answer, not a disabled/greyed-out control
 // for a decision this panel cannot actually make.
 //
-// "Active" now means "has a live enabled strategy_assignments row" (instrument.active from the
-// API), NOT enabledPaper — a token can carry enabledPaper=true and never trade, which is exactly
-// the MEXC case above and is why the two must not be conflated. Since the OKX roster is small
+// "Active" (2026-09-22 correction) means the per-token enable/disable checkbox state alone
+// (instrument.active from the API) — NOT whether a strategy happens to be assigned. A same-day
+// first version required BOTH active AND a live assignment, which broke bot/real mode entirely
+// (zero assignments there today, so every bot-mode token read active=false regardless of the
+// checkbox). The "Trading" column (instrument.hasAssignment) is the separate fact for whether a
+// strategy is actually assigned — a token can be active (checkbox on) and idle (no assignment
+// yet) at the same time, which is exactly bot mode's current shape. Since the OKX roster is small
 // (tens, not hundreds) it is fetched whole and paginated client-side, which is also what lets the
 // active/all toggle and sort compose correctly without a second server round trip.
 function MinSizeCell({ a }: { a: TokenAffordability | undefined }) {
@@ -152,6 +156,18 @@ export default function TokenModal({
     })
   }
 
+  // Enable all / disable all (2026-09-22 request) — bulk-set every OKX token's checkbox at once.
+  // Applies to the FULL roster, not just the currently filtered/paginated view: the "Active only"
+  // filter and pagination are display controls (see FilterToggle's own doc comment), and a bulk
+  // action that only touched what's on screen would silently leave off-screen rows untouched,
+  // which is not what "all" means to someone clicking this button.
+  function enableAll() {
+    setDisabled(new Set())
+  }
+  function disableAll() {
+    setDisabled(new Set(rows.map((r) => r.symbol)))
+  }
+
   async function save() {
     setSaving(true)
     try {
@@ -199,6 +215,14 @@ export default function TokenModal({
               totalCount={rows.length}
               noun="tokens"
             />
+            <div className="bulk-actions">
+              <button type="button" onClick={enableAll} disabled={saving}>
+                Enable all
+              </button>
+              <button type="button" onClick={disableAll} disabled={saving}>
+                Disable all
+              </button>
+            </div>
           </div>
         )}
 
@@ -248,7 +272,7 @@ export default function TokenModal({
                           {tokenSymbol(instId)}
                         </td>
                         <td>
-                          {in_.active ? (
+                          {in_.hasAssignment ? (
                             <span className="badge badge-green" title="Has a live strategy assignment">
                               trading
                             </span>

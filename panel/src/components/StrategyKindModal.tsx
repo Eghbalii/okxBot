@@ -145,6 +145,18 @@ export default function StrategyKindModal({
     })
   }
 
+  // Enable all / disable all (2026-09-22 request) — bulk-set every kind's checkbox at once.
+  // Applies to every kind, not just the currently filtered "Active only" view, matching
+  // TokenModal's own bulk actions: the filter is a display control (FilterToggle's own doc
+  // comment), and a bulk action scoped to what's on screen would silently miss hidden rows.
+  const allKinds = useMemo(() => [...new Set(strategies.map((s) => s.Kind))], [strategies])
+  function enableAll() {
+    setSelected(new Set(allKinds))
+  }
+  function disableAll() {
+    setSelected(new Set())
+  }
+
   async function save() {
     setSaving(true)
     try {
@@ -197,6 +209,14 @@ export default function StrategyKindModal({
                 totalCount={sortedRows.length}
                 noun="kinds"
               />
+              <div className="bulk-actions">
+                <button type="button" onClick={enableAll} disabled={saving}>
+                  Enable all
+                </button>
+                <button type="button" onClick={disableAll} disabled={saving}>
+                  Disable all
+                </button>
+              </div>
             </div>
             <div className="table-scroll" style={{ marginBottom: '1rem' }}>
               <table>
