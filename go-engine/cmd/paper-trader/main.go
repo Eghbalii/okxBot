@@ -230,7 +230,22 @@ func main() {
 	if topicExchange == "" {
 		topicExchange = "okx"
 	}
-	tickDispatcher := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, topicExchange+".tickers", "paper-trader"))
+	// consumerGroup is scoped by topicExchange, not a bare "paper-trader" (found live 2026-09-22,
+	// the same day as the topicExchange fix above): Kafka consumer groups coordinate rebalancing
+	// PER GROUP ID, so two independent processes sharing the literal group "paper-trader" — this
+	// OKX instance and paper-trader-mexc, even though they subscribe to entirely different topics
+	// (okx.* vs mexc.*) — were treated as members of ONE group and kept rebalancing against each
+	// other. Measured live: okx.tickers consumer lag climbed from ~86k to ~105k and kept growing
+	// the whole time paper-trader-mexc was running, and dropped to near-zero within 30s of
+	// stopping it — a real degradation of THIS project's production OKX paper-trading data path,
+	// not a cosmetic issue. "okx" keeps the group id "paper-trader" unchanged (the exact string
+	// every existing deployment/consumer-lag dashboard already expects); any other exchange gets
+	// its own "paper-trader-<exchange>" group, fully independent of OKX's.
+	consumerGroup := "paper-trader"
+	if topicExchange != "okx" {
+		consumerGroup = "paper-trader-" + topicExchange
+	}
+	tickDispatcher := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, topicExchange+".tickers", consumerGroup))
 	defer tickDispatcher.Close()
 	// Consume EVERY ingested bar, not just the decision bars (CLAUDE.md §9): 4H/1D are collected
 	// for higher-timeframe context that a strategy assigned to 5m can consult via
@@ -248,9 +263,9 @@ func main() {
 	}
 	candleDispatchers := make(map[string]*kafkastream.Dispatcher, len(candleBars))
 	for _, bar := range candleBars {
-		// Same topicExchange prefix as the ticker dispatcher above — see its comment for why this
-		// is cfg.Ingestion.Exchange, not the PAPER_EXCHANGE `exchange` variable.
-		d := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, topicExchange+".candles."+bar, "paper-trader"))
+		// Same topicExchange prefix AND consumerGroup as the ticker dispatcher above — see their
+		// comments for why each is what it is.
+		d := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, topicExchange+".candles."+bar, consumerGroup))
 		candleDispatchers[bar] = d
 		defer d.Close()
 	}
