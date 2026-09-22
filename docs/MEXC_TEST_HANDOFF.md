@@ -182,33 +182,98 @@ verified working correctly against real MEXC data (`curl http://localhost:8096/t
 returns real live MEXC prices) — the gap is purely that nothing publishes MEXC ticks/candles onto
 the Kafka topics `PaperTrader` consumes.
 
+## Update 2026-09-22 (third pass): full MEXC market-data pipeline built, deployed, and verified live
+
+Also fixed two live problems the operator raised directly: strategy/token management was missing
+for the MEXC profile in the panel (`StrategyStatsFor` never filtered by exchange, and
+`handleListInstruments` always checked OKX's own config regardless of which roster was being
+viewed — both fixed, `StrategyKindModal`/`TokenModal` now work for any profile via
+`discoveryExchangeFor` in `api/types.ts`, the one place that translates a paper-trading profile
+label to the real exchange name the discovery roster uses).
+
+**Market-data ingestion — chose the second shape from the prior update's list**: `cmd/ingestor`
+became exchange-parameterized exactly like `cmd/okx-gateway` (`INGEST_EXCHANGE` env,
+`cfg.Ingestion.Exchange`), and a new `mexc-ingestor` compose service runs it against MEXC. Migration
+`000038` gave `candles` an `exchange` column (widened PK to `(exchange, inst_id, bar, ts)`) so a
+second exchange's `BTC`/`ETH` rows can never collide with OKX's own. `mexc-ingestor` publishes to
+`mexc.tickers`/`mexc.candles.<bar>` in the exact wire shape OKX's ingestor already uses, so
+`usecase.decodeTick`/`decodeCandle` needed zero changes.
+
+**Three real bugs found and fixed only by actually running this against the live account** — each
+would have kept the comparison silently wrong or, for the third one, actively degraded OKX's own
+production data:
+
+1. **MEXC's WebSocket kline subscription rejects `"Hour1"`** (the correct REST interval name for
+   1H) with `{"channel":"rs.error","data":"Not support interval"}`, and only accepts `"Min60"` for
+   the same timeframe — a real REST/WS naming inconsistency on MEXC's own API, found by direct live
+   testing against `wss://contract.mexc.com/edge`, not documentation. Every other bar matches
+   between REST and WS. Fixed with a narrow `wsIntervalFor` override in `cmd/ingestor/mexc.go`.
+
+2. **A shared `KlineFinalizer` across 5 per-bar goroutines crash-looped the ingestor** with `fatal
+   error: concurrent map writes` within about a minute of real traffic — `KlineFinalizer`'s own doc
+   comment says plainly it is not safe for concurrent use, and the first version violated that by
+   giving one instance to all 5 bar-specific WS clients (each with its own dispatch goroutine).
+   Fixed by allocating one finalizer per bar. Regression test runs under `go test -race`.
+
+3. **The most serious one: `paper-trader` and `paper-trader-mexc` shared the literal Kafka
+   consumer group `"paper-trader"`.** Correct topic prefixes (`okx.*` vs `mexc.*`) did not save
+   this — Kafka coordinates rebalancing per GROUP ID, so the two independent processes were treated
+   as one logical group and kept rebalancing against each other. Measured live: starting
+   `paper-trader-mexc` made **OKX's own `okx.tickers` consumer lag climb continuously** (~86k →
+   over 105k and still rising) — a real degradation of this project's actual production paper-
+   trading data path, confirmed by watching it recover to near-zero within 30 seconds of stopping
+   `paper-trader-mexc`, before writing the fix. Fixed by scoping the consumer group by exchange
+   (`"paper-trader"` stays exactly as-is for OKX; anything else gets `"paper-trader-<exchange>"`).
+
+**A fourth bug, found while chasing why BTC specifically never got a single candle even after fix
+#3**: `cmd/paper-trader/main.go` registers BOTH the BTC trading engine's own candle consumer AND
+`usecase.BTCReference`'s independent one against `"BTC"` on the same `kafkastream.Dispatcher`
+whenever BTC is in the traded roster — `BTCReference` is deliberately built to read the event bus
+directly rather than borrow the engine's window. `Dispatcher.Register` did a plain map assignment,
+so the second registration silently **overwrote** the first; which one "won" was a startup race
+between two goroutines starting within 300ms of each other. On OKX's 40+-instrument roster this
+apparently resolves in the engine's favor in practice (the identical unguarded pattern exists in
+`cmd/trader/main.go` too — this was never MEXC-specific, just never noticed); on
+`paper-trader-mexc`'s 2-instrument roster it consistently went the wrong way and silently blinded
+BTC's trading engine while `BTCReference`'s own window kept updating normally, which is why nothing
+looked broken until candle counts were checked directly against Postgres. Fixed
+`internal/kafkastream.Dispatcher` to support multiple handlers per instID, fanning out every
+message to all of them — the correct semantics for what these two callers actually need, rather
+than special-casing around a dispatcher that was never designed to allow this.
+
+**Deploy-time housekeeping worth recording**: a malformed compound `scp` command early in this
+session accidentally copied several files into the wrong directory (`internal/backtest/backtest.go`
+and others into `internal/api/`, `StrategyKindModal.tsx`/`TokenModal.tsx`/`App.css` into
+`panel/src/api/`) — caught by comparing `go build`/`vite build` failures against a directory-listing
+diff between local and server, not assumed. All stray files were removed and every touched directory
+re-verified to match before the final rebuild. Worth checking directory listings (not just file
+content) after any multi-file transfer that used a single compound command.
+
+**Verified live end-to-end after all fixes**: both `BTC` and `ETH` candles now persist correctly
+under `exchange='mexc_100x_1'`, strategies evaluate against them (`rsi_sma` correctly reporting
+"need at least 15 candles" while the window fills, not an error), OKX's own `okx.tickers` consumer
+lag stays in the tens-to-low-hundreds range (its normal steady state) with `paper-trader-mexc`
+running, and every service (`ingestor`, `mexc-ingestor`, `paper-trader`, `paper-trader-mexc`,
+`trader`, `api`, `panel`, `okx-gateway`, `mexc-gateway`) is up with zero errors in its logs.
+
 ## What's still left
 
-1. **MEXC market data ingestion — the real blocking item, not credentials.** `paper-trader-mexc`
-   cannot run correctly until something publishes real MEXC ticks/candles onto Kafka topics it
-   reads. Two shapes worth considering, not decided here:
-   - Extend `cmd/ingestor` to also subscribe to MEXC's public WS (`internal/mexc/ws.PublicClient`
-     already exists and is live-verified per CLAUDE.md §46.6) and publish to exchange-qualified
-     topics/DB rows (would need `candles`/Kafka topic naming to carry an exchange dimension, which
-     `paper_orders`/`account_equity` etc. now have but `candles` does not).
-   - A separate, smaller MEXC-only ingestor process, publishing to its own topics
-     (`mexc.tickers`/`mexc.candles.<bar>`) that `paper-trader-mexc` is pointed at via its own Kafka
-     consumer config — more isolated, less shared code, but avoids touching `candles`' schema or
-     `cmd/ingestor`'s OKX-specific logic at all.
-   Whichever is chosen, `paper-trader-mexc` must NOT be restarted/left running until this exists —
-   restarting it today reproduces the exact silent-wrong-data bug this update just caught.
+1. **MEXC private WS (optional, not blocking).** No account-push client exists yet — irrelevant
+   for paper trading anyway, which has no exchange account to push from.
 
-2. **MEXC private WS (optional, not blocking, unchanged from the first pass).** No account-push
-   client exists yet — irrelevant for paper trading anyway, which has no exchange account to push
-   from.
-
-3. **The two pre-existing test hangs from the prior session** (`internal/strategy`,
+2. **The two pre-existing test hangs from the prior session** (`internal/strategy`,
    `internal/backtest`, decimal-arithmetic-related) — still open, still not investigated, per the
    operator's own instruction to leave them.
 
+3. **Let it run and watch the numbers.** The pipeline is now genuinely live and correct — the
+   comparison itself (OKX vs. `MEXC_100x_1` paper-trading PnL/behavior over time) hasn't started
+   accumulating meaningful history yet, since the MEXC candle windows only just began filling.
+
 ## Recommended next step
 
-Decide and build the MEXC market-data ingestion path (item 1 above) before ever starting
-`paper-trader-mexc` again. Once real MEXC ticks/candles are flowing, `docker compose up -d
-paper-trader-mexc` and watch its logs for live tick/candle consumption (not just the one-time
-Postgres seed) before trusting any of its numbers.
+Nothing blocking remains. Leave `paper-trader-mexc`/`mexc-ingestor` running and check back after a
+few hours for enough closed trades on the MEXC profile to say anything about the comparison. If
+`paper-trader-mexc` is ever stopped and restarted, watch its logs for "seeded candle window from
+database" lines for BOTH `BTC` and `ETH` shortly after startup (not just one) — that's the
+`BTCReference` race regression's visible symptom, now fixed, but worth a quick glance if this code
+changes again.
