@@ -54,12 +54,16 @@ func snapshotCandles(mu *sync.Mutex, candles map[string][]domain.Candle, bar str
 // f1af152/2026-08-29 history) for why this reads Postgres rather than calling OKX REST. limit<=0
 // is a no-op (nothing to trim into). Best-effort per bar: a read failure leaves that window
 // empty, refilled from the live feed exactly as before.
-func seedCandlesFromRepo(ctx context.Context, mu *sync.Mutex, candles map[string][]domain.Candle, repo port.Repository, instID string, bars []string, limit int, logger *slog.Logger) {
+//
+// exchange scopes the read (migration 000038, 2026-09-22 multi-exchange work) — a second
+// exchange's engine (MEXC) must never seed its window from OKX's own candle rows for the same
+// short symbol ("BTC"). "" means "okx", matching port.Repository.ListCandles' own default.
+func seedCandlesFromRepo(ctx context.Context, mu *sync.Mutex, candles map[string][]domain.Candle, repo port.Repository, exchange, instID string, bars []string, limit int, logger *slog.Logger) {
 	if limit <= 0 {
 		return
 	}
 	for _, bar := range bars {
-		rows, err := repo.ListCandles(ctx, instID, bar, limit)
+		rows, err := repo.ListCandles(ctx, exchange, instID, bar, limit)
 		if err != nil {
 			logger.Warn("seed candles from repo failed; window will fill from the live feed",
 				"instId", instID, "bar", bar, "error", err)

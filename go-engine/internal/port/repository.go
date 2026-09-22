@@ -15,9 +15,16 @@ import (
 
 // Candle is one persisted OHLCV bar for an instrument (domain.Candle plus storage identity
 // fields). The bar's timestamp lives on the embedded domain.Candle.Timestamp.
+//
+// Exchange defaults to "okx" when left empty by an existing caller that hasn't been taught about a
+// second exchange yet (2026-09-22, candles' own exchange-scoping migration 000038) — mirrors
+// account_equity's/paper_orders' own "empty string means okx" convention (CLAUDE.md §37/§46),
+// rather than requiring every one of this project's few, well-contained candle call sites to be
+// touched atomically.
 type Candle struct {
-	InstID string
-	Bar    string
+	InstID   string
+	Bar      string
+	Exchange string
 	domain.Candle
 }
 
@@ -651,7 +658,12 @@ type Repository interface {
 	// backs the panel's price-chart marker overlay (GET /api/candles, CLAUDE.md §16 point 6). Reads
 	// the same durable `candles` hypertable PaperTrader writes to (CLAUDE.md §7); no separate
 	// candle store.
-	ListCandles(ctx context.Context, instID, bar string, limit int) ([]Candle, error)
+	//
+	// exchange="" is treated as "okx" (migration 000038, CLAUDE.md §46-era multi-exchange work) —
+	// see port.Candle's own doc comment for why this is a plain parameter rather than a second
+	// *Ex-suffixed method: candles has few, well-contained callers, unlike account_equity/
+	// paper_orders which grew a parallel *Ex method instead of touching every call site at once.
+	ListCandles(ctx context.Context, exchange, instID, bar string, limit int) ([]Candle, error)
 	// ListCandlesRange returns every finalized candle for instID/bar within [from, to), oldest
 	// first. A zero `from` or `to` means unbounded on that side.
 	//
@@ -659,10 +671,10 @@ type Repository interface {
 	// FORWARD from the beginning and needs all of it in order, which a most-recent-N read cannot
 	// express. Paged by the caller via `from` so a multi-month replay does not materialize the
 	// whole table at once.
-	ListCandlesRange(ctx context.Context, instID, bar string, from, to time.Time, limit int) ([]Candle, error)
+	ListCandlesRange(ctx context.Context, exchange, instID, bar string, from, to time.Time, limit int) ([]Candle, error)
 	// CandleRange reports the oldest and newest candle timestamps held for instID/bar, so a
 	// backtest can size its own run without scanning the data first. Zero times when there are none.
-	CandleRange(ctx context.Context, instID, bar string) (oldest, newest time.Time, err error)
+	CandleRange(ctx context.Context, exchange, instID, bar string) (oldest, newest time.Time, err error)
 
 	CreateStrategy(ctx context.Context, s StrategyConfig) (int64, error)
 	GetStrategy(ctx context.Context, id int64) (StrategyConfig, error)
@@ -686,12 +698,16 @@ type Repository interface {
 	SetAssignmentEnabled(ctx context.Context, id int64, enabled bool) error
 	DeleteAssignment(ctx context.Context, id int64) error
 
-	// StrategyStatsFor computes strategyID's track record for mode ("paper" or "bot") — CLAUDE.md
-	// §11.3, extended to real trading by the real-trading readiness plan (2026-09-04): paper and
-	// real trading each have their own completely independent track record, sourced from
-	// paper_orders or bot_orders respectively (bot_orders has no "variant" column to filter by,
-	// unlike paper_orders' baseline/rl_adjusted split — every bot_orders row already counts).
-	StrategyStatsFor(ctx context.Context, strategyID int64, mode string) (StrategyStats, error)
+	// StrategyStatsFor computes strategyID's track record for mode ("paper" or "bot") and, for
+	// mode="paper", exchange (2026-09-22, multi-exchange paper trading) — CLAUDE.md §11.3,
+	// extended to real trading by the real-trading readiness plan (2026-09-04): paper and real
+	// trading each have their own completely independent track record, sourced from paper_orders
+	// or bot_orders respectively (bot_orders has no "variant" column to filter by, unlike
+	// paper_orders' baseline/rl_adjusted split — every bot_orders row already counts, and has no
+	// exchange column either, so exchange is ignored for mode="bot"). exchange="" defaults to
+	// "okx", so every existing paper caller is unaffected by this parameter's addition — before
+	// this a strategy's OKX and MEXC-profile trades were silently blended into one track record.
+	StrategyStatsFor(ctx context.Context, strategyID int64, mode, exchange string) (StrategyStats, error)
 
 	// TokenStatsAllTime computes each active token's whole-history activity (position count, PnL$,
 	// PnL%) for mode ("paper" or "bot") — backs the panel's "Manage tokens" modal, one row per

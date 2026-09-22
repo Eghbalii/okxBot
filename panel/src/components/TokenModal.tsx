@@ -37,11 +37,13 @@ function sortRows(rows: Instrument[], stats: Record<string, TokenStats>, sortBy:
 // is off (2026-09-08 request).
 //
 // 2026-09-17: reads the REAL roster (GET /api/instruments, database-backed) instead of the
-// config-file allInstIds prop this modal used to take, AND scoped to exchange=okx only — the
-// discovery scan also admits MEXC tokens (enabled_paper=true on admission, §53.1), but paper-trader
-// only ever loads the "okx" roster (no MEXC execution wiring yet, §46.6), so a MEXC row's checkbox
-// would control nothing. Hiding them here is the honest answer, not a disabled/greyed-out control
-// for a decision this panel cannot actually make.
+// config-file allInstIds prop this modal used to take.
+//
+// 2026-09-22 (multi-exchange paper trading): takes an explicit `exchange` prop (the REAL exchange
+// name instruments/market_tokens are keyed by, e.g. "okx"/"mexc" — distinct from a paper-trading
+// PROFILE label like "MEXC_100x_1", see PositionsTable/PaperTradingConfigBox) so the same modal
+// serves any exchange's roster, following the same interface/port pattern the rest of this
+// project's multi-exchange support already uses — no exchange-specific branch lives in this file.
 //
 // "Active" (2026-09-22 correction) means the per-token enable/disable checkbox state alone
 // (instrument.active from the API) — NOT whether a strategy happens to be assigned. A same-day
@@ -49,9 +51,9 @@ function sortRows(rows: Instrument[], stats: Record<string, TokenStats>, sortBy:
 // (zero assignments there today, so every bot-mode token read active=false regardless of the
 // checkbox). The "Trading" column (instrument.hasAssignment) is the separate fact for whether a
 // strategy is actually assigned — a token can be active (checkbox on) and idle (no assignment
-// yet) at the same time, which is exactly bot mode's current shape. Since the OKX roster is small
-// (tens, not hundreds) it is fetched whole and paginated client-side, which is also what lets the
-// active/all toggle and sort compose correctly without a second server round trip.
+// yet) at the same time, which is exactly bot mode's current shape. Since each exchange's roster
+// is small (tens, not hundreds) it is fetched whole and paginated client-side, which is also what
+// lets the active/all toggle and sort compose correctly without a second server round trip.
 function MinSizeCell({ a }: { a: TokenAffordability | undefined }) {
   if (!a) return <span className="text-dim">—</span>
   if (a.unknown) {
@@ -80,11 +82,23 @@ function MinSizeCell({ a }: { a: TokenAffordability | undefined }) {
 
 export default function TokenModal({
   mode,
+  exchange,
   disabledInstIds,
   onClose,
   onSave,
 }: {
   mode: PositionMode
+  // Which paper-trading profile's roster this modal manages (2026-09-22, multi-exchange paper
+  // trading) — defaults to 'okx'. The DISCOVERY roster (instruments/market_tokens, keyed by real
+  // exchange name like "okx"/"mexc") is what this reads/writes; do not confuse with a future
+  // config-variant profile label that has no real exchange behind it (this modal only makes sense
+  // for a profile that IS a real, scanned exchange).
+  // The REAL exchange name (instruments/market_tokens' own key, e.g. "okx"/"mexc") — distinct
+  // from the paper-trading profile label above it in PositionsTable (e.g. "MEXC_100x_1"), which
+  // is a free-string isolation/comparison label that need not equal a real exchange's name at
+  // all (see PAPER_PROFILES in api/types.ts, which carries both and is the single place that
+  // maps one to the other).
+  exchange: string
   disabledInstIds: string[]
   onClose: () => void
   onSave: (disabledInstIds: string[]) => Promise<void>
@@ -109,30 +123,31 @@ export default function TokenModal({
 
   useEffect(() => {
     setRosterLoading(true)
-    // exchange: 'okx' — the only tokens this modal's checkbox can actually control (see module doc
-    // comment). Unpaginated: the OKX roster is small, and fetching it whole is what lets sort and
+    // Unpaginated: each exchange's roster is small, and fetching it whole is what lets sort and
     // the active/all filter work correctly client-side.
     api
-      .instruments({ exchange: 'okx', mode })
+      .instruments({ exchange, mode })
       .then(({ items }) => setRows(items))
       .catch((err) => setError((err as Error).message))
       .finally(() => setRosterLoading(false))
-  }, [mode])
+  }, [mode, exchange])
 
   useEffect(() => {
     setStatsLoading(true)
     api
-      .tokenStatsAllTime(mode)
+      .tokenStatsAllTime(mode, exchange)
       .then((rows) => setStats(Object.fromEntries(rows.map((r) => [r.instId, r]))))
       .catch((err) => setError((err as Error).message))
       .finally(() => setStatsLoading(false))
     // Affordability is fetched separately and failures are ignored: it is supporting information,
-    // and losing it must not block the token list itself from rendering.
+    // and losing it must not block the token list itself from rendering. Bot-mode only server-side
+    // (paper has no exchange minimums, handleTokenAffordability's own doc comment) — exchange is
+    // meaningless there and harmlessly ignored.
     api
       .tokenAffordability(mode)
       .then((rows) => setAfford(Object.fromEntries(rows.map((r) => [r.instId, r]))))
       .catch(() => setAfford({}))
-  }, [mode])
+  }, [mode, exchange])
 
   // Reset to page 0 whenever the filter changes — a page number valid under "all" can be past the
   // end once "active only" shrinks the total.
@@ -200,8 +215,8 @@ export default function TokenModal({
 
         <div className="text-dim" style={{ marginBottom: '0.75rem' }}>
           Unchecking a token stops it from opening new {mode} positions. Its existing open
-          positions (if any) keep running to their normal close — nothing is force-closed. Only
-          OKX tokens are shown: these are the ones this control can actually affect.
+          positions (if any) keep running to their normal close — nothing is force-closed. Showing
+          the {exchange} roster.
         </div>
 
         {error && <div className="error-banner">{error}</div>}

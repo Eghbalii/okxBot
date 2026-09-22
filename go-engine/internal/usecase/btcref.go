@@ -33,6 +33,12 @@ type BTCReference struct {
 	// have gone quietly wrong rather than failing.
 	InstID string
 
+	// Exchange scopes which candle rows this reference reads/writes (migration 000038, 2026-09-22
+	// multi-exchange work) — a second paper-trader instance (MEXC) must see MEXC's own BTC candles
+	// as market-wide context, never OKX's. "" defaults to "okx" (port.Repository.ListCandles' own
+	// convention), so an existing single-exchange deployment needs no config change.
+	Exchange string
+
 	// Bars is every timeframe to maintain — the same set the engines decide on, since the reference
 	// block is built for whichever bar the decision is about.
 	Bars         []string
@@ -72,7 +78,7 @@ func (r *BTCReference) Run(ctx context.Context, logger *slog.Logger) error {
 	// Reuses the engines' own seeding helper, so BTC's window is filled by exactly the same code
 	// path (and the same failure handling) as every traded instrument's — one implementation of
 	// "read this instrument's recent candles out of Postgres", not a second that can drift.
-	seedCandlesFromRepo(ctx, &r.mu, r.candles, r.Repo, r.InstID, r.Bars, r.CandleWindow, logger)
+	seedCandlesFromRepo(ctx, &r.mu, r.candles, r.Repo, r.Exchange, r.InstID, r.Bars, r.CandleWindow, logger)
 
 	errCh := make(chan error, len(r.Consumers))
 	for bar, c := range r.Consumers {

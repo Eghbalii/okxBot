@@ -1,6 +1,18 @@
-// Command ingestor connects to OKX's public/business WebSockets and streams ticker + candle
-// data into Kafka (the internal event bus, CLAUDE.md §12) for downstream consumption by the
-// Paper Trading Engine, the trading engine, and research/feature building.
+// Command ingestor connects to an exchange's public WebSockets and streams ticker + candle data
+// into Kafka (the internal event bus, CLAUDE.md §12) for downstream consumption by the Paper
+// Trading Engine, the trading engine, and research/feature building.
+//
+// EXCHANGE-PARAMETERIZED (2026-09-22, mirroring cmd/okx-gateway's own GATEWAY_EXCHANGE/buildService
+// pattern exactly, CLAUDE.md §46.4): cfg.Ingestion.Exchange ("okx" or "mexc", INGEST_EXCHANGE env)
+// selects which branch runs. Per the same "second deployed instance of the same binary" design
+// already used for cmd/okx-gateway and cmd/paper-trader — running OKX and MEXC ingestion side by
+// side is a second invocation of this process with INGEST_EXCHANGE=mexc and its own CONFIG_PATH,
+// never one process juggling two exchanges' WS clients at once. The OKX branch (runOKXIngestor) is
+// the pre-existing implementation, unchanged in behavior; the MEXC branch (runMEXCIngestor) is new.
+//
+// An unknown exchange value is refused at startup rather than silently defaulting to OKX — the
+// same "a typo here is a credentials/data-pointed-at-the-wrong-place mistake, not a cosmetic one"
+// reasoning as buildService's own refusal.
 package main
 
 import (
@@ -59,14 +71,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// The instrument roster now comes from the DATABASE, not config.yaml (2026-09-13, migration
-	// 000031). That is what lets the token-discovery scan put a newly-found token to work: while the
-	// roster was trading.inst_ids plus a hand-maintained trading.symbol_map, a scanned token had
-	// neither an entry nor an exec instId and could never be subscribed to.
-	//
-	// config.yaml's own list is still the seed for a database that has never held a roster — the
-	// state of every deployment the moment this lands — so this deploy changes nothing about what is
-	// collected until a scan or an operator says otherwise. See usecase.RosterFor.
 	repo, err := postgres.New(ctx, cfg.Postgres.DSN)
 	if err != nil {
 		logger.Error("failed to connect to postgres", "error", err)
@@ -78,11 +82,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	// CLAUDE.md §27, 2026-09-04 design: symbols are short internal identities ("BTC"), never OKX's
-	// own wire-format instId — this is the ONE place in the whole pipeline that talks OKX's wire
-	// format at all, so it resolves each symbol to a real instId for the WS subscription, then
-	// translates every inbound message's instId back to the short symbol before anything is published
-	// to Kafka.
+	metrics.Serve(envOr("METRICS_ADDR", ":9101"), logger)
+
+	switch cfg.Ingestion.Exchange {
+	case "", "okx":
+		runOKXIngestor(ctx, stop, cfg, repo, logger)
+	case "mexc":
+		runMEXCIngestor(ctx, stop, cfg, repo, logger)
+	default:
+		logger.Error("unknown ingestion.exchange (want \"okx\" or \"mexc\")", "exchange", cfg.Ingestion.Exchange)
+		os.Exit(1)
+	}
+}
+
+// runOKXIngestor is the pre-existing OKX ingestor, unchanged in behavior from before this file was
+// made exchange-parameterized (2026-09-22) — every comment/design note below predates that split
+// and still describes this branch exactly.
+func runOKXIngestor(ctx context.Context, stop context.CancelFunc, cfg *config.Config, repo *postgres.Repository, logger *slog.Logger) {
+	// The instrument roster now comes from the DATABASE, not config.yaml (2026-09-13, migration
+	// 000031). That is what lets the token-discovery scan put a newly-found token to work: while the
+	// roster was trading.inst_ids plus a hand-maintained trading.symbol_map, a scanned token had
+	// neither an entry nor an exec instId and could never be subscribed to.
+	//
+	// config.yaml's own list is still the seed for a database that has never held a roster — the
+	// state of every deployment the moment this lands — so this deploy changes nothing about what is
+	// collected until a scan or an operator says otherwise. See usecase.RosterFor.
 	seedExecIDs, err := usecase.SeedExecIDs(cfg.Trading.SymbolMap, cfg.Trading.InstIDs)
 	if err != nil {
 		logger.Error("failed to resolve trading.inst_ids against trading.symbol_map", "error", err)
@@ -129,8 +153,6 @@ func main() {
 			stop()
 		},
 	}).Run(ctx)
-
-	metrics.Serve(envOr("METRICS_ADDR", ":9101"), logger)
 
 	tickerPub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "okx.tickers")
 	defer tickerPub.Close()
@@ -344,9 +366,11 @@ func main() {
 	}
 }
 
-// candleEvent wraps a raw OKX candle array with the instrument id and bar it belongs to, since
-// the candle array itself (unlike ticker payloads) doesn't carry instId, and each bar publishes
-// to its own Redis stream but shares this same event shape.
+// candleEvent wraps a raw candle array with the instrument id and bar it belongs to, since the
+// candle array itself (unlike ticker payloads) doesn't carry instId, and each bar publishes to its
+// own Kafka topic but shares this same event shape. Shared verbatim by both the OKX and MEXC
+// branches — usecase.decodeCandle (internal/usecase/tickfeed.go) is the single decoder both must
+// agree with; see runMEXCIngestor.go's own comment on the array layout it constructs to match it.
 type candleEvent struct {
 	InstID string   `json:"instId"`
 	Bar    string   `json:"bar"`

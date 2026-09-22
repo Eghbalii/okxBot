@@ -24,7 +24,7 @@ type fakeSource struct {
 	series map[string][]domain.Candle // keyed "instID/bar"
 }
 
-func (f *fakeSource) ListCandlesRange(_ context.Context, instID, bar string, from, to time.Time, limit int) ([]port.Candle, error) {
+func (f *fakeSource) ListCandlesRange(_ context.Context, _, instID, bar string, from, to time.Time, limit int) ([]port.Candle, error) {
 	var out []port.Candle
 	for _, c := range f.series[instID+"/"+bar] {
 		if !from.IsZero() && c.Timestamp.Before(from) {
@@ -41,7 +41,7 @@ func (f *fakeSource) ListCandlesRange(_ context.Context, instID, bar string, fro
 	return out, nil
 }
 
-func (f *fakeSource) CandleRange(_ context.Context, instID, bar string) (time.Time, time.Time, error) {
+func (f *fakeSource) CandleRange(_ context.Context, _, instID, bar string) (time.Time, time.Time, error) {
 	s := f.series[instID+"/"+bar]
 	if len(s) == 0 {
 		return time.Time{}, time.Time{}, nil

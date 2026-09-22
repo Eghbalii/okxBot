@@ -288,7 +288,7 @@ func (e *PaperTrader) marketView(bar string) strategy.MarketView {
 func (e *PaperTrader) seedCandlesFromRepo(ctx context.Context, logger *slog.Logger) {
 	// CandleWindow is what handleCandle trims to, so an unset window means "keep nothing" there —
 	// seeding into that would be immediately discarded.
-	seedCandlesFromRepo(ctx, &e.candlesMu, e.candles, e.Repo, e.InstID, e.Bars, e.CandleWindow, logger)
+	seedCandlesFromRepo(ctx, &e.candlesMu, e.candles, e.Repo, e.Exchange, e.InstID, e.Bars, e.CandleWindow, logger)
 }
 
 // trackPnLExtremes advances an open order's peak/trough unrealized PnL (CLAUDE.md §15.11). Only
@@ -502,7 +502,7 @@ func (e *PaperTrader) handleCandle(ctx context.Context, bar string, data []byte,
 	if !dc.Confirmed {
 		return nil // still forming; wait for the finalized bar before persisting/evaluating
 	}
-	if err := e.Repo.SaveCandle(ctx, port.Candle{InstID: e.InstID, Bar: bar, Candle: c}); err != nil {
+	if err := e.Repo.SaveCandle(ctx, port.Candle{InstID: e.InstID, Bar: bar, Exchange: e.Exchange, Candle: c}); err != nil {
 		logger.Warn("failed to persist candle", "instId", e.InstID, "bar", bar, "error", err)
 	}
 	if err := e.evaluateStrategies(ctx, bar, c.Close, logger); err != nil {

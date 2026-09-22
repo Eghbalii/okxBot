@@ -242,6 +242,16 @@ func (s *Server) handleListInstruments(w http.ResponseWriter, r *http.Request) {
 	if activeMode == "" {
 		activeMode = "paper"
 	}
+	// activeExchange (2026-09-22, multi-exchange paper trading) scopes the Active/Trading columns
+	// to the SAME profile the caller asked for via ?exchange= — previously hardcoded to "" (okx),
+	// so a MEXC instrument row always read Active/Trading against OKX's own
+	// paper_trading_config/strategy_assignments rows regardless of which exchange's roster was
+	// being viewed. Falls back to f.Exchange (the roster filter itself) since a Manage Tokens
+	// call always passes the same exchange for both.
+	activeExchange := r.URL.Query().Get("exchange")
+	if activeExchange == "" {
+		activeExchange = f.Exchange
+	}
 
 	roster, err := s.Repo.ListInstruments(r.Context(), f)
 	if err != nil {
@@ -262,7 +272,7 @@ func (s *Server) handleListInstruments(w http.ResponseWriter, r *http.Request) {
 	// The operator's own instruction: Active must track the checkbox, full stop — whether a
 	// strategy happens to be assigned is a separate question the "Trading" column already answers
 	// (instrumentView has no equivalent field for that split yet, see below).
-	ptCfg, err := s.Repo.GetPaperTradingConfig(r.Context(), activeMode, "")
+	ptCfg, err := s.Repo.GetPaperTradingConfig(r.Context(), activeMode, activeExchange)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -274,7 +284,7 @@ func (s *Server) handleListInstruments(w http.ResponseWriter, r *http.Request) {
 	// hasAssignment still backs the "Trading" column (instrumentView doc comment above) — whether
 	// a strategy is actually assigned is a real, separate fact the panel also displays, just not
 	// the same fact as Active any more.
-	assignments, err := s.Repo.ListAssignments(r.Context(), "", true, activeMode, "")
+	assignments, err := s.Repo.ListAssignments(r.Context(), "", true, activeMode, activeExchange)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { useCachedResource } from '../hooks/useCachedResource'
+import { discoveryExchangeFor } from '../api/types'
 import type { PaperProfile, PaperTradingConfig, PositionMode } from '../api/types'
 import StrategyKindModal from './StrategyKindModal'
 import TokenModal from './TokenModal'
@@ -94,13 +95,11 @@ function TradingHealthBanner({ mode }: { mode: PositionMode }) {
 }
 
 function TradingControls({ mode, exchange }: { mode: PositionMode; exchange?: PaperProfile | string }) {
-  // Non-OKX profiles have no dynamic strategy/token management UI wired up (2026-09-22): they run
-  // a small, fixed config.yaml-defined roster (e.g. MEXC's 2-token starter set), not the
-  // discovery-scan-backed `instruments` roster the Manage Strategies/Manage Tokens modals below
-  // read from — those two concepts share the word "exchange" but are otherwise unrelated (the
-  // modals' own `exchange: 'okx'` calls are to the DISCOVERY roster table, not this profile's
-  // isolation label). Hiding rather than wiring them up avoids editing the wrong roster silently.
-  const isOkx = !exchange || exchange === 'okx'
+  // Manage Strategies/Manage Tokens both work for any profile (2026-09-22): they read the
+  // discovery-scan `instruments`/per-profile stats using discoveryExchangeFor to translate this
+  // profile's isolation LABEL (e.g. "MEXC_100x_1") to the real exchange name
+  // (instruments/market_tokens' own key, "mexc") the roster and scan actually use.
+  const discoveryExchange = discoveryExchangeFor(exchange)
   const [cfg, setCfg] = useState<PaperTradingConfig | null>(null)
   const [disableLong, setDisableLong] = useState(false)
   const [disableShort, setDisableShort] = useState(false)
@@ -295,25 +294,19 @@ function TradingControls({ mode, exchange }: { mode: PositionMode; exchange?: Pa
           </div>
         </div>
 
-        {/* Strategy/token management modals read the discovery-scan roster, which only the OKX
-            profile has been wired up against (2026-09-22) — a fixed config.yaml roster otherwise. */}
-        {isOkx && (
-          <div className="config-tile">
-            <div className="config-tile-label">Strategies</div>
-            <div className="config-tile-value">{activeKindCount} active</div>
-            <button onClick={() => setShowStrategyModal(true)}>Manage strategies…</button>
-          </div>
-        )}
+        <div className="config-tile">
+          <div className="config-tile-label">Strategies</div>
+          <div className="config-tile-value">{activeKindCount} active</div>
+          <button onClick={() => setShowStrategyModal(true)}>Manage strategies…</button>
+        </div>
 
-        {isOkx && (
-          <div className="config-tile">
-            <div className="config-tile-label">Tokens</div>
-            <div className="config-tile-value">
-              {disabledTokenCount === 0 ? 'all active' : `${disabledTokenCount} disabled`}
-            </div>
-            <button onClick={() => setShowTokenModal(true)}>Manage tokens…</button>
+        <div className="config-tile">
+          <div className="config-tile-label">Tokens</div>
+          <div className="config-tile-value">
+            {disabledTokenCount === 0 ? 'all active' : `${disabledTokenCount} disabled`}
           </div>
-        )}
+          <button onClick={() => setShowTokenModal(true)}>Manage tokens…</button>
+        </div>
       </div>
 
       <div className="toolbar" style={{ marginTop: '0.9rem' }}>
@@ -323,17 +316,19 @@ function TradingControls({ mode, exchange }: { mode: PositionMode; exchange?: Pa
         {message && <span className="text-dim">{message}</span>}
       </div>
 
-      {isOkx && showStrategyModal && (
+      {showStrategyModal && (
         <StrategyKindModal
           mode={mode}
+          exchange={exchange}
           activeKinds={cfg.activeKinds}
           onClose={() => setShowStrategyModal(false)}
           onSave={saveActiveKinds}
         />
       )}
-      {isOkx && showTokenModal && (
+      {showTokenModal && (
         <TokenModal
           mode={mode}
+          exchange={discoveryExchange}
           disabledInstIds={cfg.disabledInstIds}
           onClose={() => setShowTokenModal(false)}
           onSave={saveDisabledInstIds}

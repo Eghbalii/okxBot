@@ -160,9 +160,14 @@ type KindStats struct {
 // CandleSource reads stored history. Narrower than port.Repository on purpose: a dataset builder
 // must not be able to open an order, and the type system should enforce that rather than the
 // implementation being careful — the same reasoning as §17's HistoryCandleFetcher.
+//
+// The exchange parameter exists only to keep this interface structurally satisfied by
+// port.Repository's implementation (migration 000038, 2026-09-22) — the backtest/warm-start
+// package is OKX-only (docs/RL_V8_PLAN.md), so loadCandles below always passes "okx" and this
+// package has no multi-exchange concern of its own.
 type CandleSource interface {
-	ListCandlesRange(ctx context.Context, instID, bar string, from, to time.Time, limit int) ([]port.Candle, error)
-	CandleRange(ctx context.Context, instID, bar string) (oldest, newest time.Time, err error)
+	ListCandlesRange(ctx context.Context, exchange, instID, bar string, from, to time.Time, limit int) ([]port.Candle, error)
+	CandleRange(ctx context.Context, exchange, instID, bar string) (oldest, newest time.Time, err error)
 }
 
 // Sink receives each completed sample. An interface so a run can stream to a file without holding
@@ -177,7 +182,7 @@ func loadCandles(ctx context.Context, src CandleSource, instID, bar string, from
 	var out []domain.Candle
 	cursor := from
 	for {
-		rows, err := src.ListCandlesRange(ctx, instID, bar, cursor, to, page)
+		rows, err := src.ListCandlesRange(ctx, "okx", instID, bar, cursor, to, page)
 		if err != nil {
 			return nil, err
 		}

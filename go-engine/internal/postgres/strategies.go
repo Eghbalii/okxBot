@@ -197,10 +197,17 @@ func (r *Repository) DeleteAssignment(ctx context.Context, id int64) error {
 // StrategyStatsFor computes strategyID's track record for mode, sourced from paper_orders
 // (filtered to variant='baseline', excluding shadow forks) or bot_orders (no variant column at
 // all — real trading has no forking, §27.3, so every row already counts) depending on mode.
-func (r *Repository) StrategyStatsFor(ctx context.Context, strategyID int64, mode string) (port.StrategyStats, error) {
+func (r *Repository) StrategyStatsFor(ctx context.Context, strategyID int64, mode, exchange string) (port.StrategyStats, error) {
+	if exchange == "" {
+		exchange = "okx"
+	}
 	stats := port.StrategyStats{StrategyID: strategyID}
 	var query string
+	var args []any
 	if mode == "bot" {
+		// bot_orders has no exchange column at all (real trading has no second-exchange instance,
+		// 2026-09-22) — exchange is accepted but not filtered on here, matching every other
+		// bot-mode call site's "exchange is meaningless outside paper" treatment.
 		query = `
 			SELECT
 				count(*),
@@ -213,6 +220,7 @@ func (r *Repository) StrategyStatsFor(ctx context.Context, strategyID int64, mod
 			FROM bot_orders
 			WHERE strategy_id = $1
 		`
+		args = []any{strategyID}
 	} else {
 		query = `
 			SELECT
@@ -224,13 +232,14 @@ func (r *Repository) StrategyStatsFor(ctx context.Context, strategyID int64, mod
 				min(opened_at),
 				max(coalesce(closed_at, opened_at))
 			FROM paper_orders
-			WHERE strategy_id = $1 AND variant = 'baseline'
+			WHERE strategy_id = $1 AND variant = 'baseline' AND exchange = $2
 		`
+		args = []any{strategyID, exchange}
 	}
-	err := r.pool.QueryRow(ctx, query, strategyID).Scan(&stats.SignalCount, &stats.Wins, &stats.Losses, &stats.OpenCount,
+	err := r.pool.QueryRow(ctx, query, args...).Scan(&stats.SignalCount, &stats.Wins, &stats.Losses, &stats.OpenCount,
 		&stats.RealizedPnL, &stats.FirstOpened, &stats.LastActivity)
 	if err != nil {
-		return port.StrategyStats{}, fmt.Errorf("strategy stats for %d (mode %s): %w", strategyID, mode, err)
+		return port.StrategyStats{}, fmt.Errorf("strategy stats for %d (mode %s, exchange %s): %w", strategyID, mode, exchange, err)
 	}
 	return stats, nil
 }

@@ -475,7 +475,9 @@ func (s *Server) handleStrategyStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
-	stats, err := s.Repo.StrategyStatsFor(r.Context(), id, mode)
+	// exchange scopes a strategy's stats to one paper-trading profile (2026-09-22) — empty
+	// defaults to "okx" at the repository layer, unchanged for every existing panel request.
+	stats, err := s.Repo.StrategyStatsFor(r.Context(), id, mode, r.URL.Query().Get("exchange"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1099,7 +1101,10 @@ func (s *Server) handleListCandles(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	candles, err := s.Repo.ListCandles(r.Context(), instID, bar, limit)
+	// exchange defaults to "okx" (ListCandles' own convention) — the panel's chart is OKX-only
+	// today; a ?exchange= query param can be added when the MEXC panel comparison needs it.
+	exchange := q.Get("exchange")
+	candles, err := s.Repo.ListCandles(r.Context(), exchange, instID, bar, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

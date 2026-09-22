@@ -156,10 +156,18 @@ type Config struct {
 	} `yaml:"trading"`
 
 	// Ingestion controls cmd/ingestor: the always-on, broad set of candle timeframes it collects
-	// from OKX and publishes to Redis, independent of what any given paper-trading/strategy test
-	// run actually evaluates (see PaperTrading.Bars).
+	// and publishes to Kafka, independent of what any given paper-trading/strategy test run
+	// actually evaluates (see PaperTrading.Bars).
 	Ingestion struct {
 		Bars []string `yaml:"bars"`
+		// Exchange selects which exchange THIS ingestor instance subscribes to ("okx" or "mexc"),
+		// from the INGEST_EXCHANGE env var (2026-09-22, mirroring Gateway.Exchange's own
+		// GATEWAY_EXCHANGE/strings.ToLower pattern exactly — see the parsing below). A second,
+		// fully independent cmd/ingestor process with INGEST_EXCHANGE=mexc is how MEXC's own
+		// ticks/candles reach Kafka (mexc.tickers/mexc.candles.<bar>), the same "second deployed
+		// instance of the same binary" design as cmd/okx-gateway/cmd/paper-trader's own
+		// multi-exchange wiring rather than one process juggling two exchanges' WS clients.
+		Exchange string `yaml:"-"`
 	} `yaml:"ingestion"`
 
 	PaperTrading struct {
@@ -722,6 +730,7 @@ func Load(path string) (*Config, error) {
 		cfg.Gateway.Addr = envOr("GATEWAY_ADDR", "0.0.0.0:8094")
 	}
 	cfg.Gateway.Exchange = strings.ToLower(envOr("GATEWAY_EXCHANGE", "okx"))
+	cfg.Ingestion.Exchange = strings.ToLower(envOr("INGEST_EXCHANGE", "okx"))
 	if cfg.FillTimeout.OrderFillTimeoutSec == 0 {
 		// 60s, per explicit operator decision (CLAUDE.md §27.5) — cancel-and-wait-for-next-signal,
 		// never a synthetic retry at a new price.

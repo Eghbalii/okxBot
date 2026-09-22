@@ -171,8 +171,11 @@ export const api = {
   deleteStrategy: (id: number) => request<void>(`/strategies/${id}`, { method: 'DELETE' }),
   resetStrategy: (id: number) => request<void>(`/strategies/${id}/reset`, { method: 'POST' }),
   // mode ("paper" or "bot") scopes the track record — paper and bot trading each have a fully
-  // independent one, sourced from paper_orders vs. real_orders respectively.
-  strategyStats: (id: number, mode: PositionMode) => request<StrategyStats>(`/strategies/${id}/stats?mode=${mode}`),
+  // independent one, sourced from paper_orders vs. real_orders respectively. exchange (2026-09-22)
+  // further scopes a paper track record to one profile (e.g. "MEXC_100x_1") — omitted/'okx' means
+  // exactly what it always has.
+  strategyStats: (id: number, mode: PositionMode, exchange?: PaperProfile | string) =>
+    request<StrategyStats>(`/strategies/${id}/stats?mode=${mode}${exchangeParam(exchange)}`),
 
   listAssignments: (opts?: { instId?: string; enabledOnly?: boolean; mode?: PositionMode }) => {
     const params = new URLSearchParams()

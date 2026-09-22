@@ -456,7 +456,10 @@ func (r *Run) currentBaseline(ctx context.Context) (Baseline, int64, error) {
 		return Baseline{}, originID, nil
 	}
 
-	stats, err := r.repo.StrategyStatsFor(ctx, assignedStrategyID, "paper")
+	// "" scopes this to the OKX profile explicitly (2026-09-22, multi-exchange paper trading) —
+	// the optimizer only ever tunes production's own OKX paper-trading assignments (§16.1's
+	// independence rule), never a comparison profile like MEXC_100x_1.
+	stats, err := r.repo.StrategyStatsFor(ctx, assignedStrategyID, "paper", "")
 	if err != nil {
 		return Baseline{}, originID, fmt.Errorf("stats for baseline strategy %d: %w", assignedStrategyID, err)
 	}

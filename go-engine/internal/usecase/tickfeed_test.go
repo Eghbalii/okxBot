@@ -1,6 +1,7 @@
 package usecase
 
 import (
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -109,6 +110,55 @@ func TestDecodeCandle_ErrorsOnUnparsableField(t *testing.T) {
 	_, _, err := decodeCandle(data, "BTC-USDT-SWAP")
 	if err == nil {
 		t.Fatal("expected an error for an unparsable candle field")
+	}
+}
+
+// TestDecodeCandle_ParsesMEXCShapedArray proves the exact wire contract cmd/ingestor's MEXC branch
+// (mexcCandleArray, 2026-09-22) must produce: an array with indices 6-7 (OKX's volCcy/volCcyQuote,
+// which MEXC has no equivalent of) left EMPTY rather than omitted, and index 8 ("1") marking the
+// bar finalized. decodeCandle must not care that 6-7 are blank — it never reads them, only checks
+// len(...) for the fields it does read — which is exactly what makes constructing this array safe
+// for an exchange with no volCcy/volCcyQuote concept at all. Round-tripping through the REAL
+// decodeCandle (not a re-implementation) is what proves the contract, matching CLAUDE.md §17's own
+// "a fake that diverges from its real counterpart quietly weakens the test" lesson applied to a
+// wire-format contract instead of a fake repository.
+func TestDecodeCandle_ParsesMEXCShapedArray(t *testing.T) {
+	// Mirrors mexcCandleArray's exact construction (cmd/ingestor/mexc.go):
+	// [ts_ms, open, high, low, close, volume, "", "", "1"].
+	mexcShapedArray := []string{"1700000000000", "77135.2", "77140", "77130", "77138.5", "1352118.06", "", "", "1"}
+	data, err := json.Marshal(candleEvent{InstID: "BTC", Bar: "5m", Candle: mexcShapedArray})
+	if err != nil {
+		t.Fatalf("marshal candleEvent: %v", err)
+	}
+
+	dc, ok, err := decodeCandle(data, "BTC")
+	if err != nil {
+		t.Fatalf("unexpected error decoding a MEXC-shaped candle array: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !dc.Confirmed {
+		t.Error("expected Confirmed=true (index 8 = \"1\")")
+	}
+	if !dc.Candle.Open.Equal(decimal.RequireFromString("77135.2")) {
+		t.Errorf("open: want 77135.2, got %s", dc.Candle.Open)
+	}
+	if !dc.Candle.High.Equal(decimal.RequireFromString("77140")) {
+		t.Errorf("high: want 77140, got %s", dc.Candle.High)
+	}
+	if !dc.Candle.Low.Equal(decimal.RequireFromString("77130")) {
+		t.Errorf("low: want 77130, got %s", dc.Candle.Low)
+	}
+	if !dc.Candle.Close.Equal(decimal.RequireFromString("77138.5")) {
+		t.Errorf("close: want 77138.5, got %s", dc.Candle.Close)
+	}
+	if !dc.Candle.Volume.Equal(decimal.RequireFromString("1352118.06")) {
+		t.Errorf("volume: want 1352118.06, got %s", dc.Candle.Volume)
+	}
+	wantTS := time.UnixMilli(1700000000000).UTC()
+	if !dc.Candle.Timestamp.Equal(wantTS) {
+		t.Errorf("timestamp: want %s, got %s", wantTS, dc.Candle.Timestamp)
 	}
 }
 

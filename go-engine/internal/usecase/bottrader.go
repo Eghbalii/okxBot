@@ -633,7 +633,11 @@ func (e *BotTrader) marketView(bar string) strategy.MarketView {
 }
 
 func (e *BotTrader) seedCandlesFromRepo(ctx context.Context, logger *slog.Logger) {
-	seedCandlesFromRepo(ctx, &e.candlesMu, e.candles, e.Repo, e.InstID, e.Bars, e.CandleWindow, logger)
+	// "okx": real trading (cmd/trader/BotTrader) is OKX-only today and out of scope for the
+	// 2026-09-22 multi-exchange paper-trading work — a literal here, not a new field, since
+	// BotTrader has no exchange-label string identity to thread (its own Exchange field is the
+	// port.ExchangeClient REST adapter, a different concept entirely).
+	seedCandlesFromRepo(ctx, &e.candlesMu, e.candles, e.Repo, "okx", e.InstID, e.Bars, e.CandleWindow, logger)
 }
 
 func (e *BotTrader) conductor() *conductor.Conductor {

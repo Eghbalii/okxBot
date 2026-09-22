@@ -158,6 +158,38 @@ services:
       timescaledb:
         condition: service_started
 
+  # mexc-ingestor: a SECOND, independent cmd/ingestor instance for MEXC (2026-09-22 multi-exchange
+  # paper-trading pipeline) — same binary as `ingestor` above (cmd/ingestor, built from
+  # Dockerfile.ingestor), branching to MEXC's own WS clients via INGEST_EXCHANGE=mexc
+  # (cmd/ingestor/main.go's own buildService-style branch). Publishes to "mexc.tickers"/
+  # "mexc.candles.<bar>" — distinct topics from OKX's own "okx.tickers"/"okx.candles.<bar>", never
+  # colliding on Kafka. This is what `paper-trader-mexc` actually consumes from (see its own
+  # INGEST_EXCHANGE comment) — before this service existed, paper-trader-mexc had nothing publishing
+  # to those topics at all.
+  #
+  # No orderbook/funding-rate ingestion for MEXC in this pass (paper trading does not need either).
+  mexc-ingestor:
+    logging: *default-logging
+    restart: *default-restart
+    build:
+      context: ./go-engine
+      dockerfile: Dockerfile.ingestor
+    environment:
+      CONFIG_PATH: /app/configs/config.mexc.yaml
+      INGEST_EXCHANGE: mexc
+      KAFKA_BROKERS: kafka:9092
+      METRICS_ADDR: ":9108"
+      POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
+    ports:
+      - "9108:9108"
+    volumes:
+      - ./go-engine/configs:/app/configs
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_started
+
   # okx-gateway is the single process that holds real OKX credentials and rate-limits/prioritizes
   # REST calls across every other service (CLAUDE.md §27.1). Deployed here but NOT YET the
   # exclusive credential holder — cmd/trader and the other services still read OKX_API_KEY/etc
@@ -248,6 +280,13 @@ services:
     environment:
       CONFIG_PATH: /app/configs/config.mexc.yaml
       PAPER_EXCHANGE: MEXC_100x_1
+      # Which exchange's Kafka topics to CONSUME ticks/candles from ("mexc.tickers"/
+      # "mexc.candles.<bar>", published by the mexc-ingestor service below) — NOT the same thing
+      # as PAPER_EXCHANGE above, which only scopes this process's own account/orders/config rows
+      # (2026-09-22, found and fixed this session: without this, every paper-trader instance read
+      # "okx.tickers" regardless of PAPER_EXCHANGE, so this service was consuming nothing published
+      # for it at all — see cmd/paper-trader/main.go's own comment on topicExchange).
+      INGEST_EXCHANGE: mexc
       KAFKA_BROKERS: kafka:9092
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       METRICS_ADDR: ":9107"
@@ -268,6 +307,8 @@ services:
       rl-service:
         condition: service_started
       mexc-gateway:
+        condition: service_started
+      mexc-ingestor:
         condition: service_started
       timescaledb:
         condition: service_started

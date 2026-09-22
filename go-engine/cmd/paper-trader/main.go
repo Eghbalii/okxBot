@@ -205,7 +205,32 @@ func main() {
 	// groups own whole partitions, unlike Redis Streams' per-instrument consumer identity, so the
 	// per-instrument routing that used to happen via N separate consumers now happens in-process
 	// via one dispatcher per topic (CLAUDE.md §12).
-	tickDispatcher := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.tickers", "paper-trader"))
+	//
+	// Topic PREFIX derives from cfg.Ingestion.Exchange (INGEST_EXCHANGE env, default "okx") — the
+	// same value cmd/ingestor uses to decide which exchange's market data it publishes — NOT from
+	// this process's own `exchange` (PAPER_EXCHANGE) variable above. The two answer different
+	// questions and must not be conflated: `exchange` is this PROCESS's isolation/comparison label
+	// (e.g. "MEXC_100x_1", scoping account_equity/paper_orders/config rows so two experiments never
+	// share state), while the topic prefix is which REAL exchange's ingestor populated the Kafka
+	// topics this process reads ticks/candles from. Using `exchange` here would have been wrong in
+	// the specific case that motivated this fix: PAPER_EXCHANGE="MEXC_100x_1" is not a valid topic
+	// prefix at all ("MEXC_100x_1.tickers" was never published by anything).
+	//
+	// cmd/ingestor publishes MEXC's own ticks/candles to "mexc.tickers"/"mexc.candles.<bar>" (a
+	// second, independent ingestor instance, INGEST_EXCHANGE=mexc); a paper-trader instance whose
+	// own config.yaml pairs with that ingestor (config.mexc.yaml, also carrying INGEST_EXCHANGE=mexc
+	// so both processes agree) must consume from those topics, never OKX's "okx.tickers". Before
+	// this fix, every paper-trader instance read "okx.tickers"/"okx.candles.<bar>" unconditionally
+	// regardless of cfg.Ingestion.Exchange — found this session: paper-trader-mexc was silently
+	// reading OKX's own candle data out of Postgres via a SEPARATE mechanism (both exchanges using
+	// the same short symbols under candles' then-unscoped (inst_id, bar, ts) key, fixed by
+	// migration 000038) before this Kafka-topic bug was even reached, since seedCandlesFromRepo runs
+	// before any Kafka message is ever consumed.
+	topicExchange := cfg.Ingestion.Exchange
+	if topicExchange == "" {
+		topicExchange = "okx"
+	}
+	tickDispatcher := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, topicExchange+".tickers", "paper-trader"))
 	defer tickDispatcher.Close()
 	// Consume EVERY ingested bar, not just the decision bars (CLAUDE.md §9): 4H/1D are collected
 	// for higher-timeframe context that a strategy assigned to 5m can consult via
@@ -223,7 +248,9 @@ func main() {
 	}
 	candleDispatchers := make(map[string]*kafkastream.Dispatcher, len(candleBars))
 	for _, bar := range candleBars {
-		d := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.candles."+bar, "paper-trader"))
+		// Same topicExchange prefix as the ticker dispatcher above — see its comment for why this
+		// is cfg.Ingestion.Exchange, not the PAPER_EXCHANGE `exchange` variable.
+		d := kafkastream.NewDispatcher(kafkastream.NewConsumer(cfg.Kafka.Brokers, topicExchange+".candles."+bar, "paper-trader"))
 		candleDispatchers[bar] = d
 		defer d.Close()
 	}
@@ -237,6 +264,7 @@ func main() {
 	// about the whole market.
 	btcRef := &usecase.BTCReference{
 		InstID:       btcReferenceSymbol,
+		Exchange:     exchange,
 		Bars:         paperTradingBars,
 		CandleWindow: cfg.PaperTrading.CandleLimit,
 		Repo:         repo,

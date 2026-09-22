@@ -54,6 +54,22 @@ export type PositionMode = 'paper' | 'bot' | 'manual'
 // profile selector has a closed, typo-proof set to render tabs from.
 export const PAPER_PROFILES = ['okx', 'MEXC_100x_1'] as const
 export type PaperProfile = (typeof PAPER_PROFILES)[number]
+
+// discoveryExchangeFor maps a paper-trading PROFILE label (paper_orders.exchange /
+// PaperTrader.Exchange — a free-string isolation/comparison label, not necessarily a real
+// exchange's name) to the REAL exchange name the discovery-scan roster
+// (instruments/market_tokens, exchange-scoped since migration 000031) is keyed by. This is the
+// one place that translation lives, so Manage Strategies/Manage Tokens (and any future caller)
+// never hardcode a profile-label-to-exchange-name mapping of their own — a future profile just
+// adds one entry here, matching the operator's "same interface/port mechanism, easy for future
+// exchanges" instruction (2026-09-22).
+export const PAPER_PROFILE_EXCHANGE: Record<string, string> = {
+  okx: 'okx',
+  MEXC_100x_1: 'mexc',
+}
+export function discoveryExchangeFor(profile: string | undefined): string {
+  return PAPER_PROFILE_EXCHANGE[profile ?? 'okx'] ?? 'okx'
+}
 // Fill-lifecycle status for a real order (real_orders.status) — null for paper/demo rows, which
 // have no fill lifecycle (a paper order is always instantly and fully filled).
 // 'opening'/'closing' mean a request is in flight with the exchange and its outcome is not yet

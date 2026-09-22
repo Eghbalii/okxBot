@@ -86,11 +86,16 @@ function sortRows(rows: KindRow[], sortBy: SortField, sortDesc: boolean): KindRo
 // to clearing it, handled below by treating "all checked" as saving an empty list.
 export default function StrategyKindModal({
   mode,
+  exchange,
   activeKinds,
   onClose,
   onSave,
 }: {
   mode: PositionMode
+  // Which paper-trading profile's track record the stats table shows (2026-09-22, multi-exchange
+  // paper trading) — strategy KINDS themselves are global (code-registered, shared across every
+  // exchange/profile), only their per-profile stats need scoping. Defaults to 'okx'.
+  exchange?: string
   activeKinds: string[]
   onClose: () => void
   onSave: (kinds: string[]) => Promise<void>
@@ -118,14 +123,14 @@ export default function StrategyKindModal({
         // pre-check all of them rather than leaving the list looking fully disabled.
         setSelected((prev) => (activeKinds.length === 0 ? new Set(kinds) : prev))
         const entries = await Promise.all(
-          rows.map(async (s) => [s.ID, await api.strategyStats(s.ID, mode)] as const),
+          rows.map(async (s) => [s.ID, await api.strategyStats(s.ID, mode, exchange)] as const),
         )
         setStats(Object.fromEntries(entries))
       })
       .catch((err) => setError((err as Error).message))
       .finally(() => setLoading(false))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode])
+  }, [mode, exchange])
 
   function toggleSort(field: SortField) {
     if (sortBy === field) {

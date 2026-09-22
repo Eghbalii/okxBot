@@ -74,28 +74,44 @@ func newFakeRepository() *fakeRepository {
 	}
 }
 
+// candleExchangeOrOKX mirrors internal/postgres/candles.go's own candleExchange helper: "" means
+// "okx", so a fake test construction that never sets Exchange (nearly all of them, pre-dating the
+// 2026-09-22 multi-exchange work) still filters and collides exactly like the real deployment's
+// existing single-exchange data.
+func candleExchangeOrOKX(exchange string) string {
+	if exchange == "" {
+		return "okx"
+	}
+	return exchange
+}
+
 func (r *fakeRepository) SaveCandle(ctx context.Context, c port.Candle) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// Upsert on (inst_id, bar, ts), mirroring the real Postgres implementation's ON CONFLICT.
-	// A plain append would let a test see duplicate rows that production cannot produce — and
-	// would make the backfill's idempotency (which is what allows an interrupted run to simply be
-	// re-run) untestable against this fake.
+	exchange := candleExchangeOrOKX(c.Exchange)
+	// Upsert on (exchange, inst_id, bar, ts), mirroring the real Postgres implementation's ON
+	// CONFLICT (widened by migration 000038, 2026-09-22, from (inst_id, bar, ts) alone). A plain
+	// append would let a test see duplicate rows that production cannot produce — and would make
+	// the backfill's idempotency (which is what allows an interrupted run to simply be re-run)
+	// untestable against this fake.
 	for i, existing := range r.candles {
-		if existing.InstID == c.InstID && existing.Bar == c.Bar && existing.Timestamp.Equal(c.Timestamp) {
+		if candleExchangeOrOKX(existing.Exchange) == exchange && existing.InstID == c.InstID && existing.Bar == c.Bar && existing.Timestamp.Equal(c.Timestamp) {
+			c.Exchange = exchange
 			r.candles[i] = c
 			return nil
 		}
 	}
+	c.Exchange = exchange
 	r.candles = append(r.candles, c)
 	return nil
 }
-func (r *fakeRepository) ListCandles(ctx context.Context, instID, bar string, limit int) ([]port.Candle, error) {
+func (r *fakeRepository) ListCandles(ctx context.Context, exchange, instID, bar string, limit int) ([]port.Candle, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	exchange = candleExchangeOrOKX(exchange)
 	var out []port.Candle
 	for _, c := range r.candles {
-		if c.InstID == instID && c.Bar == bar {
+		if candleExchangeOrOKX(c.Exchange) == exchange && c.InstID == instID && c.Bar == bar {
 			out = append(out, c)
 		}
 	}
@@ -108,13 +124,16 @@ func (r *fakeRepository) ListCandles(ctx context.Context, instID, bar string, li
 // ListCandlesRange and CandleRange filter the way the real query does, rather than being stubs.
 // §17's lesson: a fake that diverges from its real counterpart quietly weakens every test that uses
 // it — there, SaveCandle appended where Postgres upserts, and an idempotency test failed against a
-// fake that could not model the behaviour being asserted.
-func (r *fakeRepository) ListCandlesRange(ctx context.Context, instID, bar string, from, to time.Time, limit int) ([]port.Candle, error) {
+// fake that could not model the behaviour being asserted. Same reasoning applied to the exchange
+// column migration 000038 added: a fake that ignores Exchange would make the exact collision this
+// column exists to prevent untestable.
+func (r *fakeRepository) ListCandlesRange(ctx context.Context, exchange, instID, bar string, from, to time.Time, limit int) ([]port.Candle, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	exchange = candleExchangeOrOKX(exchange)
 	var out []port.Candle
 	for _, c := range r.candles {
-		if c.InstID != instID || c.Bar != bar {
+		if candleExchangeOrOKX(c.Exchange) != exchange || c.InstID != instID || c.Bar != bar {
 			continue
 		}
 		if !from.IsZero() && c.Timestamp.Before(from) {
@@ -131,12 +150,13 @@ func (r *fakeRepository) ListCandlesRange(ctx context.Context, instID, bar strin
 	return out, nil
 }
 
-func (r *fakeRepository) CandleRange(ctx context.Context, instID, bar string) (time.Time, time.Time, error) {
+func (r *fakeRepository) CandleRange(ctx context.Context, exchange, instID, bar string) (time.Time, time.Time, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	exchange = candleExchangeOrOKX(exchange)
 	var oldest, newest time.Time
 	for _, c := range r.candles {
-		if c.InstID != instID || c.Bar != bar {
+		if candleExchangeOrOKX(c.Exchange) != exchange || c.InstID != instID || c.Bar != bar {
 			continue
 		}
 		if oldest.IsZero() || c.Timestamp.Before(oldest) {
@@ -173,7 +193,7 @@ func (r *fakeRepository) SetAssignmentEnabled(ctx context.Context, id int64, ena
 	return nil
 }
 func (r *fakeRepository) DeleteAssignment(ctx context.Context, id int64) error { return nil }
-func (r *fakeRepository) StrategyStatsFor(ctx context.Context, strategyID int64, mode string) (port.StrategyStats, error) {
+func (r *fakeRepository) StrategyStatsFor(ctx context.Context, strategyID int64, mode, exchange string) (port.StrategyStats, error) {
 	return port.StrategyStats{}, nil
 }
 func (r *fakeRepository) TokenStatsAllTime(ctx context.Context, mode, exchange string) ([]port.TokenStats, error) {
