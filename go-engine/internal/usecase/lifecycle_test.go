@@ -172,7 +172,7 @@ func TestClose_TerminalFailureDoesNotBlockTheClose(t *testing.T) {
 		t.Fatalf("monitor should not surface a model error: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 0 {
 		t.Fatalf("order %d should be closed despite the model erroring, still open: %d", id, len(open))
 	}
@@ -217,7 +217,7 @@ func TestOpenDecision_SkipMeansNoOrder(t *testing.T) {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 0 {
 		t.Fatalf("a skip must open no order, got %d", len(open))
 	}
@@ -249,7 +249,7 @@ func TestOpenDecision_AppliesModelLevelsClamped(t *testing.T) {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 1 {
 		t.Fatalf("expected 1 open order, got %d", len(open))
 	}
@@ -275,7 +275,7 @@ func TestOpenDecision_KeepsStrategyLevelsWhenModelSetsNone(t *testing.T) {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 1 {
 		t.Fatalf("expected 1 open order, got %d", len(open))
 	}
@@ -354,7 +354,7 @@ func TestUpdate_NoForkOfAFork(t *testing.T) {
 	pt.runUpdates(context.Background(), "1m", dec("100"), testLogger()) // establishes the baseline
 	pt.runUpdates(context.Background(), "1m", dec("103"), testLogger())
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 1 {
 		t.Errorf("a fork must not be forked again, got %d open orders", len(open))
 	}

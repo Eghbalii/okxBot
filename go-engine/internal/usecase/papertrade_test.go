@@ -166,7 +166,7 @@ func (r *fakeRepository) ResetStrategyToOrigin(ctx context.Context, id int64) er
 func (r *fakeRepository) CreateAssignment(ctx context.Context, a port.StrategyAssignment) (int64, error) {
 	return 0, nil
 }
-func (r *fakeRepository) ListAssignments(ctx context.Context, instID string, enabledOnly bool, mode string) ([]port.StrategyAssignment, error) {
+func (r *fakeRepository) ListAssignments(ctx context.Context, instID string, enabledOnly bool, mode, exchange string) ([]port.StrategyAssignment, error) {
 	return nil, nil
 }
 func (r *fakeRepository) SetAssignmentEnabled(ctx context.Context, id int64, enabled bool) error {
@@ -176,7 +176,7 @@ func (r *fakeRepository) DeleteAssignment(ctx context.Context, id int64) error {
 func (r *fakeRepository) StrategyStatsFor(ctx context.Context, strategyID int64, mode string) (port.StrategyStats, error) {
 	return port.StrategyStats{}, nil
 }
-func (r *fakeRepository) TokenStatsAllTime(ctx context.Context, mode string) ([]port.TokenStats, error) {
+func (r *fakeRepository) TokenStatsAllTime(ctx context.Context, mode, exchange string) ([]port.TokenStats, error) {
 	return nil, nil
 }
 func (r *fakeRepository) ListPositions(ctx context.Context, f port.PositionFilter) ([]port.PaperOrder, error) {
@@ -265,7 +265,7 @@ func (r *fakeRepository) RequestManualClose(ctx context.Context, id int64) error
 	r.orders[id] = o
 	return nil
 }
-func (r *fakeRepository) RequestManualCloseAll(ctx context.Context) (int, error) {
+func (r *fakeRepository) RequestManualCloseAll(ctx context.Context, exchange string) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	n := 0
@@ -278,23 +278,33 @@ func (r *fakeRepository) RequestManualCloseAll(ctx context.Context) (int, error)
 	}
 	return n, nil
 }
-func (r *fakeRepository) GetPaperTradingConfig(ctx context.Context, mode string) (port.PaperTradingConfig, error) {
+// paperTradingConfigKey mirrors the real repository's (mode, exchange) composite key
+// (2026-09-22, multi-exchange paper trading) — exchange="" defaults to "okx".
+func paperTradingConfigKey(mode, exchange string) string {
+	if exchange == "" {
+		exchange = "okx"
+	}
+	return mode + "|" + exchange
+}
+func (r *fakeRepository) GetPaperTradingConfig(ctx context.Context, mode, exchange string) (port.PaperTradingConfig, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.paperTradingConfig == nil || r.paperTradingConfig[mode] == nil {
+	key := paperTradingConfigKey(mode, exchange)
+	if r.paperTradingConfig == nil || r.paperTradingConfig[key] == nil {
 		return port.PaperTradingConfig{TradingState: "running"}, nil
 	}
-	return *r.paperTradingConfig[mode], nil
+	return *r.paperTradingConfig[key], nil
 }
-func (r *fakeRepository) SavePaperTradingConfig(ctx context.Context, mode string, patch port.PaperTradingConfigPatch) (port.PaperTradingConfig, error) {
+func (r *fakeRepository) SavePaperTradingConfig(ctx context.Context, mode, exchange string, patch port.PaperTradingConfigPatch) (port.PaperTradingConfig, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.paperTradingConfig == nil {
 		r.paperTradingConfig = make(map[string]*port.PaperTradingConfig)
 	}
+	key := paperTradingConfigKey(mode, exchange)
 	c := port.PaperTradingConfig{TradingState: "running"}
-	if r.paperTradingConfig[mode] != nil {
-		c = *r.paperTradingConfig[mode]
+	if r.paperTradingConfig[key] != nil {
+		c = *r.paperTradingConfig[key]
 	}
 	if patch.TradingState != nil {
 		c.TradingState = *patch.TradingState
@@ -314,10 +324,10 @@ func (r *fakeRepository) SavePaperTradingConfig(ctx context.Context, mode string
 	if patch.ActiveBars != nil {
 		c.ActiveBars = *patch.ActiveBars
 	}
-	r.paperTradingConfig[mode] = &c
+	r.paperTradingConfig[key] = &c
 	return c, nil
 }
-func (r *fakeRepository) SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string, instIDs, bars []string) error {
+func (r *fakeRepository) SetAssignmentsEnabledForKinds(ctx context.Context, mode, exchange string, activeKinds []string, instIDs, bars []string) error {
 	return nil
 }
 func (r *fakeRepository) SaveFundingRates(ctx context.Context, rates []port.FundingRate) error {
@@ -710,6 +720,75 @@ func (r *fakeRepository) GetAccountEquity(ctx context.Context, mode string, init
 	return ae, nil
 }
 
+// accountKey mirrors the real repository's (mode, exchange) composite key (2026-09-22,
+// multi-exchange paper trading) — exchange="" defaults to "okx", same as every real Ex method.
+func accountKey(mode, exchange string) string {
+	if exchange == "" {
+		exchange = "okx"
+	}
+	return mode + "|" + exchange
+}
+
+// GetAccountEquityEx/ApplyRealizedPnLEx/ListEquityHistoryEx are the fake's exchange-scoped
+// siblings of GetAccountEquity/ApplyRealizedPnL/ListEquityHistory above, used ONLY by
+// PaperTrader — kept as genuinely separate storage (accountKey rather than sharing r.accounts)
+// so a test can assert a second exchange's PaperTrader never touches the first's account row.
+func (r *fakeRepository) GetAccountEquityEx(ctx context.Context, mode, exchange string, initialUSD decimal.Decimal) (port.AccountEquity, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := accountKey(mode, exchange)
+	if ae, ok := r.accounts[key]; ok {
+		return ae, nil
+	}
+	ae := port.AccountEquity{Mode: mode, Exchange: exchange, InitialUSD: initialUSD, EquityUSD: initialUSD, AccountBalanceUSD: initialUSD}
+	r.accounts[key] = ae
+	r.equityPoints = append(r.equityPoints, port.EquityPoint{Mode: mode, EquityUSD: initialUSD, Reason: "seed"})
+	return ae, nil
+}
+
+func (r *fakeRepository) ApplyRealizedPnLEx(ctx context.Context, mode, exchange string, pnl decimal.Decimal, orderID *int64, instID string) (port.AccountEquity, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := accountKey(mode, exchange)
+	ae, ok := r.accounts[key]
+	if !ok {
+		return port.AccountEquity{}, false, fmt.Errorf("apply pnl: no account row for mode %s, exchange %s", mode, exchange)
+	}
+	ae.EquityUSD = ae.EquityUSD.Add(pnl)
+	ae.AccountBalanceUSD = ae.AccountBalanceUSD.Add(pnl)
+	r.equityPoints = append(r.equityPoints, port.EquityPoint{
+		Mode: mode, EquityUSD: ae.EquityUSD, DeltaUSD: pnl, Reason: "trade", OrderID: orderID, InstID: instID,
+	})
+
+	reset := false
+	if ae.EquityUSD.Sign() <= 0 && mode != "bot" {
+		drained := ae.EquityUSD
+		ae.EquityUSD = ae.InitialUSD
+		ae.ResetCount++
+		reset = true
+		r.equityPoints = append(r.equityPoints, port.EquityPoint{
+			Mode: mode, EquityUSD: ae.EquityUSD, DeltaUSD: ae.EquityUSD.Sub(drained), Reason: "reset", InstID: instID,
+		})
+	}
+	r.accounts[key] = ae
+	return ae, reset, nil
+}
+
+func (r *fakeRepository) ListEquityHistoryEx(ctx context.Context, mode, exchange string, since time.Time, limit int) ([]port.EquityPoint, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []port.EquityPoint
+	for _, p := range r.equityPoints {
+		if p.Mode == mode {
+			out = append(out, p)
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out, nil
+}
+
 func (r *fakeRepository) ApplyRealizedPnL(ctx context.Context, mode string, pnl decimal.Decimal, orderID *int64, instID string) (port.AccountEquity, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -767,12 +846,18 @@ func (r *fakeRepository) RecordExchangeBalance(ctx context.Context, mode string,
 	return ae, nil
 }
 
+// SetAccountCap is exchange-agnostic (mirrors the real repository, which pins it to exchange='okx'
+// explicitly, 2026-09-22) — its un-scoped key (mode) and accountKey(mode, "okx") refer to the SAME
+// row, since GetAccountEquityEx(mode, "" or "okx", ...) reads exactly what this writes. Both keys
+// are updated so a PaperTrader reading via GetAccountEquityEx sees the cap this sets, the same way
+// the real Postgres implementation's single row does.
 func (r *fakeRepository) SetAccountCap(ctx context.Context, mode string, newCapUSD decimal.Decimal) (port.AccountEquity, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	previous := r.accounts[mode].EquityUSD
 	ae := port.AccountEquity{
 		Mode:       mode,
+		Exchange:   "okx",
 		InitialUSD: newCapUSD,
 		EquityUSD:  newCapUSD,
 		// AccountBalanceUSD moves to newCapUSD too (CLAUDE.md §31.3 correction): choosing a cap is
@@ -783,6 +868,7 @@ func (r *fakeRepository) SetAccountCap(ctx context.Context, mode string, newCapU
 		ResetCount:        r.accounts[mode].ResetCount + 1,
 	}
 	r.accounts[mode] = ae
+	r.accounts[accountKey(mode, "okx")] = ae
 	r.equityPoints = append(r.equityPoints, port.EquityPoint{
 		Mode: mode, EquityUSD: newCapUSD, DeltaUSD: newCapUSD.Sub(previous), Reason: "reset",
 	})
@@ -845,12 +931,23 @@ func (r *fakeRepository) ListEquityHistory(ctx context.Context, mode string, sin
 	return out, nil
 }
 
-func (r *fakeRepository) ListOpenPaperOrders(ctx context.Context, instID string) ([]port.PaperOrder, error) {
+// ListOpenPaperOrders filters by exchange too (2026-09-22, multi-exchange paper trading) — a
+// zero-value order (o.Exchange == "") is treated as "okx", mirroring OpenPaperOrder's own default
+// and the real repository's DEFAULT 'okx' column, so pre-existing tests that never set Exchange
+// keep seeing their own orders under an implicit exchange="" query.
+func (r *fakeRepository) ListOpenPaperOrders(ctx context.Context, instID, exchange string) ([]port.PaperOrder, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if exchange == "" {
+		exchange = "okx"
+	}
 	var out []port.PaperOrder
 	for _, o := range r.orders {
-		if o.InstID == instID && o.ClosedAt == nil {
+		oExchange := o.Exchange
+		if oExchange == "" {
+			oExchange = "okx"
+		}
+		if o.InstID == instID && o.ClosedAt == nil && oExchange == exchange {
 			out = append(out, o)
 		}
 	}
@@ -1127,7 +1224,7 @@ func TestMaxOpenOrders_GatesNewSignals(t *testing.T) {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 3 {
 		t.Errorf("expected MaxOpenOrders to gate new signals, still expected 3 open orders, got %d", len(open))
 	}
@@ -1149,7 +1246,7 @@ func TestEvaluateStrategies_OnlyRunsStrategyAssignedToThatBar(t *testing.T) {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 1 {
 		t.Fatalf("expected exactly 1 order opened (from the 1m strategy only), got %d", len(open))
 	}
@@ -1237,7 +1334,7 @@ func TestEvaluateStrategies_DistinctStrategiesOnSameTokenOnlyOneOpens(t *testing
 		t.Fatalf("evaluateStrategies returned error: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 1 {
 		t.Fatalf("expected only one position open per token, got %d", len(open))
 	}
@@ -1257,7 +1354,7 @@ func TestEvaluateStrategies_TradingPausedOpensNothing(t *testing.T) {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 0 {
 		t.Fatalf("expected no orders opened while paused, got %d", len(open))
 	}
@@ -1278,7 +1375,7 @@ func TestEvaluateStrategies_OpensDisabledStopsNewOpensOnly(t *testing.T) {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 0 {
 		t.Fatalf("expected no orders opened for a disabled token, got %d", len(open))
 	}
@@ -1298,7 +1395,7 @@ func TestEvaluateStrategies_DisableLongSkipsBuySignalsOnly(t *testing.T) {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 0 {
 		t.Fatalf("expected no buy orders opened while long is disabled, got %d", len(open))
 	}
@@ -1316,7 +1413,7 @@ func TestEvaluateStrategies_DisableShortSkipsSellSignalsOnly(t *testing.T) {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 0 {
 		t.Fatalf("expected no sell orders opened while short is disabled, got %d", len(open))
 	}
@@ -1345,7 +1442,7 @@ func TestEvaluateStrategies_NeverOpensWithoutStopLoss(t *testing.T) {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 1 {
 		t.Fatalf("expected the signal to still be traded, got %d orders", len(open))
 	}
@@ -1407,7 +1504,7 @@ func TestEvaluateStrategies_ConcurrentBarsDoNotBothOpen(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 1 {
 		t.Fatalf("two bars closing together must open exactly 1 position, got %d", len(open))
 	}
@@ -1432,7 +1529,7 @@ func TestEvaluateStrategies_SkipsOpenWhenBaselineAlreadyOpen(t *testing.T) {
 		}
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 1 {
 		t.Fatalf("expected 1 open order after 3 passes, got %d", len(open))
 	}
@@ -1844,7 +1941,7 @@ func TestRunUpdates_AppliesAdjustmentInPlace(t *testing.T) {
 		t.Fatalf("expected Predict to be called")
 	}
 
-	orders, err := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	orders, err := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if err != nil {
 		t.Fatalf("list open orders: %v", err)
 	}
@@ -1900,7 +1997,7 @@ func TestRunUpdates_RepeatedAdjustmentsAllApplyToSameOrder(t *testing.T) {
 		pt.runUpdates(context.Background(), "1m", dec("100"), testLogger())
 		pt.runUpdates(context.Background(), "1m", dec("105"), testLogger())
 
-		orders, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+		orders, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 		if len(orders) != 1 {
 			t.Fatalf("round %d: expected exactly 1 open order, got %d", i+1, len(orders))
 		}
@@ -1934,7 +2031,7 @@ func TestRunUpdates_NoOpActionDoesNotChangeOrder(t *testing.T) {
 
 	pt.runUpdates(context.Background(), "1m", dec("100"), testLogger())
 
-	orders, err := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	orders, err := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if err != nil {
 		t.Fatalf("list open orders: %v", err)
 	}
@@ -2075,7 +2172,7 @@ func TestEvaluateStrategies_PersistsDecisionTimeObservation(t *testing.T) {
 		t.Fatalf("evaluateStrategies returned error: %v", err)
 	}
 
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if len(open) != 1 {
 		t.Fatalf("expected 1 opened order, got %d", len(open))
 	}
@@ -2131,7 +2228,7 @@ func newSizingTestPaperTrader(repo port.Repository, model port.ModelClient) *Pap
 
 func openedOrder(t *testing.T, repo port.Repository) port.PaperOrder {
 	t.Helper()
-	open, err := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, err := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	if err != nil || len(open) != 1 {
 		t.Fatalf("expected exactly 1 open order (err=%v), got %d", err, len(open))
 	}
@@ -2233,7 +2330,7 @@ func TestEvaluateStrategies_DynamicSizingTracksCurrentEquity(t *testing.T) {
 	pt.PositionSlots = 5
 	// Pre-seed a DIFFERENT equity than newTestPaperTrader's AccountInitialUSD default (1000), so a
 	// pass proves the live value is actually read, not the configured fallback.
-	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("250")}
+	repo.accounts[accountKey("paper", "")] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("250")}
 
 	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies: %v", err)
@@ -2252,7 +2349,7 @@ func TestEvaluateStrategies_DynamicSizingTracksActiveTokenCount(t *testing.T) {
 	repo := newFakeRepository()
 	pt := newSizingTestPaperTrader(repo, nil)
 	pt.PositionSlots = 2
-	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.accounts[accountKey("paper", "")] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 
 	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies: %v", err)
@@ -2271,7 +2368,7 @@ func TestEvaluateStrategies_DynamicSizingFallsBackWhenEquityNotPositive(t *testi
 	repo := newFakeRepository()
 	pt := newSizingTestPaperTrader(repo, nil)
 	pt.PositionSlots = 10
-	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("0")}
+	repo.accounts[accountKey("paper", "")] = port.AccountEquity{Mode: "paper", InitialUSD: dec("1000"), EquityUSD: dec("0")}
 
 	if err := pt.evaluateStrategies(context.Background(), "1m", dec("100"), testLogger()); err != nil {
 		t.Fatalf("evaluateStrategies: %v", err)
@@ -2301,7 +2398,7 @@ func TestRLSizing_TotalExposureCeilingBlocksNewPosition(t *testing.T) {
 	}
 
 	obs := domain.Observation{AccountEquityUSD: dec("1000")}
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	_, _, ok := pt.rlSizing(context.Background(), obs, strategy.Signal{Side: strategy.Buy}, open, testLogger())
 
 	if ok {
@@ -2324,7 +2421,7 @@ func TestRLSizing_TrimsToRemainingExposureHeadroom(t *testing.T) {
 	}
 
 	obs := domain.Observation{AccountEquityUSD: dec("1000")}
-	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(context.Background(), "BTC-USDT-SWAP", "")
 	notional, _, ok := pt.rlSizing(context.Background(), obs, strategy.Signal{Side: strategy.Buy}, open, testLogger())
 
 	if !ok {
@@ -2384,7 +2481,7 @@ func TestMonitorOpenOrders_DrainedAccountResetsAndRecordsTimeline(t *testing.T) 
 	pt := newTestPaperTrader(repo, nil)
 	pt.AccountInitialUSD = dec("100")
 
-	if _, err := repo.GetAccountEquity(ctx, "paper", dec("100")); err != nil {
+	if _, err := repo.GetAccountEquityEx(ctx, "paper", "", dec("100")); err != nil {
 		t.Fatalf("seed account: %v", err)
 	}
 
@@ -2400,7 +2497,7 @@ func TestMonitorOpenOrders_DrainedAccountResetsAndRecordsTimeline(t *testing.T) 
 		t.Fatalf("monitorOpenOrders: %v", err)
 	}
 
-	acct, _ := repo.GetAccountEquity(ctx, "paper", dec("100"))
+	acct, _ := repo.GetAccountEquityEx(ctx, "paper", "", dec("100"))
 	if !acct.EquityUSD.Equal(dec("100")) {
 		t.Errorf("expected the drained account reset to its 100 initial, got %s", acct.EquityUSD)
 	}
@@ -2408,7 +2505,7 @@ func TestMonitorOpenOrders_DrainedAccountResetsAndRecordsTimeline(t *testing.T) 
 		t.Errorf("expected reset_count 1, got %d", acct.ResetCount)
 	}
 
-	history, err := repo.ListEquityHistory(ctx, "paper", time.Time{}, 0)
+	history, err := repo.ListEquityHistoryEx(ctx, "paper", "", time.Time{}, 0)
 	if err != nil {
 		t.Fatalf("list equity history: %v", err)
 	}
@@ -2714,7 +2811,7 @@ func TestRunUpdates_RequiresUpdateOrderAction(t *testing.T) {
 
 	pt.runUpdates(ctx, "1m", dec("103"), testLogger())
 
-	open, _ := repo.ListOpenPaperOrders(ctx, "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(ctx, "BTC-USDT-SWAP", "")
 	if len(open) != 1 {
 		t.Errorf("expected no fork when order_action is 'none', got %d open orders", len(open))
 	}
@@ -2993,11 +3090,11 @@ func TestTrackPnLExtremes_RecordsPeakAndTrough(t *testing.T) {
 
 	// Runs to +8%, falls back to -3%, recovers to +1%.
 	for _, px := range []string{"108", "97", "101"} {
-		open, _ := repo.ListOpenPaperOrders(ctx, "BTC-USDT-SWAP")
+		open, _ := repo.ListOpenPaperOrders(ctx, "BTC-USDT-SWAP", "")
 		pt.trackPnLExtremes(ctx, open[0], dec(px), testLogger())
 	}
 
-	open, _ := repo.ListOpenPaperOrders(ctx, "BTC-USDT-SWAP")
+	open, _ := repo.ListOpenPaperOrders(ctx, "BTC-USDT-SWAP", "")
 	o := open[0]
 	if o.ID != id {
 		t.Fatalf("unexpected order %d", o.ID)
@@ -3228,7 +3325,7 @@ func TestRealizedPnL_IsRoundedToUsdScale(t *testing.T) {
 // repeating decimal in the first place.
 func TestDynamicNotional_IsRoundedToUsdScale(t *testing.T) {
 	repo := newFakeRepository()
-	repo.accounts["paper"] = port.AccountEquity{Mode: "paper", InitialUSD: dec("40"), EquityUSD: dec("40")}
+	repo.accounts[accountKey("paper", "")] = port.AccountEquity{Mode: "paper", InitialUSD: dec("40"), EquityUSD: dec("40")}
 	pt := &PaperTrader{
 		InstID: "BTC", Repo: repo, Mode: "paper",
 		AccountInitialUSD: dec("40"), PositionSlots: 9,

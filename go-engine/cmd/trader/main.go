@@ -216,7 +216,7 @@ func runBotTrader(
 	// mirrors cmd/paper-trader/main.go's identical read exactly. Before this, cmd/trader never read
 	// paper_trading_config at all, so the Real tab's Pause/Stop/disable-long/disable-short/active-
 	// strategies/active-tokens controls appeared to save successfully but had zero effect.
-	ptCfg, err := repo.GetPaperTradingConfig(ctx, "bot")
+	ptCfg, err := repo.GetPaperTradingConfig(ctx, "bot", "")
 	if err != nil {
 		logger.Error("failed to load real-mode paper trading config", "error", err)
 		os.Exit(1)
@@ -262,7 +262,7 @@ func runBotTrader(
 		os.Exit(1)
 	}
 
-	if err := repo.SetAssignmentsEnabledForKinds(ctx, "bot", ptCfg.ActiveKinds, instIDs, decisionBars); err != nil {
+	if err := repo.SetAssignmentsEnabledForKinds(ctx, "bot", "", ptCfg.ActiveKinds, instIDs, decisionBars); err != nil {
 		logger.Error("failed to apply real-mode active-strategy-kinds restriction", "error", err)
 		os.Exit(1)
 	}
@@ -632,7 +632,7 @@ func envOr(key, fallback string) string {
 // loadBotTraderStrategyAssignments mirrors cmd/paper-trader/main.go's loadStrategyAssignments —
 // resolves durable strategy_assignments rows into live usecase.StrategyAssignment values.
 func loadBotTraderStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID string, logger *slog.Logger) ([]usecase.StrategyAssignment, error) {
-	rows, err := repo.ListAssignments(ctx, instID, true, "bot")
+	rows, err := repo.ListAssignments(ctx, instID, true, "bot", "")
 	if err != nil {
 		return nil, err
 	}

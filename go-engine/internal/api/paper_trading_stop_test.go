@@ -21,7 +21,7 @@ type stopStubRepo struct {
 	closeAllErr                   error
 }
 
-func (s *stopStubRepo) SavePaperTradingConfig(ctx context.Context, mode string, patch port.PaperTradingConfigPatch) (port.PaperTradingConfig, error) {
+func (s *stopStubRepo) SavePaperTradingConfig(ctx context.Context, mode, exchange string, patch port.PaperTradingConfigPatch) (port.PaperTradingConfig, error) {
 	s.savedPatch = patch
 	return port.PaperTradingConfig{}, nil
 }

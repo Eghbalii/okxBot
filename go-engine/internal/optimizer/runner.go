@@ -434,7 +434,7 @@ func (r *Run) currentBaseline(ctx context.Context) (Baseline, int64, error) {
 		return Baseline{}, 0, fmt.Errorf("no origin strategy row found for kind %q", r.Kind)
 	}
 
-	assignments, err := r.repo.ListAssignments(ctx, r.InstID, true, "paper")
+	assignments, err := r.repo.ListAssignments(ctx, r.InstID, true, "paper", "")
 	if err != nil {
 		return Baseline{}, originID, fmt.Errorf("list assignments for %s: %w", r.InstID, err)
 	}

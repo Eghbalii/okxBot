@@ -20,6 +20,10 @@ type paperTraderService struct {
 	logger     *slog.Logger
 	current    port.PaperTradingConfig // snapshot read at startup; GET /config reflects THIS, not a live DB round-trip
 	allInstIDs []string
+	// exchange is this process's own instance identity ("okx", "mexc", ...) — CLAUDE.md,
+	// multi-exchange paper trading (2026-09-22). Empty defaults to "okx" at the repository layer,
+	// matching this binary's own single-exchange behavior before this field existed.
+	exchange string
 }
 
 func (s *paperTraderService) routes() http.Handler {
@@ -92,7 +96,7 @@ func (s *paperTraderService) handleSaveConfig(w http.ResponseWriter, r *http.Req
 		DisabledInstIDs: req.DisabledInstIDs,
 		ActiveBars:      req.ActiveBars,
 	}
-	if _, err := s.repo.SavePaperTradingConfig(r.Context(), "paper", patch); err != nil {
+	if _, err := s.repo.SavePaperTradingConfig(r.Context(), "paper", s.exchange, patch); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

@@ -45,7 +45,7 @@ func TestTokenStatsAllTime_IncludesTradesOlderThan24Hours(t *testing.T) {
 		t.Fatalf("backdate closed_at: %v", err)
 	}
 
-	stats, err := repo.TokenStatsAllTime(ctx, "paper")
+	stats, err := repo.TokenStatsAllTime(ctx, "paper", "")
 	if err != nil {
 		t.Fatalf("token stats all-time: %v", err)
 	}

@@ -124,7 +124,7 @@ type openDecisionResult struct {
 // Best-effort throughout: an error on one order is logged and skipped, never propagated — a model
 // or database problem must not stop the engine from monitoring SL/TP on the others.
 func (e *PaperTrader) runUpdates(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) {
-	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
+	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID, e.exchange())
 	if err != nil {
 		logger.Warn("lifecycle: list open orders failed", "instId", e.InstID, "error", err)
 		return

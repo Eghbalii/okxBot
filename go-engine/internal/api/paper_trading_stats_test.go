@@ -30,6 +30,17 @@ func (r *statsStubRepo) ListEquityHistory(ctx context.Context, mode string, sinc
 	return nil, nil
 }
 
+// GetAccountEquityEx/ListEquityHistoryEx mirror the un-scoped stubs above — handlePaperTradingStats
+// switched to these exchange-scoped methods (2026-09-22, multi-exchange paper trading); the test's
+// callers never pass a real exchange, so these behave identically to their un-scoped siblings.
+func (r *statsStubRepo) GetAccountEquityEx(ctx context.Context, mode, exchange string, initialUSD decimal.Decimal) (port.AccountEquity, error) {
+	return r.accountResult, nil
+}
+
+func (r *statsStubRepo) ListEquityHistoryEx(ctx context.Context, mode, exchange string, since time.Time, limit int) ([]port.EquityPoint, error) {
+	return nil, nil
+}
+
 func (r *statsStubRepo) ListManualOrders(ctx context.Context, f port.PositionFilter) ([]port.ManualOrder, error) {
 	return r.manualOrders, nil
 }

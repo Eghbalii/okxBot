@@ -41,7 +41,7 @@ func (r *marketStubRepo) ListMarketTokens(context.Context, string, int) ([]port.
 	return r.tokens, nil
 }
 
-func (r *marketStubRepo) GetPaperTradingConfig(context.Context, string) (port.PaperTradingConfig, error) {
+func (r *marketStubRepo) GetPaperTradingConfig(context.Context, string, string) (port.PaperTradingConfig, error) {
 	return port.PaperTradingConfig{DisabledInstIDs: r.disabledInstIDs}, nil
 }
 
@@ -88,7 +88,7 @@ func (r *marketStubRepo) DeleteInstrument(_ context.Context, id int64) error {
 	return nil
 }
 
-func (r *marketStubRepo) ListAssignments(_ context.Context, instID string, enabledOnly bool, mode string) ([]port.StrategyAssignment, error) {
+func (r *marketStubRepo) ListAssignments(_ context.Context, instID string, enabledOnly bool, mode, exchange string) ([]port.StrategyAssignment, error) {
 	var out []port.StrategyAssignment
 	for _, a := range r.assignments {
 		if instID != "" && a.InstID != instID {

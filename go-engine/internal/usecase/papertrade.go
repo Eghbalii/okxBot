@@ -84,6 +84,13 @@ type PaperTrader struct {
 	// "demo"/"bot". All three are tracked simultaneously (CLAUDE.md §15.6), and only non-real
 	// modes ever auto-reset a drained balance (§15.7).
 	Mode string
+	// Exchange is which exchange this engine's process instance is running against ("okx", "mexc",
+	// ...) — added 2026-09-22 so a second, fully independent cmd/paper-trader process (a different
+	// PAPER_EXCHANGE at startup) shares NO state with the existing OKX instance: separate open
+	// orders, separate account balance/history, separate control-box config, separate strategy
+	// assignments, all under the SAME Mode="paper". Defaults to "okx" (exchange()) when empty, the
+	// same defensive fallback pattern as PositionSlots falling back to 1.
+	Exchange string
 	// AccountInitialUSD is the shared account's configured starting balance — what a drained
 	// paper/demo account resets back to. Every token trades against this one pool rather than a
 	// per-token slice of it (CLAUDE.md §15.6's 2026-08-28 revision).
@@ -307,6 +314,16 @@ func (e *PaperTrader) accountMode() string {
 	return e.Mode
 }
 
+// exchange returns e.Exchange, defaulting to "okx" — every PaperTrader constructed before this
+// field existed (or that leaves it unset in a test/struct literal) behaves exactly as it did when
+// there was only one exchange (CLAUDE.md, multi-exchange paper trading, 2026-09-22).
+func (e *PaperTrader) exchange() string {
+	if e.Exchange == "" {
+		return "okx"
+	}
+	return e.Exchange
+}
+
 // dynamicNotional is what a new position opens at when RLSizing is off: CurrentEquity /
 // PositionSlots, not a fixed config constant (CLAUDE.md §31.2). This is how a real exchange
 // account actually behaves — the amount committed per position tracks the account's current
@@ -341,7 +358,7 @@ func (e *PaperTrader) dynamicNotional(ctx context.Context, logger *slog.Logger) 
 	countDec := decimal.NewFromInt(int64(count))
 
 	equity := e.AccountInitialUSD
-	if acct, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), e.AccountInitialUSD); err == nil {
+	if acct, err := e.Repo.GetAccountEquityEx(ctx, e.accountMode(), e.exchange(), e.AccountInitialUSD); err == nil {
 		equity = acct.EquityUSD
 	} else {
 		logger.Warn("dynamic notional: get account equity failed, falling back to configured initial",
@@ -512,7 +529,7 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 	e.openMu.Lock()
 	defer e.openMu.Unlock()
 
-	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
+	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID, e.exchange())
 	if err != nil {
 		return fmt.Errorf("list open paper orders: %w", err)
 	}
@@ -567,6 +584,7 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 		}
 
 		order := buildPaperOrder(e.InstID, price, signal, e.dynamicNotional(ctx, logger), a.StrategyID, bar)
+		order.Exchange = e.exchange()
 
 		// Retain this signal for carry-forward onto later price-driven update calls (CLAUDE.md
 		// §15.12): a higher-timeframe opinion stays meaningful between its candles, and dropping it
@@ -665,7 +683,7 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 }
 
 func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decimal, logger *slog.Logger) error {
-	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID)
+	open, err := e.Repo.ListOpenPaperOrders(ctx, e.InstID, e.exchange())
 	if err != nil {
 		return fmt.Errorf("list open paper orders: %w", err)
 	}
@@ -806,7 +824,7 @@ func (e *PaperTrader) closeOrder(
 	if o.Variant == "baseline" || o.Variant == "" {
 		if e.AccountInitialUSD.IsPositive() {
 			orderID := o.ID
-			if acct, reset, err := e.Repo.ApplyRealizedPnL(ctx, e.accountMode(), pnl, &orderID, e.InstID); err != nil {
+			if acct, reset, err := e.Repo.ApplyRealizedPnLEx(ctx, e.accountMode(), e.exchange(), pnl, &orderID, e.InstID); err != nil {
 				logger.Error("failed to apply realized pnl to account", "instId", e.InstID, "error", err)
 			} else if reset {
 				// Recorded as a reason="reset" point in the equity timeline too, so a drain that

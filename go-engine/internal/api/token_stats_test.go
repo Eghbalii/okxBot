@@ -19,7 +19,7 @@ type tokenStatsStubRepo struct {
 	err   error
 }
 
-func (s *tokenStatsStubRepo) TokenStatsAllTime(ctx context.Context, mode string) ([]port.TokenStats, error) {
+func (s *tokenStatsStubRepo) TokenStatsAllTime(ctx context.Context, mode, exchange string) ([]port.TokenStats, error) {
 	return s.stats, s.err
 }
 

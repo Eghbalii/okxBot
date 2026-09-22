@@ -153,7 +153,7 @@ func (s *AffordabilityService) RunOnce(ctx context.Context) error {
 		return nil
 	}
 
-	cfg, err := s.Repo.GetPaperTradingConfig(ctx, s.mode())
+	cfg, err := s.Repo.GetPaperTradingConfig(ctx, s.mode(), "")
 	if err != nil {
 		return fmt.Errorf("read %s trading config: %w", s.mode(), err)
 	}
@@ -193,7 +193,7 @@ func (s *AffordabilityService) RunOnce(ctx context.Context) error {
 	// separately would leave a window where a token is disabled with no record of who disabled it,
 	// and a crash inside that window would strand it as apparently-manual forever.
 	nextAuto := s.applyPlanAuto(autoDisabled, plan)
-	if _, err := s.Repo.SavePaperTradingConfig(ctx, s.mode(), port.PaperTradingConfigPatch{
+	if _, err := s.Repo.SavePaperTradingConfig(ctx, s.mode(), "", port.PaperTradingConfigPatch{
 		DisabledInstIDs:     &next,
 		AutoDisabledInstIDs: &nextAuto,
 	}); err != nil {
@@ -452,7 +452,7 @@ func (s *AffordabilityService) Report(ctx context.Context) (AffordabilityReport,
 		return AffordabilityReport{}, err
 	}
 
-	cfg, err := s.Repo.GetPaperTradingConfig(ctx, s.mode())
+	cfg, err := s.Repo.GetPaperTradingConfig(ctx, s.mode(), "")
 	if err != nil {
 		return AffordabilityReport{}, fmt.Errorf("read %s trading config: %w", s.mode(), err)
 	}

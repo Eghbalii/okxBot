@@ -1,0 +1,110 @@
+# config.mexc.yaml — a SECOND, independent config for the MEXC paper-trading comparison
+# (2026-09-22, docs/MEXC_TEST_HANDOFF.md). Loaded by paper-trader-mexc / okx-gateway-mexc via
+# CONFIG_PATH (docker-compose.yml), completely separate from configs/config.yaml's OKX instance.
+#
+# kafka.brokers is set via KAFKA_BROKERS only, same as the OKX config.
+
+# The [okx] section is unused by this file's services (okx-gateway-mexc branches to the MEXC
+# adapter via GATEWAY_EXCHANGE=mexc; paper-trader-mexc has no OKX REST dependency at all — its
+# only exchange call is the funding-rate poller, which reads trading.symbol_map/ExecInstType, not
+# this section) — left out entirely rather than duplicated with placeholder values.
+
+trading:
+  # A small starter set, plain MEXC symbols (BTC_USDT, stable, no expiry — internal/mexc/adapter.go
+  # returns an identity SymbolResolver, so every entry below maps to itself in symbol_map).
+  inst_ids:
+    - "BTC"
+    - "ETH"
+  poll_interval_sec: 5
+  # MEXC has no cross/isolated split OKX has — see internal/mexc's own doc comments; this field is
+  # read by cmd/trader/BotTrader only, which this deployment does not run (paper trading only).
+  td_mode: "isolated"
+  pos_mode: "net"
+  min_order_usd: 10
+  allow_real_money: false
+  use_conductor_lifecycle: false
+  allow_rl_early_close: false
+  safe_money_usd: 0
+  # MEXC's own symbols ARE the exec id (internal/mexc/adapter.go's IdentitySymbolResolver) — this
+  # map still has to exist because usecase.SeedExecIDs requires an entry for every configured
+  # inst_ids symbol (it fails loudly on a missing entry rather than seeding a row with an empty
+  # exec id), not because MEXC needs any actual translation.
+  symbol_map:
+    BTC: "BTC_USDT"
+    ETH: "ETH_USDT"
+  # MEXC's futures API has exactly one contract family — there is nothing else to select between,
+  # unlike OKX's SWAP vs FUTURES(X-Perp) split.
+  exec_inst_type: ""
+  exec_settle_ccy: "USDT"
+
+trading_fill_timeout:
+  order_fill_timeout_sec: 60
+
+ingestion:
+  bars:
+    - "5m"
+    - "15m"
+    - "1H"
+    - "4H"
+    - "1D"
+
+paper_trading:
+  notional_usd: 4
+  max_open_orders: 3
+  bars:
+    - "5m"
+    - "15m"
+    - "1H"
+  candle_limit: 100
+  rl_decision_bar: "5m"
+  rl_sltp_adjust: false
+  rl_sizing: false
+  rl_update_pnl_threshold_pct: 0.01
+  rl_update_max_interval: 15m
+  rl_early_close: false
+  rl_clamps:
+    min_sl_dist_pct: 0.005
+    max_sl_dist_pct: 0.05
+    max_loss_pct: 0.15
+    min_tp_sl_ratio: 1.5
+    max_tp_sl_ratio: 3
+  rl_max_open_duration: 6h
+
+# One shared paper-trading pool for THIS instance only — completely separate from the OKX
+# instance's account_equity row (both are mode="paper", isolated by the new exchange column,
+# 2026-09-22). $100 starting balance for this throwaway comparison test.
+account:
+  initial_usd: 100
+  max_position_pct: 0.25
+  max_total_exposure_pct: 0.60
+
+risk:
+  # 100x max leverage, per the operator's explicit ask for this MEXC test
+  # (docs/MEXC_TEST_HANDOFF.md item 4) — distinct from the OKX config's 10x, which reflects that
+  # real account's own OKX-imposed ceiling and has nothing to do with MEXC.
+  max_leverage: 100
+  max_position_notional_usd: 1000
+  max_daily_drawdown_pct: 5
+  min_liquidation_buffer_pct: 5
+
+# cmd/api/optimizer/tester sections omitted: this deployment runs only okx-gateway-mexc and
+# paper-trader-mexc (docker-compose.yml), neither of which reads them.
+
+gateway:
+  addr: "0.0.0.0:8096"
+  trade:
+    capacity: 20
+    refill: 20
+    interval_ms: 2000
+  leverage:
+    capacity: 10
+    refill: 10
+    interval_ms: 2000
+  account:
+    capacity: 10
+    refill: 10
+    interval_ms: 2000
+  market:
+    capacity: 20
+    refill: 20
+    interval_ms: 2000

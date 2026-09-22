@@ -52,6 +52,11 @@ type StrategyAssignment struct {
 	// so a strategy tuned/enabled for paper trading has no effect on real trading and vice versa.
 	// Defaults to "paper" for every row created before this field existed.
 	Mode string
+	// Exchange scopes this assignment to one exchange ("okx", "mexc", ...) — a second,
+	// independent paper-trader instance running against a different exchange gets its own
+	// assignments, so a strategy tuned for one exchange has no effect on the other (2026-09-22).
+	// Defaults to "okx" for every row created before this field existed.
+	Exchange string
 }
 
 // StrategyStats summarizes one strategy's paper-trading track record (CLAUDE.md §11.3),
@@ -91,7 +96,10 @@ type TokenStats struct {
 type PositionFilter struct {
 	Mode   string // "paper", "demo", "bot", or "" for all
 	InstID string // "" for all
-	Open   *bool  // nil = both open and closed
+	// Exchange narrows to one exchange's positions ("okx", "mexc", ...); "" matches every
+	// exchange, which is what every pre-existing caller does and must keep doing (2026-09-22).
+	Exchange string
+	Open     *bool // nil = both open and closed
 	// SortBy: "opened_at", "closed_at" (default), "pnl", "inst_id". SortDesc reverses order.
 	SortBy   string
 	SortDesc bool
@@ -104,8 +112,13 @@ type PositionFilter struct {
 
 // PaperOrder is a virtual (forward-test) trade opened by the Paper Trading Engine (CLAUDE.md §8).
 type PaperOrder struct {
-	ID         int64
-	InstID     string
+	ID     int64
+	InstID string
+	// Exchange scopes this order to one exchange ("okx", "mexc", ...) — a second, fully
+	// independent paper-trader instance running against a different exchange writes its own rows
+	// here, completely isolated from the existing OKX instance's (2026-09-22). Defaults to "okx"
+	// for every row created before this field existed.
+	Exchange   string
 	StrategyID *int64
 	// Bar is the decision timeframe the signal that opened this order fired on (e.g. "5m", "1H").
 	// Captured at open time rather than reconstructed from strategy_assignments afterward, since
@@ -422,7 +435,12 @@ type ManualOrderIntent struct {
 // zero" is a fact the system can act on directly, and so reset events (ResetCount/LastResetAt) stay
 // visible for training-run analysis rather than looking like unlimited free money.
 type AccountEquity struct {
-	Mode       string          // "paper", "demo", or "bot"
+	Mode string // "paper", "demo", or "bot"
+	// Exchange scopes this balance row to one exchange ("okx", "mexc", ...) — a second paper-
+	// trading instance running against a different exchange gets a completely separate account
+	// row under the same mode="paper" (2026-09-22). Defaults to "okx" for every row created
+	// before this field existed.
+	Exchange   string
 	InitialUSD decimal.Decimal // configured starting balance a reset returns to
 	EquityUSD  decimal.Decimal // "Total Equity": running balance SINCE the last reset/cap choice
 	// AccountBalanceUSD is "Account Balance": the real, continuous running total (CLAUDE.md
@@ -494,6 +512,11 @@ type PaperTradingConfig struct {
 	ActiveBars          []string // empty = use paper_trading.bars from config.yaml as-is
 	UpdatedAt           time.Time
 }
+
+// PaperTradingConfigExchange is GetPaperTradingConfig/SavePaperTradingConfig's default exchange
+// when a caller passes "" — every pre-existing caller before the multi-exchange paper-trading
+// work (2026-09-22), so an omitted exchange keeps behaving exactly as before.
+const PaperTradingConfigExchange = "okx"
 
 // PaperTradingConfigPatch is SavePaperTradingConfig's input — nil fields leave the corresponding
 // column unchanged, matching tester.RuntimeConfig's patch shape. The slice fields are pointers to
@@ -653,10 +676,13 @@ type Repository interface {
 	// exactly which variant was running where (CLAUDE.md §11.3) instead of relying on in-code
 	// wiring like cmd/paper-trader/main.go's current hardcoded []usecase.StrategyAssignment.
 	CreateAssignment(ctx context.Context, a StrategyAssignment) (int64, error)
-	// ListAssignments returns assignments for mode ("paper" or "bot") — CLAUDE.md real-trading
-	// readiness plan, 2026-09-04: paper and real trading each maintain independent assignments, so
-	// a strategy tuned/enabled for one has no effect on the other.
-	ListAssignments(ctx context.Context, instID string, enabledOnly bool, mode string) ([]StrategyAssignment, error)
+	// ListAssignments returns assignments for mode ("paper" or "bot") and exchange ("okx", "mexc",
+	// ...) — CLAUDE.md real-trading readiness plan, 2026-09-04: paper and real trading each
+	// maintain independent assignments, so a strategy tuned/enabled for one has no effect on the
+	// other. Exchange scoping added 2026-09-22 for the same reason, one level down: a second
+	// paper-trading instance against a different exchange gets its own assignments too. exchange=""
+	// defaults to "okx", matching every pre-existing call site.
+	ListAssignments(ctx context.Context, instID string, enabledOnly bool, mode, exchange string) ([]StrategyAssignment, error)
 	SetAssignmentEnabled(ctx context.Context, id int64, enabled bool) error
 	DeleteAssignment(ctx context.Context, id int64) error
 
@@ -672,12 +698,15 @@ type Repository interface {
 	// inst_id that has at least one closed trade for that mode. Renamed from TokenStats24h
 	// (2026-09-22 operator instruction): a 24h window hid most of a token's real track record,
 	// the same reason StrategyStatsFor (above) has never had a time window at all — the two now
-	// match.
-	TokenStatsAllTime(ctx context.Context, mode string) ([]TokenStats, error)
+	// match. exchange scopes to one exchange's paper_orders rows ("" defaults to "okx", matching
+	// every pre-existing call site) — added 2026-09-22 so a second exchange's paper trading gets
+	// its own token stats rather than being blended into the existing OKX ones.
+	TokenStatsAllTime(ctx context.Context, mode, exchange string) ([]TokenStats, error)
 
 	// OpenPaperOrder inserts o and returns its id. o.ExchangeOrderID is persisted when set (real
 	// trading, CLAUDE.md §27) — the algo order's ID is not known until after this call returns
 	// (PlaceAlgoOrder happens second), so it is written separately via SetExchangeAlgoOrderID.
+	// o.Exchange defaults to "okx" when empty, same convention as o.Mode defaulting to "paper".
 	OpenPaperOrder(ctx context.Context, o PaperOrder) (int64, error)
 	// GetPaperOrder fetches a single order by id, open or closed. Used by the manual SL/TP-edit
 	// endpoint (CLAUDE.md §27.3's plan §3b) to resolve EntryPx/Leverage/Side before converting the
@@ -700,7 +729,11 @@ type Repository interface {
 	// enough to distort per-strategy stats, so the mechanic now edits the one bot order directly
 	// and RecordPaperOrderAdjustment (below) is the audit trail that replaces the fork.
 	UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, tpPx *decimal.Decimal) error
-	ListOpenPaperOrders(ctx context.Context, instID string) ([]PaperOrder, error)
+	// ListOpenPaperOrders returns instID's still-open orders, scoped to exchange ("" defaults to
+	// "okx", matching every pre-existing call site) — this is the CRITICAL isolation point for a
+	// second, independent paper-trading instance (2026-09-22): two engines must never see each
+	// other's open positions even if instID happens to collide across exchanges.
+	ListOpenPaperOrders(ctx context.Context, instID, exchange string) ([]PaperOrder, error)
 	// RequestManualClose flags an open order for the panel's manual close button (2026-08-31
 	// request). cmd/api runs in a separate process from the PaperTrader that owns this order's
 	// instrument, so it cannot run the real close path itself — it only sets this flag; PaperTrader
@@ -713,8 +746,11 @@ type Repository interface {
 	RequestManualClose(ctx context.Context, id int64) error
 	// RequestManualCloseAll is RequestManualClose's bulk form, used when the operator sets
 	// trading_state="stopped" from the panel's control box (CLAUDE.md): flags every open paper
-	// order for close on its next tick. Returns how many rows were flagged.
-	RequestManualCloseAll(ctx context.Context) (int, error)
+	// order for close on its next tick. Returns how many rows were flagged. exchange scopes the
+	// sweep to one exchange's rows ("" defaults to "okx", matching every pre-existing call site) —
+	// added 2026-09-22 so stopping one exchange's paper trading never touches the other's open
+	// orders.
+	RequestManualCloseAll(ctx context.Context, exchange string) (int, error)
 	// UpdatePaperOrderPnLExtremes records new peak/trough unrealized PnL for an open order
 	// (CLAUDE.md §15.11). Both are written together since they move as one high-water pair.
 	UpdatePaperOrderPnLExtremes(ctx context.Context, id int64, maxPct, minPct decimal.Decimal) error
@@ -934,6 +970,20 @@ type Repository interface {
 	// without a matching move in the total — the whole reason the two lines are drawn together.
 	SetTradingCap(ctx context.Context, mode string, capUSD decimal.Decimal) (AccountEquity, error)
 
+	// GetAccountEquityEx/ApplyRealizedPnLEx/ListEquityHistoryEx are exchange-scoped siblings of
+	// GetAccountEquity/ApplyRealizedPnL/ListEquityHistory above (2026-09-22, multi-exchange paper
+	// trading) — used ONLY by usecase.PaperTrader, which now carries its own Exchange field so a
+	// second, fully independent paper-trading instance (e.g. against MEXC) keeps a completely
+	// separate balance/history under the same mode="paper", rather than sharing the single OKX
+	// instance's row. Added as new methods rather than widening GetAccountEquity/ApplyRealizedPnL/
+	// ListEquityHistory's own signatures, since cmd/trader's bot/manual-mode callers (out of scope
+	// for this change) would otherwise need touching for no behavior change of their own.
+	// exchange="" behaves exactly like the un-scoped method (defaults to "okx"), so every existing
+	// call path is unaffected.
+	GetAccountEquityEx(ctx context.Context, mode, exchange string, initialUSD decimal.Decimal) (AccountEquity, error)
+	ApplyRealizedPnLEx(ctx context.Context, mode, exchange string, pnl decimal.Decimal, orderID *int64, instID string) (AccountEquity, bool, error)
+	ListEquityHistoryEx(ctx context.Context, mode, exchange string, since time.Time, limit int) ([]EquityPoint, error)
+
 	// RecordPaperOrderAdjustment appends one entry to an order's in-trade SL/TP adjustment history
 	// (CLAUDE.md §15.4/§15.12 revision, 2026-09-02) — replaces the old shadow-fork mechanic's
 	// implicit "look at the fork's levels" comparison with an explicit, append-only log so a click
@@ -994,24 +1044,27 @@ type Repository interface {
 	// every exchange; limit 0 means no limit.
 	ListMarketTokens(ctx context.Context, exchange string, limit int) ([]MarketToken, error)
 
-	// GetPaperTradingConfig returns mode's ("paper" or "bot") panel-editable control-box config
-	// (CLAUDE.md real-trading readiness plan, 2026-09-04 — paper_trading_config is now one row per
-	// mode), seeding it at column defaults if it hasn't been written yet.
-	GetPaperTradingConfig(ctx context.Context, mode string) (PaperTradingConfig, error)
-	// SavePaperTradingConfig applies patch's non-nil fields onto mode's row.
-	SavePaperTradingConfig(ctx context.Context, mode string, patch PaperTradingConfigPatch) (PaperTradingConfig, error)
-	// SetAssignmentsEnabledForKinds bulk-enables/disables mode's strategy_assignments so only
-	// assignments whose strategy's Kind is in activeKinds are enabled — the global per-kind "active
-	// strategies" toggle, scoped to one mode. A no-op when activeKinds is empty (no restriction
-	// configured).
+	// GetPaperTradingConfig returns (mode, exchange)'s panel-editable control-box config (CLAUDE.md
+	// real-trading readiness plan, 2026-09-04 — paper_trading_config is now one row per mode),
+	// seeding it at column defaults if it hasn't been written yet. exchange scoping added
+	// 2026-09-22: a second, independent paper-trading instance against a different exchange gets
+	// its own control-box row under the same mode="paper" — exchange="" defaults to "okx",
+	// matching every pre-existing call site.
+	GetPaperTradingConfig(ctx context.Context, mode, exchange string) (PaperTradingConfig, error)
+	// SavePaperTradingConfig applies patch's non-nil fields onto (mode, exchange)'s row.
+	SavePaperTradingConfig(ctx context.Context, mode, exchange string, patch PaperTradingConfigPatch) (PaperTradingConfig, error)
+	// SetAssignmentsEnabledForKinds bulk-enables/disables (mode, exchange)'s strategy_assignments so
+	// only assignments whose strategy's Kind is in activeKinds are enabled — the global per-kind
+	// "active strategies" toggle, scoped to one mode and exchange. A no-op when activeKinds is
+	// empty (no restriction configured).
 	//
 	// It also CREATES the assignments an activated kind is missing, across instIDs x bars, from
 	// that kind's origin strategy (2026-09-09). Enabling alone is not enough: a kind with no rows
 	// for this mode has nothing to enable, so activating it in the panel silently did nothing —
 	// the kind read as active in the config while being absent from the roster the engine loads.
 	// Existing rows are never touched by the create step, so a per-token assignment an operator
-	// disabled on the Strategies page stays disabled.
-	SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string, instIDs, bars []string) error
+	// disabled on the Strategies page stays disabled. exchange="" defaults to "okx".
+	SetAssignmentsEnabledForKinds(ctx context.Context, mode, exchange string, activeKinds []string, instIDs, bars []string) error
 
 	// SaveFundingRates upserts a batch of funding-rate periods (2026-09-06's funding-cost service).
 	// Upsert on (inst_id, funding_time) so re-polling an already-stored period is a safe no-op —

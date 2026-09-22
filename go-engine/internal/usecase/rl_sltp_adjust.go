@@ -221,7 +221,7 @@ func (e *PaperTrader) buildObservation(ctx context.Context, bar string, price de
 		return domain.Observation{}, err
 	}
 
-	acct, err := e.Repo.GetAccountEquity(ctx, e.accountMode(), e.AccountInitialUSD)
+	acct, err := e.Repo.GetAccountEquityEx(ctx, e.accountMode(), e.exchange(), e.AccountInitialUSD)
 	if err != nil {
 		// No longer a Warn-and-continue. Equity feeds three ratios plus the position-size budget,
 		// so a zero here is not one missing number but a coherent-looking lie about the account.

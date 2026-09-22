@@ -498,7 +498,11 @@ func (s *Server) handleListAssignments(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
-	list, err := s.Repo.ListAssignments(r.Context(), instID, enabledOnly, mode)
+	// exchange ("okx", "mexc", ...) is optional and defaults to "okx" at the repository layer, so
+	// every existing call with no ?exchange= behaves exactly as before (2026-09-22, multi-exchange
+	// paper trading).
+	exchange := r.URL.Query().Get("exchange")
+	list, err := s.Repo.ListAssignments(r.Context(), instID, enabledOnly, mode, exchange)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

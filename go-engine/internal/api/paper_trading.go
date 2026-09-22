@@ -62,6 +62,11 @@ func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// exchange ("okx", "mexc", ...) only means anything for mode="paper" today — bot/manual
+	// trading has no second-exchange instance (2026-09-22). Defaults to "okx" at the repository
+	// layer when omitted, so every existing panel request keeps reading the OKX instance's stats.
+	exchange := r.URL.Query().Get("exchange")
+
 	open := true
 	var openCount int
 	var usedMarginUSD decimal.Decimal
@@ -91,7 +96,7 @@ func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request)
 			usedMarginUSD = usedMarginUSD.Add(p.Size)
 		}
 	default:
-		positions, err := s.Repo.ListPositions(ctx, port.PositionFilter{Mode: mode, Open: &open})
+		positions, err := s.Repo.ListPositions(ctx, port.PositionFilter{Mode: mode, Exchange: exchange, Open: &open})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -102,7 +107,7 @@ func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	account, err := s.Repo.GetAccountEquity(ctx, mode, s.AccountInitialUSD)
+	account, err := s.Repo.GetAccountEquityEx(ctx, mode, exchange, s.AccountInitialUSD)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -111,7 +116,7 @@ func (s *Server) handlePaperTradingStats(w http.ResponseWriter, r *http.Request)
 	// One history read covering the longest window (30d) is enough for all three sub-windows —
 	// each is a fold over the same rows, not a separate query.
 	now := time.Now().UTC()
-	history, err := s.Repo.ListEquityHistory(ctx, mode, now.Add(-30*24*time.Hour), 0)
+	history, err := s.Repo.ListEquityHistoryEx(ctx, mode, exchange, now.Add(-30*24*time.Hour), 0)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -189,7 +194,8 @@ func (s *Server) handleTokenStatsAllTime(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
-	stats, err := s.Repo.TokenStatsAllTime(r.Context(), mode)
+	// exchange defaults to "okx" at the repository layer when omitted (2026-09-22).
+	stats, err := s.Repo.TokenStatsAllTime(r.Context(), mode, r.URL.Query().Get("exchange"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -232,7 +238,8 @@ func (s *Server) handleGetPaperTradingConfig(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "invalid mode (want paper or bot)")
 		return
 	}
-	c, err := s.Repo.GetPaperTradingConfig(r.Context(), mode)
+	// exchange defaults to "okx" at the repository layer when omitted (2026-09-22).
+	c, err := s.Repo.GetPaperTradingConfig(r.Context(), mode, r.URL.Query().Get("exchange"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -249,7 +256,11 @@ func (s *Server) handleGetPaperTradingConfig(w http.ResponseWriter, r *http.Requ
 }
 
 type savePaperTradingConfigRequest struct {
-	Mode            string    `json:"mode"`
+	Mode string `json:"mode"`
+	// Exchange is optional and defaults to "okx" at the repository layer when omitted
+	// (2026-09-22, multi-exchange paper trading) — every existing panel request that has never
+	// heard of this field keeps saving against the OKX instance's row, unchanged.
+	Exchange        string    `json:"exchange"`
 	TradingState    *string   `json:"tradingState"`
 	DisableLong     *bool     `json:"disableLong"`
 	DisableShort    *bool     `json:"disableShort"`
@@ -285,7 +296,7 @@ func (s *Server) handleSavePaperTradingConfig(w http.ResponseWriter, r *http.Req
 		DisabledInstIDs: req.DisabledInstIDs,
 		ActiveBars:      req.ActiveBars,
 	}
-	if _, err := s.Repo.SavePaperTradingConfig(r.Context(), mode, patch); err != nil {
+	if _, err := s.Repo.SavePaperTradingConfig(r.Context(), mode, req.Exchange, patch); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

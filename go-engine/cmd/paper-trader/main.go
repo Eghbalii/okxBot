@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -53,6 +54,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// PAPER_EXCHANGE (default "okx") is this PROCESS's own instance identity — running a second,
+	// fully independent cmd/paper-trader (e.g. against MEXC) is a second invocation of this same
+	// binary with PAPER_EXCHANGE=mexc, its own CONFIG_PATH, and its own GATEWAY_URL, rather than
+	// one process juggling two exchanges' state (2026-09-22, mirroring cmd/okx-gateway's own
+	// GATEWAY_EXCHANGE pattern, §46.4). Every Exchange-scoped repository call/field below is threaded
+	// from this one value.
+	exchange := strings.ToLower(envOr("PAPER_EXCHANGE", "okx"))
+
 	metrics.Serve(envOr("METRICS_ADDR", ":9102"), logger)
 
 	repo, err := postgres.New(ctx, cfg.Postgres.DSN)
@@ -76,7 +85,7 @@ func main() {
 		logger.Error("failed to resolve trading.inst_ids against trading.symbol_map", "error", err)
 		os.Exit(1)
 	}
-	roster, err := usecase.RosterFor(ctx, repo, "okx", "paper",
+	roster, err := usecase.RosterFor(ctx, repo, exchange, "paper",
 		cfg.Trading.InstIDs, seedExecIDs, cfg.Trading.ExecInstType, logger)
 	if err != nil {
 		logger.Error("failed to load instrument roster", "error", err)
@@ -93,7 +102,7 @@ func main() {
 	// instrument's candle windows and consumer registrations, built once at startup, and a restart
 	// re-derives all of it from the database rather than mutating it in place half-way.
 	go (&usecase.RosterWatcher{
-		Repo: repo, Exchange: "okx", Consumer: "paper",
+		Repo: repo, Exchange: exchange, Consumer: "paper",
 		Interval: time.Minute, Logger: logger, Baseline: instIDs,
 		OnChange: func(reason string) {
 			logger.Info("restarting to pick up the new instrument roster", "reason", reason)
@@ -121,7 +130,7 @@ func main() {
 	// crash-recovery posture as loadStrategyAssignments below — a restart resumes with exactly the
 	// pause/stop/direction/kind/token/bar restrictions the panel last saved, not whatever was true
 	// in memory before the process last exited.
-	ptCfg, err := repo.GetPaperTradingConfig(ctx, "paper")
+	ptCfg, err := repo.GetPaperTradingConfig(ctx, "paper", exchange)
 	if err != nil {
 		logger.Error("failed to load paper trading config", "error", err)
 		os.Exit(1)
@@ -145,14 +154,14 @@ func main() {
 		logger.Error("failed to seed origin strategies", "error", err)
 		os.Exit(1)
 	}
-	if err := ensureDefaultAssignment(ctx, repo, instIDs, paperTradingBars); err != nil {
+	if err := ensureDefaultAssignment(ctx, repo, exchange, instIDs, paperTradingBars); err != nil {
 		logger.Error("failed to ensure default strategy assignment", "error", err)
 		os.Exit(1)
 	}
 	// Global per-kind "active strategies" toggle (CLAUDE.md): bulk-applied to strategy_assignments
 	// BEFORE loadStrategyAssignments reads them below, so ListAssignments(enabledOnly=true) picks
 	// up the result with no change needed to that function. A no-op when ActiveKinds is empty.
-	if err := repo.SetAssignmentsEnabledForKinds(ctx, "paper", ptCfg.ActiveKinds, instIDs, paperTradingBars); err != nil {
+	if err := repo.SetAssignmentsEnabledForKinds(ctx, "paper", exchange, ptCfg.ActiveKinds, instIDs, paperTradingBars); err != nil {
 		logger.Error("failed to apply active-strategy-kinds restriction", "error", err)
 		os.Exit(1)
 	}
@@ -162,7 +171,7 @@ func main() {
 	// deliberate, infrequent operator action, and every open position closes on its very next tick
 	// regardless of how this flag was applied.
 	if ptCfg.TradingState == "stopped" {
-		n, err := repo.RequestManualCloseAll(ctx)
+		n, err := repo.RequestManualCloseAll(ctx, exchange)
 		if err != nil {
 			logger.Error("failed to request manual close of all open orders", "error", err)
 			os.Exit(1)
@@ -173,7 +182,7 @@ func main() {
 	// Panel control-box HTTP surface (CLAUDE.md) — GET/PUT /config + POST /restart, mirroring
 	// cmd/strategy-tester's own pattern. GET /config reflects ptCfg as loaded at THIS startup, not
 	// a live DB round-trip, same asymmetry as the tester (a save is only "live" after a restart).
-	ptSvc := &paperTraderService{repo: repo, logger: logger, current: ptCfg, allInstIDs: instIDs}
+	ptSvc := &paperTraderService{repo: repo, logger: logger, current: ptCfg, allInstIDs: instIDs, exchange: exchange}
 	ptAddr := envOr("PAPER_TRADER_ADDR", "0.0.0.0:8093")
 	ptHTTPServer := &http.Server{Addr: ptAddr, Handler: ptSvc.routes()}
 	go func() {
@@ -271,7 +280,7 @@ func main() {
 		// fresh from Postgres on every start, so a crash/restart resumes with exactly the same
 		// token/timeframe->strategy bindings the panel last configured, not whatever was hardcoded
 		// here in Go.
-		strategies, err := loadStrategyAssignments(ctx, repo, instID, logger)
+		strategies, err := loadStrategyAssignments(ctx, repo, instID, exchange, logger)
 		if err != nil {
 			logger.Error("failed to load strategy assignments", "instId", instID, "error", err)
 			os.Exit(1)
@@ -340,8 +349,12 @@ func main() {
 			BTCCandles: btcRef.Window,
 			TokenStats: tokenStats.For,
 			// One shared account across every token (CLAUDE.md §15.6): each per-instrument engine
-			// trades against the same "paper" balance row, not a slice of it.
+			// trades against the same "paper" balance row, not a slice of it. Exchange scopes that
+			// balance/config/assignments/open-orders to THIS process's own instance identity
+			// (2026-09-22 multi-exchange paper trading) — a second process with PAPER_EXCHANGE=mexc
+			// shares no state with this one despite both using Mode="paper".
 			Mode:                "paper",
+			Exchange:            exchange,
 			AccountInitialUSD:   cfg.Account.InitialUSD,
 			MaxPositionPct:      cfg.Account.MaxPositionPct,
 			MaxTotalExposurePct: cfg.Account.MaxTotalExposurePct,
@@ -437,7 +450,7 @@ func envOr(key, fallback string) string {
 // configured instrument, matching the previous hardcoded behavior, so a fresh install still
 // trades out of the box. Once the panel (CLAUDE.md §11) is used to manage assignments, this is a
 // no-op for any instrument that already has one.
-func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, instIDs []string, paperTradingBars []string) error {
+func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, exchange string, instIDs []string, paperTradingBars []string) error {
 	origins, err := repo.ListStrategies(ctx, "", false)
 	if err != nil {
 		return err
@@ -462,7 +475,7 @@ func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, ins
 	defaultBar := paperTradingBars[0]
 
 	for _, instID := range instIDs {
-		assignments, err := repo.ListAssignments(ctx, instID, false, "paper")
+		assignments, err := repo.ListAssignments(ctx, instID, false, "paper", exchange)
 		if err != nil {
 			return err
 		}
@@ -475,6 +488,7 @@ func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, ins
 			Bar:        defaultBar,
 			Enabled:    true,
 			Mode:       "paper",
+			Exchange:   exchange,
 		}); err != nil {
 			return err
 		}
@@ -485,8 +499,8 @@ func ensureDefaultAssignment(ctx context.Context, repo *postgres.Repository, ins
 // loadStrategyAssignments resolves an instrument's durable strategy_assignments rows into live
 // usecase.StrategyAssignment values the PaperTrader can run, rebuilding the strategy.Strategy from
 // its DB row's Kind+Config every time (CLAUDE.md §11.3) rather than trusting any in-memory cache.
-func loadStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID string, logger *slog.Logger) ([]usecase.StrategyAssignment, error) {
-	rows, err := repo.ListAssignments(ctx, instID, true, "paper")
+func loadStrategyAssignments(ctx context.Context, repo *postgres.Repository, instID, exchange string, logger *slog.Logger) ([]usecase.StrategyAssignment, error) {
+	rows, err := repo.ListAssignments(ctx, instID, true, "paper", exchange)
 	if err != nil {
 		return nil, err
 	}

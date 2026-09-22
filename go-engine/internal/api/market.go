@@ -262,7 +262,7 @@ func (s *Server) handleListInstruments(w http.ResponseWriter, r *http.Request) {
 	// The operator's own instruction: Active must track the checkbox, full stop — whether a
 	// strategy happens to be assigned is a separate question the "Trading" column already answers
 	// (instrumentView has no equivalent field for that split yet, see below).
-	ptCfg, err := s.Repo.GetPaperTradingConfig(r.Context(), activeMode)
+	ptCfg, err := s.Repo.GetPaperTradingConfig(r.Context(), activeMode, "")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -274,7 +274,7 @@ func (s *Server) handleListInstruments(w http.ResponseWriter, r *http.Request) {
 	// hasAssignment still backs the "Trading" column (instrumentView doc comment above) — whether
 	// a strategy is actually assigned is a real, separate fact the panel also displays, just not
 	// the same fact as Active any more.
-	assignments, err := s.Repo.ListAssignments(r.Context(), "", true, activeMode)
+	assignments, err := s.Repo.ListAssignments(r.Context(), "", true, activeMode, "")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

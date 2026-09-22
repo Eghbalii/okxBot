@@ -9,11 +9,17 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
 
-// OpenPaperOrder inserts a new virtual trade and returns its id.
+// OpenPaperOrder inserts a new virtual trade and returns its id. o.Exchange defaults to "okx"
+// when unset (2026-09-22, multi-exchange paper trading), same convention as o.Mode defaulting to
+// "paper" — every order opened before this field existed reads as an OKX order, which is correct.
 func (r *Repository) OpenPaperOrder(ctx context.Context, o port.PaperOrder) (int64, error) {
 	mode := o.Mode
 	if mode == "" {
 		mode = "paper"
+	}
+	exchange := o.Exchange
+	if exchange == "" {
+		exchange = "okx"
 	}
 	variant := o.Variant
 	if variant == "" {
@@ -21,10 +27,10 @@ func (r *Repository) OpenPaperOrder(ctx context.Context, o port.PaperOrder) (int
 	}
 	var id int64
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO paper_orders (inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, features_json, mode, parent_order_id, variant, bar, exchange_order_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		INSERT INTO paper_orders (inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, features_json, mode, parent_order_id, variant, bar, exchange_order_id, exchange)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		RETURNING id
-	`, o.InstID, o.StrategyID, o.Side, o.EntryPx, o.SLPx, o.TPPx, o.Size, o.Leverage, o.FeaturesJSON, mode, o.ParentOrderID, variant, o.Bar, o.ExchangeOrderID).Scan(&id)
+	`, o.InstID, o.StrategyID, o.Side, o.EntryPx, o.SLPx, o.TPPx, o.Size, o.Leverage, o.FeaturesJSON, mode, o.ParentOrderID, variant, o.Bar, o.ExchangeOrderID, exchange).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("open paper order for %s: %w", o.InstID, err)
 	}
@@ -40,12 +46,12 @@ func (r *Repository) GetPaperOrder(ctx context.Context, id int64) (port.PaperOrd
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at,
 			closed_at, close_reason, close_px, realized_pnl, features_json, mode, parent_order_id,
-			variant, bar, pnl_max_pct, pnl_min_pct, manual_close_requested, exchange_order_id, exchange_algo_order_id
+			variant, bar, pnl_max_pct, pnl_min_pct, manual_close_requested, exchange_order_id, exchange_algo_order_id, exchange
 		FROM paper_orders WHERE id = $1
 	`, id).Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size,
 		&o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx, &o.RealizedPnL,
 		&o.FeaturesJSON, &o.Mode, &o.ParentOrderID, &o.Variant, &bar, &o.PnLMaxPct, &o.PnLMinPct,
-		&o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID)
+		&o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.Exchange)
 	if err != nil {
 		return port.PaperOrder{}, fmt.Errorf("get paper order %d: %w", id, err)
 	}
@@ -100,15 +106,23 @@ func (r *Repository) UpdatePaperOrderSLTP(ctx context.Context, id int64, slPx, t
 // ListOpenPaperOrders returns still-open virtual trades for an instrument (both baseline and
 // rl_adjusted-fork variants — the SL/TP monitor loop treats them uniformly, each hits its own
 // SL/TP independently; only reward/budget attribution filters by Variant, CLAUDE.md §15.4).
-func (r *Repository) ListOpenPaperOrders(ctx context.Context, instID string) ([]port.PaperOrder, error) {
+//
+// exchange is the CRITICAL isolation point for a second, independent paper-trading instance
+// (2026-09-22, multi-exchange paper trading): two engines must never see each other's open
+// positions even if instID happens to collide across exchanges. "" defaults to "okx", matching
+// every pre-existing call site from before this parameter existed.
+func (r *Repository) ListOpenPaperOrders(ctx context.Context, instID, exchange string) ([]port.PaperOrder, error) {
+	if exchange == "" {
+		exchange = "okx"
+	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, parent_order_id, variant, pnl_max_pct, pnl_min_pct, bar, manual_close_requested, exchange_order_id, exchange_algo_order_id
 		FROM paper_orders
-		WHERE inst_id = $1 AND closed_at IS NULL
+		WHERE inst_id = $1 AND closed_at IS NULL AND exchange = $2
 		ORDER BY opened_at
-	`, instID)
+	`, instID, exchange)
 	if err != nil {
-		return nil, fmt.Errorf("list open paper orders for %s: %w", instID, err)
+		return nil, fmt.Errorf("list open paper orders for %s (exchange %s): %w", instID, exchange, err)
 	}
 	defer rows.Close()
 
@@ -186,7 +200,7 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 		SELECT po.id, po.inst_id, po.strategy_id, po.side, po.entry_px, po.sl_px, po.tp_px, po.size, po.leverage,
 			po.opened_at, po.closed_at, po.close_reason, po.close_px, po.realized_pnl, po.fees_usd, po.funding_usd, po.features_json, po.mode,
 			po.parent_order_id, po.variant, po.bar, po.pnl_max_pct, po.pnl_min_pct, COALESCE(s.name, ''),
-			po.exchange_order_id, po.exchange_algo_order_id,
+			po.exchange_order_id, po.exchange_algo_order_id, po.exchange,
 			-- How many in-place SL/TP edits this order has had. The panel's "Updated" column used to
 			-- be derived from parent_order_id (was this order shadow-forked?), but forking was
 			-- replaced by in-place edits on 2026-09-02 (CLAUDE.md §15.4 revision), so that column has
@@ -199,9 +213,14 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 		WHERE ($1 = '' OR po.mode = $1)
 			AND ($2 = '' OR po.inst_id = $2)
 			AND ($3::boolean IS NULL OR (po.closed_at IS NULL) = $3)
+			AND ($4 = '' OR po.exchange = $4)
 		ORDER BY ` + orderClause
 
-	args := []any{f.Mode, f.InstID, f.Open}
+	// f.Exchange="" matches every exchange (unlike other Exchange-scoped methods elsewhere in this
+	// file, which default an empty value to "okx") — ListPositions/CountPositions back the panel's
+	// cross-mode positions view, and a panel that has never heard of a second exchange must keep
+	// seeing every row it saw before this filter existed (2026-09-22).
+	args := []any{f.Mode, f.InstID, f.Open, f.Exchange}
 	if f.Limit > 0 {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
 		args = append(args, f.Limit, f.Offset)
@@ -221,7 +240,7 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 			&o.Size, &o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx,
 			&o.RealizedPnL, &o.FeesUSD, &o.FundingUSD, &o.FeaturesJSON, &o.Mode, &o.ParentOrderID, &o.Variant, &bar,
 			&o.PnLMaxPct, &o.PnLMinPct, &o.StrategyName, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID,
-			&o.AdjustmentCount); err != nil {
+			&o.Exchange, &o.AdjustmentCount); err != nil {
 			return nil, fmt.Errorf("scan position: %w", err)
 		}
 		if bar != nil {
@@ -232,8 +251,8 @@ func (r *Repository) ListPositions(ctx context.Context, f port.PositionFilter) (
 	return out, rows.Err()
 }
 
-// CountPositions returns how many rows f's Mode/InstID/Open filters match — what the panel's
-// pagination control needs to compute total page count without pulling every row back.
+// CountPositions returns how many rows f's Mode/InstID/Open/Exchange filters match — what the
+// panel's pagination control needs to compute total page count without pulling every row back.
 func (r *Repository) CountPositions(ctx context.Context, f port.PositionFilter) (int, error) {
 	var count int
 	err := r.pool.QueryRow(ctx, `
@@ -242,7 +261,8 @@ func (r *Repository) CountPositions(ctx context.Context, f port.PositionFilter) 
 		WHERE ($1 = '' OR po.mode = $1)
 			AND ($2 = '' OR po.inst_id = $2)
 			AND ($3::boolean IS NULL OR (po.closed_at IS NULL) = $3)
-	`, f.Mode, f.InstID, f.Open).Scan(&count)
+			AND ($4 = '' OR po.exchange = $4)
+	`, f.Mode, f.InstID, f.Open, f.Exchange).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count positions: %w", err)
 	}
@@ -262,8 +282,16 @@ func (r *Repository) CountPositions(ctx context.Context, f port.PositionFilter) 
 // table read as "recent activity" when the operator wanted a whole-history view, the same as
 // StrategyStatsFor (which has never had a time window). Dropped the interval filter rather than
 // widening it, matching that sibling function's own unbounded WHERE clause.
-func (r *Repository) TokenStatsAllTime(ctx context.Context, mode string) ([]port.TokenStats, error) {
+// exchange scopes the paper_orders branch to one exchange's rows ("" defaults to "okx", matching
+// every pre-existing call site) — added 2026-09-22 so a second exchange's paper trading gets its
+// own token stats rather than being blended into the existing OKX ones. Ignored for mode="bot":
+// bot_orders has no exchange dimension (no second exchange trades real money today).
+func (r *Repository) TokenStatsAllTime(ctx context.Context, mode, exchange string) ([]port.TokenStats, error) {
+	if exchange == "" {
+		exchange = "okx"
+	}
 	var query string
+	var args []any
 	if mode == "bot" {
 		query = `
 			SELECT inst_id, count(*), coalesce(sum(realized_pnl), 0), coalesce(sum(size), 0)
@@ -275,14 +303,15 @@ func (r *Repository) TokenStatsAllTime(ctx context.Context, mode string) ([]port
 		query = `
 			SELECT inst_id, count(*), coalesce(sum(realized_pnl), 0), coalesce(sum(size), 0)
 			FROM paper_orders
-			WHERE mode = 'paper' AND variant = 'baseline'
+			WHERE mode = 'paper' AND variant = 'baseline' AND exchange = $1
 				AND closed_at IS NOT NULL
 			GROUP BY inst_id
 		`
+		args = []any{exchange}
 	}
-	rows, err := r.pool.Query(ctx, query)
+	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("token stats all-time (mode %s): %w", mode, err)
+		return nil, fmt.Errorf("token stats all-time (mode %s, exchange %s): %w", mode, exchange, err)
 	}
 	defer rows.Close()
 

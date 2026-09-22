@@ -9,22 +9,30 @@ import (
 
 const paperTradingConfigCols = `trading_state, disable_long, disable_short, active_kinds, disabled_inst_ids, auto_disabled_inst_ids, active_bars, updated_at`
 
-// GetPaperTradingConfig returns mode's panel-editable control-box config (CLAUDE.md real-trading
-// readiness plan, 2026-09-04 — paper_trading_config is now one row per mode, PK on mode, replacing
-// migration 000015's id=1 singleton), seeding it at column defaults if it hasn't been written yet.
-// A fresh row defaults trading_state='running' via this INSERT — matches paper's own long-standing
-// default; mode='real' already has a seeded row from migration 000020 with trading_state='stopped'
-// so this INSERT's default is never actually exercised for real mode in practice, but stays
-// correct as a fallback rather than assuming the seed row always exists.
-func (r *Repository) GetPaperTradingConfig(ctx context.Context, mode string) (port.PaperTradingConfig, error) {
+// GetPaperTradingConfig returns (mode, exchange)'s panel-editable control-box config (CLAUDE.md
+// real-trading readiness plan, 2026-09-04 — paper_trading_config is now one row per (mode,
+// exchange), replacing migration 000015's id=1 singleton), seeding it at column defaults if it
+// hasn't been written yet. A fresh row defaults trading_state='running' via this INSERT — matches
+// paper's own long-standing default; mode='real' already has a seeded row from migration 000020
+// with trading_state='stopped' so this INSERT's default is never actually exercised for real mode
+// in practice, but stays correct as a fallback rather than assuming the seed row always exists.
+//
+// exchange="" defaults to "okx" (2026-09-22, multi-exchange paper trading), matching every
+// pre-existing call site from before exchange scoping existed — a second, independent
+// paper-trading instance against a different exchange gets its own control-box row under the same
+// mode="paper".
+func (r *Repository) GetPaperTradingConfig(ctx context.Context, mode, exchange string) (port.PaperTradingConfig, error) {
+	if exchange == "" {
+		exchange = port.PaperTradingConfigExchange
+	}
 	var c port.PaperTradingConfig
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO paper_trading_config (mode) VALUES ($1)
-		ON CONFLICT (mode) DO UPDATE SET mode = paper_trading_config.mode
-		RETURNING `+paperTradingConfigCols, mode).
+		INSERT INTO paper_trading_config (mode, exchange) VALUES ($1, $2)
+		ON CONFLICT (mode, exchange) DO UPDATE SET mode = paper_trading_config.mode
+		RETURNING `+paperTradingConfigCols, mode, exchange).
 		Scan(&c.TradingState, &c.DisableLong, &c.DisableShort, &c.ActiveKinds, &c.DisabledInstIDs, &c.AutoDisabledInstIDs, &c.ActiveBars, &c.UpdatedAt)
 	if err != nil {
-		return port.PaperTradingConfig{}, fmt.Errorf("get paper trading config for mode %s: %w", mode, err)
+		return port.PaperTradingConfig{}, fmt.Errorf("get paper trading config for mode %s, exchange %s: %w", mode, exchange, err)
 	}
 	return c, nil
 }
@@ -34,7 +42,12 @@ func (r *Repository) GetPaperTradingConfig(ctx context.Context, mode string) (po
 // fields are *[]string (a pointer to a slice) rather than []string so an explicit empty slice
 // ("clear this restriction") is distinguishable from a nil pointer ("field omitted, leave the
 // saved restriction as-is") — both would otherwise scan/bind identically as SQL NULL.
-func (r *Repository) SavePaperTradingConfig(ctx context.Context, mode string, patch port.PaperTradingConfigPatch) (port.PaperTradingConfig, error) {
+// exchange="" defaults to "okx" (2026-09-22, multi-exchange paper trading), matching every
+// pre-existing call site from before exchange scoping existed.
+func (r *Repository) SavePaperTradingConfig(ctx context.Context, mode, exchange string, patch port.PaperTradingConfigPatch) (port.PaperTradingConfig, error) {
+	if exchange == "" {
+		exchange = port.PaperTradingConfigExchange
+	}
 	var activeKinds, disabledInstIDs, activeBars any
 	if patch.ActiveKinds != nil {
 		activeKinds = *patch.ActiveKinds
@@ -58,9 +71,9 @@ func (r *Repository) SavePaperTradingConfig(ctx context.Context, mode string, pa
 
 	var c port.PaperTradingConfig
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO paper_trading_config (mode, trading_state, disable_long, disable_short, active_kinds, disabled_inst_ids, active_bars, auto_disabled_inst_ids, updated_at)
-		VALUES ($7, coalesce($1, 'running'), coalesce($2, false), coalesce($3, false), $4, $5, $6, coalesce($11::text[], '{}'::text[]), now())
-		ON CONFLICT (mode) DO UPDATE SET
+		INSERT INTO paper_trading_config (mode, exchange, trading_state, disable_long, disable_short, active_kinds, disabled_inst_ids, active_bars, auto_disabled_inst_ids, updated_at)
+		VALUES ($7, $13, coalesce($1, 'running'), coalesce($2, false), coalesce($3, false), $4, $5, $6, coalesce($11::text[], '{}'::text[]), now())
+		ON CONFLICT (mode, exchange) DO UPDATE SET
 			trading_state = coalesce($1, paper_trading_config.trading_state),
 			disable_long = coalesce($2, paper_trading_config.disable_long),
 			disable_short = coalesce($3, paper_trading_config.disable_short),
@@ -73,10 +86,10 @@ func (r *Repository) SavePaperTradingConfig(ctx context.Context, mode string, pa
 		patch.TradingState, patch.DisableLong, patch.DisableShort,
 		activeKinds, disabledInstIDs, activeBars, mode,
 		patch.ActiveKinds != nil, patch.DisabledInstIDs != nil, patch.ActiveBars != nil,
-		autoDisabled, patch.AutoDisabledInstIDs != nil).
+		autoDisabled, patch.AutoDisabledInstIDs != nil, exchange).
 		Scan(&c.TradingState, &c.DisableLong, &c.DisableShort, &c.ActiveKinds, &c.DisabledInstIDs, &c.AutoDisabledInstIDs, &c.ActiveBars, &c.UpdatedAt)
 	if err != nil {
-		return port.PaperTradingConfig{}, fmt.Errorf("save paper trading config for mode %s: %w", mode, err)
+		return port.PaperTradingConfig{}, fmt.Errorf("save paper trading config for mode %s, exchange %s: %w", mode, exchange, err)
 	}
 	return c, nil
 }
@@ -85,37 +98,47 @@ func (r *Repository) SavePaperTradingConfig(ctx context.Context, mode string, pa
 // RequestManualClose — used when the operator sets trading_state="stopped" from the panel (CLAUDE.md):
 // every open position closes at the live price on its very next tick, same manual-close path and
 // reward-reporting treatment (conductor.CloseReasonManual -> CategoryClosedEarly) as a single
-// order's Close button. Returns how many rows were flagged.
-func (r *Repository) RequestManualCloseAll(ctx context.Context) (int, error) {
+// order's Close button. Returns how many rows were flagged. exchange scopes the sweep to one
+// exchange's rows ("" defaults to "okx", matching every pre-existing call site) — added
+// 2026-09-22 so stopping one exchange's paper trading never touches the other's open orders.
+func (r *Repository) RequestManualCloseAll(ctx context.Context, exchange string) (int, error) {
+	if exchange == "" {
+		exchange = "okx"
+	}
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE paper_orders SET manual_close_requested = true
-		WHERE closed_at IS NULL AND mode = 'paper'
-	`)
+		WHERE closed_at IS NULL AND mode = 'paper' AND exchange = $1
+	`, exchange)
 	if err != nil {
-		return 0, fmt.Errorf("request manual close all: %w", err)
+		return 0, fmt.Errorf("request manual close all (exchange %s): %w", exchange, err)
 	}
 	return int(tag.RowsAffected()), nil
 }
 
-// SetAssignmentsEnabledForKinds bulk-enables/disables mode's strategy_assignments so only
-// assignments whose strategy's Kind is in activeKinds are enabled — the global per-kind "active
-// strategies" toggle (CLAUDE.md), applied uniformly across every token rather than per-assignment,
-// scoped to one mode so this never touches the other mode's assignments. A no-op (returns nil
-// without touching any row) when activeKinds is empty: an empty restriction means "no restriction
-// configured," preserving today's per-assignment-managed behavior for anyone who has never touched
-// this control.
-func (r *Repository) SetAssignmentsEnabledForKinds(ctx context.Context, mode string, activeKinds []string, instIDs, bars []string) error {
+// SetAssignmentsEnabledForKinds bulk-enables/disables (mode, exchange)'s strategy_assignments so
+// only assignments whose strategy's Kind is in activeKinds are enabled — the global per-kind
+// "active strategies" toggle (CLAUDE.md), applied uniformly across every token rather than
+// per-assignment, scoped to one mode and exchange so this never touches another mode's or
+// exchange's assignments. A no-op (returns nil without touching any row) when activeKinds is
+// empty: an empty restriction means "no restriction configured," preserving today's
+// per-assignment-managed behavior for anyone who has never touched this control. exchange=""
+// defaults to "okx" (2026-09-22, multi-exchange paper trading), matching every pre-existing call
+// site from before exchange scoping existed.
+func (r *Repository) SetAssignmentsEnabledForKinds(ctx context.Context, mode, exchange string, activeKinds []string, instIDs, bars []string) error {
 	if len(activeKinds) == 0 {
 		return nil
+	}
+	if exchange == "" {
+		exchange = "okx"
 	}
 	_, err := r.pool.Exec(ctx, `
 		UPDATE strategy_assignments
 		SET enabled = (s.kind = ANY($1)), updated_at = now()
 		FROM strategies s
-		WHERE strategy_assignments.strategy_id = s.id AND strategy_assignments.mode = $2
-	`, activeKinds, mode)
+		WHERE strategy_assignments.strategy_id = s.id AND strategy_assignments.mode = $2 AND strategy_assignments.exchange = $3
+	`, activeKinds, mode, exchange)
 	if err != nil {
-		return fmt.Errorf("set assignments enabled for kinds %v (mode %s): %w", activeKinds, mode, err)
+		return fmt.Errorf("set assignments enabled for kinds %v (mode %s, exchange %s): %w", activeKinds, mode, exchange, err)
 	}
 
 	// Create the rows a newly-activated kind needs, rather than only flipping rows that already
@@ -134,16 +157,16 @@ func (r *Repository) SetAssignmentsEnabledForKinds(ctx context.Context, mode str
 		return nil
 	}
 	_, err = r.pool.Exec(ctx, `
-		INSERT INTO strategy_assignments (strategy_id, inst_id, bar, enabled, mode)
-		SELECT s.id, inst.inst_id, bar.bar, true, $4
+		INSERT INTO strategy_assignments (strategy_id, inst_id, bar, enabled, mode, exchange)
+		SELECT s.id, inst.inst_id, bar.bar, true, $4, $5
 		FROM strategies s
 		CROSS JOIN unnest($2::text[]) AS inst(inst_id)
 		CROSS JOIN unnest($3::text[]) AS bar(bar)
 		WHERE s.kind = ANY($1) AND s.is_origin
-		ON CONFLICT (strategy_id, inst_id, bar, mode) DO NOTHING
-	`, activeKinds, instIDs, bars, mode)
+		ON CONFLICT (strategy_id, inst_id, bar, mode, exchange) DO NOTHING
+	`, activeKinds, instIDs, bars, mode, exchange)
 	if err != nil {
-		return fmt.Errorf("create missing assignments for kinds %v (mode %s): %w", activeKinds, mode, err)
+		return fmt.Errorf("create missing assignments for kinds %v (mode %s, exchange %s): %w", activeKinds, mode, exchange, err)
 	}
 	return nil
 }

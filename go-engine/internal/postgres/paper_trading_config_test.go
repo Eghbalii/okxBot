@@ -56,17 +56,17 @@ func TestSavePaperTradingConfig_SavesWithoutTouchingAutoDisabled(t *testing.T) {
 	repo := testRepo(t)
 	ctx := context.Background()
 
-	before, err := repo.GetPaperTradingConfig(ctx, "paper")
+	before, err := repo.GetPaperTradingConfig(ctx, "paper", "")
 	if err != nil {
 		t.Fatalf("read current config: %v", err)
 	}
 	t.Cleanup(func() {
 		state := before.TradingState
-		_, _ = repo.SavePaperTradingConfig(ctx, "paper", port.PaperTradingConfigPatch{TradingState: &state})
+		_, _ = repo.SavePaperTradingConfig(ctx, "paper", "", port.PaperTradingConfigPatch{TradingState: &state})
 	})
 
 	state := "running"
-	got, err := repo.SavePaperTradingConfig(ctx, "paper", port.PaperTradingConfigPatch{TradingState: &state})
+	got, err := repo.SavePaperTradingConfig(ctx, "paper", "", port.PaperTradingConfigPatch{TradingState: &state})
 	if err != nil {
 		t.Fatalf("a patch that omits auto_disabled_inst_ids must still save: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestSavePaperTradingConfig_RoundTripsAutoDisabled(t *testing.T) {
 	repo := testRepo(t)
 	ctx := context.Background()
 
-	before, err := repo.GetPaperTradingConfig(ctx, "paper")
+	before, err := repo.GetPaperTradingConfig(ctx, "paper", "")
 	if err != nil {
 		t.Fatalf("read current config: %v", err)
 	}
@@ -89,11 +89,11 @@ func TestSavePaperTradingConfig_RoundTripsAutoDisabled(t *testing.T) {
 		if restore == nil {
 			restore = []string{}
 		}
-		_, _ = repo.SavePaperTradingConfig(ctx, "paper", port.PaperTradingConfigPatch{AutoDisabledInstIDs: &restore})
+		_, _ = repo.SavePaperTradingConfig(ctx, "paper", "", port.PaperTradingConfigPatch{AutoDisabledInstIDs: &restore})
 	})
 
 	want := []string{"AAA", "BBB"}
-	got, err := repo.SavePaperTradingConfig(ctx, "paper", port.PaperTradingConfigPatch{AutoDisabledInstIDs: &want})
+	got, err := repo.SavePaperTradingConfig(ctx, "paper", "", port.PaperTradingConfigPatch{AutoDisabledInstIDs: &want})
 	if err != nil {
 		t.Fatalf("save with auto-disabled set: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestSavePaperTradingConfig_RoundTripsAutoDisabled(t *testing.T) {
 
 	// Clearing it to empty must also work, and must be distinguishable from "leave it alone".
 	empty := []string{}
-	cleared, err := repo.SavePaperTradingConfig(ctx, "paper", port.PaperTradingConfigPatch{AutoDisabledInstIDs: &empty})
+	cleared, err := repo.SavePaperTradingConfig(ctx, "paper", "", port.PaperTradingConfigPatch{AutoDisabledInstIDs: &empty})
 	if err != nil {
 		t.Fatalf("clear auto-disabled: %v", err)
 	}

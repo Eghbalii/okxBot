@@ -192,6 +192,77 @@ services:
     volumes:
       - ./go-engine/configs:/app/configs
 
+  # okx-gateway-mexc: a SECOND, independent gateway instance for MEXC (2026-09-22 multi-exchange
+  # paper-trading test, docs/MEXC_TEST_HANDOFF.md) — same image as okx-gateway, GATEWAY_EXCHANGE=mexc
+  # selects the MEXC branch of cmd/okx-gateway/main.go's buildService (already exchange-parameterized,
+  # commit "feat(gateway): make cmd/okx-gateway exchange-parameterized for MEXC"). Runs on its own
+  # port (8096, since 8094 is OKX's) and holds MEXC's own credentials — the OKX gateway is completely
+  # untouched by this addition, per the operator's explicit "separate running instance, not a switch"
+  # requirement.
+  okx-gateway-mexc:
+    logging: *default-logging
+    restart: *default-restart
+    build:
+      context: ./go-engine
+      dockerfile: Dockerfile.okx-gateway
+    environment:
+      CONFIG_PATH: /app/configs/config.mexc.yaml
+      GATEWAY_ADDR: "0.0.0.0:8096"
+      GATEWAY_EXCHANGE: mexc
+      METRICS_ADDR: ":9106"
+      MEXC_API_KEY: ${MEXC_API_KEY}
+      MEXC_API_SECRET: ${MEXC_API_SECRET}
+      # MEXC has no private-WS client yet (internal/mexc/ws has only public.go, per the handoff
+      # doc) — this gateway instance runs on the reconciliation poll alone, which §27.6 already
+      # treats as a legitimate baseline, not a blocking gap. KAFKA_BROKERS is still set because the
+      # gateway's own metrics/limiter machinery is shared code with the OKX path.
+      KAFKA_BROKERS: kafka:9092
+    depends_on:
+      - kafka
+    ports:
+      - "8096:8096"
+      - "9106:9106"
+    volumes:
+      - ./go-engine/configs:/app/configs
+
+  # paper-trader-mexc: a SECOND, fully independent cmd/paper-trader process trading against MEXC in
+  # parallel with the existing OKX paper-trader — PAPER_EXCHANGE=mexc threads usecase.PaperTrader's
+  # own Exchange field through every exchange-scoped repository call (open orders, account balance/
+  # history, control-box config, strategy assignments), so the two share Postgres/Kafka/rl-service
+  # but touch none of the same rows. Points at okx-gateway-mexc, never the OKX one.
+  paper-trader-mexc:
+    logging: *default-logging
+    restart: *default-restart
+    build:
+      context: ./go-engine
+      dockerfile: Dockerfile.paper-trader
+    environment:
+      CONFIG_PATH: /app/configs/config.mexc.yaml
+      PAPER_EXCHANGE: mexc
+      KAFKA_BROKERS: kafka:9092
+      POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
+      METRICS_ADDR: ":9107"
+      # Distinct from paper-trader's own 8093 — both control-box HTTP surfaces run in the same
+      # Docker network and would otherwise collide.
+      PAPER_TRADER_ADDR: "0.0.0.0:8098"
+      RL_SERVICE_URL: http://rl-service:8000
+      # The MEXC gateway, not the OKX one — this is the whole point of running a second instance.
+      OKX_GATEWAY_URL: http://okx-gateway-mexc:8096
+    ports:
+      - "9107:9107"
+      - "8098:8098"
+    volumes:
+      - ./go-engine/configs:/app/configs
+    depends_on:
+      kafka:
+        condition: service_healthy
+      rl-service:
+        condition: service_started
+      okx-gateway-mexc:
+        condition: service_started
+      timescaledb:
+        condition: service_started
+
   trader:
     logging: *default-logging
     # unless-stopped since 2026-09-09, replacing on-failure:5. The cap was protecting against a

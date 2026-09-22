@@ -12,10 +12,22 @@ import (
 
 const accountEquityCols = `mode, initial_usd, equity_usd, account_balance_usd, trading_cap_usd, reset_count, last_reset_at, updated_at`
 
+// accountEquityColsEx additionally selects exchange, for the exchange-scoped Ex methods below
+// (2026-09-22, multi-exchange paper trading) — kept as a separate column list rather than adding
+// exchange to accountEquityCols/scanAccountEquity so every pre-existing call site (bot/manual
+// modes, which never pass an exchange) is untouched.
+const accountEquityColsEx = accountEquityCols + `, exchange`
+
 func scanAccountEquity(row interface {
 	Scan(dest ...any) error
 }, ae *port.AccountEquity) error {
 	return row.Scan(&ae.Mode, &ae.InitialUSD, &ae.EquityUSD, &ae.AccountBalanceUSD, &ae.TradingCapUSD, &ae.ResetCount, &ae.LastResetAt, &ae.UpdatedAt)
+}
+
+func scanAccountEquityEx(row interface {
+	Scan(dest ...any) error
+}, ae *port.AccountEquity) error {
+	return row.Scan(&ae.Mode, &ae.InitialUSD, &ae.EquityUSD, &ae.AccountBalanceUSD, &ae.TradingCapUSD, &ae.ResetCount, &ae.LastResetAt, &ae.UpdatedAt, &ae.Exchange)
 }
 
 // GetAccountEquity returns mode's current balance row, seeding it (plus a "seed" history point)
@@ -44,11 +56,16 @@ func (r *Repository) GetAccountEquity(ctx context.Context, mode string, initialU
 	// xmax = 0 identifies a row this statement actually inserted, as opposed to one the no-op
 	// DO UPDATE just returned — that's what tells us whether to write the seed history point,
 	// without a second round trip to check for existence first.
+	// exchange is pinned to 'okx' explicitly — account_equity's key widened to (mode, exchange)
+	// when multi-exchange paper trading landed (2026-09-22, migration 000037), so ON CONFLICT
+	// (mode) alone no longer matches any constraint on this table. Every caller of this un-scoped
+	// method (bot/manual/paper's own operator-facing endpoints) predates exchange scoping and must
+	// keep reading/writing exactly the row it always did.
 	var inserted bool
 	row := r.pool.QueryRow(ctx, `
-		INSERT INTO account_equity (mode, initial_usd, equity_usd, account_balance_usd)
-		VALUES ($1, $2, $3, $2)
-		ON CONFLICT (mode) DO UPDATE SET mode = account_equity.mode
+		INSERT INTO account_equity (mode, exchange, initial_usd, equity_usd, account_balance_usd)
+		VALUES ($1, 'okx', $2, $3, $2)
+		ON CONFLICT (mode, exchange) DO UPDATE SET mode = account_equity.mode
 		RETURNING `+accountEquityCols+`, (xmax = 0)
 	`, mode, initialUSD, seedEquity)
 	if err := row.Scan(&ae.Mode, &ae.InitialUSD, &ae.EquityUSD, &ae.AccountBalanceUSD, &ae.TradingCapUSD, &ae.ResetCount, &ae.LastResetAt, &ae.UpdatedAt, &inserted); err != nil {
@@ -93,21 +110,24 @@ func (r *Repository) ApplyRealizedPnL(
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
 
+	// exchange pinned to 'okx' explicitly throughout this method, for the same reason as
+	// GetAccountEquity above: this un-scoped path predates exchange scoping and must keep
+	// touching exactly the row it always did, not every exchange sharing this mode.
 	var ae port.AccountEquity
 	row := tx.QueryRow(ctx, `
 		UPDATE account_equity
 		SET equity_usd = equity_usd + $2,
 			account_balance_usd = account_balance_usd + $2,
 			updated_at = now()
-		WHERE mode = $1
+		WHERE mode = $1 AND exchange = 'okx'
 		RETURNING `+accountEquityCols, mode, pnl)
 	if err := scanAccountEquity(row, &ae); err != nil {
 		return port.AccountEquity{}, false, fmt.Errorf("apply realized pnl for mode %s: %w", mode, err)
 	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO account_equity_history (mode, equity_usd, delta_usd, reason, order_id, inst_id)
-		VALUES ($1, $2, $3, 'trade', $4, $5)
+		INSERT INTO account_equity_history (mode, exchange, equity_usd, delta_usd, reason, order_id, inst_id)
+		VALUES ($1, 'okx', $2, $3, 'trade', $4, $5)
 	`, mode, ae.EquityUSD, pnl, orderID, nullableText(instID)); err != nil {
 		return port.AccountEquity{}, false, fmt.Errorf("record equity history for mode %s: %w", mode, err)
 	}
@@ -127,7 +147,7 @@ func (r *Repository) ApplyRealizedPnL(
 			reset_count = reset_count + 1,
 			last_reset_at = now(),
 			updated_at = now()
-		WHERE mode = $1
+		WHERE mode = $1 AND exchange = 'okx'
 		RETURNING `+accountEquityCols, mode)
 	if err := scanAccountEquity(row, &ae); err != nil {
 		return port.AccountEquity{}, false, fmt.Errorf("reset drained account for mode %s: %w", mode, err)
@@ -168,7 +188,7 @@ func (r *Repository) RecordExchangeBalance(ctx context.Context, mode string, raw
 	var previousBalance, previousEquity decimal.Decimal
 	var previousCap *decimal.Decimal
 	if err := tx.QueryRow(ctx, `
-		SELECT account_balance_usd, equity_usd, trading_cap_usd FROM account_equity WHERE mode = $1
+		SELECT account_balance_usd, equity_usd, trading_cap_usd FROM account_equity WHERE mode = $1 AND exchange = 'okx'
 	`, mode).Scan(&previousBalance, &previousEquity, &previousCap); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("record exchange balance for mode %s: no existing row (call GetAccountEquity first): %w", mode, err)
 	}
@@ -213,7 +233,7 @@ func (r *Repository) RecordExchangeBalance(ctx context.Context, mode string, raw
 		SET account_balance_usd = $2,
 			equity_usd = $3,
 			updated_at = now()
-		WHERE mode = $1
+		WHERE mode = $1 AND exchange = 'okx'
 		RETURNING `+accountEquityCols, mode, rawBalanceUSD, tradable)
 	if err := scanAccountEquity(row, &ae); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("record exchange balance for mode %s: %w", mode, err)
@@ -221,8 +241,8 @@ func (r *Repository) RecordExchangeBalance(ctx context.Context, mode string, raw
 
 	if !delta.IsZero() {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO account_equity_history (mode, equity_usd, delta_usd, reason, inst_id)
-			VALUES ($1, $2, $3, 'trade', $4)
+			INSERT INTO account_equity_history (mode, exchange, equity_usd, delta_usd, reason, inst_id)
+			VALUES ($1, 'okx', $2, $3, 'trade', $4)
 		`, mode, ae.EquityUSD, delta, nullableText(instID)); err != nil {
 			return port.AccountEquity{}, fmt.Errorf("record exchange balance history for mode %s: %w", mode, err)
 		}
@@ -262,15 +282,15 @@ func (r *Repository) SetAccountCap(ctx context.Context, mode string, newCapUSD d
 	// zero when the operator chose a new cap. A missing row (fresh mode) has no "previous", so the
 	// delta is simply the new cap, same as GetAccountEquity's own first-seed behavior.
 	var previous decimal.Decimal
-	if err := tx.QueryRow(ctx, `SELECT equity_usd FROM account_equity WHERE mode = $1`, mode).Scan(&previous); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT equity_usd FROM account_equity WHERE mode = $1 AND exchange = 'okx'`, mode).Scan(&previous); err != nil {
 		previous = decimal.Zero
 	}
 
 	var ae port.AccountEquity
 	row := tx.QueryRow(ctx, `
-		INSERT INTO account_equity (mode, initial_usd, equity_usd, account_balance_usd, reset_count, last_reset_at)
-		VALUES ($1, $2, $2, $2, 1, now())
-		ON CONFLICT (mode) DO UPDATE SET
+		INSERT INTO account_equity (mode, exchange, initial_usd, equity_usd, account_balance_usd, reset_count, last_reset_at)
+		VALUES ($1, 'okx', $2, $2, $2, 1, now())
+		ON CONFLICT (mode, exchange) DO UPDATE SET
 			initial_usd = $2,
 			equity_usd = $2,
 			account_balance_usd = $2,
@@ -283,8 +303,8 @@ func (r *Repository) SetAccountCap(ctx context.Context, mode string, newCapUSD d
 	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO account_equity_history (mode, equity_usd, delta_usd, reason)
-		VALUES ($1, $2, $3, 'reset')
+		INSERT INTO account_equity_history (mode, exchange, equity_usd, delta_usd, reason)
+		VALUES ($1, 'okx', $2, $3, 'reset')
 	`, mode, newCapUSD, newCapUSD.Sub(previous)); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("record account cap reset for mode %s: %w", mode, err)
 	}
@@ -314,7 +334,7 @@ func (r *Repository) AdjustAccountCap(ctx context.Context, mode string, deltaUSD
 		SET equity_usd = equity_usd + $2,
 			account_balance_usd = account_balance_usd + $2,
 			updated_at = now()
-		WHERE mode = $1
+		WHERE mode = $1 AND exchange = 'okx'
 		RETURNING `+accountEquityCols, mode, deltaUSD)
 	if err := scanAccountEquity(row, &ae); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("adjust account cap for mode %s: no existing row (call GetAccountEquity first): %w", mode, err)
@@ -323,8 +343,8 @@ func (r *Repository) AdjustAccountCap(ctx context.Context, mode string, deltaUSD
 	// reason="cap": this is sizing-budget bookkeeping following the roster's own growth, not a
 	// trading outcome — it must never reach the PnL/win-rate figures a reason="trade" row would.
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO account_equity_history (mode, equity_usd, delta_usd, reason)
-		VALUES ($1, $2, $3, 'cap')
+		INSERT INTO account_equity_history (mode, exchange, equity_usd, delta_usd, reason)
+		VALUES ($1, 'okx', $2, $3, 'cap')
 	`, mode, ae.EquityUSD, deltaUSD); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("record account cap adjustment for mode %s: %w", mode, err)
 	}
@@ -375,7 +395,7 @@ func (r *Repository) SetTradingCap(ctx context.Context, mode string, capUSD deci
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
 
 	var previousEquity decimal.Decimal
-	if err := tx.QueryRow(ctx, `SELECT equity_usd FROM account_equity WHERE mode = $1`, mode).Scan(&previousEquity); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT equity_usd FROM account_equity WHERE mode = $1 AND exchange = 'okx'`, mode).Scan(&previousEquity); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("set trading cap for mode %s: no existing row (call GetAccountEquity first): %w", mode, err)
 	}
 
@@ -390,7 +410,7 @@ func (r *Repository) SetTradingCap(ctx context.Context, mode string, capUSD deci
 			continue
 		}
 		var claimed decimal.Decimal
-		if err := tx.QueryRow(ctx, `SELECT equity_usd FROM account_equity WHERE mode = $1`, sibling).Scan(&claimed); err == nil {
+		if err := tx.QueryRow(ctx, `SELECT equity_usd FROM account_equity WHERE mode = $1 AND exchange = 'okx'`, sibling).Scan(&claimed); err == nil {
 			siblingClaimed = siblingClaimed.Add(claimed)
 		}
 	}
@@ -408,7 +428,7 @@ func (r *Repository) SetTradingCap(ctx context.Context, mode string, capUSD deci
 		SET trading_cap_usd = $2,
 			equity_usd = LEAST($2, account_balance_usd, GREATEST(account_balance_usd - $3, 0)),
 			updated_at = now()
-		WHERE mode = $1
+		WHERE mode = $1 AND exchange = 'okx'
 		RETURNING `+accountEquityCols, mode, capUSD, siblingClaimed)
 	if err := scanAccountEquity(row, &ae); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("set trading cap for mode %s: %w", mode, err)
@@ -418,8 +438,8 @@ func (r *Repository) SetTradingCap(ctx context.Context, mode string, capUSD deci
 	// stamp LastResetAt (which the chart's default window and "balance since I chose a baseline"
 	// both anchor to) the way a genuine re-baselining does.
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO account_equity_history (mode, equity_usd, delta_usd, reason)
-		VALUES ($1, $2, $3, 'cap')
+		INSERT INTO account_equity_history (mode, exchange, equity_usd, delta_usd, reason)
+		VALUES ($1, 'okx', $2, $3, 'cap')
 	`, mode, ae.EquityUSD, ae.EquityUSD.Sub(previousEquity)); err != nil {
 		return port.AccountEquity{}, fmt.Errorf("record trading cap change for mode %s: %w", mode, err)
 	}
@@ -430,14 +450,16 @@ func (r *Repository) SetTradingCap(ctx context.Context, mode string, capUSD deci
 	return ae, nil
 }
 
-// ListEquityHistory returns mode's balance timeline oldest-first, ready to plot directly.
+// ListEquityHistory returns mode's balance timeline oldest-first, ready to plot directly. Pinned
+// to exchange='okx' explicitly (this un-scoped method predates exchange scoping, 2026-09-22 —
+// see ListEquityHistoryEx for the exchange-parameterized sibling PaperTrader uses).
 func (r *Repository) ListEquityHistory(ctx context.Context, mode string, since time.Time, limit int) ([]port.EquityPoint, error) {
 	// Ordered DESC with the LIMIT so a capped read returns the MOST RECENT points (a chart wants
 	// the latest window, not the first N rows ever written), then reversed to oldest-first below.
 	q := `
 		SELECT id, mode, equity_usd, delta_usd, reason, order_id, COALESCE(inst_id, ''), created_at
 		FROM account_equity_history
-		WHERE mode = $1 AND ($2::timestamptz IS NULL OR created_at >= $2)
+		WHERE mode = $1 AND exchange = 'okx' AND ($2::timestamptz IS NULL OR created_at >= $2)
 		ORDER BY created_at DESC, id DESC`
 	args := []any{mode, nullableTime(since)}
 	if limit > 0 {
@@ -474,6 +496,156 @@ func nullableTime(t time.Time) *time.Time {
 		return nil
 	}
 	return &t
+}
+
+// GetAccountEquityEx/ApplyRealizedPnLEx/ListEquityHistoryEx are exchange-scoped siblings of
+// GetAccountEquity/ApplyRealizedPnL/ListEquityHistory above (2026-09-22, multi-exchange paper
+// trading) — used ONLY by usecase.PaperTrader, so a second, fully independent paper-trading
+// instance against a different exchange keeps a completely separate balance/history under the
+// same mode="paper", rather than sharing the single OKX instance's row.
+//
+// exchange="" defaults to "okx", so every un-scoped call elsewhere in this codebase is unaffected
+// by this migration's DEFAULT 'okx' column — these Ex methods are additive, not a replacement.
+
+// GetAccountEquityEx mirrors GetAccountEquity, keyed by (mode, exchange) instead of mode alone.
+func (r *Repository) GetAccountEquityEx(ctx context.Context, mode, exchange string, initialUSD decimal.Decimal) (port.AccountEquity, error) {
+	if exchange == "" {
+		exchange = "okx"
+	}
+	var ae port.AccountEquity
+	seedEquity := initialUSD
+	if isRealMoneyMode(mode) {
+		seedEquity = decimal.Zero
+	}
+	var inserted bool
+	row := r.pool.QueryRow(ctx, `
+		INSERT INTO account_equity (mode, exchange, initial_usd, equity_usd, account_balance_usd)
+		VALUES ($1, $2, $3, $4, $3)
+		ON CONFLICT (mode, exchange) DO UPDATE SET mode = account_equity.mode
+		RETURNING `+accountEquityColsEx+`, (xmax = 0)
+	`, mode, exchange, initialUSD, seedEquity)
+	if err := row.Scan(&ae.Mode, &ae.InitialUSD, &ae.EquityUSD, &ae.AccountBalanceUSD, &ae.TradingCapUSD, &ae.ResetCount, &ae.LastResetAt, &ae.UpdatedAt, &ae.Exchange, &inserted); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("get account equity for mode %s, exchange %s: %w", mode, exchange, err)
+	}
+
+	if inserted {
+		if _, err := r.pool.Exec(ctx, `
+			INSERT INTO account_equity_history (mode, exchange, equity_usd, delta_usd, reason)
+			VALUES ($1, $2, $3, 0, 'seed')
+		`, mode, exchange, ae.EquityUSD); err != nil {
+			return ae, nil
+		}
+	}
+	return ae, nil
+}
+
+// ApplyRealizedPnLEx mirrors ApplyRealizedPnL, keyed by (mode, exchange) instead of mode alone.
+func (r *Repository) ApplyRealizedPnLEx(
+	ctx context.Context,
+	mode, exchange string,
+	pnl decimal.Decimal,
+	orderID *int64,
+	instID string,
+) (port.AccountEquity, bool, error) {
+	if exchange == "" {
+		exchange = "okx"
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return port.AccountEquity{}, false, fmt.Errorf("begin apply realized pnl: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+
+	var ae port.AccountEquity
+	row := tx.QueryRow(ctx, `
+		UPDATE account_equity
+		SET equity_usd = equity_usd + $3,
+			account_balance_usd = account_balance_usd + $3,
+			updated_at = now()
+		WHERE mode = $1 AND exchange = $2
+		RETURNING `+accountEquityColsEx, mode, exchange, pnl)
+	if err := scanAccountEquityEx(row, &ae); err != nil {
+		return port.AccountEquity{}, false, fmt.Errorf("apply realized pnl for mode %s, exchange %s: %w", mode, exchange, err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO account_equity_history (mode, exchange, equity_usd, delta_usd, reason, order_id, inst_id)
+		VALUES ($1, $2, $3, $4, 'trade', $5, $6)
+	`, mode, exchange, ae.EquityUSD, pnl, orderID, nullableText(instID)); err != nil {
+		return port.AccountEquity{}, false, fmt.Errorf("record equity history for mode %s, exchange %s: %w", mode, exchange, err)
+	}
+
+	if ae.EquityUSD.Sign() > 0 || mode == "bot" {
+		if err := tx.Commit(ctx); err != nil {
+			return port.AccountEquity{}, false, fmt.Errorf("commit apply realized pnl: %w", err)
+		}
+		return ae, false, nil
+	}
+
+	drained := ae.EquityUSD
+	row = tx.QueryRow(ctx, `
+		UPDATE account_equity
+		SET equity_usd = initial_usd,
+			reset_count = reset_count + 1,
+			last_reset_at = now(),
+			updated_at = now()
+		WHERE mode = $1 AND exchange = $2
+		RETURNING `+accountEquityColsEx, mode, exchange)
+	if err := scanAccountEquityEx(row, &ae); err != nil {
+		return port.AccountEquity{}, false, fmt.Errorf("reset drained account for mode %s, exchange %s: %w", mode, exchange, err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO account_equity_history (mode, exchange, equity_usd, delta_usd, reason, inst_id)
+		VALUES ($1, $2, $3, $4, 'reset', $5)
+	`, mode, exchange, ae.EquityUSD, ae.EquityUSD.Sub(drained), nullableText(instID)); err != nil {
+		return port.AccountEquity{}, false, fmt.Errorf("record equity reset for mode %s, exchange %s: %w", mode, exchange, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return port.AccountEquity{}, false, fmt.Errorf("commit account reset: %w", err)
+	}
+	return ae, true, nil
+}
+
+// ListEquityHistoryEx mirrors ListEquityHistory, keyed by (mode, exchange) instead of mode alone.
+func (r *Repository) ListEquityHistoryEx(ctx context.Context, mode, exchange string, since time.Time, limit int) ([]port.EquityPoint, error) {
+	if exchange == "" {
+		exchange = "okx"
+	}
+	q := `
+		SELECT id, mode, equity_usd, delta_usd, reason, order_id, COALESCE(inst_id, ''), created_at
+		FROM account_equity_history
+		WHERE mode = $1 AND exchange = $2 AND ($3::timestamptz IS NULL OR created_at >= $3)
+		ORDER BY created_at DESC, id DESC`
+	args := []any{mode, exchange, nullableTime(since)}
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT $%d", len(args)+1)
+		args = append(args, limit)
+	}
+
+	rows, err := r.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list equity history for mode %s, exchange %s: %w", mode, exchange, err)
+	}
+	defer rows.Close()
+
+	var out []port.EquityPoint
+	for rows.Next() {
+		var p port.EquityPoint
+		if err := rows.Scan(&p.ID, &p.Mode, &p.EquityUSD, &p.DeltaUSD, &p.Reason, &p.OrderID, &p.InstID, &p.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan equity history row: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate equity history: %w", err)
+	}
+
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
 }
 
 func nullableText(s string) *string {
