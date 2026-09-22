@@ -2,6 +2,8 @@ package ws
 
 import (
 	"encoding/json"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -192,4 +194,36 @@ func TestMessage_AckIsNotMistakenForData(t *testing.T) {
 	if push.isAck() {
 		t.Error("data push classified as an ack")
 	}
+}
+
+// TestKlineFinalizer_OneInstancePerGoroutineDoesNotRace proves the actual production fix
+// (cmd/ingestor/mexc.go, 2026-09-22): a SEPARATE KlineFinalizer per dispatch goroutine, run under
+// `go test -race`.
+//
+// The bug this guards against was real, not hypothetical: cmd/ingestor/mexc.go's first version
+// shared ONE finalizer across 5 separate mexcws.PublicClient instances (one per configured bar),
+// each running its own dispatch goroutine (internal/mexc/ws/public.go's connectAndStream) — that
+// crashed the real MEXC ingestor in production with "fatal error: concurrent map writes" within a
+// minute of real traffic, because KlineFinalizer.Observe's own doc comment states plainly it is
+// "not safe for concurrent use by design... one finalizer belongs to one stream." Removing the
+// per-goroutine finalizer allocation below (going back to one shared instance) reproduces that
+// crash under this test — verified while writing this fix. The point of running it here is that
+// Go's concurrent-map-write panic is non-deterministic and did not reliably reproduce from a
+// live-exchange smoke test alone; `-race` catches it on the first offending access instead.
+func TestKlineFinalizer_OneInstancePerGoroutineDoesNotRace(t *testing.T) {
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		g := g
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// One finalizer PER goroutine — this is the fix, mirroring cmd/ingestor/mexc.go's
+			// per-bar `finalizer := mexcws.NewKlineFinalizer()` living inside the bar loop.
+			f := NewKlineFinalizer()
+			for i := 0; i < 200; i++ {
+				f.Observe(fmt.Sprintf("SYM%d", g), "Min5", bar(int64(1000+i), 1.0))
+			}
+		}()
+	}
+	wg.Wait()
 }

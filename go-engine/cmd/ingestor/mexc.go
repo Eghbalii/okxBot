@@ -111,11 +111,23 @@ func runMEXCIngestor(ctx context.Context, stop context.CancelFunc, cfg *config.C
 		},
 	}
 
-	// One WS client + one Kafka topic per configured timeframe, mirroring the OKX branch's own
-	// per-bar structure — a bar with no MEXC interval equivalent (rest.IntervalFor's ok=false) is
-	// skipped with a loud warning rather than silently subscribing to nothing, the same "loud
-	// failure over a silent data gap" rule as §9's bar-casing validation.
-	finalizer := mexcws.NewKlineFinalizer()
+	// One WS client + one Kafka topic + one KlineFinalizer per configured timeframe, mirroring the
+	// OKX branch's own per-bar structure — a bar with no MEXC interval equivalent
+	// (rest.IntervalFor's ok=false) is skipped with a loud warning rather than silently
+	// subscribing to nothing, the same "loud failure over a silent data gap" rule as §9's
+	// bar-casing validation.
+	//
+	// A SEPARATE finalizer per bar, not one shared across all of them (found live 2026-09-22: a
+	// single finalizer here crash-looped the whole process with "fatal error: concurrent map
+	// writes" within a minute of real traffic). mexcws.KlineFinalizer's own doc comment states its
+	// safety invariant plainly — "not safe for concurrent use... one finalizer belongs to one
+	// stream, and the WS client's dispatch goroutine is single-threaded" — and this loop spawns a
+	// SEPARATE PublicClient (hence a separate dispatch goroutine, internal/mexc/ws/public.go's own
+	// connectAndStream) per bar below, so a finalizer shared across the loop violates that
+	// invariant the instant two bars' goroutines call Observe concurrently, which real MEXC
+	// traffic across 5 simultaneous kline subscriptions does almost immediately. Each finalizer is
+	// still internally keyed by (symbol, interval) — see its own doc comment on why that matters
+	// within one stream — but the stream boundary here is per-bar, not per-process.
 	candlePubs := make(map[string]*kafkastream.Publisher, len(cfg.Ingestion.Bars))
 	candleClients := make([]*mexcws.PublicClient, 0, len(cfg.Ingestion.Bars))
 	for _, bar := range cfg.Ingestion.Bars {
@@ -125,6 +137,7 @@ func runMEXCIngestor(ctx context.Context, stop context.CancelFunc, cfg *config.C
 			logger.Warn("mexc has no interval equivalent for this bar, skipping", "bar", bar)
 			continue
 		}
+		finalizer := mexcws.NewKlineFinalizer()
 		pub := kafkastream.NewPublisher(cfg.Kafka.Brokers, "mexc.candles."+bar)
 		candlePubs[bar] = pub
 		defer pub.Close()
