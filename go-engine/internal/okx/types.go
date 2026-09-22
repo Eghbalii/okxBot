@@ -119,14 +119,35 @@ type OrderRequest struct {
 	OrdType string          `json:"ordType"`           // "market", "limit", ...
 	Sz      decimal.Decimal `json:"sz"`                // size in contracts
 	Px      decimal.Decimal `json:"px,omitempty"`      // required for limit orders
+	// AttachAlgoOrds is OKX's attach-SL/TP-at-placement array — activates once (and only once)
+	// this order fills (2026-09-22).
+	AttachAlgoOrds []AttachAlgoOrd `json:"attachAlgoOrds,omitempty"`
+}
+
+// AttachAlgoOrd is one element of OrderRequest.AttachAlgoOrds, matching OKX's own field names.
+// OrdPx of "-1" means "market order on trigger", the same convention PlaceAlgoOrder already uses.
+type AttachAlgoOrd struct {
+	TPTriggerPx     string `json:"tpTriggerPx,omitempty"`
+	TPOrdPx         string `json:"tpOrdPx,omitempty"`
+	TPTriggerPxType string `json:"tpTriggerPxType,omitempty"`
+	SLTriggerPx     string `json:"slTriggerPx,omitempty"`
+	SLOrdPx         string `json:"slOrdPx,omitempty"`
+	SLTriggerPxType string `json:"slTriggerPxType,omitempty"`
 }
 
 // OrderRequestFromDomain converts a domain.OrderRequest to the OKX wire payload.
 func OrderRequestFromDomain(req domain.OrderRequest) OrderRequest {
-	return OrderRequest{
+	out := OrderRequest{
 		InstID: req.InstID, TdMode: req.TdMode, Side: req.Side, PosSide: req.PosSide,
 		OrdType: req.OrdType, Sz: req.Sz, Px: req.Px,
 	}
+	for _, a := range req.AttachAlgoOrds {
+		out.AttachAlgoOrds = append(out.AttachAlgoOrds, AttachAlgoOrd{
+			TPTriggerPx: a.TPTriggerPx, TPOrdPx: a.TPOrdPx, TPTriggerPxType: a.TPTriggerPxType,
+			SLTriggerPx: a.SLTriggerPx, SLOrdPx: a.SLOrdPx, SLTriggerPxType: a.SLTriggerPxType,
+		})
+	}
+	return out
 }
 
 // OrderResult mirrors a single entry of the /api/v5/trade/order response data array.

@@ -11,6 +11,25 @@ type OrderRequest struct {
 	OrdType string // "market", "limit", ...
 	Sz      decimal.Decimal
 	Px      decimal.Decimal // required for limit orders
+	// AttachAlgoOrds carries SL/TP set AT PLACEMENT TIME (OKX's attachAlgoOrds), activating only
+	// once the parent order actually fills — if the parent is canceled unfilled, the attached
+	// algo is discarded with it (2026-09-22, manual verification ahead of wiring this into
+	// BotTrader's own open path — currently unused by any caller in this codebase, which still
+	// places the resting protective order as a SEPARATE order-algo call after the position exists,
+	// §35).
+	AttachAlgoOrds []AttachAlgoOrder
+}
+
+// AttachAlgoOrder is one attached SL/TP leg for AttachAlgoOrds. OrdPx of "-1" (OKX's convention)
+// means "execute as a market order once triggered" — the same convention the standalone
+// PlaceAlgoOrder call already uses.
+type AttachAlgoOrder struct {
+	TPTriggerPx     string
+	TPOrdPx         string
+	TPTriggerPxType string // "last", "index", or "mark"
+	SLTriggerPx     string
+	SLOrdPx         string
+	SLTriggerPxType string
 }
 
 // OrderResult is the exchange's response to a placed order.
