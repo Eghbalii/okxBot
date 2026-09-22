@@ -120,7 +120,7 @@ func runMEXCIngestor(ctx context.Context, stop context.CancelFunc, cfg *config.C
 	candleClients := make([]*mexcws.PublicClient, 0, len(cfg.Ingestion.Bars))
 	for _, bar := range cfg.Ingestion.Bars {
 		bar := bar
-		interval, ok := mexcrest.IntervalFor(bar)
+		interval, ok := wsIntervalFor(bar)
 		if !ok {
 			logger.Warn("mexc has no interval equivalent for this bar, skipping", "bar", bar)
 			continue
@@ -204,4 +204,21 @@ func mexcCandleArray(c domain.Candle) []string {
 		"", "", // indices 6-7: OKX's volCcy/volCcyQuote, no MEXC equivalent, unread by decodeCandle
 		"1", // index 8: confirm flag — always finalized by the time this is built
 	}
+}
+
+// wsIntervalFor translates an internal bar name into the interval string MEXC's WEBSOCKET kline
+// subscription accepts — which is NOT always identical to rest.IntervalFor's REST-endpoint
+// vocabulary, discovered live 2026-09-22: the REST candles endpoint accepts "Hour1" for 1H
+// (rest.IntervalFor's own "verified live" comment, predating this file), but the WS sub.kline
+// method rejects "Hour1" outright ({"channel":"rs.error","data":"Not support interval"}) and only
+// accepts "Min60" for the same timeframe. Every other bar (1m/5m/15m/30m/4H/8H/1D/1W/1M) was
+// confirmed identical between the two endpoints by direct live testing before this fix — this is a
+// narrow, one-bar exchange quirk, not a systematic REST/WS naming difference, so it is handled as
+// a single override here rather than forking rest.IntervalFor's whole table (which the REST candle
+// path still depends on being correct for "Hour1").
+func wsIntervalFor(bar string) (string, bool) {
+	if bar == "1H" {
+		return "Min60", true
+	}
+	return mexcrest.IntervalFor(bar)
 }

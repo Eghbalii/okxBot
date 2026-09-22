@@ -108,3 +108,47 @@ func TestBarToMEXCInterval_UnsupportedBarIsReportedNotSilentlySkipped(t *testing
 		t.Fatal("\"3m\" has no MEXC equivalent (see internal/mexc/rest/intervals.go's table) — expected ok=false")
 	}
 }
+
+// TestWSIntervalFor_OverridesHour1ToMin60 pins the one confirmed live divergence between MEXC's
+// REST candle vocabulary (rest.IntervalFor, which the REST path must keep using "Hour1" for — it
+// was verified live and still is) and its WebSocket sub.kline vocabulary, found live 2026-09-22:
+// subscribing with "Hour1" gets {"channel":"rs.error","data":"Not support interval"} from MEXC's
+// own WS, produces zero candle data, and (in the deployed ingestor) triggers a reconnect loop that
+// re-sends the same rejected interval forever. "Min60" is what the WS actually accepts for 1H.
+// Every other bar was confirmed identical between REST and WS by direct live testing before this
+// fix — this test exists so a future "simplify wsIntervalFor back to calling IntervalFor directly"
+// change fails immediately instead of silently reintroducing the exact bug this override fixes.
+func TestWSIntervalFor_OverridesHour1ToMin60(t *testing.T) {
+	got, ok := wsIntervalFor("1H")
+	if !ok {
+		t.Fatal("expected ok=true for 1H")
+	}
+	if got != "Min60" {
+		t.Errorf("wsIntervalFor(\"1H\") = %q, want \"Min60\" (MEXC's WS-specific name — REST uses %q, which is a DIFFERENT string and must not be used for the WS subscription)", got, mustInterval(t, "1H"))
+	}
+}
+
+// TestWSIntervalFor_EveryOtherConfiguredBarMatchesREST proves wsIntervalFor and rest.IntervalFor
+// agree for every bar EXCEPT 1H, so the override above stays a single, narrow exception rather than
+// silently drifting into a second REST/WS mismatch nobody noticed.
+func TestWSIntervalFor_EveryOtherConfiguredBarMatchesREST(t *testing.T) {
+	for _, bar := range []string{"5m", "15m", "4H", "1D"} {
+		ws, ok := wsIntervalFor(bar)
+		if !ok {
+			t.Fatalf("wsIntervalFor(%q): expected ok=true", bar)
+		}
+		rest := mustInterval(t, bar)
+		if ws != rest {
+			t.Errorf("wsIntervalFor(%q) = %q, rest.IntervalFor(%q) = %q — expected these to match (only 1H is a known exception)", bar, ws, bar, rest)
+		}
+	}
+}
+
+func mustInterval(t *testing.T, bar string) string {
+	t.Helper()
+	v, ok := mexcrest.IntervalFor(bar)
+	if !ok {
+		t.Fatalf("mexcrest.IntervalFor(%q): expected ok=true", bar)
+	}
+	return v
+}
