@@ -149,7 +149,7 @@ func scannerFor(repo port.Repository, client allTickerFetcher, topN int) *Market
 		Exchanges: []ExchangeSource{{
 			// TradesLive: true matches production's own cmd/api wiring for "okx" — this helper
 			// always builds an okx source, which genuinely is the exchange paper-trader loads.
-			Name: "okx", Client: client, InstType: "FUTURES", QuoteSuffixes: okxSuffixes, TradesLive: true,
+			Name: "okx", Client: client, InstType: "FUTURES", QuoteSuffixes: okxSuffixes, TradesLive: true, AccountExchange: "okx",
 		}},
 		TopN: topN,
 	}
@@ -413,7 +413,7 @@ func TestScan_OnlyTradesLiveExchangeCountsTowardTopUp(t *testing.T) {
 			{
 				Name: "okx", Client: stubTickers{toks: []domain.MarketTicker{
 					mt("BTC-USD_UM_XPERP-310404", 77000, 76000, 78000, 75500, 69_000_000),
-				}}, InstType: "FUTURES", QuoteSuffixes: okxSuffixes, TradesLive: true,
+				}}, InstType: "FUTURES", QuoteSuffixes: okxSuffixes, TradesLive: true, AccountExchange: "okx",
 			},
 			{
 				Name: "mexc", Client: stubTickers{toks: []domain.MarketTicker{

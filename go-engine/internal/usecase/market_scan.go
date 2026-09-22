@@ -47,16 +47,19 @@ type ExchangeSource struct {
 	// admits dated futures or spot pairs to a perpetual-futures bot.
 	QuoteSuffixes []string
 	// TradesLive marks an exchange whose admitted tokens actually reach a running PaperTrader
-	// engine (2026-09-18 fix): paper-trader's own roster load is hardcoded to "okx" (no MEXC
-	// execution wiring exists yet, §46.6), so a MEXC admission can never spend a share of the
-	// paper account's sizing budget the way an OKX one does. Scan discovers and ranks MEXC tokens
-	// regardless (useful for future real-money candidates, §53's own reasoning) but the account
-	// top-up (topUpForNewTokens) counts only admissions from exchanges with this set — topping up
-	// for a MEXC discovery would grow the account for a token that never uses that growth, diluting
-	// every OKX position's size further than PerTokenCapUSD was meant to allow. Found in production:
-	// the operator noticed the paper account's equity had grown well past what the OKX-only roster's
-	// own token count justified, and 4 of the last admissions turned out to all be MEXC.
+	// engine — a token discovery here can spend a share of a REAL paper-trading account's sizing
+	// budget. Scan discovers and ranks every configured exchange's tokens regardless of this flag
+	// (useful for future candidates, §53's own reasoning), but only a TradesLive exchange's
+	// admissions trigger the $4/token top-up (topUpForNewTokens) — topping up for an exchange
+	// nothing trades would grow an account for tokens that never use that growth.
 	TradesLive bool
+	// AccountExchange is which paper-trading PROFILE's account_equity row this exchange's top-ups
+	// land on (2026-09-22, multi-exchange paper trading) — the free-string isolation label
+	// PaperTrader.Exchange uses (e.g. "mexc_100x_1"), NOT necessarily equal to Name (the real
+	// exchange name the discovery/instruments roster is keyed by). Required whenever TradesLive is
+	// true; topUpForNewTokens fails loudly rather than guessing if it is left empty on a
+	// TradesLive source, since a wrong guess would silently top up the wrong account.
+	AccountExchange string
 }
 
 // Scan weights. Deliberately a small, explicit set rather than a tuned model: the scan's job is to
@@ -217,41 +220,46 @@ type ScanResult struct {
 // opposite of useful (ReplaceMarketTokens declines an empty write for exactly this).
 func (s *MarketScanner) Scan(ctx context.Context) []ScanResult {
 	out := make([]ScanResult, 0, len(s.Exchanges))
-	newTradeableTokens := 0
 	for _, ex := range s.Exchanges {
 		res := s.scanOne(ctx, ex)
 		out = append(out, res)
-		// Only an exchange paper-trader actually loads can spend a share of the top-up — counting a
-		// non-tradeable exchange's admissions here would grow the account for tokens that never use
-		// that growth, diluting every real position's size (see TradesLive's own doc comment).
+		// Only an exchange paper-trader actually loads can spend a share of the top-up — topping
+		// up a non-tradeable exchange's admissions would grow an account for tokens that never use
+		// that growth. Each TradesLive exchange tops up its OWN account_equity row
+		// (ex.AccountExchange), never a shared pool — this is what makes the top-up genuinely
+		// dynamic per exchange rather than one bucket summed across all of them (2026-09-22 fix).
 		if ex.TradesLive {
-			newTradeableTokens += res.NewlyAdmitted
+			s.topUpForNewTokens(ctx, ex.AccountExchange, res.NewlyAdmitted)
 		}
 	}
-	s.topUpForNewTokens(ctx, newTradeableTokens)
 	return out
 }
 
-// topUpForNewTokens adds newTokens * PerTokenCapUSD to the paper account, so a token the scan just
-// admitted has real sizing budget the moment it starts trading rather than sharing an unchanged
-// account with every token already on the roster.
+// topUpForNewTokens adds newTokens * PerTokenCapUSD to exchange's own paper account, so a token
+// the scan just admitted on THAT exchange has real sizing budget the moment it starts trading
+// rather than sharing an unchanged account with every token already on that exchange's roster.
 //
 // A failure here is logged, not propagated: Scan's whole point is admitting tokens to the roster,
 // and a sizing top-up that could not be written must not make that look like it failed too — the
 // next scan (or a manual account-cap edit from the panel) can still correct it, and the alternative
 // of the roster and the balance drifting apart resolves itself as soon as this succeeds again.
-func (s *MarketScanner) topUpForNewTokens(ctx context.Context, newTokens int) {
+func (s *MarketScanner) topUpForNewTokens(ctx context.Context, exchange string, newTokens int) {
 	if newTokens <= 0 || !s.PerTokenCapUSD.IsPositive() {
 		return
 	}
+	if exchange == "" {
+		s.log().Error("scan: TradesLive exchange has no AccountExchange set, refusing to top up (would silently pick okx)",
+			"newTokens", newTokens)
+		return
+	}
 	delta := s.PerTokenCapUSD.Mul(decimal.NewFromInt(int64(newTokens)))
-	if _, err := s.Repo.AdjustAccountCap(ctx, "paper", delta); err != nil {
+	if _, err := s.Repo.AdjustAccountCapEx(ctx, "paper", exchange, delta); err != nil {
 		s.log().Warn("scan: could not top up paper account for newly admitted tokens",
-			"newTokens", newTokens, "deltaUsd", delta, "err", err)
+			"exchange", exchange, "newTokens", newTokens, "deltaUsd", delta, "err", err)
 		return
 	}
 	s.log().Info("scan: topped up paper account for newly admitted tokens",
-		"newTokens", newTokens, "deltaUsd", delta)
+		"exchange", exchange, "newTokens", newTokens, "deltaUsd", delta)
 }
 
 func (s *MarketScanner) scanOne(ctx context.Context, ex ExchangeSource) ScanResult {

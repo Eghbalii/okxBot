@@ -355,6 +355,47 @@ func (r *Repository) AdjustAccountCap(ctx context.Context, mode string, deltaUSD
 	return ae, nil
 }
 
+// AdjustAccountCapEx is the exchange-scoped sibling of AdjustAccountCap above (2026-09-22,
+// multi-exchange paper trading) — used by MarketScanner's per-token top-up so a second
+// paper-trading profile's (e.g. "mexc_100x_1") own account row grows with ITS OWN newly-admitted
+// tokens, not OKX's. Same precondition as AdjustAccountCap: requires an existing (mode, exchange)
+// row (GetAccountEquityEx must have seeded it first). exchange="" behaves exactly like
+// AdjustAccountCap (defaults to "okx").
+func (r *Repository) AdjustAccountCapEx(ctx context.Context, mode, exchange string, deltaUSD decimal.Decimal) (port.AccountEquity, error) {
+	if exchange == "" {
+		exchange = "okx"
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return port.AccountEquity{}, fmt.Errorf("begin adjust account cap: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+
+	var ae port.AccountEquity
+	row := tx.QueryRow(ctx, `
+		UPDATE account_equity
+		SET equity_usd = equity_usd + $3,
+			account_balance_usd = account_balance_usd + $3,
+			updated_at = now()
+		WHERE mode = $1 AND exchange = $2
+		RETURNING `+accountEquityColsEx, mode, exchange, deltaUSD)
+	if err := scanAccountEquityEx(row, &ae); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("adjust account cap for mode %s, exchange %s: no existing row (call GetAccountEquityEx first): %w", mode, exchange, err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO account_equity_history (mode, exchange, equity_usd, delta_usd, reason)
+		VALUES ($1, $2, $3, $4, 'cap')
+	`, mode, exchange, ae.EquityUSD, deltaUSD); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("record account cap adjustment for mode %s, exchange %s: %w", mode, exchange, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("commit adjust account cap: %w", err)
+	}
+	return ae, nil
+}
+
 // realMoneyModes are every mode that shares ONE real exchange balance (Account page, 2026-09-20
 // request: bot trading and manual trading are two separate slices of the same OKX account, not
 // two independent pools) — used by SetTradingCap to bound one mode's cap against what the OTHER

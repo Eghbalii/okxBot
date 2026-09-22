@@ -52,13 +52,18 @@ func buildExchangeSources(cfg *config.Config, logger *slog.Logger) []usecase.Exc
 		switch ex.Name {
 		case "okx":
 			src.Client = gatewayclient.New(cfg.Gateway.URL, "api")
-			// The only exchange a running PaperTrader engine actually loads (cmd/paper-trader's
-			// roster load is hardcoded to "okx", no MEXC execution wiring exists yet, §46.6) — see
-			// TradesLive's own doc comment for why this must stay in sync with that hardcoding, not
-			// derived from it, until MEXC trading is wired up.
 			src.TradesLive = true
+			src.AccountExchange = "okx"
 		case "mexc":
 			src.Client = mexcrest.New(cfg.MEXC.RESTBaseURL, cfg.MEXC.APIKey, cfg.MEXC.APISecret)
+			// paper-trader-mexc is a real, running execution instance now (2026-09-22
+			// multi-exchange paper trading) — a MEXC discovery admission DOES spend a share of a
+			// real account's sizing budget, so this must top up like OKX's own. AccountExchange is
+			// the paper-trading profile label PAPER_EXCHANGE=MEXC_100x_1 resolves to
+			// (strings.ToLower in cmd/paper-trader/main.go), not the bare exchange name "mexc" —
+			// account_equity is keyed by that label, never the discovery roster's exchange name.
+			src.TradesLive = true
+			src.AccountExchange = "mexc_100x_1"
 		default:
 			// config.validateScanExchanges already refused an unknown name at startup, so reaching
 			// here means a new exchange was added to that allowlist without being wired up. Log

@@ -968,6 +968,11 @@ type Repository interface {
 	// balance stepped, but it is a bookkeeping change, not a trade outcome, so it must never reach
 	// PnL/win-rate figures the same way a reason="trade" row would.
 	AdjustAccountCap(ctx context.Context, mode string, deltaUSD decimal.Decimal) (AccountEquity, error)
+	// AdjustAccountCapEx is the exchange-scoped sibling of AdjustAccountCap above (2026-09-22,
+	// multi-exchange paper trading) — used by MarketScanner's per-token top-up so a second
+	// paper-trading profile's own account grows with ITS OWN newly-admitted tokens. exchange=""
+	// behaves exactly like AdjustAccountCap (defaults to "okx").
+	AdjustAccountCapEx(ctx context.Context, mode, exchange string, deltaUSD decimal.Decimal) (AccountEquity, error)
 	// SetTradingCap is real trading's counterpart to SetAccountCap, and deliberately a DIFFERENT
 	// operation rather than a mode branch inside it (2026-09-08 request). The distinction is what
 	// AccountBalanceUSD means per mode: in paper it is bookkeeping this system owns, so a cap

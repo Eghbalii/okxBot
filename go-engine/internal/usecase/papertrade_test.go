@@ -940,6 +940,36 @@ func (r *fakeRepository) AdjustAccountCap(ctx context.Context, mode string, delt
 	return ae, nil
 }
 
+// AdjustAccountCapEx is the fake's exchange-scoped sibling of AdjustAccountCap above, stored
+// under accountKey like the rest of this fake's *Ex methods.
+func (r *fakeRepository) AdjustAccountCapEx(ctx context.Context, mode, exchange string, deltaUSD decimal.Decimal) (port.AccountEquity, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if exchange == "" {
+		exchange = "okx"
+	}
+	key := accountKey(mode, exchange)
+	ae, ok := r.accounts[key]
+	if !ok && exchange == "okx" {
+		// GetAccountEquity (the un-scoped method) seeds the bare `mode` key, not accountKey — the
+		// same dual-key relationship SetAccountCap/SetAccountCapEx already handle, mirrored here.
+		ae, ok = r.accounts[mode]
+	}
+	if !ok {
+		return port.AccountEquity{}, fmt.Errorf("adjust account cap: no existing row for mode %s, exchange %s", mode, exchange)
+	}
+	ae.EquityUSD = ae.EquityUSD.Add(deltaUSD)
+	ae.AccountBalanceUSD = ae.AccountBalanceUSD.Add(deltaUSD)
+	r.accounts[key] = ae
+	if exchange == "okx" {
+		r.accounts[mode] = ae
+	}
+	r.equityPoints = append(r.equityPoints, port.EquityPoint{
+		Mode: mode, EquityUSD: ae.EquityUSD, DeltaUSD: deltaUSD, Reason: "cap",
+	})
+	return ae, nil
+}
+
 // SetTradingCap mirrors the real implementation: sets ONLY the cap and the derived equity
 // (clamped to the real balance), never AccountBalanceUSD — a fake that rewrote the balance here
 // would let a test pass against behavior the real repository deliberately forbids in real mode.
