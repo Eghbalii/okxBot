@@ -95,51 +95,69 @@ real bug in `internal/strategy`'s indicator computation (possibly an actual infi
 just slowness — worth checking `smmaOfField`/`ADX` for a loop bound that can fail to terminate on
 certain input shapes).
 
-## What's left before an actual MEXC paper-trading comparison can run
+## Update 2026-09-22: scope changed to PAPER TRADING ONLY, and items 2/3/4 are DONE
 
-Ordered roughly by dependency:
+The operator redirected this mid-session: **only `cmd/paper-trader` runs against MEXC, not
+`cmd/trader`/bot trading** — that stays OKX-only and untouched. The operator also asked for a more
+general mechanism than a one-off MEXC hack: something that also supports running a *config-variant*
+experiment later (e.g. `rl_early_close` on/off) as a repeatable comparison, not just a second
+exchange.
 
-1. **MEXC credentials.** Need real API key/secret for a MEXC account with futures access, placed
-   as env vars on the server (`MEXC_API_KEY`/`MEXC_API_SECRET`) — never on the local machine, same
-   rule as OKX credentials (CLAUDE.md's own standing instruction).
+Resolution on item 3's (a) vs (b) choice: **neither, exactly** — `mode` (already the key that gives
+`paper_orders`/`account_equity`/`paper_trading_config`/`strategy_assignments` their own isolated
+balance/config/assignments per instance) stays a closed whitelist (`paper`/`bot`/`demo`/`manual`,
+hardcoded across `internal/api`) and is NOT widened. Instead a **new `exchange` column** (default
+`'okx'`) was added to all four of those tables (migration `000037`), and `usecase.PaperTrader`
+gained an `Exchange` field threaded through every repo call. `mode` stays `"paper"` for both
+instances; `exchange` is the new isolation/comparison dimension, and it's a free string — so
+`PAPER_EXCHANGE=mexc` for the exchange test, or e.g. `PAPER_EXCHANGE=no_early_close` for a future
+config-variant experiment, work identically with no further schema change. See the commit
+`feat(paper-trading): add exchange scoping for parallel paper-trading experiments` for the full
+implementation (also fixed a real pre-existing-method-breakage bug found while widening
+`account_equity`'s key — see the commit message).
 
-2. **A second gateway container.** `docker-compose.yml` needs a new service (e.g.
-   `okx-gateway-mexc`) — same image as `okx-gateway`, different `GATEWAY_EXCHANGE=mexc` env, its
-   own port (e.g. `8096`, since `8094` is OKX's), its own `MEXC_API_KEY`/`MEXC_API_SECRET`. Model
-   this on the existing `okx-gateway` service block.
+**Deployed and verified live** (2026-09-22): migration applied cleanly against production
+(2833 pre-existing `paper_orders` rows, 3 `account_equity` rows, all preserved), `paper-trader`/
+`api`/`panel` rebuilt one at a time with docker build-cache pruned between builds, monitoring
+stopped/restarted around the builds per the server's memory constraints. Existing OKX paper-trading
+instance confirmed working identically with and without the new `?exchange=` query param — zero
+regression. `docker-compose.yml` gained `okx-gateway-mexc` (port 8096/9106) and `paper-trader-mexc`
+(port 8098/9107) service definitions plus `go-engine/configs/config.mexc.yaml` (2-token starter
+roster BTC/ETH, 100x leverage per the operator's ask, its own $100 `account.initial_usd`) — **not
+yet started**, since MEXC credentials aren't on the server.
 
-3. **Mode-scoped storage for MEXC.** The operator wants separate stats/PnL. `bot_orders` already
-   has no `mode` column (per CLAUDE.md §33's history, "the table is the discriminator" —
-   `paper_orders` vs `bot_orders` vs `real_orders`/`manual_orders` are separate tables, not one
-   table with a mode flag). Two real options, needs a decision:
-   - (a) Add a `mode` or `exchange` column to `bot_orders` and filter every existing query by it
-     (touches `internal/postgres/bot_orders.go`'s every SELECT — the same shape of change as the
-     SL/TP-split migration this session already did to that file, so the pattern is fresh).
-   - (b) A new table (`mexc_bot_orders` or similar), mirroring `bot_orders`' schema exactly,
-     with its own repository methods. More isolated, more duplication.
-   Given the operator's explicit "maximize shared code" instruction, (a) is probably closer to
-   the spirit of the ask — worth confirming with the operator directly rather than assuming.
+Item 2 (second gateway container) and item 4 (second trader instance) are effectively superseded by
+this — there is no second `cmd/trader`, only `paper-trader-mexc`, and the gateway container is
+already defined in `docker-compose.yml`, just not running.
 
-4. **A second `cmd/trader` instance.** Needs its own config (`configs/config.mexc.yaml` or
-   similar) pointing `Gateway.URL` at the new MEXC gateway's port, its own `trading.inst_ids`
-   (MEXC symbols are plain `BTC_USDT` etc., no `symbol_map` needed per the identity resolver),
-   `risk.max_leverage: 100` (the operator's explicit ask for this test), and whatever mode value
-   item 3 settles on. `docker-compose.yml` needs a new `trader-mexc` service block, same image as
-   `trader`, different config/env.
+## What's still left
 
-5. **Panel visibility (lower priority for a 24h throwaway test, but worth knowing it's missing)**:
-   the panel's Positions page currently only has Paper/Real tabs (CLAUDE.md §34) — no MEXC view
-   exists. For a quick comparison, direct DB queries or a temporary Grafana panel are probably
-   faster than building panel UI for a test that may be thrown away.
+1. **MEXC credentials — the one blocking item.** Need real API key/secret for a MEXC account with
+   futures access, placed as env vars on the server (`MEXC_API_KEY`/`MEXC_API_SECRET` in
+   `/opt/okxBot/.env`) — never on the local machine, same standing rule as OKX credentials. Once
+   present: `ssh okx 'cd /opt/okxBot && docker compose up -d okx-gateway-mexc paper-trader-mexc'`
+   starts both new containers (they're already built as of this deploy, or rebuild first if the
+   compose file changes again). Confirm `curl http://localhost:8096/health` reports MEXC-shaped
+   output and `paper-trader-mexc`'s logs show it seeding candle windows before considering it live.
 
-6. **MEXC private WS (optional, not blocking).** No account-push client exists yet
-   (`internal/mexc/ws` has only `public.go`). The gateway change in this session already scopes
-   the private-stream wiring to OKX only, so a MEXC gateway instance runs correctly without it —
-   just on reconciliation-poll-only visibility, matching how this whole system worked before the
-   OKX private WS existed.
+2. **Panel visibility (still lower priority for a throwaway test)**: the panel's Positions page has
+   Paper/Real tabs (CLAUDE.md §34) with no exchange filter UI yet — `?exchange=` is supported
+   server-side (`internal/api/paper_trading.go`, `market.go`) but nothing in `panel/` sends it yet.
+   For a quick comparison, `SELECT * FROM paper_orders WHERE exchange = 'mexc'` / the stats/history
+   endpoints with `?exchange=mexc` are faster than building panel UI for a test that may be
+   discarded.
+
+3. **MEXC private WS (optional, not blocking).** No account-push client exists yet
+   (`internal/mexc/ws` has only `public.go`) — `paper-trader-mexc` runs fine without it, on
+   reconciliation-poll-only visibility (matches how the whole system worked before the OKX private
+   WS existed, §27.6).
+
+4. **The two pre-existing test hangs from the prior session** (`internal/strategy`,
+   `internal/backtest`, both decimal-arithmetic-related, unrelated to any of this work) were not
+   re-investigated this session either — still open, still explicitly deferred by the operator.
 
 ## Recommended next step
 
-Item 2 (second gateway container) and item 3's decision are the actual unblocking work — item 4
-is mostly copy-paste once those two are settled. Get the operator's confirmation on 3(a) vs 3(b)
-before writing the migration, since it affects every existing query against `bot_orders`.
+Get MEXC credentials onto the server, then start the two new containers and watch
+`paper-trader-mexc`'s logs / `?exchange=mexc` stats for the first hour before leaving it running
+for the full comparison window.
