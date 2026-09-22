@@ -52,7 +52,7 @@ export type PositionMode = 'paper' | 'bot' | 'manual'
 // trading). 'okx' is the original, always-on instance; new entries are just data, no schema
 // change needed to add one. Kept as a literal union (not a bare string) so the Paper page's
 // profile selector has a closed, typo-proof set to render tabs from.
-export const PAPER_PROFILES = ['okx', 'MEXC_100x_1'] as const
+export const PAPER_PROFILES = ['okx', 'mexc_100x_1'] as const
 export type PaperProfile = (typeof PAPER_PROFILES)[number]
 
 // discoveryExchangeFor maps a paper-trading PROFILE label (paper_orders.exchange /
@@ -65,7 +65,7 @@ export type PaperProfile = (typeof PAPER_PROFILES)[number]
 // exchanges" instruction (2026-09-22).
 export const PAPER_PROFILE_EXCHANGE: Record<string, string> = {
   okx: 'okx',
-  MEXC_100x_1: 'mexc',
+  mexc_100x_1: 'mexc',
 }
 export function discoveryExchangeFor(profile: string | undefined): string {
   return PAPER_PROFILE_EXCHANGE[profile ?? 'okx'] ?? 'okx'
