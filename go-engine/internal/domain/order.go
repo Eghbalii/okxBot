@@ -3,6 +3,13 @@ package domain
 import "github.com/shopspring/decimal"
 
 // OrderRequest is a request to place an order on an instrument.
+//
+// SL/TP is deliberately NOT attached to this request at placement time (OKX's attachAlgoOrds
+// parameter was tried and removed 2026-09-22): a live test against this account's X-Perp
+// instruments found OKX silently drops the attach — the order placed and filled normally, but the
+// resulting position carried no linked algo order at all, with no error anywhere. Protection is
+// instead rested via two SEPARATE PlaceAlgoOrder calls immediately after the entry fills
+// (internal/usecase/bot_protection.go), which was verified to work.
 type OrderRequest struct {
 	InstID  string
 	TdMode  string // "cross" or "isolated"
@@ -11,25 +18,6 @@ type OrderRequest struct {
 	OrdType string // "market", "limit", ...
 	Sz      decimal.Decimal
 	Px      decimal.Decimal // required for limit orders
-	// AttachAlgoOrds carries SL/TP set AT PLACEMENT TIME (OKX's attachAlgoOrds), activating only
-	// once the parent order actually fills — if the parent is canceled unfilled, the attached
-	// algo is discarded with it (2026-09-22, manual verification ahead of wiring this into
-	// BotTrader's own open path — currently unused by any caller in this codebase, which still
-	// places the resting protective order as a SEPARATE order-algo call after the position exists,
-	// §35).
-	AttachAlgoOrds []AttachAlgoOrder
-}
-
-// AttachAlgoOrder is one attached SL/TP leg for AttachAlgoOrds. OrdPx of "-1" (OKX's convention)
-// means "execute as a market order once triggered" — the same convention the standalone
-// PlaceAlgoOrder call already uses.
-type AttachAlgoOrder struct {
-	TPTriggerPx     string
-	TPOrdPx         string
-	TPTriggerPxType string // "last", "index", or "mark"
-	SLTriggerPx     string
-	SLOrdPx         string
-	SLTriggerPxType string
 }
 
 // OrderResult is the exchange's response to a placed order.

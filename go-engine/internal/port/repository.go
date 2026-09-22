@@ -298,8 +298,18 @@ type BotOrder struct {
 
 	ManualCloseRequested bool
 
-	ExchangeOrderID     *string
-	ExchangeAlgoOrderID *string
+	ExchangeOrderID *string
+	// ExchangeAlgoOrderID is the resting STOP-LOSS algo order's ID. ExchangeTPAlgoOrderID is the
+	// resting TAKE-PROFIT algo order's ID, placed as a SEPARATE order (2026-09-22) — the combined
+	// SL/TP OCO form (one conditional order carrying both trigger prices) was found silently
+	// dropping the TP side on this account's X-Perp instruments; both sides decoded correctly on
+	// the Go side and the request left this process with both set, but OKX's own resting order
+	// came back with only the SL trigger stored. Splitting them reintroduces the risk the combined
+	// form existed to prevent — a stranded order left resting after its sibling triggers, which in
+	// net_mode could later fire against an unrelated future position — so the reconciliation poll
+	// cancels whichever side is left once the other has triggered or vanished (bot_protection.go).
+	ExchangeAlgoOrderID   *string
+	ExchangeTPAlgoOrderID *string
 }
 
 // ManualOrder is a discretionary, operator-placed real-money order (docs/MANUAL_TRADE_PLAN.md),
@@ -730,10 +740,13 @@ type Repository interface {
 	// SetBotOrderFeatures records the decision-time observation snapshot, mirroring how
 	// FeaturesJSON is set on PaperOrder — called once the fill/partial/canceled outcome is known.
 	SetBotOrderFeatures(ctx context.Context, id int64, featuresJSON json.RawMessage) error
-	// SetBotOrderExchangeAlgoOrderID mirrors SetExchangeAlgoOrderID for bot_orders. Kept for
-	// parity even though no resting exchange-side algo order is placed today (§27.3's correction:
-	// real trading watches SL/TP in-process, the same mechanism paper trading uses).
+	// SetBotOrderExchangeAlgoOrderID mirrors SetExchangeAlgoOrderID for bot_orders — records the
+	// resting STOP-LOSS algo order's ID (§35: real trading rests protection on the exchange).
 	SetBotOrderExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error
+	// SetBotOrderExchangeTPAlgoOrderID records the resting TAKE-PROFIT algo order's ID, the
+	// sibling of SetBotOrderExchangeAlgoOrderID — SL and TP are placed as two SEPARATE orders
+	// (2026-09-22, BotOrder.ExchangeTPAlgoOrderID's own doc comment explains why).
+	SetBotOrderExchangeTPAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error
 	// CloseBotOrder mirrors ClosePaperOrder.
 	CloseBotOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error
 	// UpdateBotOrderSLTP mirrors UpdatePaperOrderSLTP — callers must have already clamped the

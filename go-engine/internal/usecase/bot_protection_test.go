@@ -37,6 +37,10 @@ func openOneBotPosition(t *testing.T, repo *fakeRepository, exchange *fakeExchan
 // The whole point of this feature: opening a real position must rest its stop on the EXCHANGE, not
 // merely store it in a column this process watches. Real order 33 opened with a stop that existed
 // only in the database, which is what this asserts can no longer happen.
+//
+// SL and TP are placed as TWO SEPARATE orders (2026-09-22) — buySignal() carries both a SL and a
+// TP, so this test's position gets both legs, letting it assert on each independently rather than
+// on one order that would (per the bug this split fixes) silently be missing its TP side.
 func TestOpenBot_RestsStopLossOnTheExchange(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
@@ -46,31 +50,54 @@ func TestOpenBot_RestsStopLossOnTheExchange(t *testing.T) {
 		t.Fatalf("expected 1 open position, got %d", len(open))
 	}
 
-	if len(exchange.placedAlgoOrders) != 1 {
-		t.Fatalf("opening a real position must rest exactly one protective order on the exchange, got %d",
+	if len(exchange.placedAlgoOrders) != 2 {
+		t.Fatalf("opening a real position with both SL and TP levels must rest TWO separate protective orders, got %d",
 			len(exchange.placedAlgoOrders))
 	}
-	algo := exchange.placedAlgoOrders[0]
-	if !algo.SLTriggerPx.IsPositive() {
-		t.Error("the protective order must carry a stop-loss trigger price")
+	var slAlgo, tpAlgo *domain.AlgoOrderRequest
+	for i, a := range exchange.placedAlgoOrders {
+		if a.SLTriggerPx.IsPositive() {
+			slAlgo = &exchange.placedAlgoOrders[i]
+		}
+		if a.TPTriggerPx.IsPositive() {
+			tpAlgo = &exchange.placedAlgoOrders[i]
+		}
+	}
+	if slAlgo == nil {
+		t.Fatal("one of the two orders must carry the stop-loss trigger")
+	}
+	if tpAlgo == nil {
+		t.Fatal("one of the two orders must carry the take-profit trigger")
+	}
+	if slAlgo.TPTriggerPx.IsPositive() {
+		t.Error("the SL order must not ALSO carry a TP trigger — this is the combined-OCO shape found to silently drop TP")
+	}
+	if tpAlgo.SLTriggerPx.IsPositive() {
+		t.Error("the TP order must not ALSO carry an SL trigger")
 	}
 	// The exchange's stop must be the SAME level the position records. A protective order resting
 	// at a different price than the row shows is the divergence this feature exists to prevent.
-	if open[0].SLPx == nil || !algo.SLTriggerPx.Equal(*open[0].SLPx) {
-		t.Errorf("the exchange's stop %v must match the position's own stop %v", algo.SLTriggerPx, open[0].SLPx)
+	if open[0].SLPx == nil || !slAlgo.SLTriggerPx.Equal(*open[0].SLPx) {
+		t.Errorf("the exchange's stop %v must match the position's own stop %v", slAlgo.SLTriggerPx, open[0].SLPx)
+	}
+	if open[0].TPPx == nil || !tpAlgo.TPTriggerPx.Equal(*open[0].TPPx) {
+		t.Errorf("the exchange's target %v must match the position's own target %v", tpAlgo.TPTriggerPx, open[0].TPPx)
 	}
 	// A protective order closes the position, so it is the OPPOSITE side of the entry.
-	if algo.Side != "sell" {
-		t.Errorf("a protective order for a long must be a sell, got %q", algo.Side)
+	if slAlgo.Side != "sell" {
+		t.Errorf("a protective order for a long must be a sell, got %q", slAlgo.Side)
 	}
 	// It must be sized to the contracts actually filled — a protective order for the wrong size
 	// leaves part of the position unprotected.
-	if open[0].Contracts == nil || !algo.Sz.Equal(*open[0].Contracts) {
-		t.Errorf("the protective order size %v must match the filled contracts %v", algo.Sz, open[0].Contracts)
+	if open[0].Contracts == nil || !slAlgo.Sz.Equal(*open[0].Contracts) {
+		t.Errorf("the protective order size %v must match the filled contracts %v", slAlgo.Sz, open[0].Contracts)
 	}
-	// And its id must be recorded, or no later adjustment could reach it and no close could cancel it.
+	// Both ids must be recorded, or no later adjustment could reach them and no close could cancel them.
 	if open[0].ExchangeAlgoOrderID == nil || *open[0].ExchangeAlgoOrderID == "" {
-		t.Error("the resting order's algoId must be recorded on the position")
+		t.Error("the resting SL order's algoId must be recorded on the position")
+	}
+	if open[0].ExchangeTPAlgoOrderID == nil || *open[0].ExchangeTPAlgoOrderID == "" {
+		t.Error("the resting TP order's algoId must be recorded on the position")
 	}
 }
 
@@ -98,6 +125,11 @@ func TestOpenBot_ClosesThePositionWhenProtectionCannotBePlaced(t *testing.T) {
 // Verification, not blind trust: a position whose protective order has vanished from the exchange
 // gets a new one. An algo order can be cancelled from OKX's own UI or lost to a margin-mode change,
 // neither of which produces any signal in this process.
+//
+// SL and TP are two SEPARATE orders (2026-09-22) — algoStatus applies to BOTH legs' GetAlgoOrder
+// reads in this fake, so both read as "canceled" (vanished) and both get re-placed. Asserting 2
+// placements, one per side, is what proves ensureProtection checks each leg independently rather
+// than treating the position as protected once any one algoId is present.
 func TestEnsureProtection_ReplacesAMissingProtectiveOrder(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{
@@ -105,21 +137,128 @@ func TestEnsureProtection_ReplacesAMissingProtectiveOrder(t *testing.T) {
 	}
 	rt := newTestBotTrader(repo, exchange, nil, nil)
 
-	sl, tp, contracts, algo := dec("95"), dec("110"), dec("3"), "algo-gone"
+	sl, tp, contracts, slAlgo, tpAlgo := dec("95"), dec("110"), dec("3"), "algo-sl-gone", "algo-tp-gone"
 	order := port.BotOrder{
 		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
 		SLPx: &sl, TPPx: &tp, Size: dec("10"), Leverage: dec("1"),
-		Contracts: &contracts, ExchangeAlgoOrderID: &algo,
+		Contracts: &contracts, ExchangeAlgoOrderID: &slAlgo, ExchangeTPAlgoOrderID: &tpAlgo,
+	}
+	repo.realOrders[1] = order
+
+	rt.ensureProtection(context.Background(), []port.BotOrder{order}, testLogger())
+
+	if len(exchange.placedAlgoOrders) != 2 {
+		t.Fatalf("both vanished protective order legs must be re-placed, got %d placements", len(exchange.placedAlgoOrders))
+	}
+	var gotSL, gotTP bool
+	for _, a := range exchange.placedAlgoOrders {
+		if a.SLTriggerPx.Equal(sl) {
+			gotSL = true
+		}
+		if a.TPTriggerPx.Equal(tp) {
+			gotTP = true
+		}
+	}
+	if !gotSL {
+		t.Errorf("the replacement must carry the position's own stop %v", sl)
+	}
+	if !gotTP {
+		t.Errorf("the replacement must carry the position's own target %v", tp)
+	}
+}
+
+// The ONE-legged case: only the TP leg has vanished (SL is still live). ensureProtection must
+// re-place TP alone, not touch the still-good SL — re-placing a live SL would rest a second SL
+// order on top of a perfectly good one.
+func TestEnsureProtection_ReplacesOnlyTheMissingLeg(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		algoStatusByID: map[string]domain.AlgoOrderStatus{
+			"algo-sl-live": {State: "live", SLTriggerPx: dec("95")},
+			"algo-tp-gone": {State: "canceled"},
+		},
+	}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+
+	sl, tp, contracts, slAlgo, tpAlgo := dec("95"), dec("110"), dec("3"), "algo-sl-live", "algo-tp-gone"
+	order := port.BotOrder{
+		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
+		SLPx: &sl, TPPx: &tp, Size: dec("10"), Leverage: dec("1"),
+		Contracts: &contracts, ExchangeAlgoOrderID: &slAlgo, ExchangeTPAlgoOrderID: &tpAlgo,
 	}
 	repo.realOrders[1] = order
 
 	rt.ensureProtection(context.Background(), []port.BotOrder{order}, testLogger())
 
 	if len(exchange.placedAlgoOrders) != 1 {
-		t.Fatalf("a vanished protective order must be re-placed, got %d placements", len(exchange.placedAlgoOrders))
+		t.Fatalf("only the missing TP leg must be re-placed, got %d placements", len(exchange.placedAlgoOrders))
 	}
-	if !exchange.placedAlgoOrders[0].SLTriggerPx.Equal(sl) {
-		t.Errorf("the replacement must carry the position's own stop %v, got %v", sl, exchange.placedAlgoOrders[0].SLTriggerPx)
+	if !exchange.placedAlgoOrders[0].TPTriggerPx.Equal(tp) {
+		t.Errorf("the replacement must be the TP leg carrying %v, got %v", tp, exchange.placedAlgoOrders[0].TPTriggerPx)
+	}
+	if exchange.placedAlgoOrders[0].SLTriggerPx.IsPositive() {
+		t.Error("the still-live SL must NOT have been re-placed")
+	}
+}
+
+// The stranded-order case slProtectionRequest's own doc comment names as the risk the SL/TP split
+// reintroduces: SL has TRIGGERED (the position is closing), and TP is still LIVE. ensureProtection
+// must cancel the now-stranded TP so it cannot later fire against an unrelated future position on
+// this net_mode account — the exact scenario that motivated keeping SL and TP as one OCO order in
+// the first place, now handled after the fact instead of never allowed to occur.
+func TestEnsureProtection_CancelsTheStrandedSideAfterItsSiblingTriggers(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		algoStatusByID: map[string]domain.AlgoOrderStatus{
+			"algo-sl-fired": {State: "effective", SLTriggerPx: dec("95")},
+			"algo-tp-live":  {State: "live", TPTriggerPx: dec("110")},
+		},
+	}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+
+	sl, tp, contracts, slAlgo, tpAlgo := dec("95"), dec("110"), dec("3"), "algo-sl-fired", "algo-tp-live"
+	order := port.BotOrder{
+		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
+		SLPx: &sl, TPPx: &tp, Size: dec("10"), Leverage: dec("1"),
+		Contracts: &contracts, ExchangeAlgoOrderID: &slAlgo, ExchangeTPAlgoOrderID: &tpAlgo,
+	}
+	repo.realOrders[1] = order
+
+	rt.ensureProtection(context.Background(), []port.BotOrder{order}, testLogger())
+
+	if len(exchange.placedAlgoOrders) != 0 {
+		t.Errorf("a triggered leg must not cause any new placement, got %d", len(exchange.placedAlgoOrders))
+	}
+	if len(exchange.canceledAlgoIDs) != 1 || exchange.canceledAlgoIDs[0] != tpAlgo {
+		t.Errorf("the still-live TP (%s) must be cancelled once its SL sibling has fired, got cancellations %v",
+			tpAlgo, exchange.canceledAlgoIDs)
+	}
+}
+
+// The mirror case: TP has fired, SL is still live. The still-live SL must be cancelled.
+func TestEnsureProtection_CancelsTheStrandedSLAfterTPTriggers(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		algoStatusByID: map[string]domain.AlgoOrderStatus{
+			"algo-sl-live":  {State: "live", SLTriggerPx: dec("95")},
+			"algo-tp-fired": {State: "effective", TPTriggerPx: dec("110")},
+		},
+	}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+
+	sl, tp, contracts, slAlgo, tpAlgo := dec("95"), dec("110"), dec("3"), "algo-sl-live", "algo-tp-fired"
+	order := port.BotOrder{
+		ID: 1, InstID: rt.InstID, Side: "buy", Status: "filled", EntryPx: dec("100"),
+		SLPx: &sl, TPPx: &tp, Size: dec("10"), Leverage: dec("1"),
+		Contracts: &contracts, ExchangeAlgoOrderID: &slAlgo, ExchangeTPAlgoOrderID: &tpAlgo,
+	}
+	repo.realOrders[1] = order
+
+	rt.ensureProtection(context.Background(), []port.BotOrder{order}, testLogger())
+
+	if len(exchange.canceledAlgoIDs) != 1 || exchange.canceledAlgoIDs[0] != slAlgo {
+		t.Errorf("the still-live SL (%s) must be cancelled once its TP sibling has fired, got cancellations %v",
+			slAlgo, exchange.canceledAlgoIDs)
 	}
 }
 
@@ -214,9 +353,12 @@ func TestCloseBot_SucceedsEvenIfCancellingProtectionFails(t *testing.T) {
 	}
 }
 
-// Both levels ride on ONE order, so OKX's own OCO handling cancels the loser when the winner fires.
-// Two separate orders would leave the losing side resting after the position closed.
-func TestProtectionRequest_CarriesBothLevelsOnOneOrder(t *testing.T) {
+// SL and TP are placed as TWO SEPARATE orders (2026-09-22, revising the original combined-OCO
+// design) — the combined form was found live to silently drop the TP side on this account's
+// X-Perp instruments, even though both trigger prices decoded correctly on the Go side before the
+// request left this process. slProtectionRequest/tpProtectionRequest each produce a single-sided
+// request; neither one's request carries the other side's trigger price.
+func TestProtectionRequest_PlacesSLAndTPAsSeparateOrders(t *testing.T) {
 	rt := newTestBotTrader(newFakeRepository(), &fakeExchangeClient{}, nil, nil)
 
 	sl, tp, contracts := dec("95"), dec("110"), dec("3")
@@ -225,12 +367,80 @@ func TestProtectionRequest_CarriesBothLevelsOnOneOrder(t *testing.T) {
 		SLPx: &sl, TPPx: &tp, Contracts: &contracts,
 	}
 
-	req, ok := rt.protectionRequest(order)
-	if !ok {
-		t.Fatal("a position with both levels must produce a protective order")
+	slReq, slOK := rt.slProtectionRequest(order)
+	if !slOK {
+		t.Fatal("a position with an SL level must produce an SL order")
 	}
-	if !req.SLTriggerPx.Equal(sl) || !req.TPTriggerPx.Equal(tp) {
-		t.Errorf("one order must carry both levels, got sl=%v tp=%v", req.SLTriggerPx, req.TPTriggerPx)
+	if !slReq.SLTriggerPx.Equal(sl) {
+		t.Errorf("SL request must carry the SL trigger, got %v", slReq.SLTriggerPx)
+	}
+	if slReq.TPTriggerPx.IsPositive() {
+		t.Errorf("SL-only request must NOT carry a TP trigger, got %v — this is the exact shape that was found to silently drop TP", slReq.TPTriggerPx)
+	}
+
+	tpReq, tpOK := rt.tpProtectionRequest(order)
+	if !tpOK {
+		t.Fatal("a position with a TP level must produce a TP order")
+	}
+	if !tpReq.TPTriggerPx.Equal(tp) {
+		t.Errorf("TP request must carry the TP trigger, got %v", tpReq.TPTriggerPx)
+	}
+	if tpReq.SLTriggerPx.IsPositive() {
+		t.Errorf("TP-only request must NOT carry an SL trigger, got %v", tpReq.SLTriggerPx)
+	}
+}
+
+// placeProtection places SL first and, per explicit operator instruction, prioritizes it: SL
+// failing closes the position (tested via openBot's own caller), but TP failing after SL succeeds
+// must NOT undo the SL placement — the position stays protected on the loss side while
+// ensureProtection's next reconciliation pass retries TP.
+func TestPlaceProtection_TPFailureDoesNotUndoSL(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{placeAlgoOrderFailOn: "tp"}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+
+	sl, tp, contracts := dec("95"), dec("110"), dec("3")
+	order := port.BotOrder{
+		ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"),
+		SLPx: &sl, TPPx: &tp, Contracts: &contracts,
+	}
+	repo.realOrders[1] = order
+
+	slAlgoID, tpAlgoID, err := rt.placeProtection(context.Background(), order, true, true, testLogger())
+	if err != nil {
+		t.Fatalf("a TP failure alone must not fail placeProtection: %v", err)
+	}
+	if slAlgoID == "" {
+		t.Error("SL must have been placed despite the TP failure")
+	}
+	if tpAlgoID != "" {
+		t.Error("TP must NOT have an algoId — it failed to place")
+	}
+}
+
+// The reconciliation loop must only re-place the side that is actually missing — re-placing a
+// side that is already live would rest a second order on top of a perfectly good one.
+func TestPlaceProtection_WantFlagsControlWhichLegIsPlaced(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+
+	sl, tp, contracts := dec("95"), dec("110"), dec("3")
+	order := port.BotOrder{
+		ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"),
+		SLPx: &sl, TPPx: &tp, Contracts: &contracts,
+	}
+	repo.realOrders[1] = order
+
+	slAlgoID, tpAlgoID, err := rt.placeProtection(context.Background(), order, false, true, testLogger())
+	if err != nil {
+		t.Fatalf("placeProtection: %v", err)
+	}
+	if slAlgoID != "" {
+		t.Error("wantSL=false must not place an SL order")
+	}
+	if tpAlgoID == "" {
+		t.Error("wantTP=true must place a TP order")
 	}
 }
 

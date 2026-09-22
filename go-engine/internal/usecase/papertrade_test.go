@@ -455,6 +455,18 @@ func (r *fakeRepository) SetBotOrderExchangeAlgoOrderID(ctx context.Context, id 
 	r.realOrders[id] = o
 	return nil
 }
+func (r *fakeRepository) SetBotOrderExchangeTPAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o, ok := r.realOrders[id]
+	if !ok {
+		return fmt.Errorf("bot order %d not found", id)
+	}
+	aid := algoOrderID
+	o.ExchangeTPAlgoOrderID = &aid
+	r.realOrders[id] = o
+	return nil
+}
 func (r *fakeRepository) CloseBotOrder(ctx context.Context, id int64, closePx decimal.Decimal, reason string, realizedPnL decimal.Decimal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

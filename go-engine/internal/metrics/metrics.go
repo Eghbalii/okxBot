@@ -70,6 +70,16 @@ var (
 		Help: "Failed attempts to rest an SL/TP order on the exchange, by instrument.",
 	}, []string{"inst_id"})
 
+	// BotProtectionTPFailedTotal counts a specific, narrower failure than the one above (2026-09-22,
+	// SL/TP split into two separate orders): the stop-loss side placed successfully but the
+	// take-profit side did not. The position IS protected on the loss side in this case — this
+	// counter exists to distinguish "half-protected, will self-heal next reconciliation pass" from
+	// BotProtectionFailedTotal's "nothing placed at all".
+	BotProtectionTPFailedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "okxbot_bot_protection_tp_failed_total",
+		Help: "Stop-loss placed but the separate take-profit order failed, by instrument.",
+	}, []string{"inst_id"})
+
 	BotProtectionAmendedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "okxbot_bot_protection_amended_total",
 		Help: "Resting SL/TP orders successfully amended on the exchange, by instrument.",

@@ -37,6 +37,7 @@ func (r *Repository) GetBotOrder(ctx context.Context, id int64) (port.BotOrder, 
 		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at,
 			closed_at, close_reason, close_px, realized_pnl, features_json, status, bar,
 			pnl_max_pct, pnl_min_pct, manual_close_requested, exchange_order_id, exchange_algo_order_id,
+			exchange_tp_algo_order_id,
 			manual_override,
 			-- Added 2026-09-09: this read was written before the exchange-truth columns existed and
 			-- never picked them up, so a single-order fetch silently reported no close order id even
@@ -48,7 +49,8 @@ func (r *Repository) GetBotOrder(ctx context.Context, id int64) (port.BotOrder, 
 	`, id).Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size,
 		&o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx, &o.RealizedPnL,
 		&o.FeaturesJSON, &o.Status, &bar, &o.PnLMaxPct, &o.PnLMinPct,
-		&o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.ManualOverride,
+		&o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.ExchangeTPAlgoOrderID,
+		&o.ManualOverride,
 		&o.ExchangeCloseOrderID, &o.ExchangeRealizedPnL, &o.ExchangeFee, &o.ExchangeClosePx,
 		&o.LastError, &o.LastErrorAt, &o.ExchangeOpenRaw, &o.ExchangeCloseRaw, &o.Contracts)
 	if err != nil {
@@ -93,13 +95,28 @@ func (r *Repository) SetBotOrderFeatures(ctx context.Context, id int64, features
 	return nil
 }
 
-// SetBotOrderExchangeAlgoOrderID mirrors SetExchangeAlgoOrderID for bot_orders.
+// SetBotOrderExchangeAlgoOrderID mirrors SetExchangeAlgoOrderID for bot_orders. Records the
+// STOP-LOSS algo order's ID (2026-09-22: SL and TP are separate resting orders, see BotOrder's
+// own doc comment).
 func (r *Repository) SetBotOrderExchangeAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE bot_orders SET exchange_algo_order_id = $2 WHERE id = $1
 	`, id, algoOrderID)
 	if err != nil {
 		return fmt.Errorf("set exchange algo order id for bot order %d: %w", id, err)
+	}
+	return nil
+}
+
+// SetBotOrderExchangeTPAlgoOrderID records the TAKE-PROFIT algo order's ID — the sibling of
+// SetBotOrderExchangeAlgoOrderID (which holds the stop-loss side), placed as a separate order
+// (2026-09-22).
+func (r *Repository) SetBotOrderExchangeTPAlgoOrderID(ctx context.Context, id int64, algoOrderID string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE bot_orders SET exchange_tp_algo_order_id = $2 WHERE id = $1
+	`, id, algoOrderID)
+	if err != nil {
+		return fmt.Errorf("set exchange tp algo order id for bot order %d: %w", id, err)
 	}
 	return nil
 }
@@ -274,7 +291,7 @@ func (r *Repository) UpdateBotOrderSLTP(ctx context.Context, id int64, slPx, tpP
 // position (it isn't one yet).
 func (r *Repository) ListOpenBotOrders(ctx context.Context, instID string) ([]port.BotOrder, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, status, pnl_max_pct, pnl_min_pct, bar, manual_close_requested, exchange_order_id, exchange_algo_order_id, contracts
+		SELECT id, inst_id, strategy_id, side, entry_px, sl_px, tp_px, size, leverage, opened_at, features_json, status, pnl_max_pct, pnl_min_pct, bar, manual_close_requested, exchange_order_id, exchange_algo_order_id, exchange_tp_algo_order_id, contracts
 		FROM bot_orders
 		-- 'closing' is included deliberately: a flatten is in flight but unconfirmed, so the
 		-- position is still REAL and still needs monitoring. Excluding it here would make the
@@ -292,7 +309,7 @@ func (r *Repository) ListOpenBotOrders(ctx context.Context, instID string) ([]po
 	for rows.Next() {
 		var o port.BotOrder
 		var bar *string
-		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.OpenedAt, &o.FeaturesJSON, &o.Status, &o.PnLMaxPct, &o.PnLMinPct, &bar, &o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.Contracts); err != nil {
+		if err := rows.Scan(&o.ID, &o.InstID, &o.StrategyID, &o.Side, &o.EntryPx, &o.SLPx, &o.TPPx, &o.Size, &o.Leverage, &o.OpenedAt, &o.FeaturesJSON, &o.Status, &o.PnLMaxPct, &o.PnLMinPct, &bar, &o.ManualCloseRequested, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID, &o.ExchangeTPAlgoOrderID, &o.Contracts); err != nil {
 			return nil, fmt.Errorf("scan bot order: %w", err)
 		}
 		if bar != nil {
@@ -372,7 +389,8 @@ func (r *Repository) ListBotPositions(ctx context.Context, f port.PositionFilter
 		SELECT ro.id, ro.inst_id, ro.strategy_id, ro.side, ro.entry_px, ro.sl_px, ro.tp_px, ro.size, ro.leverage,
 			ro.opened_at, ro.closed_at, ro.close_reason, ro.close_px, ro.realized_pnl, ro.features_json, ro.status,
 			ro.bar, ro.pnl_max_pct, ro.pnl_min_pct, COALESCE(s.name, ''),
-			ro.exchange_order_id, ro.exchange_algo_order_id, ro.manual_close_requested, ro.manual_override,
+			ro.exchange_order_id, ro.exchange_algo_order_id, ro.exchange_tp_algo_order_id,
+			ro.manual_close_requested, ro.manual_override,
 			ro.exchange_close_order_id, ro.exchange_realized_pnl, ro.exchange_fee, ro.exchange_close_px,
 			ro.last_error, ro.last_error_at, ro.contracts,
 			-- In-place SL/TP edit count, mirroring ListPositions — backs the panel's "Updated"
@@ -404,6 +422,7 @@ func (r *Repository) ListBotPositions(ctx context.Context, f port.PositionFilter
 			&o.Size, &o.Leverage, &o.OpenedAt, &o.ClosedAt, &o.CloseReason, &o.ClosePx,
 			&o.RealizedPnL, &o.FeaturesJSON, &o.Status, &bar,
 			&o.PnLMaxPct, &o.PnLMinPct, &o.StrategyName, &o.ExchangeOrderID, &o.ExchangeAlgoOrderID,
+			&o.ExchangeTPAlgoOrderID,
 			&o.ManualCloseRequested, &o.ManualOverride,
 			&o.ExchangeCloseOrderID, &o.ExchangeRealizedPnL, &o.ExchangeFee, &o.ExchangeClosePx,
 			&o.LastError, &o.LastErrorAt, &o.Contracts,

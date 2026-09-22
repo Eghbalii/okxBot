@@ -73,21 +73,35 @@ type fakeExchangeClient struct {
 	amendedAlgoOrders []domain.AlgoOrderAmend
 	canceledAlgoIDs   []string
 	placeAlgoErr      error
-	amendAlgoErr      error
-	cancelAlgoErr     error
+	// placeAlgoOrderFailOn, when set to "sl" or "tp", fails only the algo order carrying that
+	// side's trigger price (2026-09-22, SL/TP split into two separate orders) — for tests that need
+	// one leg to fail independently of the other, which placeAlgoErr (a blanket failure) cannot do.
+	placeAlgoOrderFailOn string
+	amendAlgoErr         error
+	cancelAlgoErr        error
 	// algoSeq gives each placed algo order its own id, so a test can tell one from another.
 	algoSeq int
-	// algoStatus, when set, is what GetAlgoOrder reports; unset means a live order carrying the
-	// most recently placed triggers.
+	// algoStatus, when set, is what GetAlgoOrder reports for every algoId; unset means a live order
+	// carrying the most recently placed triggers.
 	algoStatus      *domain.AlgoOrderStatus
 	algoStatusQueue []domain.AlgoOrderStatus
-	getAlgoErr      error
-	getAlgoCalls    int
+	// algoStatusByID answers GetAlgoOrder PER algoId (2026-09-22, SL/TP split into two separate
+	// orders — a test may need the SL leg and TP leg to report different states at once, which
+	// algoStatus's single shared value cannot express). Checked before algoStatus/the live default.
+	algoStatusByID map[string]domain.AlgoOrderStatus
+	getAlgoErr     error
+	getAlgoCalls   int
 }
 
 func (f *fakeExchangeClient) PlaceAlgoOrder(req domain.AlgoOrderRequest) (string, error) {
 	if f.placeAlgoErr != nil {
 		return "", f.placeAlgoErr
+	}
+	if f.placeAlgoOrderFailOn == "sl" && req.SLTriggerPx.IsPositive() {
+		return "", fmt.Errorf("fake: sl leg placement failed")
+	}
+	if f.placeAlgoOrderFailOn == "tp" && req.TPTriggerPx.IsPositive() {
+		return "", fmt.Errorf("fake: tp leg placement failed")
 	}
 	f.placedAlgoOrders = append(f.placedAlgoOrders, req)
 	f.algoSeq++
@@ -121,6 +135,11 @@ func (f *fakeExchangeClient) GetAlgoOrder(instID, algoID string) (domain.AlgoOrd
 	}
 	if f.getAlgoErr != nil {
 		return domain.AlgoOrderStatus{}, f.getAlgoErr
+	}
+	if f.algoStatusByID != nil {
+		if status, ok := f.algoStatusByID[algoID]; ok {
+			return status, nil
+		}
 	}
 	if f.algoStatus != nil {
 		return *f.algoStatus, nil

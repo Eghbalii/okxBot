@@ -1188,19 +1188,27 @@ func (e *BotTrader) openBot(
 	// in bot_orders, watched by this process's own tick monitor — so any interruption of this
 	// service left real capital running unprotected, which is what bot order 33 exposed.
 	//
-	// A position that cannot be protected is CLOSED again immediately rather than kept. That costs
-	// a round-trip fee on a rare failure; holding an unprotected real position costs an unbounded
-	// loss, and "keep it and hope the retry works" is exactly the posture this change removes.
-	// Note this runs even when the DB insert failed (persisted == false). The position is LIVE on
-	// the exchange either way, and a live position is exactly what must not go unprotected — losing
-	// our own record of it is a bookkeeping problem, running it without a stop is a capital one.
-	// placeProtection skips only the algoId write in that case, which openBot has nowhere to store
-	// anyway.
+	// SL and TP are two SEPARATE algo orders (2026-09-22, see slProtectionRequest's own doc
+	// comment — the combined OCO form was found silently dropping TP on this account's X-Perp
+	// instruments). placeProtection places SL first: per explicit operator instruction it matters
+	// more, so ONLY a failure to place SL closes the position immediately — a missing TP alone is
+	// reported loudly but left for ensureProtection's next reconciliation pass to fill in, the
+	// same self-healing path a TP that later vanishes already goes through. Holding a position
+	// with a stop but no target is a real, deliberate intermediate state, not a failure.
+	//
+	// A position that cannot even get its STOP placed is CLOSED again immediately rather than
+	// kept. That costs a round-trip fee on a rare failure; holding a position with no downside
+	// protection at all costs an unbounded loss, and "keep it and hope the retry works" is exactly
+	// the posture this change removes. Note this runs even when the DB insert failed (persisted ==
+	// false). The position is LIVE on the exchange either way, and a live position is exactly what
+	// must not go unprotected — losing our own record of it is a bookkeeping problem, running it
+	// without a stop is a capital one. placeProtection skips only the algoId write in that case,
+	// which openBot has nowhere to store anyway.
 	{
-		algoID, protErr := e.placeProtection(ctx, order, logger)
+		slAlgoID, tpAlgoID, protErr := e.placeProtection(ctx, order, true, true, logger)
 		if protErr != nil {
 			metrics.BotUnprotectedClosedTotal.WithLabelValues(e.InstID).Inc()
-			logger.Error("could not rest sl/tp on the exchange for a just-opened real position; closing it immediately",
+			logger.Error("could not rest a stop-loss on the exchange for a just-opened real position; closing it immediately",
 				"id", order.ID, "instId", e.InstID, "error", protErr)
 			if closeErr := e.closeBot(ctx, order, price, conductor.CloseReasonManual, logger); closeErr != nil {
 				// Now genuinely dangerous: an unprotected position that also would not flatten.
@@ -1214,7 +1222,12 @@ func (e *BotTrader) openBot(
 			}
 			return nil, nil
 		}
-		order.ExchangeAlgoOrderID = &algoID
+		if slAlgoID != "" {
+			order.ExchangeAlgoOrderID = &slAlgoID
+		}
+		if tpAlgoID != "" {
+			order.ExchangeTPAlgoOrderID = &tpAlgoID
+		}
 	}
 
 	metrics.PaperOrdersOpenedTotal.WithLabelValues(a.Kind, e.InstID, order.Side).Inc()
