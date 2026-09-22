@@ -130,34 +130,85 @@ Item 2 (second gateway container) and item 4 (second trader instance) are effect
 this — there is no second `cmd/trader`, only `paper-trader-mexc`, and the gateway container is
 already defined in `docker-compose.yml`, just not running.
 
+## Update 2026-09-22 (second pass): no API key needed, panel done, real blocker is MEXC market data
+
+Operator feedback corrected two wrong assumptions from the first pass:
+
+- **Paper trading needs no MEXC API credentials at all.** Positions are virtual; nothing here ever
+  calls MEXC's authenticated endpoints (place/cancel order, positions, balance). Only public
+  ticker/candle/funding-rate data is needed, and `internal/mexc/rest`'s `doPublic` path sends no
+  auth headers. `MEXC_API_KEY`/`MEXC_API_SECRET` were removed from the compose file entirely — the
+  gateway starts and serves real MEXC data fine with them unset. The item below about "credentials"
+  in the first pass of this doc was simply wrong; don't go looking for a MEXC key.
+- Renamed `okx-gateway-mexc` → **`mexc-gateway`** in `docker-compose.yml` (the binary/package is
+  still `cmd/okx-gateway`/`Dockerfile.okx-gateway` — those names predate the exchange-parameterized
+  design and weren't worth the larger, riskier rename; only the compose service name changed).
+- `PAPER_EXCHANGE` for the MEXC instance is **`MEXC_100x_1`** (the operator's own chosen profile
+  label), not a bare `mexc` — this label is what appears in the `exchange` column and what the
+  panel's profile switcher shows. `account.initial_usd` in `config.mexc.yaml` is **$8** ($4/token ×
+  2 starter tokens BTC/ETH, per the operator's explicit instruction), not $100.
+- **Panel done**: `PositionsPage` → Paper tab now has a Profile selector (OKX / MEXC_100x_1) above
+  the stats/config boxes, threading `?exchange=` through positions/stats/config/balance-history/
+  restart. Non-OKX profiles hide the Manage Strategies/Manage Tokens buttons — those modals read the
+  discovery-scan `instruments` roster (a different, OKX-only "exchange" concept), not this profile
+  label, and wiring them up against the wrong roster would silently corrupt it.
+
+### A deploy-time discovery, fixed same session
+
+The **previous** session's `cmd/okx-gateway` exchange-parameterization commit had been committed to
+git but genuinely **never deployed** — the running `okx-gateway`/`trader` binaries on the server
+predated it (confirmed via `docker inspect`'s `Created` timestamp, and via `strings` on the running
+binary finding zero occurrence of MEXC-specific error strings). This was caught only because the
+first live MEXC ticker call through the freshly-built `mexc-gateway` returned an *OKX*-shaped error
+— tracing it down found the whole gateway/trader stack was stale. Deployed the missing 3 files,
+rebuilt `okx-gateway`+`trader` (both confirmed behavior-preserving for OKX before restarting — real
+trading was `stopped` throughout, no capital at risk), and re-verified via `strings` on the rebuilt
+binaries this time, not just a successful build exit code. **Lesson for next time: never assume a
+prior session's commit reached the server just because a service `git log` says it should have —
+check the running binary directly.**
+
+### The real remaining blocker: MEXC has no live market data pipeline
+
+Found while first starting `paper-trader-mexc` for real: it seeded its candle windows from
+Postgres's `candles` table and consumed live ticks from Kafka's `okx.tickers`/`okx.candles.<bar>`
+topics — **exactly like the OKX instance does**, because `candles` has no `exchange` column
+(`PRIMARY KEY (inst_id, bar, ts)` only, migration `000001`) and `cmd/ingestor` has zero MEXC
+awareness (`grep -i mexc go-engine/cmd/ingestor/*.go` → nothing). `paper-trader-mexc` was about to
+silently trade "MEXC" positions against **OKX's own BTC/ETH price feed**, which would have
+invalidated the whole comparison without any visible error. **Stopped `paper-trader-mexc`
+immediately** (`docker compose stop paper-trader-mexc`) before it opened anything — confirmed zero
+rows exist under `exchange='MEXC_100x_1'` in `paper_orders`. `mexc-gateway` itself stays up and is
+verified working correctly against real MEXC data (`curl http://localhost:8096/ticker?instId=BTC_USDT`
+returns real live MEXC prices) — the gap is purely that nothing publishes MEXC ticks/candles onto
+the Kafka topics `PaperTrader` consumes.
+
 ## What's still left
 
-1. **MEXC credentials — the one blocking item.** Need real API key/secret for a MEXC account with
-   futures access, placed as env vars on the server (`MEXC_API_KEY`/`MEXC_API_SECRET` in
-   `/opt/okxBot/.env`) — never on the local machine, same standing rule as OKX credentials. Once
-   present: `ssh okx 'cd /opt/okxBot && docker compose up -d okx-gateway-mexc paper-trader-mexc'`
-   starts both new containers (they're already built as of this deploy, or rebuild first if the
-   compose file changes again). Confirm `curl http://localhost:8096/health` reports MEXC-shaped
-   output and `paper-trader-mexc`'s logs show it seeding candle windows before considering it live.
+1. **MEXC market data ingestion — the real blocking item, not credentials.** `paper-trader-mexc`
+   cannot run correctly until something publishes real MEXC ticks/candles onto Kafka topics it
+   reads. Two shapes worth considering, not decided here:
+   - Extend `cmd/ingestor` to also subscribe to MEXC's public WS (`internal/mexc/ws.PublicClient`
+     already exists and is live-verified per CLAUDE.md §46.6) and publish to exchange-qualified
+     topics/DB rows (would need `candles`/Kafka topic naming to carry an exchange dimension, which
+     `paper_orders`/`account_equity` etc. now have but `candles` does not).
+   - A separate, smaller MEXC-only ingestor process, publishing to its own topics
+     (`mexc.tickers`/`mexc.candles.<bar>`) that `paper-trader-mexc` is pointed at via its own Kafka
+     consumer config — more isolated, less shared code, but avoids touching `candles`' schema or
+     `cmd/ingestor`'s OKX-specific logic at all.
+   Whichever is chosen, `paper-trader-mexc` must NOT be restarted/left running until this exists —
+   restarting it today reproduces the exact silent-wrong-data bug this update just caught.
 
-2. **Panel visibility (still lower priority for a throwaway test)**: the panel's Positions page has
-   Paper/Real tabs (CLAUDE.md §34) with no exchange filter UI yet — `?exchange=` is supported
-   server-side (`internal/api/paper_trading.go`, `market.go`) but nothing in `panel/` sends it yet.
-   For a quick comparison, `SELECT * FROM paper_orders WHERE exchange = 'mexc'` / the stats/history
-   endpoints with `?exchange=mexc` are faster than building panel UI for a test that may be
-   discarded.
+2. **MEXC private WS (optional, not blocking, unchanged from the first pass).** No account-push
+   client exists yet — irrelevant for paper trading anyway, which has no exchange account to push
+   from.
 
-3. **MEXC private WS (optional, not blocking).** No account-push client exists yet
-   (`internal/mexc/ws` has only `public.go`) — `paper-trader-mexc` runs fine without it, on
-   reconciliation-poll-only visibility (matches how the whole system worked before the OKX private
-   WS existed, §27.6).
-
-4. **The two pre-existing test hangs from the prior session** (`internal/strategy`,
-   `internal/backtest`, both decimal-arithmetic-related, unrelated to any of this work) were not
-   re-investigated this session either — still open, still explicitly deferred by the operator.
+3. **The two pre-existing test hangs from the prior session** (`internal/strategy`,
+   `internal/backtest`, decimal-arithmetic-related) — still open, still not investigated, per the
+   operator's own instruction to leave them.
 
 ## Recommended next step
 
-Get MEXC credentials onto the server, then start the two new containers and watch
-`paper-trader-mexc`'s logs / `?exchange=mexc` stats for the first hour before leaving it running
-for the full comparison window.
+Decide and build the MEXC market-data ingestion path (item 1 above) before ever starting
+`paper-trader-mexc` again. Once real MEXC ticks/candles are flowing, `docker compose up -d
+paper-trader-mexc` and watch its logs for live tick/candle consumption (not just the one-time
+Postgres seed) before trusting any of its numbers.
