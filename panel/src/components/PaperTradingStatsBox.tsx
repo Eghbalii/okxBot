@@ -2,7 +2,7 @@ import { Link } from 'react-router-dom'
 import { usePolling } from '../hooks/usePolling'
 import { api } from '../api/client'
 import { formatUsd, pnlClass } from '../utils/format'
-import type { PositionMode } from '../api/types'
+import type { PaperProfile, PositionMode } from '../api/types'
 import BalanceChart from './BalanceChart'
 
 // A PnL figure: the percentage leads because it is the comparable number across windows, with the
@@ -52,14 +52,27 @@ function StatTile({
 // Trader's own row gains a Reserve tile since bot's cap now interacts with manual's on the SAME
 // real balance (see AccountPage). Polls at a slower interval than the position table's own 5s
 // poll — this data doesn't need that freshness.
-export default function PaperTradingStatsBox({ mode }: { mode: PositionMode }) {
+export default function PaperTradingStatsBox({
+  mode,
+  exchange,
+}: {
+  mode: PositionMode
+  // Which paper-trading profile this box shows (2026-09-22, multi-exchange paper trading) —
+  // undefined/'okx' behaves exactly as before this prop existed. Meaningless outside mode='paper'.
+  exchange?: PaperProfile | string
+}) {
   // Was previously bumped by the Set Trading Cap control's onSaved callback to force an immediate
   // re-poll after the operator changed the cap — that control moved to the Account page
   // (2026-09-20), so nothing in this component changes the cap anymore and refreshSignal now only
   // exists to satisfy BalanceChart's prop contract (its own doc comment: deliberately NOT part of
   // its cache key, see CLAUDE.md §14/§50.2b's history with this exact prop).
   const refreshSignal = 0
-  const { data, error } = usePolling(() => api.paperTradingStats(mode), 15_000, [mode], refreshSignal)
+  const { data, error } = usePolling(
+    () => api.paperTradingStats(mode, exchange),
+    15_000,
+    [mode, exchange],
+    refreshSignal,
+  )
 
   return (
     <div className="card">
@@ -124,6 +137,7 @@ export default function PaperTradingStatsBox({ mode }: { mode: PositionMode }) {
           <div className="stats-chart">
             <BalanceChart
               mode={mode}
+              exchange={exchange}
               currentEquity={Number(data.totalEquityUsd)}
               currentBalance={Number(data.accountBalanceUsd)}
               refreshSignal={refreshSignal}

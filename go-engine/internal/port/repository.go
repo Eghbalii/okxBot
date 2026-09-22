@@ -983,6 +983,13 @@ type Repository interface {
 	GetAccountEquityEx(ctx context.Context, mode, exchange string, initialUSD decimal.Decimal) (AccountEquity, error)
 	ApplyRealizedPnLEx(ctx context.Context, mode, exchange string, pnl decimal.Decimal, orderID *int64, instID string) (AccountEquity, bool, error)
 	ListEquityHistoryEx(ctx context.Context, mode, exchange string, since time.Time, limit int) ([]EquityPoint, error)
+	// SetAccountCapEx is the exchange-scoped sibling of SetAccountCap above (2026-09-22), used by
+	// cmd/api's panel-triggered "Set Trading Cap" control (handleSetAccountCap) so an operator can
+	// seed/re-baseline a second paper-trading profile's balance (e.g. "MEXC_100x_1") the same way
+	// they already can for the OKX one — same semantics, same reason="reset" history point, just
+	// scoped to a second, isolated account_equity row. exchange="" behaves exactly like
+	// SetAccountCap (defaults to "okx"), so every existing panel call is unaffected.
+	SetAccountCapEx(ctx context.Context, mode, exchange string, newCapUSD decimal.Decimal) (AccountEquity, error)
 
 	// RecordPaperOrderAdjustment appends one entry to an order's in-trade SL/TP adjustment history
 	// (CLAUDE.md §15.4/§15.12 revision, 2026-09-02) — replaces the old shadow-fork mechanic's

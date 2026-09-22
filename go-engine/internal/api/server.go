@@ -32,6 +32,13 @@ type Server struct {
 	// Repo instead, same as every other cmd/api handler, since that data must stay readable/
 	// writable even when cmd/paper-trader itself happens to be down or mid-restart.
 	PaperTraderBaseURL string
+	// PaperTraderProfileURLs maps a second (or later, third, fourth, ...) independent
+	// cmd/paper-trader instance's Exchange label (e.g. "MEXC_100x_1") to ITS OWN control-box
+	// base URL, for handleRestartTrading (2026-09-22, multi-exchange paper trading) — the OKX
+	// instance stays reachable via PaperTraderBaseURL above regardless of this map's contents.
+	// Nil/missing entries are not an error: a restart request for an unconfigured profile fails
+	// with the same "not configured" message PaperTraderBaseURL's own empty case already gives.
+	PaperTraderProfileURLs map[string]string
 	// Affordability answers "can this account afford to trade this token", for the Manage Tokens
 	// modal's minimum-size column and its auto-disabled tag (2026-09-08 request). Optional: nil
 	// simply makes that endpoint return an empty list, so cmd/api still runs anywhere the exchange
@@ -694,7 +701,12 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	filter := port.PositionFilter{
-		Mode:     mode,
+		Mode: mode,
+		// Exchange only means anything for mode="paper" today (2026-09-22, multi-exchange paper
+		// trading) — bot/manual positions come from a different table with no exchange column, so
+		// this is a no-op there. Empty defaults to "okx" at the repository layer, unchanged for
+		// every existing panel request that never sends it.
+		Exchange: q.Get("exchange"),
 		InstID:   q.Get("instId"),
 		SortBy:   q.Get("sortBy"),
 		SortDesc: q.Get("sortDesc") == "true",

@@ -72,9 +72,11 @@ paper_trading:
 
 # One shared paper-trading pool for THIS instance only — completely separate from the OKX
 # instance's account_equity row (both are mode="paper", isolated by the new exchange column,
-# 2026-09-22). $100 starting balance for this throwaway comparison test.
+# 2026-09-22). $4 per active token (the operator's own instruction) x 2 starter tokens (BTC, ETH)
+# = $8 starting balance. Raise this by $4 for every token added to trading.inst_ids below, same
+# per-token-budget reasoning as the OKX account's own history (CLAUDE.md §26).
 account:
-  initial_usd: 100
+  initial_usd: 8
   max_position_pct: 0.25
   max_total_exposure_pct: 0.60
 

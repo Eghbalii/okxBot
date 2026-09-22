@@ -875,6 +875,32 @@ func (r *fakeRepository) SetAccountCap(ctx context.Context, mode string, newCapU
 	return ae, nil
 }
 
+// SetAccountCapEx is the fake's exchange-scoped sibling of SetAccountCap above (2026-09-22),
+// stored under accountKey rather than the bare mode key so a second profile's cap can never
+// collide with or leak into the default OKX one.
+func (r *fakeRepository) SetAccountCapEx(ctx context.Context, mode, exchange string, newCapUSD decimal.Decimal) (port.AccountEquity, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if exchange == "" {
+		exchange = "okx"
+	}
+	key := accountKey(mode, exchange)
+	previous := r.accounts[key].EquityUSD
+	ae := port.AccountEquity{
+		Mode:              mode,
+		Exchange:          exchange,
+		InitialUSD:        newCapUSD,
+		EquityUSD:         newCapUSD,
+		AccountBalanceUSD: newCapUSD,
+		ResetCount:        r.accounts[key].ResetCount + 1,
+	}
+	r.accounts[key] = ae
+	r.equityPoints = append(r.equityPoints, port.EquityPoint{
+		Mode: mode, EquityUSD: newCapUSD, DeltaUSD: newCapUSD.Sub(previous), Reason: "reset",
+	})
+	return ae, nil
+}
+
 // AdjustAccountCap mirrors the real implementation: ADDS deltaUSD to both EquityUSD and
 // AccountBalanceUSD, records a reason="cap" point, and touches neither ResetCount nor
 // LastResetAt — the property that distinguishes it from SetAccountCap above.

@@ -53,5 +53,15 @@ func (s *Server) handleRestartTrading(w http.ResponseWriter, r *http.Request) {
 		s.proxyTraderRequest(w, r, r.Method, "/restart")
 		return
 	}
-	s.proxyPaperTraderRequest(w, r, r.Method, "/restart")
+	// exchange picks which independent paper-trading instance to restart (2026-09-22, multi-
+	// exchange paper trading) — empty/"okx" (the default profile) still goes to the original
+	// PaperTraderBaseURL, exactly as before this change; any other value looks up
+	// PaperTraderProfileURLs instead, so a second/third profile's restart button reaches ITS
+	// process, not the OKX one.
+	exchange := r.URL.Query().Get("exchange")
+	if exchange == "" || exchange == "okx" {
+		s.proxyPaperTraderRequest(w, r, r.Method, "/restart")
+		return
+	}
+	s.proxyPaperTraderRequestTo(w, r, s.PaperTraderProfileURLs[exchange], r.Method, "/restart")
 }

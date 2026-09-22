@@ -51,7 +51,10 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account, err := s.Repo.GetAccountEquity(r.Context(), mode, s.AccountInitialUSD)
+	// exchange ("okx", "MEXC_100x_1", ...) only means anything for mode="paper" today — bot/manual
+	// trading has no second-exchange instance (2026-09-22). Empty defaults to "okx" at the
+	// repository layer, unchanged for every existing panel request that never sends it.
+	account, err := s.Repo.GetAccountEquityEx(r.Context(), mode, r.URL.Query().Get("exchange"), s.AccountInitialUSD)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -65,6 +68,9 @@ type setAccountCapRequest struct {
 	// file — a body field rather than a query param since this is a mutating POST, not a GET.
 	Mode      string          `json:"mode"`
 	NewCapUSD decimal.Decimal `json:"newCapUsd"`
+	// Exchange ("okx", "MEXC_100x_1", ...) only means anything for mode="paper" (2026-09-22) —
+	// empty defaults to "okx" at the repository layer, unchanged for every existing panel request.
+	Exchange string `json:"exchange"`
 }
 
 // handleSetAccountCap lets the operator explicitly DEPOSIT/WITHDRAW to bring a mode's real balance
@@ -124,7 +130,7 @@ func (s *Server) handleSetAccountCap(w http.ResponseWriter, r *http.Request) {
 	if realMoneyModes[mode] {
 		account, err = s.Repo.SetTradingCap(r.Context(), mode, req.NewCapUSD)
 	} else {
-		account, err = s.Repo.SetAccountCap(r.Context(), mode, req.NewCapUSD)
+		account, err = s.Repo.SetAccountCapEx(r.Context(), mode, req.Exchange, req.NewCapUSD)
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -142,6 +148,9 @@ func (s *Server) handleAccountHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	// Only means anything for mode="paper" (2026-09-22) — empty defaults to "okx" at the
+	// repository layer, unchanged for every existing panel request that never sends it.
+	exchange := q.Get("exchange")
 
 	var since time.Time
 	if v := q.Get("since"); v != "" {
@@ -151,7 +160,7 @@ func (s *Server) handleAccountHistory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		since = parsed
-	} else if account, err := s.Repo.GetAccountEquity(r.Context(), mode, s.AccountInitialUSD); err == nil && account.LastResetAt != nil {
+	} else if account, err := s.Repo.GetAccountEquityEx(r.Context(), mode, exchange, s.AccountInitialUSD); err == nil && account.LastResetAt != nil {
 		// CLAUDE.md §31.2: with no explicit since, the chart shows the balance's story since the
 		// operator last chose a baseline (SetAccountCap) or a drain auto-reset happened — not the
 		// account's entire lifetime, which may span sizing regimes with nothing to do with the
@@ -170,7 +179,7 @@ func (s *Server) handleAccountHistory(w http.ResponseWriter, r *http.Request) {
 		limit = parsed
 	}
 
-	points, err := s.Repo.ListEquityHistory(r.Context(), mode, since, limit)
+	points, err := s.Repo.ListEquityHistoryEx(r.Context(), mode, exchange, since, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

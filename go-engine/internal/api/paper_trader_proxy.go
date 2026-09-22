@@ -18,11 +18,19 @@ var paperTraderHTTPClient = &http.Client{Timeout: 5 * time.Second}
 // proxyPaperTraderRequest forwards method+body to cmd/paper-trader's control-box HTTP surface at
 // path and copies its response back verbatim, same shape as proxyTesterRequest.
 func (s *Server) proxyPaperTraderRequest(w http.ResponseWriter, r *http.Request, method, path string) {
-	if s.PaperTraderBaseURL == "" {
+	s.proxyPaperTraderRequestTo(w, r, s.PaperTraderBaseURL, method, path)
+}
+
+// proxyPaperTraderRequestTo is proxyPaperTraderRequest widened to take an explicit base URL
+// (2026-09-22, multi-exchange paper trading) — a second, independent cmd/paper-trader instance
+// (e.g. paper-trader-mexc) runs its own control-box HTTP surface on its own port, so
+// handleRestartTrading needs to pick which one to reach rather than always the OKX default.
+func (s *Server) proxyPaperTraderRequestTo(w http.ResponseWriter, r *http.Request, baseURL, method, path string) {
+	if baseURL == "" {
 		writeError(w, http.StatusServiceUnavailable, "paper-trader is not configured (PAPER_TRADER_SERVICE_URL unset)")
 		return
 	}
-	req, err := http.NewRequestWithContext(r.Context(), method, s.PaperTraderBaseURL+path, r.Body)
+	req, err := http.NewRequestWithContext(r.Context(), method, baseURL+path, r.Body)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

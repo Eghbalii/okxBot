@@ -648,6 +648,53 @@ func (r *Repository) ListEquityHistoryEx(ctx context.Context, mode, exchange str
 	return out, nil
 }
 
+// SetAccountCapEx mirrors SetAccountCap, keyed by (mode, exchange) instead of mode alone
+// (2026-09-22, multi-exchange paper trading) — see that function's own doc comment for why Balance
+// and Equity move together here.
+func (r *Repository) SetAccountCapEx(ctx context.Context, mode, exchange string, newCapUSD decimal.Decimal) (port.AccountEquity, error) {
+	if exchange == "" {
+		exchange = "okx"
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return port.AccountEquity{}, fmt.Errorf("begin set account cap: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once Commit succeeds
+
+	var previous decimal.Decimal
+	if err := tx.QueryRow(ctx, `SELECT equity_usd FROM account_equity WHERE mode = $1 AND exchange = $2`, mode, exchange).Scan(&previous); err != nil {
+		previous = decimal.Zero
+	}
+
+	var ae port.AccountEquity
+	row := tx.QueryRow(ctx, `
+		INSERT INTO account_equity (mode, exchange, initial_usd, equity_usd, account_balance_usd, reset_count, last_reset_at)
+		VALUES ($1, $2, $3, $3, $3, 1, now())
+		ON CONFLICT (mode, exchange) DO UPDATE SET
+			initial_usd = $3,
+			equity_usd = $3,
+			account_balance_usd = $3,
+			reset_count = account_equity.reset_count + 1,
+			last_reset_at = now(),
+			updated_at = now()
+		RETURNING `+accountEquityColsEx, mode, exchange, newCapUSD)
+	if err := scanAccountEquityEx(row, &ae); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("set account cap for mode %s, exchange %s: %w", mode, exchange, err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO account_equity_history (mode, exchange, equity_usd, delta_usd, reason)
+		VALUES ($1, $2, $3, $4, 'reset')
+	`, mode, exchange, newCapUSD, newCapUSD.Sub(previous)); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("record account cap reset for mode %s, exchange %s: %w", mode, exchange, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return port.AccountEquity{}, fmt.Errorf("commit set account cap: %w", err)
+	}
+	return ae, nil
+}
+
 func nullableText(s string) *string {
 	if s == "" {
 		return nil

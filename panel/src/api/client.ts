@@ -8,6 +8,7 @@ import type {
   PaperTradingConfig,
   PaperTradingStats,
   ParamChange,
+  PaperProfile,
   Position,
   PositionMode,
   StrategyAssignment,
@@ -63,6 +64,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 async function requestList<T>(path: string, init?: RequestInit): Promise<T[]> {
   const data = await request<T[] | null>(path, init)
   return data ?? []
+}
+
+// exchangeParam appends "&exchange=<value>" when a non-default profile is given, otherwise nothing
+// (2026-09-22, multi-exchange paper trading) — omitting the param for 'okx'/undefined keeps every
+// URL byte-identical to before this parameter existed, matching cmd/api's own "empty defaults to
+// okx" behavior at the repository layer.
+function exchangeParam(exchange: string | undefined): string {
+  return exchange && exchange !== 'okx' ? `&exchange=${encodeURIComponent(exchange)}` : ''
 }
 
 export const api = {
@@ -186,6 +195,10 @@ export const api = {
   // and a multi-MB payload. page is 0-indexed; pageSize defaults server-side if omitted.
   listPositions: (opts?: {
     mode?: PositionMode
+    // Which paper-trading profile to read from (2026-09-22, multi-exchange paper trading) —
+    // meaningless for bot/manual mode, whose tables have no exchange column. Omitted/'okx' behaves
+    // exactly as before this field existed.
+    exchange?: PaperProfile | string
     instId?: string
     open?: boolean
     sortBy?: 'opened_at' | 'closed_at' | 'pnl' | 'inst_id'
@@ -195,6 +208,7 @@ export const api = {
   }) => {
     const params = new URLSearchParams()
     if (opts?.mode) params.set('mode', opts.mode)
+    if (opts?.exchange) params.set('exchange', opts.exchange)
     if (opts?.instId) params.set('instId', opts.instId)
     if (opts?.open !== undefined) params.set('open', String(opts.open))
     if (opts?.sortBy) params.set('sortBy', opts.sortBy)
@@ -270,10 +284,14 @@ export const api = {
 
   // Paper-trading control box + stats box (2026-09-01 request, extended to real trading
   // 2026-09-04), above the Positions table — mode selects which tab's data this serves.
-  paperTradingStats: (mode: PositionMode) => request<PaperTradingStats>(`/paper-trading/stats?mode=${mode}`),
+  // exchange (2026-09-22, multi-exchange paper trading) picks which paper-trading PROFILE within
+  // that tab — omitted/'okx' behaves exactly as before this parameter existed.
+  paperTradingStats: (mode: PositionMode, exchange?: PaperProfile | string) =>
+    request<PaperTradingStats>(`/paper-trading/stats?mode=${mode}${exchangeParam(exchange)}`),
   // "Manage tokens" modal's per-token all-time stats table (2026-09-04 request, widened from a
   // 24h window 2026-09-22 per operator instruction — matches strategyStats, which never had one).
-  tokenStatsAllTime: (mode: PositionMode) => requestList<TokenStats>(`/paper-trading/token-stats?mode=${mode}`),
+  tokenStatsAllTime: (mode: PositionMode, exchange?: PaperProfile | string) =>
+    requestList<TokenStats>(`/paper-trading/token-stats?mode=${mode}${exchangeParam(exchange)}`),
   // Per-token exchange minimums vs. the current per-token budget, for the Manage Tokens modal's
   // min-size column and auto-disabled tag (2026-09-08). Empty in paper mode by design.
   // OKX's own untouched record for both legs of a real position, fetched live rather than served
@@ -302,44 +320,50 @@ export const api = {
   // consumers can always call .length/.map on these fields without a crash (found live: an
   // unnormalized null.length threw and unmounted the whole app to a blank page after the initial
   // paint, since nothing here has an error boundary).
-  paperTradingConfig: (mode: PositionMode) =>
-    request<PaperTradingConfig>(`/paper-trading/config?mode=${mode}`).then((c) => ({
+  paperTradingConfig: (mode: PositionMode, exchange?: PaperProfile | string) =>
+    request<PaperTradingConfig>(`/paper-trading/config?mode=${mode}${exchangeParam(exchange)}`).then((c) => ({
       ...c,
       activeKinds: c.activeKinds ?? [],
       disabledInstIds: c.disabledInstIds ?? [],
       activeBars: c.activeBars ?? [],
       allInstIds: c.allInstIds ?? [],
     })),
-  savePaperTradingConfig: (mode: PositionMode, patch: Partial<Omit<PaperTradingConfig, 'allInstIds'>>) =>
+  savePaperTradingConfig: (
+    mode: PositionMode,
+    patch: Partial<Omit<PaperTradingConfig, 'allInstIds'>>,
+    exchange?: PaperProfile | string,
+  ) =>
     request<{ ok: boolean; restartRequired: boolean }>('/paper-trading/config', {
       method: 'PUT',
-      body: JSON.stringify({ ...patch, mode }),
+      body: JSON.stringify({ ...patch, mode, exchange }),
     }),
   // Paper trading restarts cmd/paper-trader; real trading restarts cmd/trader (its own self-restart
-  // handler, added alongside the mode-scoped config work) via cmd/api's mode-aware proxy.
-  restartPaperTrader: (mode: PositionMode) =>
-    request<{ status: string }>(`/paper-trading/restart?mode=${mode}`, { method: 'POST' }),
+  // handler, added alongside the mode-scoped config work) via cmd/api's mode-aware proxy. exchange
+  // routes to a second/third... profile's OWN control-box process (2026-09-22) — bot mode ignores it.
+  restartPaperTrader: (mode: PositionMode, exchange?: PaperProfile | string) =>
+    request<{ status: string }>(`/paper-trading/restart?mode=${mode}${exchangeParam(exchange)}`, { method: 'POST' }),
 
   // CLAUDE.md §31.2/§31.3: an explicit deposit/withdrawal bringing both "Total Equity" and the
   // real, continuous "Account Balance" to the same new value together — takes effect immediately,
   // no restart needed, since dynamic sizing reads the live account_equity row on every open rather
   // than a cached value.
-  setAccountCap: (newCapUsd: string, mode: PositionMode) =>
+  setAccountCap: (newCapUsd: string, mode: PositionMode, exchange?: PaperProfile | string) =>
     request<AccountEquity>('/account/cap', {
       method: 'POST',
-      body: JSON.stringify({ mode, newCapUsd }),
+      body: JSON.stringify({ mode, newCapUsd, exchange }),
     }),
 
   // Current account row, for the trading-cap slider's upper bound (the real Account Balance —
   // capping above what the account actually holds isn't a deposit the panel can make).
-  account: (mode: PositionMode) => request<AccountEquity>(`/account?mode=${mode}`),
+  account: (mode: PositionMode, exchange?: PaperProfile | string) =>
+    request<AccountEquity>(`/account?mode=${mode}${exchangeParam(exchange)}`),
 
   // Balance/equity timeline for the stats box's chart. `since` is RFC3339; passing it explicitly
   // overrides cmd/api's own default of "since the last reset" (CLAUDE.md §31.2), which is what the
   // day/week/month/year range selector needs — a fixed window, not one that shifts with resets.
-  accountHistory: (mode: PositionMode, since: Date, limit = 0) =>
+  accountHistory: (mode: PositionMode, since: Date, limit = 0, exchange?: PaperProfile | string) =>
     requestList<EquityPoint>(
-      `/account/history?mode=${mode}&since=${encodeURIComponent(since.toISOString())}&limit=${limit}`,
+      `/account/history?mode=${mode}&since=${encodeURIComponent(since.toISOString())}&limit=${limit}${exchangeParam(exchange)}`,
     ),
 
   // Manual/discretionary trading page (docs/MANUAL_TRADE_PLAN.md). Every write here is an async

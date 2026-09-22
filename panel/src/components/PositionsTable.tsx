@@ -13,7 +13,7 @@ import Pagination, { DEFAULT_PAGE_SIZE } from './Pagination'
 import SortableTh from './SortableTh'
 import { api } from '../api/client'
 import { formatDateTimeLines, formatUsd, pnlClass, tokenSymbol, trimPrice } from '../utils/format'
-import type { CloseReason, OrderStatus, Position, PositionMode } from '../api/types'
+import { PAPER_PROFILES, type CloseReason, type OrderStatus, type PaperProfile, type Position, type PositionMode } from '../api/types'
 
 // Sortable columns are limited to what Postgres can ORDER BY directly (internal/postgres's
 // positionSortColumns) since sorting/paging moved server-side 2026-09-02 — closed positions grew
@@ -111,6 +111,13 @@ function formatPct1(pct: number): string {
  * is the natural place, and PositionsPage's own mode selector never needs a manual entry now.
  */
 export default function PositionsTable({ mode }: { mode: PositionMode }) {
+  // Profile selector (2026-09-22 request): a second, fully independent cmd/paper-trader instance
+  // (e.g. against MEXC, 100x leverage) can run in parallel with the default OKX one, isolated by
+  // the `exchange` column — this lets the SAME Paper page switch between them instead of building
+  // a whole separate route/page. Meaningless outside mode='paper', so it stays pinned to 'okx' (and
+  // hidden) for bot/manual — those tables have no exchange column at all.
+  const [profile, setProfile] = useState<PaperProfile | string>('okx')
+  const exchange = mode === 'paper' ? profile : undefined
   const [instId, setInstId] = useState('')
   // Defaults to open-only: the panel's job is to show real open positions, not the full historical
   // log — closed trades are still one click away via the filter.
@@ -163,12 +170,13 @@ export default function PositionsTable({ mode }: { mode: PositionMode }) {
   // increments on every order open and close, the whole list visibly blanked and reappeared several
   // times a minute: the "it suddenly has a seizure, all positions vanish, then come back" the
   // operator reported. An event must REVALIDATE this query, not ask a different one.
-  const queryKey = `positions:${mode}:${instId}:${openFilter}:${sortBy}:${sortDesc}:${page}:${pageSize}`
+  const queryKey = `positions:${mode}:${exchange ?? 'okx'}:${instId}:${openFilter}:${sortBy}:${sortDesc}:${page}:${pageSize}`
   const { data, error, refresh, loading } = useCachedResource(
     queryKey,
     () =>
       api.listPositions({
         mode,
+        exchange,
         instId: instId || undefined,
         open: openFilter === 'all' ? undefined : openFilter === 'open',
         sortBy,
@@ -224,7 +232,7 @@ export default function PositionsTable({ mode }: { mode: PositionMode }) {
   // Any change to what is being listed starts again from the first page.
   useEffect(() => {
     setPage(0)
-  }, [mode, instId, openFilter, pageSize, sortBy, sortDesc])
+  }, [mode, exchange, instId, openFilter, pageSize, sortBy, sortDesc])
 
   function toggleSort(field: SortField) {
     userPickedSort.current = true
@@ -287,10 +295,28 @@ export default function PositionsTable({ mode }: { mode: PositionMode }) {
           manual mode: both are strategy-trading concepts (active strategies/timeframes, the
           trading-state pause/stop control) that have no equivalent for hand-placed orders — manual
           mode only ever needed the positions table itself (2026-09-19 request). */}
+      {/* Profile selector (2026-09-22 request): a second, fully independent paper-trading instance
+          (e.g. "MEXC_100x_1", 100x leverage) runs in parallel with the always-on OKX one, isolated
+          by the `exchange` column added the same day. Only meaningful on the Paper tab — bot/manual
+          trading has no second instance to switch between. */}
+      {mode === 'paper' && PAPER_PROFILES.length > 1 && (
+        <div className="profile-tabs">
+          {PAPER_PROFILES.map((p) => (
+            <button
+              key={p}
+              className={'profile-tab' + (profile === p ? ' active' : '')}
+              onClick={() => setProfile(p)}
+            >
+              {p === 'okx' ? 'OKX (default)' : p}
+            </button>
+          ))}
+        </div>
+      )}
+
       {mode !== 'manual' && (
         <>
-          <PaperTradingStatsBox mode={mode} />
-          <PaperTradingConfigBox mode={mode} />
+          <PaperTradingStatsBox mode={mode} exchange={exchange} />
+          <PaperTradingConfigBox mode={mode} exchange={exchange} />
         </>
       )}
 

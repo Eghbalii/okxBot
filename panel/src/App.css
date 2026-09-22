@@ -129,6 +129,39 @@ body {
   color: var(--accent);
 }
 
+/* Paper-trading profile selector (2026-09-22): a second, isolated paper-trading instance (e.g.
+   MEXC) switchable from within the Paper tab. Same visual shape as .mode-tabs, kept as its own
+   class since it is a page-local control, not top-level navigation. */
+.profile-tabs {
+  display: flex;
+  gap: 0.25rem;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.2rem;
+  margin-bottom: 0.9rem;
+  width: fit-content;
+}
+
+.profile-tab {
+  background: none;
+  border: none;
+  padding: 0.3rem 0.75rem;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  border-radius: 6px;
+}
+
+.profile-tab:hover {
+  color: var(--text);
+  border-color: transparent;
+}
+
+.profile-tab.active {
+  background: #1f2a3a;
+  color: var(--accent);
+}
+
 .empty-state {
   color: var(--text-dim);
   font-size: 0.85rem;

@@ -192,14 +192,21 @@ services:
     volumes:
       - ./go-engine/configs:/app/configs
 
-  # okx-gateway-mexc: a SECOND, independent gateway instance for MEXC (2026-09-22 multi-exchange
-  # paper-trading test, docs/MEXC_TEST_HANDOFF.md) — same image as okx-gateway, GATEWAY_EXCHANGE=mexc
-  # selects the MEXC branch of cmd/okx-gateway/main.go's buildService (already exchange-parameterized,
-  # commit "feat(gateway): make cmd/okx-gateway exchange-parameterized for MEXC"). Runs on its own
-  # port (8096, since 8094 is OKX's) and holds MEXC's own credentials — the OKX gateway is completely
-  # untouched by this addition, per the operator's explicit "separate running instance, not a switch"
-  # requirement.
-  okx-gateway-mexc:
+  # mexc-gateway: a SECOND, independent gateway instance for MEXC (2026-09-22 multi-exchange
+  # paper-trading test, docs/MEXC_TEST_HANDOFF.md) — same underlying binary as okx-gateway
+  # (cmd/okx-gateway, built from Dockerfile.okx-gateway; the Go package/file names predate this
+  # exchange-parameterized design and were left as-is rather than renamed, a larger and riskier
+  # change than this addition needed — GATEWAY_EXCHANGE=mexc is what actually selects the MEXC
+  # branch of buildService). Runs on its own port (8096, since 8094 is OKX's), completely separate
+  # from and untouched by the OKX gateway, per the operator's "separate running instance" requirement.
+  #
+  # NO real MEXC API credentials are configured here, and none are needed: paper trading only ever
+  # calls this gateway's public/unauthenticated endpoints (ticker, candles, funding rate — see
+  # internal/mexc/rest/client.go's doPublic, which sends no auth headers at all). Authenticated
+  # calls (place/cancel order, positions, balance) are never reached from the paper-trading path —
+  # positions here are virtual, tracked entirely in Postgres. MEXC_API_KEY/MEXC_API_SECRET are left
+  # unset; the gateway starts fine with empty credentials since it never signs a public request.
+  mexc-gateway:
     logging: *default-logging
     restart: *default-restart
     build:
@@ -210,8 +217,6 @@ services:
       GATEWAY_ADDR: "0.0.0.0:8096"
       GATEWAY_EXCHANGE: mexc
       METRICS_ADDR: ":9106"
-      MEXC_API_KEY: ${MEXC_API_KEY}
-      MEXC_API_SECRET: ${MEXC_API_SECRET}
       # MEXC has no private-WS client yet (internal/mexc/ws has only public.go, per the handoff
       # doc) — this gateway instance runs on the reconciliation poll alone, which §27.6 already
       # treats as a legitimate baseline, not a blocking gap. KAFKA_BROKERS is still set because the
@@ -226,10 +231,14 @@ services:
       - ./go-engine/configs:/app/configs
 
   # paper-trader-mexc: a SECOND, fully independent cmd/paper-trader process trading against MEXC in
-  # parallel with the existing OKX paper-trader — PAPER_EXCHANGE=mexc threads usecase.PaperTrader's
-  # own Exchange field through every exchange-scoped repository call (open orders, account balance/
-  # history, control-box config, strategy assignments), so the two share Postgres/Kafka/rl-service
-  # but touch none of the same rows. Points at okx-gateway-mexc, never the OKX one.
+  # parallel with the existing OKX paper-trader. PAPER_EXCHANGE is the free-string isolation/
+  # comparison label PaperTrader.Exchange is threaded through every exchange-scoped repository call
+  # with (open orders, account balance/history, control-box config, strategy assignments) — it is
+  # NOT the same thing as mexc-gateway's GATEWAY_EXCHANGE (which selects which exchange's REST
+  # adapter to build). Set to "MEXC_100x_1" (the operator's own chosen profile name/column value,
+  # 2026-09-22) rather than a bare "mexc", since this mechanism generalizes beyond one exchange to
+  # any future config-variant experiment (e.g. "no_early_close") — the label is what the panel's
+  # profile switcher shows and what a direct DB query filters on. Points at mexc-gateway, never OKX.
   paper-trader-mexc:
     logging: *default-logging
     restart: *default-restart
@@ -238,7 +247,7 @@ services:
       dockerfile: Dockerfile.paper-trader
     environment:
       CONFIG_PATH: /app/configs/config.mexc.yaml
-      PAPER_EXCHANGE: mexc
+      PAPER_EXCHANGE: MEXC_100x_1
       KAFKA_BROKERS: kafka:9092
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       METRICS_ADDR: ":9107"
@@ -247,7 +256,7 @@ services:
       PAPER_TRADER_ADDR: "0.0.0.0:8098"
       RL_SERVICE_URL: http://rl-service:8000
       # The MEXC gateway, not the OKX one — this is the whole point of running a second instance.
-      OKX_GATEWAY_URL: http://okx-gateway-mexc:8096
+      OKX_GATEWAY_URL: http://mexc-gateway:8096
     ports:
       - "9107:9107"
       - "8098:8098"
@@ -258,7 +267,7 @@ services:
         condition: service_healthy
       rl-service:
         condition: service_started
-      okx-gateway-mexc:
+      mexc-gateway:
         condition: service_started
       timescaledb:
         condition: service_started
@@ -459,6 +468,12 @@ services:
       RL_SERVICE_URL: http://rl-service:8000
       TESTER_SERVICE_URL: http://strategy-tester:8092
       PAPER_TRADER_SERVICE_URL: http://paper-trader:8093
+      # Second/third/... independent cmd/paper-trader profile control-box URLs, keyed by their own
+      # Exchange label (2026-09-22, multi-exchange paper trading) — parsed by
+      # parsePaperTraderProfileURLs (cmd/api/main.go) into Server.PaperTraderProfileURLs, so
+      # handleRestartTrading's ?exchange= routes to the right process. The OKX/default profile
+      # keeps using PAPER_TRADER_SERVICE_URL above unconditionally; this is additive.
+      PAPER_TRADER_PROFILE_URLS: "MEXC_100x_1=http://paper-trader-mexc:8098"
       TRADER_SERVICE_URL: http://trader:8095
       # cmd/api calls the gateway for two things: amending a real position's resting SL/TP when an
       # operator edits it from the panel (CLAUDE.md §35), and the Manage Tokens modal's

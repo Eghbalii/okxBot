@@ -63,7 +63,11 @@ func (r *accountStubRepo) SetTradingCap(ctx context.Context, mode string, capUSD
 	return r.setCapResult, nil
 }
 
-func (r *accountStubRepo) SetAccountCap(ctx context.Context, mode string, newCapUSD decimal.Decimal) (port.AccountEquity, error) {
+// SetAccountCapEx is what handleSetAccountCap actually calls (2026-09-22, multi-exchange paper
+// trading) — exchange is not exercised by these tests (all pre-date exchange scoping and expect
+// the OKX-default routing), so it's accepted and ignored, matching how mode alone was checked
+// before.
+func (r *accountStubRepo) SetAccountCapEx(ctx context.Context, mode, exchange string, newCapUSD decimal.Decimal) (port.AccountEquity, error) {
 	r.setCapCalls = append(r.setCapCalls, struct {
 		mode string
 		cap  decimal.Decimal
@@ -74,14 +78,16 @@ func (r *accountStubRepo) SetAccountCap(ctx context.Context, mode string, newCap
 	return r.setCapResult, nil
 }
 
-func (r *accountStubRepo) GetAccountEquity(ctx context.Context, mode string, initialUSD decimal.Decimal) (port.AccountEquity, error) {
+// GetAccountEquityEx is what handleGetAccount/handleAccountHistory actually call.
+func (r *accountStubRepo) GetAccountEquityEx(ctx context.Context, mode, exchange string, initialUSD decimal.Decimal) (port.AccountEquity, error) {
 	if r.getAccountErr != nil {
 		return port.AccountEquity{}, r.getAccountErr
 	}
 	return r.getAccountResult, nil
 }
 
-func (r *accountStubRepo) ListEquityHistory(ctx context.Context, mode string, since time.Time, limit int) ([]port.EquityPoint, error) {
+// ListEquityHistoryEx is what handleAccountHistory actually calls.
+func (r *accountStubRepo) ListEquityHistoryEx(ctx context.Context, mode, exchange string, since time.Time, limit int) ([]port.EquityPoint, error) {
 	r.historyQueries = append(r.historyQueries, struct {
 		mode  string
 		since time.Time

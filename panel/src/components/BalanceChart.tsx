@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { api } from '../api/client'
 import { useCachedResource } from '../hooks/useCachedResource'
-import type { PositionMode } from '../api/types'
+import type { PaperProfile, PositionMode } from '../api/types'
 
 // Plain inline SVG, no charting library — the same "hand-rolled CSS/minimal deps" convention
 // ParamChangeChart already follows (CLAUDE.md §14 Phase 3). Two lines over one timeline: Total
@@ -60,11 +60,15 @@ function tickLabel(ms: number, range: Range): string {
 
 export default function BalanceChart({
   mode,
+  exchange,
   currentEquity,
   currentBalance,
   refreshSignal,
 }: {
   mode: PositionMode
+  // Which paper-trading profile this chart reads (2026-09-22, multi-exchange paper trading) —
+  // undefined/'okx' behaves exactly as before this prop existed.
+  exchange?: PaperProfile | string
   currentEquity: number
   currentBalance: number
   refreshSignal: number
@@ -98,8 +102,9 @@ export default function BalanceChart({
     loading,
     refresh,
   } = useCachedResource(
-    `equity:${mode}:${range}`,
-    () => api.accountHistory(mode, new Date(Date.now() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000)),
+    `equity:${mode}:${exchange ?? 'okx'}:${range}`,
+    () =>
+      api.accountHistory(mode, new Date(Date.now() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000), 0, exchange),
     // Longer than the 15s stats poll around it: the equity timeline only changes when a trade
     // closes, so revalidating every few seconds costs a 173KB re-parse for nothing.
     { maxAgeMs: 120_000 },

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -148,12 +149,13 @@ func main() {
 	scanner := newMarketScanner(cfg, repo, logger)
 
 	srv := &api.Server{
-		Repo:               repo,
-		RLBaseURL:          cfg.RLService.URL,
-		GrafanaURL:         cfg.API.GrafanaURL,
-		TesterBaseURL:      cfg.Tester.URL,
-		PaperTraderBaseURL: cfg.PaperTrading.URL,
-		TraderBaseURL:      cfg.Trading.URL,
+		Repo:                   repo,
+		RLBaseURL:              cfg.RLService.URL,
+		GrafanaURL:             cfg.API.GrafanaURL,
+		TesterBaseURL:          cfg.Tester.URL,
+		PaperTraderBaseURL:     cfg.PaperTrading.URL,
+		PaperTraderProfileURLs: parsePaperTraderProfileURLs(os.Getenv("PAPER_TRADER_PROFILE_URLS")),
+		TraderBaseURL:          cfg.Trading.URL,
 		// Read-only: Report never changes the roster, so opening the Manage Tokens modal cannot
 		// enable or disable anything. cmd/trader owns the acting half (AffordabilityService.Run).
 		Affordability: &usecase.AffordabilityService{
@@ -354,4 +356,29 @@ func main() {
 		logger.Error("api server exited", "error", err)
 		os.Exit(1)
 	}
+}
+
+// parsePaperTraderProfileURLs parses PAPER_TRADER_PROFILE_URLS, a comma-separated list of
+// "<exchange-label>=<base-url>" pairs (2026-09-22, multi-exchange paper trading) — e.g.
+// "MEXC_100x_1=http://paper-trader-mexc:8098". Deliberately a single generic env var rather than
+// one new env var per profile: any future config-variant paper-trading experiment (a different
+// exchange, or the same exchange with a different flag set) is just another entry here, with no
+// code change needed to support it. A malformed entry (no "=", empty key) is skipped rather than
+// failing startup — a typo in this optional, comparison-only mapping should not take the whole
+// API service down.
+func parsePaperTraderProfileURLs(raw string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		key, url, ok := strings.Cut(pair, "=")
+		key, url = strings.TrimSpace(key), strings.TrimSpace(url)
+		if !ok || key == "" || url == "" {
+			continue
+		}
+		out[key] = url
+	}
+	return out
 }

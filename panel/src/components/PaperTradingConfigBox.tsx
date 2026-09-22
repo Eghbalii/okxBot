@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { useCachedResource } from '../hooks/useCachedResource'
-import type { PaperTradingConfig, PositionMode } from '../api/types'
+import type { PaperProfile, PaperTradingConfig, PositionMode } from '../api/types'
 import StrategyKindModal from './StrategyKindModal'
 import TokenModal from './TokenModal'
 
@@ -21,13 +21,23 @@ const STATE_META: Record<string, { label: string; badge: string; dot: string }> 
 // mode selection, so this component just renders whichever mode it's given (CLAUDE.md real-trading
 // readiness plan, 2026-09-04: both modes are wired up identically, reading/writing the same
 // mode-scoped Postgres rows via cmd/api's now mode-aware endpoints).
-export default function PaperTradingConfigBox({ mode }: { mode: PositionMode }) {
+//
+// exchange (2026-09-22, multi-exchange paper trading) picks which PROFILE within mode="paper" this
+// renders — a second, fully independent cmd/paper-trader process (e.g. against MEXC) with its own
+// isolated account/config/assignments. Meaningless for mode="bot", which has no second instance.
+export default function PaperTradingConfigBox({
+  mode,
+  exchange,
+}: {
+  mode: PositionMode
+  exchange?: PaperProfile | string
+}) {
   return (
     <div className="card config-box">
       <div className="config-box-header">
         <h2>Trading controls</h2>
       </div>
-      <TradingControls mode={mode} />
+      <TradingControls mode={mode} exchange={exchange} />
     </div>
   )
 }
@@ -83,7 +93,14 @@ function TradingHealthBanner({ mode }: { mode: PositionMode }) {
   )
 }
 
-function TradingControls({ mode }: { mode: PositionMode }) {
+function TradingControls({ mode, exchange }: { mode: PositionMode; exchange?: PaperProfile | string }) {
+  // Non-OKX profiles have no dynamic strategy/token management UI wired up (2026-09-22): they run
+  // a small, fixed config.yaml-defined roster (e.g. MEXC's 2-token starter set), not the
+  // discovery-scan-backed `instruments` roster the Manage Strategies/Manage Tokens modals below
+  // read from — those two concepts share the word "exchange" but are otherwise unrelated (the
+  // modals' own `exchange: 'okx'` calls are to the DISCOVERY roster table, not this profile's
+  // isolation label). Hiding rather than wiring them up avoids editing the wrong roster silently.
+  const isOkx = !exchange || exchange === 'okx'
   const [cfg, setCfg] = useState<PaperTradingConfig | null>(null)
   const [disableLong, setDisableLong] = useState(false)
   const [disableShort, setDisableShort] = useState(false)
@@ -98,7 +115,7 @@ function TradingControls({ mode }: { mode: PositionMode }) {
 
   function load() {
     api
-      .paperTradingConfig(mode)
+      .paperTradingConfig(mode, exchange)
       .then((c) => {
         setCfg(c)
         setDisableLong(c.disableLong)
@@ -109,7 +126,7 @@ function TradingControls({ mode }: { mode: PositionMode }) {
       .catch((err) => setError((err as Error).message))
   }
 
-  useEffect(load, [mode])
+  useEffect(load, [mode, exchange])
 
   function toggleBar(bar: string) {
     setActiveBars((prev) => {
@@ -131,8 +148,8 @@ function TradingControls({ mode }: { mode: PositionMode }) {
     setStateChanging(true)
     setError(null)
     try {
-      await api.savePaperTradingConfig(mode, { tradingState: next })
-      await api.restartPaperTrader(mode)
+      await api.savePaperTradingConfig(mode, { tradingState: next }, exchange)
+      await api.restartPaperTrader(mode, exchange)
       setMessage(`${STATE_META[next].label} — applying now, back within a few seconds.`)
       setTimeout(load, 4000)
     } catch (err) {
@@ -150,12 +167,16 @@ function TradingControls({ mode }: { mode: PositionMode }) {
     setSaving(true)
     setError(null)
     try {
-      await api.savePaperTradingConfig(mode, {
-        disableLong,
-        disableShort,
-        activeBars: [...activeBars],
-      })
-      await api.restartPaperTrader(mode)
+      await api.savePaperTradingConfig(
+        mode,
+        {
+          disableLong,
+          disableShort,
+          activeBars: [...activeBars],
+        },
+        exchange,
+      )
+      await api.restartPaperTrader(mode, exchange)
       setDirty(false)
       setMessage('Saved — applying now, back within a few seconds.')
       setTimeout(load, 4000)
@@ -167,15 +188,15 @@ function TradingControls({ mode }: { mode: PositionMode }) {
   }
 
   async function saveActiveKinds(kinds: string[]) {
-    await api.savePaperTradingConfig(mode, { activeKinds: kinds })
-    await api.restartPaperTrader(mode)
+    await api.savePaperTradingConfig(mode, { activeKinds: kinds }, exchange)
+    await api.restartPaperTrader(mode, exchange)
     setMessage('Saved — applying now, back within a few seconds.')
     setTimeout(load, 4000)
   }
 
   async function saveDisabledInstIds(instIds: string[]) {
-    await api.savePaperTradingConfig(mode, { disabledInstIds: instIds })
-    await api.restartPaperTrader(mode)
+    await api.savePaperTradingConfig(mode, { disabledInstIds: instIds }, exchange)
+    await api.restartPaperTrader(mode, exchange)
     setMessage('Saved — applying now, back within a few seconds.')
     setTimeout(load, 4000)
   }
@@ -274,19 +295,25 @@ function TradingControls({ mode }: { mode: PositionMode }) {
           </div>
         </div>
 
-        <div className="config-tile">
-          <div className="config-tile-label">Strategies</div>
-          <div className="config-tile-value">{activeKindCount} active</div>
-          <button onClick={() => setShowStrategyModal(true)}>Manage strategies…</button>
-        </div>
-
-        <div className="config-tile">
-          <div className="config-tile-label">Tokens</div>
-          <div className="config-tile-value">
-            {disabledTokenCount === 0 ? 'all active' : `${disabledTokenCount} disabled`}
+        {/* Strategy/token management modals read the discovery-scan roster, which only the OKX
+            profile has been wired up against (2026-09-22) — a fixed config.yaml roster otherwise. */}
+        {isOkx && (
+          <div className="config-tile">
+            <div className="config-tile-label">Strategies</div>
+            <div className="config-tile-value">{activeKindCount} active</div>
+            <button onClick={() => setShowStrategyModal(true)}>Manage strategies…</button>
           </div>
-          <button onClick={() => setShowTokenModal(true)}>Manage tokens…</button>
-        </div>
+        )}
+
+        {isOkx && (
+          <div className="config-tile">
+            <div className="config-tile-label">Tokens</div>
+            <div className="config-tile-value">
+              {disabledTokenCount === 0 ? 'all active' : `${disabledTokenCount} disabled`}
+            </div>
+            <button onClick={() => setShowTokenModal(true)}>Manage tokens…</button>
+          </div>
+        )}
       </div>
 
       <div className="toolbar" style={{ marginTop: '0.9rem' }}>
@@ -296,7 +323,7 @@ function TradingControls({ mode }: { mode: PositionMode }) {
         {message && <span className="text-dim">{message}</span>}
       </div>
 
-      {showStrategyModal && (
+      {isOkx && showStrategyModal && (
         <StrategyKindModal
           mode={mode}
           activeKinds={cfg.activeKinds}
@@ -304,7 +331,7 @@ function TradingControls({ mode }: { mode: PositionMode }) {
           onSave={saveActiveKinds}
         />
       )}
-      {showTokenModal && (
+      {isOkx && showTokenModal && (
         <TokenModal
           mode={mode}
           disabledInstIds={cfg.disabledInstIds}

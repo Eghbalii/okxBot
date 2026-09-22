@@ -84,6 +84,10 @@ function manualOrderToPosition(o: ManualOrder): Position {
     ExchangeClosePx: null,
     LastError: o.LastError,
     LastErrorAt: o.LastErrorAt,
+    // manual_orders has no exchange column (2026-09-22, multi-exchange paper trading only widened
+    // paper_orders/bot's mode-scoped tables) — 'okx' matches every other non-paper table's fixed
+    // value.
+    Exchange: 'okx',
   }
 }
 

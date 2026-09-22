@@ -45,6 +45,15 @@ export interface TokenStats {
 // 'manual' added 2026-09-19: the /trade page's own discretionary orders (manual_orders), shown on
 // the Positions page the same way bot/paper positions are — same shape, separate table.
 export type PositionMode = 'paper' | 'bot' | 'manual'
+
+// PaperProfile is a paper-trading "profile" — a second, fully independent cmd/paper-trader
+// instance (a different exchange, or later a different config variant) running in parallel with
+// the default one, isolated by the `exchange` column added 2026-09-22 (multi-exchange paper
+// trading). 'okx' is the original, always-on instance; new entries are just data, no schema
+// change needed to add one. Kept as a literal union (not a bare string) so the Paper page's
+// profile selector has a closed, typo-proof set to render tabs from.
+export const PAPER_PROFILES = ['okx', 'MEXC_100x_1'] as const
+export type PaperProfile = (typeof PAPER_PROFILES)[number]
 // Fill-lifecycle status for a real order (real_orders.status) — null for paper/demo rows, which
 // have no fill lifecycle (a paper order is always instantly and fully filled).
 // 'opening'/'closing' mean a request is in flight with the exchange and its outcome is not yet
@@ -118,6 +127,11 @@ export interface Position {
   // stuck open or close rather than find it in a log later.
   LastError: string | null
   LastErrorAt: string | null
+  // Which paper-trading profile this row belongs to (2026-09-22, multi-exchange paper trading) —
+  // 'okx' for every pre-existing row and the default instance; a second profile like
+  // 'MEXC_100x_1' is its own fully isolated account/config/strategy-assignment set. Always 'okx'
+  // for bot/manual rows (their tables have no exchange column at all).
+  Exchange: PaperProfile | string
 }
 
 // PaperOrderAdjustment is one row of an order's in-trade SL/TP adjustment history (CLAUDE.md
