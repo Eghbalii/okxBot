@@ -16,29 +16,53 @@ import (
 // Register and Run's internal lookups can happen concurrently (e.g. a RegisteredConsumer.Run
 // registering from its own goroutine while the dispatcher's Run loop is already reading), so the
 // handler map is mutex-guarded rather than assuming all Register calls happen before Run starts.
+//
+// More than one handler CAN be registered for the same instID (2026-09-22 fix) — every message for
+// that instID is delivered to all of them. Before this, a second Register call for an instID
+// already registered silently OVERWROTE the first, which is exactly what happened in production:
+// cmd/paper-trader/main.go registers BOTH the per-instrument trading engine's own candle consumer
+// AND usecase.BTCReference's independent consumer against "BTC" on the same dispatcher whenever
+// BTC is in the traded roster (BTCReference's own doc comment explains why it deliberately does
+// NOT borrow the trading engine's window instead — it needs its own event-bus-sourced one). Which
+// registration "won" the map write was a startup race between two goroutines starting within
+// engineStartStagger (300ms) of each other, and on a small roster (2 instruments, the MEXC
+// comparison profile) it consistently went the wrong way: BTCReference silently stole BTC's whole
+// candle stream, so the BTC trading engine itself never received a single candle. The same
+// unguarded race exists on the larger OKX/bot-trading rosters (cmd/trader has the identical
+// pattern) — it happened not to manifest there, which is a reason to fix the dispatcher itself
+// rather than special-case around one caller.
 type Dispatcher struct {
 	consumer *Consumer
 
 	mu       sync.RWMutex
-	handlers map[string]func(ctx context.Context, data []byte) error
+	handlers map[string][]func(ctx context.Context, data []byte) error
 }
 
-// NewDispatcher wraps consumer, dispatching each message to the handler registered for its
+// NewDispatcher wraps consumer, dispatching each message to every handler registered for its
 // instId (see Register). Messages for an unregistered instId are dropped silently — the shared
 // topic can carry other instruments' data this process doesn't care about.
 func NewDispatcher(consumer *Consumer) *Dispatcher {
-	return &Dispatcher{consumer: consumer, handlers: make(map[string]func(ctx context.Context, data []byte) error)}
+	return &Dispatcher{consumer: consumer, handlers: make(map[string][]func(ctx context.Context, data []byte) error)}
 }
 
-// Register assigns instID's messages to handler. Safe to call concurrently with Run.
+// Register ADDS handler to instID's list — it does not replace an earlier registration for the
+// same instID, so two independent consumers of one instrument (e.g. a trading engine and
+// usecase.BTCReference both wanting "BTC") both receive every message. Safe to call concurrently
+// with Run and with other Register calls.
 func (d *Dispatcher) Register(instID string, handler func(ctx context.Context, data []byte) error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.handlers[instID] = handler
+	d.handlers[instID] = append(d.handlers[instID], handler)
 }
 
-// Run blocks, reading the underlying consumer and routing each message by instId, until ctx is
-// cancelled.
+// Run blocks, reading the underlying consumer and routing each message by instId to every handler
+// registered for it, until ctx is cancelled.
+//
+// Handlers run sequentially, not concurrently, and the first error stops delivery to any
+// handlers after it for that message (matching the original single-handler contract's error
+// semantics exactly — a message either fully succeeds or the whole Run call returns the error,
+// same as before this fixed-fan-out change; there was never more than one handler to run
+// concurrently against before now).
 func (d *Dispatcher) Run(ctx context.Context) error {
 	return d.consumer.Run(ctx, func(ctx context.Context, data []byte) error {
 		var envelope struct {
@@ -48,12 +72,17 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 			return fmt.Errorf("decode instId envelope: %w", err)
 		}
 		d.mu.RLock()
-		handler, ok := d.handlers[envelope.InstID]
+		handlers := d.handlers[envelope.InstID]
 		d.mu.RUnlock()
-		if !ok {
+		if len(handlers) == 0 {
 			return nil // shared topic across instruments; this process doesn't handle this one
 		}
-		return handler(ctx, data)
+		for _, handler := range handlers {
+			if err := handler(ctx, data); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
