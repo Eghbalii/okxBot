@@ -241,43 +241,26 @@ func runBotTrader(
 		logger.Error("paper_trading.bars is empty; BotTrader needs at least one decision bar")
 		os.Exit(1)
 	}
-	// The instrument roster comes from the DATABASE, filtered to rows a person has explicitly enabled
-	// for REAL money (2026-09-13, migration 000031). This is where the discovery scan's own posture
-	// takes effect: a scanned token is admitted with enabled_real=FALSE, so it collects data and
-	// paper-trades without ever reaching this loop until somebody turns it on from the panel.
+	// The instrument roster is trading.inst_ids from config.yaml — the SAME configured list
+	// paper-trader trades — filtered ONLY by paper_trading_config.disabled_inst_ids (the Manage
+	// Tokens checkbox), exactly mirroring cmd/paper-trader's own roster (CLAUDE.md, corrected
+	// 2026-09-22 per explicit operator instruction).
 	//
-	// No config fallback here, deliberately, unlike the ingestor and paper-trader: those seed an
-	// empty table from config.yaml so an existing deployment keeps collecting and paper-trading
-	// exactly what it did before. Seeding real-money instruments from a config file on a service's
-	// own initiative is a different kind of act, and this process refuses rather than assumes.
-	realRoster, err := usecase.RosterFor(ctx, repo, "okx", "bot", nil, nil, "", logger)
-	if err != nil {
-		logger.Error("failed to load real-mode instrument roster", "error", err)
-		os.Exit(1)
-	}
-	instIDs := realRoster.Symbols
+	// REVISES the 2026-09-13 design (migration 000031's separate instruments.enabled_real column):
+	// that column was meant to be a second, explicit real-money gate a person would flip per token
+	// from the panel — but no panel control for it was ever built, so in practice it just sat at
+	// its default (false, admitted-but-off) for every token. The operator's own instruction is
+	// direct: there is exactly ONE save action for tokens/strategies (Manage Tokens) and exactly
+	// ONE run action (the Real tab's Run button) — whatever is checked when Run is pressed is what
+	// trades, with no second flag anywhere else to also remember to flip. enabled_real is no longer
+	// read by this process; the column itself is left in place (still read by the Home page's
+	// display badge, §53.6) rather than dropped, since removing it is a schema change this fix does
+	// not need to make.
+	instIDs := append([]string(nil), cfg.Trading.InstIDs...)
 	if len(instIDs) == 0 {
-		logger.Error("no instrument is enabled for real trading — enable one from the panel's roster")
+		logger.Error("trading.inst_ids is empty — configure at least one instrument for real trading")
 		os.Exit(1)
 	}
-	// Prefer the roster's own exec id over config's symbol_map: the roster is what a scan writes, and
-	// OKX's X-Perp ids carry a rolling expiry (§33.4) that the roster refreshes on every scan while a
-	// YAML map goes stale silently.
-	for _, sym := range instIDs {
-		if id := realRoster.ExecInstID[sym]; id != "" {
-			execInstIDFor[sym] = id
-		}
-	}
-	// Restart when the real roster changes, so enabling a token from the panel takes effect without a
-	// manual redeploy — the same mechanism the other two services use.
-	go (&usecase.RosterWatcher{
-		Repo: repo, Exchange: "okx", Consumer: "bot",
-		Interval: time.Minute, Logger: logger, Baseline: instIDs,
-		OnChange: func(reason string) {
-			logger.Info("restarting to pick up the new real-mode instrument roster", "reason", reason)
-			os.Exit(0)
-		},
-	}).Run(ctx)
 
 	if err := repo.SetAssignmentsEnabledForKinds(ctx, "bot", ptCfg.ActiveKinds, instIDs, decisionBars); err != nil {
 		logger.Error("failed to apply real-mode active-strategy-kinds restriction", "error", err)
