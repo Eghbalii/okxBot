@@ -416,7 +416,13 @@ type Config struct {
 		// building its own rest.Client (CLAUDE.md §27.1's migration order), it reads this.
 		URL string `yaml:"-"`
 		// Addr is this service's own HTTP bind address.
-		Addr     string            `yaml:"addr"`
+		Addr string `yaml:"addr"`
+		// Exchange selects which adapter THIS gateway instance constructs and holds credentials
+		// for — "okx" (default) or "mexc" (2026-09-22, running a second, parallel instance for a
+		// live A/B comparison per the operator's own explicit design: same Go code, separate
+		// deployed instances, never a single process juggling two credential sets). Env-only, same
+		// treatment as every other value that decides which real account a process talks to.
+		Exchange string            `yaml:"-"`
 		Trade    GatewayClassLimit `yaml:"trade"`
 		Leverage GatewayClassLimit `yaml:"leverage"`
 		Account  GatewayClassLimit `yaml:"account"`
@@ -715,6 +721,7 @@ func Load(path string) (*Config, error) {
 	if cfg.Gateway.Addr == "" {
 		cfg.Gateway.Addr = envOr("GATEWAY_ADDR", "0.0.0.0:8094")
 	}
+	cfg.Gateway.Exchange = strings.ToLower(envOr("GATEWAY_EXCHANGE", "okx"))
 	if cfg.FillTimeout.OrderFillTimeoutSec == 0 {
 		// 60s, per explicit operator decision (CLAUDE.md §27.5) — cancel-and-wait-for-next-signal,
 		// never a synthetic retry at a new price.

@@ -233,6 +233,19 @@ func (c *Client) GetOrder(instID, ordID string) (domain.OrderStatus, error) {
 	}, nil
 }
 
+// GetOrderRaw returns MEXC's own order-status payload untouched — mirrors okx/rest.Client's
+// method of the same name (added there 2026-09-09 for the panel's exchange-report view), so a
+// gateway instance running against either exchange exposes the same audit path. instID is unused
+// (MEXC's order-get endpoint is keyed by ordID alone) but kept in the signature to match the
+// exchangeClient interface okx-gateway's handlers already assert against.
+func (c *Client) GetOrderRaw(instID, ordID string) (json.RawMessage, error) {
+	var raw json.RawMessage
+	if err := c.do("GET", "/api/v1/private/order/get/"+ordID, nil, nil, &raw); err != nil {
+		return nil, fmt.Errorf("mexc get order raw %s: %w", ordID, err)
+	}
+	return raw, nil
+}
+
 // SetLeverage changes an instrument's leverage.
 func (c *Client) SetLeverage(req domain.LeverageChange) error {
 	body := map[string]any{
