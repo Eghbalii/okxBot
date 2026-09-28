@@ -145,6 +145,37 @@ Should always read 0. If it doesn't, something regressed in `Promote()` or the a
   looking into separately (is `Promote()`'s "better candidate" comparison logic actually always
   picking the better one?), not something investigated or fixed in this pass.
 
+## Panel round 3 (same day) — DisplayName collision bug, real root cause of "Rejected looks wrong"
+
+The operator was right to be suspicious. **Confirmed bug, fixed**: `Candidate.DisplayName()`
+(`internal/optimizer/store.go`) was built from
+`Kind_InstID_R<leverage>_G<generation>_B<backtestUpdates>_P<paperUpdates>` — NONE of which are
+guaranteed unique within one generation. `proposeCandidate` routinely proposes several different
+tuned parameter sets in the same generation before one passes validation, so two completely
+different candidate rows (different ids, different real stats) rendered as the **exact same
+string**. Live-confirmed example: candidate 27617 (`paper_replaced`, $79.96 PnL, 53.3% win, 30
+trades) and candidate 40200 (`paper_active`, $10.64 PnL, 46.9% win, 32 trades) are both
+`coin_flip/DASH`, generation 2, `B0_P0` — both rendered as `coin_flip_DASH_R10_G2_B0_P0`, making
+the `replacedReason` sentence look like it was naming the same strategy as both the "replaced" one
+and the "replaced by" one, when they were actually two distinct rows the whole time (the
+underlying `ReplacedByFor` SQL lookup itself was correct — verified by timestamp: both share the
+exact `now()` from `PromoteCandidate`'s one transaction, confirming 40200 really is what replaced
+27617). **Fix**: `DisplayName` now appends `_#<id>` (the candidate's own always-unique database
+id) — minimal fix, no new counter/migration needed. Deployed same day; not yet re-verified against
+a fresh live example post-fix (do this first thing next session: pull a few `paper_replaced` rows'
+`replacedReason` and confirm the two names in each sentence now differ whenever the underlying ids
+differ).
+
+**Still open / worth a closer look next session**: the operator separately asked for a raw
+trade-data column on the Reason side (not just embedded in the sentence) — not done this round,
+deferred given the DisplayName fix was the higher-priority root cause and context ran out. Also
+worth re-examining once names are trustworthy: is `Promote()`'s own "pick the best candidate"
+logic ever promoting a candidate that scores WORSE than the one it replaces? The pre-fix example
+above (79.96/53.3%/30 replaced by 10.64/46.9%/32) suggested this, but re-verify with the naming
+bug fixed before concluding anything — it's possible what looked like "worse replaced by worse"
+was actually reading two different unrelated candidates' numbers side by side due to the name
+collision, not a real promotion-logic bug. Don't assume either way; check fresh.
+
 ## Known remaining gap
 
 - **`ParamChangeModal` will show "no recorded parameter changes"** for every candidate promoted

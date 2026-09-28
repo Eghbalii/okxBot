@@ -71,8 +71,17 @@ type Candidate struct {
 // rather than stored, so changing the convention later needs no backfill (the same reasoning the
 // old tester_strategy_versions used for its own "{kind}_v{version}" display name).
 func (c Candidate) DisplayName(leverage int) string {
-	return fmt.Sprintf("%s_%s_R%d_G%d_B%d_P%d",
-		c.Lineage.Kind, c.Lineage.InstID, leverage, c.Generation, c.BacktestUpdates, c.PaperUpdates)
+	// Trailing #<id> (2026-09-28 fix) — Generation/BacktestUpdates/PaperUpdates alone do NOT
+	// uniquely identify a candidate: proposeCandidate can (and routinely does) propose several
+	// different tuned parameter sets within the SAME generation before one passes, so two
+	// completely different candidates for the same lineage rendered as the exact same string.
+	// Found live: a paper_replaced candidate's "replaced by" reason named the very same display
+	// name as the candidate it was itself describing being replaced BY — reading as nonsense —
+	// because both candidates were real, distinct, generation-2 rows with identical
+	// B0_P0 suffixes. The id is always present and always unique, so appending it is the minimal
+	// fix rather than inventing a new counter that would need its own migration/backfill.
+	return fmt.Sprintf("%s_%s_R%d_G%d_B%d_P%d_#%d",
+		c.Lineage.Kind, c.Lineage.InstID, leverage, c.Generation, c.BacktestUpdates, c.PaperUpdates, c.ID)
 }
 
 // ValidationConfig is one risk profile's panel-editable promotion thresholds
