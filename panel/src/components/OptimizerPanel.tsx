@@ -411,13 +411,12 @@ export default function OptimizerPanel({ mode }: { mode: PositionMode }) {
                 <thead>
                   <tr>
                     <th className="th-static">Name</th>
-                    <th className="th-static">Token / bar</th>
-                    <th className="th-static">Leverage</th>
-                    <th className="th-static">Period</th>
-                    <th className="th-static col-group-backtest" colSpan={3}>
+                    <th className="th-static">Token</th>
+                    <th className="th-static">Bar</th>
+                    <th className="th-static col-group-backtest col-edge-start col-edge-end" colSpan={5}>
                       Backtest (at promotion)
                     </th>
-                    <th className="th-static col-group-live" colSpan={3}>
+                    <th className="th-static col-group-live col-edge-start col-edge-end" colSpan={3}>
                       Live since promotion
                     </th>
                   </tr>
@@ -425,13 +424,14 @@ export default function OptimizerPanel({ mode }: { mode: PositionMode }) {
                     <th className="th-static"></th>
                     <th className="th-static"></th>
                     <th className="th-static"></th>
-                    <th className="th-static"></th>
+                    <th className="th-static col-cell-backtest col-edge-start">Leverage</th>
+                    <th className="th-static col-cell-backtest">Period</th>
                     <th className="th-static col-cell-backtest">Trades</th>
                     <SortHeader label="Win rate" sortKey="backtestWinRate" active={activeSortKey} dir={activeSortDir} onClick={toggleActiveSort} className="col-cell-backtest" />
-                    <SortHeader label="PnL" sortKey="backtestPnl" active={activeSortKey} dir={activeSortDir} onClick={toggleActiveSort} className="col-cell-backtest" />
-                    <SortHeader label="Signals" sortKey="liveSignals" active={activeSortKey} dir={activeSortDir} onClick={toggleActiveSort} className="col-cell-live" />
+                    <SortHeader label="PnL" sortKey="backtestPnl" active={activeSortKey} dir={activeSortDir} onClick={toggleActiveSort} className="col-cell-backtest col-edge-end" />
+                    <SortHeader label="Signals" sortKey="liveSignals" active={activeSortKey} dir={activeSortDir} onClick={toggleActiveSort} className="col-cell-live col-edge-start" />
                     <SortHeader label="Win rate" sortKey="liveWinRate" active={activeSortKey} dir={activeSortDir} onClick={toggleActiveSort} className="col-cell-live" />
-                    <SortHeader label="PnL" sortKey="livePnl" active={activeSortKey} dir={activeSortDir} onClick={toggleActiveSort} className="col-cell-live" />
+                    <SortHeader label="PnL" sortKey="livePnl" active={activeSortKey} dir={activeSortDir} onClick={toggleActiveSort} className="col-cell-live col-edge-end" />
                   </tr>
                 </thead>
                 <tbody>
@@ -440,17 +440,16 @@ export default function OptimizerPanel({ mode }: { mode: PositionMode }) {
                       <td>
                         <StrategyNameLink candidate={candidate} onOpen={() => setParamModal(candidate)} />
                       </td>
-                      <td>
-                        {tokenSymbol(candidate.instId)} / {candidate.bar}
-                      </td>
-                      <td className="mono">{candidate.leverage}x</td>
-                      <td className="mono text-dim">{tradingPeriod(candidate.backtestFrom, candidate.backtestTo)}</td>
+                      <td>{tokenSymbol(candidate.instId)}</td>
+                      <td>{candidate.bar}</td>
+                      <td className="mono col-cell-backtest col-edge-start">{candidate.leverage}x</td>
+                      <td className="mono col-cell-backtest">{tradingPeriod(candidate.backtestFrom, candidate.backtestTo)}</td>
                       <td className="mono col-cell-backtest">{candidate.backtestTradeCount ?? '—'}</td>
                       <td className="col-cell-backtest">{candidate.backtestWinRatePct ? `${Number(candidate.backtestWinRatePct).toFixed(1)}%` : '—'}</td>
-                      <PnLCell pnl={candidate.backtestRealizedPnl} capitalUsd={capitalUsd} className="col-cell-backtest" />
-                      <td className="col-cell-live">{liveStats?.SignalCount ?? '—'}</td>
+                      <PnLCell pnl={candidate.backtestRealizedPnl} capitalUsd={capitalUsd} className="col-cell-backtest col-edge-end" />
+                      <td className="col-cell-live col-edge-start">{liveStats?.SignalCount ?? '—'}</td>
                       <td className="col-cell-live">{winRate(liveStats?.Wins, liveStats?.Losses)}</td>
-                      <td className={'mono col-cell-live ' + pnlClass(liveStats ? Number(liveStats.RealizedPnL) : null)}>
+                      <td className={'mono col-cell-live col-edge-end ' + pnlClass(liveStats ? Number(liveStats.RealizedPnL) : null)}>
                         {liveStats ? formatUsd(Number(liveStats.RealizedPnL)) : '—'}
                       </td>
                     </tr>
@@ -474,12 +473,23 @@ export default function OptimizerPanel({ mode }: { mode: PositionMode }) {
                 <thead>
                   <tr>
                     <th className="th-static">Name</th>
-                    <th className="th-static">Token / bar</th>
-                    <th className="th-static">Leverage</th>
-                    <th className="th-static">Period</th>
-                    <SortHeader label="Trades" sortKey="trades" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} />
-                    <SortHeader label="Win rate" sortKey="winRate" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} />
-                    <SortHeader label="PnL" sortKey="pnl" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} />
+                    <th className="th-static">Token</th>
+                    <th className="th-static">Bar</th>
+                    <th className="th-static col-group-backtest col-edge-start col-edge-end" colSpan={5}>
+                      Backtest
+                    </th>
+                    <th className="th-static">Reason</th>
+                  </tr>
+                  <tr>
+                    <th className="th-static"></th>
+                    <th className="th-static"></th>
+                    <th className="th-static"></th>
+                    <th className="th-static col-cell-backtest col-edge-start">Leverage</th>
+                    <th className="th-static col-cell-backtest">Period</th>
+                    <SortHeader label="Trades" sortKey="trades" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} className="col-cell-backtest" />
+                    <SortHeader label="Win rate" sortKey="winRate" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} className="col-cell-backtest" />
+                    <SortHeader label="PnL" sortKey="pnl" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} className="col-cell-backtest col-edge-end" />
+                    <th className="th-static"></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -488,14 +498,16 @@ export default function OptimizerPanel({ mode }: { mode: PositionMode }) {
                       <td>
                         <StrategyNameLink candidate={c} onOpen={() => setParamModal(c)} />
                       </td>
-                      <td>
-                        {tokenSymbol(c.instId)} / {c.bar}
+                      <td>{tokenSymbol(c.instId)}</td>
+                      <td>{c.bar}</td>
+                      <td className="mono col-cell-backtest col-edge-start">{c.leverage}x</td>
+                      <td className="mono col-cell-backtest">{tradingPeriod(c.backtestFrom, c.backtestTo)}</td>
+                      <td className="col-cell-backtest">{c.backtestTradeCount ?? '—'}</td>
+                      <td className="col-cell-backtest">{c.backtestWinRatePct ? `${Number(c.backtestWinRatePct).toFixed(1)}%` : '—'}</td>
+                      <PnLCell pnl={c.backtestRealizedPnl} capitalUsd={capitalUsd} className="col-cell-backtest col-edge-end" />
+                      <td className="text-dim" style={{ fontSize: '0.78rem', maxWidth: 260 }}>
+                        {c.replacedReason ?? '—'}
                       </td>
-                      <td className="mono">{c.leverage}x</td>
-                      <td className="mono text-dim">{tradingPeriod(c.backtestFrom, c.backtestTo)}</td>
-                      <td>{c.backtestTradeCount ?? '—'}</td>
-                      <td>{c.backtestWinRatePct ? `${Number(c.backtestWinRatePct).toFixed(1)}%` : '—'}</td>
-                      <PnLCell pnl={c.backtestRealizedPnl} capitalUsd={capitalUsd} />
                     </tr>
                   ))}
                 </tbody>

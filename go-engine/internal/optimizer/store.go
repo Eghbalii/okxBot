@@ -11,6 +11,7 @@ package optimizer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -247,6 +248,35 @@ func (s *Store) ListCandidatesByStatus(ctx context.Context, status string, limit
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// ReplacedByFor finds the candidate that replaced a 'paper_replaced' candidate for its own
+// lineage — whichever candidate was promoted (promoted_at set) at or immediately after this one
+// was demoted (updated_at, the exact moment PromoteCandidate's transaction flipped its status).
+// This is what lets the panel show a REAL, service-computed reason a candidate stopped trading
+// ("replaced by a candidate scoring $X vs this one's $Y"), rather than a hardcoded label — the
+// old backtest_rejection_reason column is only ever set for backtest_rejected candidates, which
+// never traded at all; a paper_replaced candidate was never "rejected" in that sense; it just lost
+// to something better, and this is what actually happened.
+func (s *Store) ReplacedByFor(ctx context.Context, candidateID int64) (Candidate, bool, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT `+candidateColumns+` FROM strategy_candidates c
+		WHERE (c.kind, c.inst_id, c.bar, c.exchange, c.risk_profile) = (
+			SELECT kind, inst_id, bar, exchange, risk_profile FROM strategy_candidates WHERE id = $1
+		)
+		AND c.id <> $1
+		AND c.promoted_at >= (SELECT updated_at FROM strategy_candidates WHERE id = $1)
+		ORDER BY c.promoted_at ASC
+		LIMIT 1
+	`, candidateID)
+	c, err := scanCandidate(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Candidate{}, false, nil
+		}
+		return Candidate{}, false, fmt.Errorf("find replacement for candidate %d: %w", candidateID, err)
+	}
+	return c, true, nil
 }
 
 // ActiveCandidate returns l's current 'paper_active' candidate, if any.

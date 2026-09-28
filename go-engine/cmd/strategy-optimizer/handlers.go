@@ -54,6 +54,11 @@ type candidateView struct {
 	BacktestTo   *time.Time `json:"backtestTo,omitempty"`
 
 	StrategyID *int64 `json:"strategyId,omitempty"`
+	// Only set for status=paper_replaced — a real, computed comparison against whichever candidate
+	// actually replaced this one, built from the two candidates' own recorded stats (never a
+	// hardcoded label): a paper_replaced candidate was never "rejected" by validation the way
+	// BacktestRejectReason candidates were, it traded and lost to something that scored better.
+	ReplacedReason *string `json:"replacedReason,omitempty"`
 }
 
 func toCandidateView(c optimizer.Candidate, leverage int) candidateView {
@@ -132,9 +137,51 @@ func (s *scheduler) handleListByStatus(w http.ResponseWriter, r *http.Request) {
 	views := make([]candidateView, 0, len(candidates))
 	for _, c := range candidates {
 		profile := s.cfg.StrategyOptimizer.RiskProfiles[c.Lineage.RiskProfile]
-		views = append(views, toCandidateView(c, int(profile.MaxLeverage.IntPart())))
+		v := toCandidateView(c, int(profile.MaxLeverage.IntPart()))
+		if status == "paper_replaced" {
+			if replacement, ok, err := s.store.ReplacedByFor(r.Context(), c.ID); err != nil {
+				s.logger.Error("failed to look up replacement candidate", "candidateId", c.ID, "error", err)
+			} else if ok {
+				replacementLeverage := s.cfg.StrategyOptimizer.RiskProfiles[replacement.Lineage.RiskProfile].MaxLeverage.IntPart()
+				reason := replacedReason(c, replacement, int(replacementLeverage))
+				v.ReplacedReason = &reason
+			}
+		}
+		views = append(views, v)
 	}
 	writeJSON(w, views)
+}
+
+// replacedReason builds a real, computed comparison sentence from two candidates' own recorded
+// backtest stats — never a hardcoded label. old is the paper_replaced candidate; newer is whatever
+// optimizer.Store.ReplacedByFor found took over its lineage.
+func replacedReason(old, newer optimizer.Candidate, newerLeverage int) string {
+	oldPnL, newPnL := "?", "?"
+	if old.BacktestRealizedPnL != nil {
+		oldPnL = old.BacktestRealizedPnL.StringFixed(2)
+	}
+	if newer.BacktestRealizedPnL != nil {
+		newPnL = newer.BacktestRealizedPnL.StringFixed(2)
+	}
+	oldWin, newWin := "?", "?"
+	if old.BacktestWinRatePct != nil {
+		oldWin = old.BacktestWinRatePct.StringFixed(1)
+	}
+	if newer.BacktestWinRatePct != nil {
+		newWin = newer.BacktestWinRatePct.StringFixed(1)
+	}
+	return fmt.Sprintf(
+		"Replaced by %s ($%s PnL, %s%% win rate over %d trades) — this one scored $%s PnL, %s%% win rate over %d trades",
+		newer.DisplayName(newerLeverage), newPnL, newWin, statTradeCount(newer.BacktestTradeCount),
+		oldPnL, oldWin, statTradeCount(old.BacktestTradeCount),
+	)
+}
+
+func statTradeCount(n *int) int {
+	if n == nil {
+		return 0
+	}
+	return *n
 }
 
 // handleBacktestCapital reports the capital every backtest's PnL is actually measured against —

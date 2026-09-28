@@ -243,6 +243,9 @@ export interface OptimizerCandidate {
   backtestFrom?: string
   backtestTo?: string
   strategyId?: number
+  // Only set for status=paper_replaced — a real, service-computed comparison against whichever
+  // candidate actually replaced this one (see cmd/strategy-optimizer's replacedReason).
+  replacedReason?: string
 }
 
 export interface OptimizerValidationConfig {
