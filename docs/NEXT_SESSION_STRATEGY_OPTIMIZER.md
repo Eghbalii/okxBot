@@ -118,6 +118,33 @@ Should always read 0. If it doesn't, something regressed in `Promote()` or the a
   wrapper removed entirely** — operator's explicit "دیتای مفیدی نمیده بهمون". `StrategiesPage.tsx`
   is now just the mode tabs + `<OptimizerPanel />`, nothing else.
 
+## Panel round 2 (same day, operator feedback on round 1's styling)
+
+- Group header backgrounds are now solid colored + `box-shadow`, not just colored/shadowed text
+  (`.col-group-backtest`/`.col-group-live` in `App.css`).
+- Thick borders (`.col-edge-start`/`.col-edge-end`, applied explicitly per-cell in JSX, not via
+  CSS `:first-child`/`:last-child` — every `col-cell-*` td is adjacent so those pseudo-selectors
+  would key off the row's children, not the group's) make each column group read as one
+  contiguous block.
+- Leverage/Period columns moved under the Backtest group header (`colSpan={5}` now, was 3)
+  — they describe the backtest, not the live position, per operator's explicit correction.
+- Token/Bar split into two separate columns everywhere (was one combined "Token / bar" cell).
+- **Rejected tab "no data" investigated and fixed**: the trade count/win rate/PnL data was
+  ALWAYS present in the database and the raw API response for every `paper_replaced` candidate —
+  verified directly, not assumed. What was actually missing was a reject/replace REASON column.
+  `backtest_rejection_reason` only ever gets set for `backtest_rejected` candidates (never traded
+  at all); a `paper_replaced` candidate traded successfully and was later superseded, so that
+  column was always empty for it — reading as "no data" even though the real trade stats were
+  right there. Fixed with a genuinely new, service-computed field:
+  `Store.ReplacedByFor` (`internal/optimizer/store.go`) finds whichever candidate replaced a given
+  `paper_replaced` one for the same lineage (by `promoted_at` ordering), and
+  `handlers.go`'s `replacedReason` builds a real comparison sentence from both candidates' own
+  recorded stats — e.g. live-verified: *"Replaced by X ($23.29 PnL, 46.8% win rate over 111
+  trades) — this one scored $23.59 PnL, 47.2% win rate over 127 trades"*. Note this specific
+  example shows the REPLACEMENT scoring slightly worse than what it replaced — worth the operator
+  looking into separately (is `Promote()`'s "better candidate" comparison logic actually always
+  picking the better one?), not something investigated or fixed in this pass.
+
 ## Known remaining gap
 
 - **`ParamChangeModal` will show "no recorded parameter changes"** for every candidate promoted
@@ -133,10 +160,14 @@ Should always read 0. If it doesn't, something regressed in `Promote()` or the a
 
 ## Load/resource notes (server is genuinely tight)
 
-- **Disk repeatedly hit 90-98% full during this session's builds**, caused by build-cache growth
-  during `docker compose build` combined with a leftover throwaway test-Postgres image from
-  earlier testing (2.32GB, since removed). `docker builder prune -f` after every build reclaims
-  700MB-5.6GB reliably — this is now essential after every single build on this box, not optional.
+- **Disk repeatedly hit 90-100% full during this session's builds** (one build ran with a
+  confirmed 0 bytes free for several minutes — no service crashed, Kafka's restart count never
+  moved, but this was genuinely one build away from a real incident). Root cause found on the
+  SECOND round of this: **`docker builder prune -f` alone does NOT reliably reclaim build cache on
+  this box** — it repeatedly reported 5-6GB of cache as 0B reclaimable even right after a build
+  finished. **`docker builder prune -af` (the `-a` flag) is what actually works** — one run
+  recovered disk from 100% (0 free) to 75% (6.0G free) instantly. **Use `-af`, not `-f`, after
+  every single build on this box, no exceptions.**
 - **Kafka crash-looped at least twice this session** under combined CPU (strategy-optimizer's tick
   load) and disk pressure, both times self-recovering within seconds. `trader`/`paper-trader` both
   correctly retried with backoff per the existing §28 fix — no data loss either time, but this is
