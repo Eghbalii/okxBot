@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -105,7 +106,31 @@ type Consumer struct {
 // clear of any normal processing lag (this pipeline runs at sub-second latency) while still
 // catching the failure that motivated it — a consumer resuming from a far-behind committed offset
 // after a broker restart, replaying hours of ticks into live decision code.
+//
+// This is the default for everything EXCEPT ticker topics, which get tickerMaxMessageAge instead
+// (see NewConsumer) — candle topics still want the full 2 minutes, since a candle only closes once
+// per bar and losing one to a tight staleness window during a brief catch-up is a real gap in the
+// strategy's decision history, not just a stale display value.
 const defaultMaxMessageAge = 2 * time.Minute
+
+// tickerMaxMessageAge bounds staleness specifically for "*.tickers" topics (2026-09-28, operator
+// decision after a live incident): a ticker's only purpose is "what is the price right now" — a
+// price from even 10-20 seconds ago during a backlog catch-up has zero value once a fresher one is
+// sitting right behind it in the same backlog, unlike a candle close or a strategy signal, which
+// each represent a discrete event worth not losing. Observed directly after a Kafka reconnect: with
+// the old 2-minute window, catching up through a backlog fed the panel 10-20 price "changes" per
+// second, each one a real (if very recent) historical price with no decision value and a
+// deliberately confusing, flickering result on screen. 3 seconds is chosen to comfortably clear
+// this pipeline's normal sub-second latency while being tight enough that a backlog drains as a
+// jump straight to the current price instead of a replay of everything in between.
+const tickerMaxMessageAge = 3 * time.Second
+
+// isTickerTopic reports whether topic is a "*.tickers" topic (e.g. "okx.tickers", "mexc.tickers")
+// — every exchange in this codebase publishes ticks under that exact suffix (cmd/ingestor), so a
+// suffix check is reliable without threading a new parameter through every NewConsumer call site.
+func isTickerTopic(topic string) bool {
+	return strings.HasSuffix(topic, ".tickers")
+}
 
 // isStale reports whether a message published at msgTime is too old to act on. A zero time (a
 // broker that did not stamp one) is never stale: refusing to process unstamped messages would
@@ -137,17 +162,38 @@ func (c *Consumer) isStale(msgTime time.Time) bool {
 // Candle topics get the same treatment, which is safe for the same reason: PaperTrader/BotTrader
 // seed their candle windows from Postgres at startup (CLAUDE.md §14), so history comes from the
 // database rather than from replaying the bus.
+//
+// CommitInterval batches offset commits instead of the kafka-go default of committing
+// synchronously on every single CommitMessages call (2026-09-28, root-cause fix): a consumer
+// draining a large backlog — every dropped-as-stale message still gets committed so the reader
+// advances past it, see Run — was paying one broker round-trip PER MESSAGE just to skip it, which
+// under any CPU contention (a concurrent process pinning the host's cores) throttled drain
+// throughput below the topic's own production rate, so lag GREW instead of shrinking and never
+// recovered on its own (root-caused live: paper-trader's okx.tickers lag reached ~715k and was
+// still climbing after CPU pressure from another process eased, only fixed by a manual offset
+// reset). Batching commits removes that per-message broker round-trip from the hot path entirely,
+// so even a CPU-starved consumer can fetch-and-drop through a backlog far faster than one message
+// per commit round-trip allowed. Trade-off: on an unclean process exit, up to CommitInterval's
+// worth of already-handled messages can be reprocessed after restart rather than being lost —
+// accepted because every handler on this bus is already idempotent-safe against exactly that (SL/TP
+// checks and PnL tracking re-derive from current state, they don't accumulate irreversibly per
+// tick).
 func NewConsumer(brokers []string, topic, group string) *Consumer {
+	maxAge := defaultMaxMessageAge
+	if isTickerTopic(topic) {
+		maxAge = tickerMaxMessageAge
+	}
 	return &Consumer{
 		reader: kafka.NewReader(kafka.ReaderConfig{
-			Brokers:     brokers,
-			Topic:       topic,
-			GroupID:     group,
-			StartOffset: kafka.LastOffset,
+			Brokers:        brokers,
+			Topic:          topic,
+			GroupID:        group,
+			StartOffset:    kafka.LastOffset,
+			CommitInterval: time.Second,
 		}),
 		Topic:         topic,
 		Group:         group,
-		MaxMessageAge: defaultMaxMessageAge,
+		MaxMessageAge: maxAge,
 	}
 }
 

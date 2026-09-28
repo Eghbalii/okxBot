@@ -738,22 +738,24 @@ func (e *PaperTrader) monitorOpenOrders(ctx context.Context, price decimal.Decim
 		// operator explicitly asked to exit right now, unlike the timeout/SL/TP checks below,
 		// which are the engine's own background decisions. Checked first rather than after the
 		// touch check, since "close it now" should not wait for a coincidental SL/TP touch on the
-		// same tick to decide the reason for a close that was already requested.
-		reason, hit := conductor.CloseReasonManual, o.ManualCloseRequested
+		// same tick to decide the reason for a close that was already requested. Manual/timeout
+		// closes use the live tick price as-is — there is no "level" to close exactly at, unlike an
+		// SL/TP touch (resolvePaperTouch below).
+		reason, closePx, hit := conductor.CloseReasonManual, price, o.ManualCloseRequested
 		if !hit {
-			reason, hit = closeReason(o, price)
+			reason, closePx, hit = resolvePaperTouch(o, price)
 		}
 		if !hit && e.conductor().IsTimedOut(o.OpenedAt, now) {
 			// A position that has run past MaxOpenDuration is force-closed regardless of what
 			// SL/TP would otherwise decide (CLAUDE.md §15.14) — checked only once neither level
 			// has actually been touched this tick, so a genuine SL/TP hit always takes priority
 			// over a timeout that happens to land on the same tick.
-			reason, hit = conductor.CloseReasonTimeout, true
+			reason, closePx, hit = conductor.CloseReasonTimeout, price, true
 		}
 		if !hit {
 			continue
 		}
-		if err := e.closeOrder(ctx, o, price, reason, logger); err != nil {
+		if err := e.closeOrder(ctx, o, closePx, reason, logger); err != nil {
 			logger.Error("failed to close paper order", "id", o.ID, "error", err)
 			continue
 		}
@@ -885,6 +887,41 @@ func (e *PaperTrader) publishOrderEvent(ctx context.Context, eventType string, o
 
 func closeReason(o port.PaperOrder, price decimal.Decimal) (string, bool) {
 	return SLTPTouchReason(o.Side, o.SLPx, o.TPPx, price)
+}
+
+// resolvePaperTouch decides a paper order's close reason AND close price for a tick that has
+// touched SL or TP (2026-09-28, operator decision) — paper-trading-only, deliberately not shared
+// with BotTrader (which always records the real exchange fill price, CLAUDE.md §35/§37) or the
+// backtest engine (which judges purely by SL/TP touch against replayed candle data, §16.1's
+// RL-independence rule — this function's exact-price substitution is a different concern from that
+// one and must not be pulled into that path).
+//
+// closePx is the LEVEL itself (o.SLPx or o.TPPx), never the raw tick price that triggered the
+// touch. A single tick can legitimately overshoot past a level — most commonly while draining a
+// Kafka backlog, where consecutive processed ticks can be seconds or minutes apart in market time —
+// and using that overshoot price as the realized fill would make the trade's outcome depend on how
+// large the price gap happened to be between two processed ticks, an artifact of consumer lag, not
+// of the strategy or the model's decision. Closing exactly at the level is what the SL/TP number
+// itself promised: neither better nor worse, so the model's training signal reflects the decision
+// it actually made rather than incidental catch-up noise.
+//
+// Deliberately does NOT attempt to resolve "both SL and TP touched" — for a normal (non-inverted)
+// order, SL sits on the opposite side of entry from TP, so a single price sample cannot cross both
+// (SLTPTouchReason's own SL-first order is what already governs that edge case, unchanged here).
+// The harder related question — a tick after a gap (e.g. a Kafka outage) shows only SL touched,
+// but price may have genuinely touched TP first during the gap and reversed, with zero tick data
+// from that window to tell either way — was raised and explicitly deferred by the operator
+// (2026-09-28): there is no data-driven way to answer it from tick data alone, and it needs its own
+// decision (e.g. consulting OKX's own candle history for the gap window) before being built.
+func resolvePaperTouch(o port.PaperOrder, price decimal.Decimal) (reason string, closePx decimal.Decimal, hit bool) {
+	reason, hit = SLTPTouchReason(o.Side, o.SLPx, o.TPPx, price)
+	if !hit {
+		return "", decimal.Zero, false
+	}
+	if reason == "sl" {
+		return reason, *o.SLPx, true
+	}
+	return reason, *o.TPPx, true
 }
 
 // SLTPTouchReason is the shared SL/TP-touch comparison — genuine domain logic that every caller

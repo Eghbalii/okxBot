@@ -1125,6 +1125,42 @@ func TestCloseReason_PriceBetweenSLAndTPDoesNotClose(t *testing.T) {
 	}
 }
 
+func TestResolvePaperTouch_ClosesAtTheExactLevelNotTheOvershootPrice(t *testing.T) {
+	// A tick that has gapped well past SL (e.g. after a Kafka backlog catch-up jump) must still
+	// close at the SL level itself, not the overshoot price — otherwise the realized PnL depends on
+	// how large the gap happened to be between two processed ticks, an artifact of consumer lag.
+	sl := dec("99")
+	order := port.PaperOrder{Side: "buy", EntryPx: dec("100"), SLPx: &sl}
+	reason, closePx, hit := resolvePaperTouch(order, dec("95"))
+	if !hit || reason != "sl" {
+		t.Fatalf("expected sl hit, got hit=%v reason=%q", hit, reason)
+	}
+	if !closePx.Equal(sl) {
+		t.Errorf("expected close price to be the SL level (%s), got %s (the raw overshoot tick price)", sl, closePx)
+	}
+}
+
+func TestResolvePaperTouch_TPOvershootAlsoClosesAtTheExactLevel(t *testing.T) {
+	tp := dec("110")
+	order := port.PaperOrder{Side: "buy", EntryPx: dec("100"), TPPx: &tp}
+	reason, closePx, hit := resolvePaperTouch(order, dec("115"))
+	if !hit || reason != "tp" {
+		t.Fatalf("expected tp hit, got hit=%v reason=%q", hit, reason)
+	}
+	if !closePx.Equal(tp) {
+		t.Errorf("expected close price to be the TP level (%s), got %s", tp, closePx)
+	}
+}
+
+func TestResolvePaperTouch_NoTouchReturnsFalse(t *testing.T) {
+	sl, tp := dec("95"), dec("105")
+	order := port.PaperOrder{Side: "buy", EntryPx: dec("100"), SLPx: &sl, TPPx: &tp}
+	_, _, hit := resolvePaperTouch(order, dec("100.5"))
+	if hit {
+		t.Errorf("expected no touch for a price strictly between SL and TP")
+	}
+}
+
 func TestRealizedPnL_ExactNoFloatDrift(t *testing.T) {
 	// Regression test for the float64->decimal.Decimal migration.
 	order := port.PaperOrder{Side: "buy", EntryPx: dec("9.0"), Size: dec("100"), Leverage: dec("5")}
@@ -1682,6 +1718,34 @@ func TestMonitorOpenOrders_ClosesOnSLHit(t *testing.T) {
 	}
 	if closed.CloseReason == nil || *closed.CloseReason != "sl" {
 		t.Errorf("expected close reason 'sl', got %v", closed.CloseReason)
+	}
+}
+
+// Regression coverage for the 2026-09-28 exact-close-price fix: a tick that OVERSHOOTS past SL
+// (e.g. a large jump while draining a Kafka backlog) must still record the close at the SL level
+// itself, not the overshoot tick price — verified end-to-end through monitorOpenOrders/closeOrder,
+// not just resolvePaperTouch in isolation, so this also proves the resolved price actually reaches
+// the repository rather than the raw tick price still being used at the closeOrder call site.
+func TestMonitorOpenOrders_ClosesAtExactSLLevelOnOvershoot(t *testing.T) {
+	repo := newFakeRepository()
+	sl := dec("99")
+	id, _ := repo.OpenPaperOrder(context.Background(), port.PaperOrder{
+		InstID: "BTC-USDT-SWAP", Side: "buy", EntryPx: dec("100"), SLPx: &sl, Size: dec("100"), Leverage: dec("1"),
+	})
+
+	pt := newTestPaperTrader(repo, nil)
+	// Tick price (95) has overshot well past SL (99) — as if two processed ticks were far apart in
+	// market time, e.g. while draining a Kafka backlog.
+	if err := pt.monitorOpenOrders(context.Background(), dec("95"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenOrders returned error: %v", err)
+	}
+
+	closed := repo.orders[id]
+	if closed.ClosedAt == nil {
+		t.Fatal("expected order to be closed after SL hit")
+	}
+	if closed.ClosePx == nil || !closed.ClosePx.Equal(sl) {
+		t.Errorf("expected close price to be the exact SL level (%s), got %v (likely the raw overshoot tick price 95)", sl, closed.ClosePx)
 	}
 }
 

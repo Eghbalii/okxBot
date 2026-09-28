@@ -360,11 +360,36 @@ func TestIsStale(t *testing.T) {
 
 // A fresh consumer group must start at the END of the topic, not replay the retained backlog.
 func TestNewConsumer_StartsAtLastOffset(t *testing.T) {
-	c := NewConsumer([]string{"localhost:9092"}, "okx.tickers", "trader")
+	c := NewConsumer([]string{"localhost:9092"}, "okx.candles.5m", "trader")
 	if got := c.reader.(*kafka.Reader).Config().StartOffset; got != kafka.LastOffset {
 		t.Fatalf("StartOffset: want LastOffset (%d) so a new group does not replay history, got %d", kafka.LastOffset, got)
 	}
 	if c.MaxMessageAge != defaultMaxMessageAge {
-		t.Fatalf("MaxMessageAge: want the default %v, got %v", defaultMaxMessageAge, c.MaxMessageAge)
+		t.Fatalf("MaxMessageAge: want the default %v for a non-ticker topic, got %v", defaultMaxMessageAge, c.MaxMessageAge)
+	}
+}
+
+func TestNewConsumer_TickerTopicsGetTheShorterStalenessWindow(t *testing.T) {
+	for _, topic := range []string{"okx.tickers", "mexc.tickers"} {
+		c := NewConsumer([]string{"localhost:9092"}, topic, "some-group")
+		if c.MaxMessageAge != tickerMaxMessageAge {
+			t.Fatalf("topic %s: MaxMessageAge: want %v, got %v", topic, tickerMaxMessageAge, c.MaxMessageAge)
+		}
+	}
+}
+
+func TestNewConsumer_NonTickerTopicsKeepTheDefaultStalenessWindow(t *testing.T) {
+	for _, topic := range []string{"okx.candles.1H", "okx.paper-order-events", "okx.orderbook"} {
+		c := NewConsumer([]string{"localhost:9092"}, topic, "some-group")
+		if c.MaxMessageAge != defaultMaxMessageAge {
+			t.Fatalf("topic %s: MaxMessageAge: want the default %v, got %v", topic, defaultMaxMessageAge, c.MaxMessageAge)
+		}
+	}
+}
+
+func TestNewConsumer_BatchesCommits(t *testing.T) {
+	c := NewConsumer([]string{"localhost:9092"}, "okx.tickers", "trader")
+	if got := c.reader.(*kafka.Reader).Config().CommitInterval; got != time.Second {
+		t.Fatalf("CommitInterval: want 1s so a backlog drain does not pay one broker round-trip per message, got %v", got)
 	}
 }

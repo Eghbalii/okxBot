@@ -20,9 +20,23 @@ import (
 // looked frozen even though the pipeline was working. Kept modest (not "one per core") because
 // each worker also holds a Postgres connection and drives real candle-replay CPU work, and this
 // server has previously been pushed into an OOM/crash-loop by less concurrent load than this
-// (CLAUDE.md §16.10/§35.7) — 4 is deliberately conservative on a 2-core box, not a throughput
-// maximum.
-const tickWorkers = 4
+// (CLAUDE.md §16.10/§35.7).
+//
+// Lowered 4 -> 3 -> 2 (2026-09-28, operator decision): with the token-discovery scan (CLAUDE.md
+// §53) having admitted ~265 paper-enabled instruments across OKX+MEXC, one tick now covers 5,394
+// lineages (63 strategy kinds x ~265 tokens) and was pinning >100% CPU continuously for the full
+// ~14+ minute pass, every single hour (schedule_interval). That pushed Kafka into commit failures
+// under CPU starvation ("[-1] Unknown: an unexpected server error occurred" on every consumer
+// group), which is what actually broke the panel's live price/position updates — not a Kafka bug,
+// a resource-contention symptom of this constant. 3 workers was tried first and measured live:
+// CPU still 109-149%, load average still ~4.3-4.5, and Kafka commit failures / dropped websocket
+// events continued at essentially the same rate as 4 workers (24 paper-trader commit failures +
+// 1,724 dropped ws events in a 2-minute sample) — the worker count alone was not the bottleneck at
+// 3. Dropped to 2 next. If 2 is still not stable, the real fix is cutting the lineage count itself
+// (see the scheduler's own lineages() doc comment) — the token-discovery scan admitted far more
+// instruments than this box's 2 cores can back-test hourly, and reducing tickWorkers further just
+// trades tick duration for CPU share without changing the total CPU-seconds one full pass costs.
+const tickWorkers = 2
 
 // scheduler owns the periodic tick loop across every configured lineage. A "lineage" is derived
 // fresh on every scheduled pass from config.RiskProfiles' own Bars/StrategyKinds crossed with the
