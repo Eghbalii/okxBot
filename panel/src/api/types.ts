@@ -256,6 +256,9 @@ export interface OptimizerValidationConfig {
   minSignificanceT: string
   maxResets: number
   backtestLookback: string
+  // Gates auto-promotion (2026-09-28): a new candidate passing its backtest does not replace this
+  // lineage's active candidate until the active one has this many real closed live paper trades.
+  minLiveTradesBeforeReplace: number
 }
 
 // What every backtest's PnL is actually measured against — GET /api/optimizer/backtest-capital.

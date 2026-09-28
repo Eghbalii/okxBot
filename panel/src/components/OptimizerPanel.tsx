@@ -64,6 +64,14 @@ function ValidationConfigForm({ riskProfile }: { riskProfile: string }) {
         <input type="number" value={cfg.maxResets} onChange={(e) => set('maxResets', Number(e.target.value))} />
       </label>
       <label className="config-tile">
+        Min live trades before replacing active
+        <input
+          type="number"
+          value={cfg.minLiveTradesBeforeReplace}
+          onChange={(e) => set('minLiveTradesBeforeReplace', Number(e.target.value))}
+        />
+      </label>
+      <label className="config-tile">
         Backtest lookback
         <input
           type="text"
@@ -112,17 +120,15 @@ function activeSortValue(row: { candidate: OptimizerCandidate; liveStats?: Strat
 // (status='paper_replaced') — a strictly more useful "rejected" view than one dominated by
 // candidates that never even opened a trade (operator's explicit request, 2026-09-28): this is
 // the only "rejected" signal that reflects a real, executed track record.
-type RejectedSortKey = 'winRate' | 'pnl' | 'trades'
+//
+// Shares the exact same column shape as the Active tab (operator's explicit request, same day —
+// "این بخش با بخش Active از نظر ستون دیتا باید یکی باشن فقط اینجا یه Reason هم اضافه میشه"): a
+// rejected candidate can still have real live trade history from the time it WAS active, and that
+// is exactly what tells the operator whether replacing it was actually the right call.
+type RejectedSortKey = 'backtestWinRate' | 'backtestPnl' | 'liveWinRate' | 'livePnl' | 'liveSignals'
 
-function rejectedSortValue(c: OptimizerCandidate, key: RejectedSortKey): number {
-  switch (key) {
-    case 'winRate':
-      return c.backtestWinRatePct ? Number(c.backtestWinRatePct) : -Infinity
-    case 'pnl':
-      return c.backtestRealizedPnl ? Number(c.backtestRealizedPnl) : -Infinity
-    case 'trades':
-      return c.backtestTradeCount ?? -Infinity
-  }
+function rejectedSortValue(row: { candidate: OptimizerCandidate; liveStats?: StrategyStats }, key: RejectedSortKey): number {
+  return activeSortValue(row, key)
 }
 
 // Days spanned by the historical candles the backtest actually replayed — "over how many days was
@@ -230,7 +236,7 @@ const CANDIDATE_LIST_LIMIT = 2000
 export default function OptimizerPanel({ mode }: { mode: PositionMode }) {
   const [tab, setTab] = useState<Tab>('active')
   const [active, setActive] = useState<{ candidate: OptimizerCandidate; liveStats?: StrategyStats }[]>([])
-  const [rejected, setRejected] = useState<OptimizerCandidate[]>([])
+  const [rejected, setRejected] = useState<{ candidate: OptimizerCandidate; liveStats?: StrategyStats }[]>([])
   const [capital, setCapital] = useState<OptimizerBacktestCapital | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -239,11 +245,20 @@ export default function OptimizerPanel({ mode }: { mode: PositionMode }) {
   const [configProfile, setConfigProfile] = useState<'low' | 'high'>('low')
   const [activeSortKey, setActiveSortKey] = useState<ActiveSortKey>('livePnl')
   const [activeSortDir, setActiveSortDir] = useState<'asc' | 'desc'>('desc')
-  const [rejectedSortKey, setRejectedSortKey] = useState<RejectedSortKey>('pnl')
+  const [rejectedSortKey, setRejectedSortKey] = useState<RejectedSortKey>('livePnl')
   const [rejectedSortDir, setRejectedSortDir] = useState<'asc' | 'desc'>('desc')
   const [page, setPage] = useState(0)
   const [lastChecked, setLastChecked] = useState<Date | null>(null)
   const [paramModal, setParamModal] = useState<OptimizerCandidate | null>(null)
+
+  async function withLiveStats(candidates: OptimizerCandidate[]) {
+    return Promise.all(
+      candidates.map(async (candidate) => ({
+        candidate,
+        liveStats: candidate.strategyId ? await api.strategyStats(candidate.strategyId, mode) : undefined,
+      })),
+    )
+  }
 
   async function reload(showSpinner: boolean) {
     if (showSpinner) setLoading(true)
@@ -254,15 +269,13 @@ export default function OptimizerPanel({ mode }: { mode: PositionMode }) {
         api.optimizerBacktestCapital().catch(() => null),
       ])
 
-      const activeRows = await Promise.all(
-        activeCandidates.map(async (candidate) => ({
-          candidate,
-          liveStats: candidate.strategyId ? await api.strategyStats(candidate.strategyId, mode) : undefined,
-        })),
-      )
+      const [activeRows, rejectedRows] = await Promise.all([
+        withLiveStats(activeCandidates),
+        withLiveStats(rejectedCandidates),
+      ])
 
       setActive(activeRows)
-      setRejected(rejectedCandidates)
+      setRejected(rejectedRows)
       setCapital(cap)
       setError(null)
       setLastChecked(new Date())
@@ -476,7 +489,10 @@ export default function OptimizerPanel({ mode }: { mode: PositionMode }) {
                     <th className="th-static">Token</th>
                     <th className="th-static">Bar</th>
                     <th className="th-static col-group-backtest col-edge-start col-edge-end" colSpan={5}>
-                      Backtest
+                      Backtest (at promotion)
+                    </th>
+                    <th className="th-static col-group-live col-edge-start col-edge-end" colSpan={3}>
+                      Live while active
                     </th>
                     <th className="th-static">Reason</th>
                   </tr>
@@ -486,27 +502,35 @@ export default function OptimizerPanel({ mode }: { mode: PositionMode }) {
                     <th className="th-static"></th>
                     <th className="th-static col-cell-backtest col-edge-start">Leverage</th>
                     <th className="th-static col-cell-backtest">Period</th>
-                    <SortHeader label="Trades" sortKey="trades" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} className="col-cell-backtest" />
-                    <SortHeader label="Win rate" sortKey="winRate" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} className="col-cell-backtest" />
-                    <SortHeader label="PnL" sortKey="pnl" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} className="col-cell-backtest col-edge-end" />
+                    <th className="th-static col-cell-backtest">Trades</th>
+                    <SortHeader label="Win rate" sortKey="backtestWinRate" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} className="col-cell-backtest" />
+                    <SortHeader label="PnL" sortKey="backtestPnl" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} className="col-cell-backtest col-edge-end" />
+                    <SortHeader label="Signals" sortKey="liveSignals" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} className="col-cell-live col-edge-start" />
+                    <SortHeader label="Win rate" sortKey="liveWinRate" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} className="col-cell-live" />
+                    <SortHeader label="PnL" sortKey="livePnl" active={rejectedSortKey} dir={rejectedSortDir} onClick={toggleRejectedSort} className="col-cell-live col-edge-end" />
                     <th className="th-static"></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {slice(sortedRejected).map((c) => (
-                    <tr key={c.id}>
+                  {slice(sortedRejected).map(({ candidate, liveStats }) => (
+                    <tr key={candidate.id}>
                       <td>
-                        <StrategyNameLink candidate={c} onOpen={() => setParamModal(c)} />
+                        <StrategyNameLink candidate={candidate} onOpen={() => setParamModal(candidate)} />
                       </td>
-                      <td>{tokenSymbol(c.instId)}</td>
-                      <td>{c.bar}</td>
-                      <td className="mono col-cell-backtest col-edge-start">{c.leverage}x</td>
-                      <td className="mono col-cell-backtest">{tradingPeriod(c.backtestFrom, c.backtestTo)}</td>
-                      <td className="col-cell-backtest">{c.backtestTradeCount ?? '—'}</td>
-                      <td className="col-cell-backtest">{c.backtestWinRatePct ? `${Number(c.backtestWinRatePct).toFixed(1)}%` : '—'}</td>
-                      <PnLCell pnl={c.backtestRealizedPnl} capitalUsd={capitalUsd} className="col-cell-backtest col-edge-end" />
+                      <td>{tokenSymbol(candidate.instId)}</td>
+                      <td>{candidate.bar}</td>
+                      <td className="mono col-cell-backtest col-edge-start">{candidate.leverage}x</td>
+                      <td className="mono col-cell-backtest">{tradingPeriod(candidate.backtestFrom, candidate.backtestTo)}</td>
+                      <td className="mono col-cell-backtest">{candidate.backtestTradeCount ?? '—'}</td>
+                      <td className="col-cell-backtest">{candidate.backtestWinRatePct ? `${Number(candidate.backtestWinRatePct).toFixed(1)}%` : '—'}</td>
+                      <PnLCell pnl={candidate.backtestRealizedPnl} capitalUsd={capitalUsd} className="col-cell-backtest col-edge-end" />
+                      <td className="col-cell-live col-edge-start">{liveStats?.SignalCount ?? '—'}</td>
+                      <td className="col-cell-live">{winRate(liveStats?.Wins, liveStats?.Losses)}</td>
+                      <td className={'mono col-cell-live col-edge-end ' + pnlClass(liveStats ? Number(liveStats.RealizedPnL) : null)}>
+                        {liveStats ? formatUsd(Number(liveStats.RealizedPnL)) : '—'}
+                      </td>
                       <td className="text-dim" style={{ fontSize: '0.78rem', maxWidth: 260 }}>
-                        {c.replacedReason ?? '—'}
+                        {candidate.replacedReason ?? '—'}
                       </td>
                     </tr>
                   ))}

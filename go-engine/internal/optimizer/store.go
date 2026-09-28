@@ -71,31 +71,48 @@ type Candidate struct {
 // rather than stored, so changing the convention later needs no backfill (the same reasoning the
 // old tester_strategy_versions used for its own "{kind}_v{version}" display name).
 func (c Candidate) DisplayName(leverage int) string {
-	// Trailing #<id> (2026-09-28 fix) — Generation/BacktestUpdates/PaperUpdates alone do NOT
-	// uniquely identify a candidate: proposeCandidate can (and routinely does) propose several
-	// different tuned parameter sets within the SAME generation before one passes, so two
-	// completely different candidates for the same lineage rendered as the exact same string.
-	// Found live: a paper_replaced candidate's "replaced by" reason named the very same display
-	// name as the candidate it was itself describing being replaced BY — reading as nonsense —
-	// because both candidates were real, distinct, generation-2 rows with identical
-	// B0_P0 suffixes. The id is always present and always unique, so appending it is the minimal
-	// fix rather than inventing a new counter that would need its own migration/backfill.
-	return fmt.Sprintf("%s_%s_R%d_G%d_B%d_P%d_#%d",
-		c.Lineage.Kind, c.Lineage.InstID, leverage, c.Generation, c.BacktestUpdates, c.PaperUpdates, c.ID)
+	// G<generation> is the REAL answer to "how many times has this lineage been re-tuned"
+	// (2026-09-28, root-cause fix — see MaxGeneration's own doc comment): every candidate
+	// proposeCandidate creates for one lineage now gets the next generation number after whatever
+	// that lineage has ever reached, rather than every candidate landing on the same number
+	// (origin.Generation+1, always 2, regardless of how many were tried before). Two genuinely
+	// related candidates — one an update of the other — are now visibly G2 vs G3 vs G4.
+	//
+	// The trailing #<id> that the previous session added as a collision workaround was REMOVED
+	// (2026-09-28, explicit operator instruction) once the real fix above made it unnecessary: an
+	// id-suffix is not a version number, and showing one next to a correct generation number just
+	// restates the same "which one is newer" question the generation already answers on its own.
+	return fmt.Sprintf("%s_%s_R%d_G%d_B%d_P%d",
+		c.Lineage.Kind, c.Lineage.InstID, leverage, c.Generation, c.BacktestUpdates, c.PaperUpdates)
 }
 
 // ValidationConfig is one risk profile's panel-editable promotion thresholds
 // (strategy_optimizer_config) — combined deliberately ("ترکیبی باشه نه فقط تمرکز روی یک چیز"),
 // matching every dimension internal/backtest.Result already reports per strategy.
+// ValidationConfig's JSON tags were added 2026-09-28 alongside the MinLiveTradesBeforeReplace
+// field — until now this struct had none, so json.Encode wrote capital-first Go field names
+// (RiskProfile, MinTrades, ...) while the panel's OptimizerValidationConfig TypeScript type reads
+// camelCase (riskProfile, minTrades, ...) with no case translation anywhere in between (a straight
+// pass-through proxy, internal/api/optimizer_proxy.go, and a plain JSON.parse client-side). Found
+// while wiring the new field through: the panel's whole validation-config edit form
+// (ValidationConfigForm, OptimizerPanel.tsx) had been silently reading every value as `undefined`
+// since it was built.
 type ValidationConfig struct {
-	RiskProfile      string
-	MinTrades        int
-	MinWinRatePct    decimal.Decimal
-	MinRealizedPnL   decimal.Decimal
-	MinSignificanceT decimal.Decimal
-	MaxResets        int
-	BacktestLookback string // e.g. "30d", parsed Go-side
-	UpdatedAt        time.Time
+	RiskProfile      string          `json:"riskProfile"`
+	MinTrades        int             `json:"minTrades"`
+	MinWinRatePct    decimal.Decimal `json:"minWinRatePct"`
+	MinRealizedPnL   decimal.Decimal `json:"minRealizedPnL"`
+	MinSignificanceT decimal.Decimal `json:"minSignificanceT"`
+	MaxResets        int             `json:"maxResets"`
+	BacktestLookback string          `json:"backtestLookback"` // e.g. "30d", parsed Go-side
+	// MinLiveTradesBeforeReplace gates auto-promotion (migration 000041, 2026-09-28 operator
+	// decision): a new candidate that clears every threshold above still does NOT replace this
+	// lineage's currently-active candidate until that active candidate has accumulated at least
+	// this many real closed live paper trades of its own. A passing backtest is not, by itself,
+	// evidence the active candidate is worse — only real trading data is. See runAndRecord's own
+	// call site for where this is enforced.
+	MinLiveTradesBeforeReplace int       `json:"minLiveTradesBeforeReplace"`
+	UpdatedAt                  time.Time `json:"updatedAt"`
 }
 
 // Store is a thin Postgres access layer over strategy_candidates/strategy_optimizer_config/
@@ -228,6 +245,28 @@ func (s *Store) ListCandidatesForLineage(ctx context.Context, l Lineage) ([]Cand
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// MaxGeneration returns the highest generation number ever used for l (1 if only the origin
+// exists, i.e. no real candidate has ever been proposed yet) — what proposeCandidate uses to
+// derive a NEW candidate's generation, instead of the bug this fixes (2026-09-28): every proposal
+// used origin.Generation+1 unconditionally, so every candidate ever tried for one lineage landed
+// on the SAME generation number (2), forcing DisplayName to disambiguate collisions by appending
+// the row's own database id — a real fix would have been incrementing the generation each time a
+// new candidate is actually proposed, which is what this enables. MAX(), not a plain "most recent
+// row's generation", so a lineage's numbering survives even if an older, lower-generation row is
+// somehow re-touched later (updated_at bumped, e.g. by a manual edit) — id-ordering alone would be
+// fragile to that in a way a straightforward MAX() aggregate is not.
+func (s *Store) MaxGeneration(ctx context.Context, l Lineage) (int, error) {
+	var gen int
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(MAX(generation), 1) FROM strategy_candidates
+		WHERE kind = $1 AND inst_id = $2 AND bar = $3 AND exchange = $4 AND risk_profile = $5
+	`, l.Kind, l.InstID, l.Bar, l.Exchange, l.RiskProfile).Scan(&gen)
+	if err != nil {
+		return 0, fmt.Errorf("max generation for %+v: %w", l, err)
+	}
+	return gen, nil
 }
 
 // ListCandidatesByStatus returns up to limit candidates across EVERY lineage matching status,
@@ -393,9 +432,9 @@ func (s *Store) IncrementPaperUpdates(ctx context.Context, candidateID int64) er
 func (s *Store) GetValidationConfig(ctx context.Context, riskProfile string) (ValidationConfig, error) {
 	var v ValidationConfig
 	err := s.pool.QueryRow(ctx, `
-		SELECT risk_profile, min_trades, min_win_rate_pct, min_realized_pnl, min_significance_t, max_resets, backtest_lookback, updated_at
+		SELECT risk_profile, min_trades, min_win_rate_pct, min_realized_pnl, min_significance_t, max_resets, backtest_lookback, min_live_trades_before_replace, updated_at
 		FROM strategy_optimizer_config WHERE risk_profile = $1
-	`, riskProfile).Scan(&v.RiskProfile, &v.MinTrades, &v.MinWinRatePct, &v.MinRealizedPnL, &v.MinSignificanceT, &v.MaxResets, &v.BacktestLookback, &v.UpdatedAt)
+	`, riskProfile).Scan(&v.RiskProfile, &v.MinTrades, &v.MinWinRatePct, &v.MinRealizedPnL, &v.MinSignificanceT, &v.MaxResets, &v.BacktestLookback, &v.MinLiveTradesBeforeReplace, &v.UpdatedAt)
 	if err != nil {
 		return ValidationConfig{}, fmt.Errorf("get validation config for %q: %w", riskProfile, err)
 	}
@@ -408,9 +447,10 @@ func (s *Store) SaveValidationConfig(ctx context.Context, v ValidationConfig) er
 	_, err := s.pool.Exec(ctx, `
 		UPDATE strategy_optimizer_config SET
 			min_trades = $2, min_win_rate_pct = $3, min_realized_pnl = $4,
-			min_significance_t = $5, max_resets = $6, backtest_lookback = $7, updated_at = now()
+			min_significance_t = $5, max_resets = $6, backtest_lookback = $7,
+			min_live_trades_before_replace = $8, updated_at = now()
 		WHERE risk_profile = $1
-	`, v.RiskProfile, v.MinTrades, v.MinWinRatePct, v.MinRealizedPnL, v.MinSignificanceT, v.MaxResets, v.BacktestLookback)
+	`, v.RiskProfile, v.MinTrades, v.MinWinRatePct, v.MinRealizedPnL, v.MinSignificanceT, v.MaxResets, v.BacktestLookback, v.MinLiveTradesBeforeReplace)
 	if err != nil {
 		return fmt.Errorf("save validation config for %q: %w", v.RiskProfile, err)
 	}

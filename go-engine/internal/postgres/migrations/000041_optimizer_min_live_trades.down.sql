@@ -1,0 +1,1 @@
+ALTER TABLE strategy_optimizer_config DROP COLUMN IF EXISTS min_live_trades_before_replace;

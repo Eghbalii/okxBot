@@ -132,11 +132,14 @@ func (l *Loop) proposeCandidate(ctx context.Context, lin Lineage, params Backtes
 		return fmt.Errorf("marshal candidate params: %w", err)
 	}
 
-	origin, err := l.Store.GetCandidate(ctx, originID)
+	// Generation = the highest one this lineage has EVER used, plus one — not origin.Generation+1,
+	// which put every candidate a lineage ever tried on the same generation number (2026-09-28 fix,
+	// see MaxGeneration's own doc comment for the DisplayName-collision bug this caused).
+	maxGen, err := l.Store.MaxGeneration(ctx, lin)
 	if err != nil {
 		return err
 	}
-	candidateID, err := l.Store.CreateCandidate(ctx, lin, configJSON, originID, origin.Generation+1, 0, 0, "optimizer", &sc.TrialID)
+	candidateID, err := l.Store.CreateCandidate(ctx, lin, configJSON, originID, maxGen+1, 0, 0, "optimizer", &sc.TrialID)
 	if err != nil {
 		return err
 	}
@@ -255,13 +258,31 @@ func (l *Loop) runAndRecord(ctx context.Context, lin Lineage, candidateID int64,
 	// +$30 candidate sitting unpromoted with nobody having ever seen it). Promote() itself already
 	// handles "a different candidate for this lineage is currently paper_active" by demoting it in
 	// the same transaction (§21's fix), so calling it here on every pass is safe to repeat.
+	//
+	// BUT a passing backtest alone is never grounds to replace an ALREADY-ACTIVE candidate
+	// (2026-09-28, explicit operator decision, same day as the above): a new candidate's backtest
+	// result says nothing about whether the currently-running one is actually worse in real
+	// trading — that's only knowable once the active one has accumulated real closed live trades.
+	// readyToReplaceActive checks that before Promote is even called, so an active candidate with
+	// too little live history yet is left running untouched no matter how good a new backtest
+	// looks; this new candidate simply stays backtest_passed, available and visible on the panel,
+	// until either the active one earns enough live trades or the active one is replaced later once
+	// it has.
 	if verdict.Passed {
-		leverage := int(params.MaxLeverage.IntPart())
-		if _, err := Promote(ctx, l.Store, l.Repo, candidateID, leverage); err != nil {
-			// Promotion failing (e.g. the kind's origin row hasn't been seeded yet) must not lose
-			// the backtest result itself — it stays recorded as backtest_passed and the NEXT tick
-			// that revisits this lineage will try to promote it again.
-			l.Logger.Error("auto-promote failed", "candidateId", candidateID, "lineage", lin, "error", err)
+		ready, err := l.readyToReplaceActive(ctx, lin, vc)
+		if err != nil {
+			l.Logger.Error("failed to check live-trade gate before auto-promote", "candidateId", candidateID, "lineage", lin, "error", err)
+		} else if !ready {
+			l.Logger.Info("candidate passed backtest but active candidate has too little live data to replace yet",
+				"candidateId", candidateID, "lineage", lin, "minLiveTrades", vc.MinLiveTradesBeforeReplace)
+		} else {
+			leverage := int(params.MaxLeverage.IntPart())
+			if _, err := Promote(ctx, l.Store, l.Repo, candidateID, leverage); err != nil {
+				// Promotion failing (e.g. the kind's origin row hasn't been seeded yet) must not lose
+				// the backtest result itself — it stays recorded as backtest_passed and the NEXT tick
+				// that revisits this lineage will try to promote it again.
+				l.Logger.Error("auto-promote failed", "candidateId", candidateID, "lineage", lin, "error", err)
+			}
 		}
 	}
 
@@ -284,6 +305,29 @@ func (l *Loop) runAndRecord(ctx context.Context, lin Lineage, candidateID int64,
 	}
 
 	return l.Store.SetOptimizerState(ctx, lin, nil)
+}
+
+// readyToReplaceActive reports whether lin's currently-active candidate (if any) has earned enough
+// real closed live paper trades to be eligible for replacement — the gate runAndRecord applies
+// before ever calling Promote (2026-09-28, explicit operator decision). No active candidate at all
+// (a lineage's very first promotion) always reports ready: there is nothing yet to protect. An
+// active candidate with no StrategyID (should not happen in practice — Promote always sets one —
+// but defended rather than assumed) also reports ready, since there is no strategy row to look up
+// live stats for.
+func (l *Loop) readyToReplaceActive(ctx context.Context, lin Lineage, vc ValidationConfig) (bool, error) {
+	active, hasActive, err := l.Store.ActiveCandidate(ctx, lin)
+	if err != nil {
+		return false, fmt.Errorf("check active candidate for %+v: %w", lin, err)
+	}
+	if !hasActive || active.StrategyID == nil {
+		return true, nil
+	}
+	stats, err := l.Repo.StrategyStatsFor(ctx, *active.StrategyID, "paper", lin.Exchange)
+	if err != nil {
+		return false, fmt.Errorf("live trade stats for active candidate %d's strategy %d: %w", active.ID, *active.StrategyID, err)
+	}
+	liveTrades := stats.Wins + stats.Losses
+	return liveTrades >= int64(vc.MinLiveTradesBeforeReplace), nil
 }
 
 // SweepUnpromoted promotes the BEST 'backtest_passed' candidate (by realized PnL — the same

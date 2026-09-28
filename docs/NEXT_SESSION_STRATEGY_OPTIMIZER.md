@@ -1,8 +1,124 @@
-# Strategy backtest/optimize pipeline — handoff (updated 2026-09-28, session 2)
+# Strategy backtest/optimize pipeline — handoff (updated 2026-09-28, session 3)
 
-Status: **deployed and running live**, panel improvements shipped same day. Written so a new
-session can resume without re-deriving context. Supersedes the previous version of this doc for
-everything covered below; sections not mentioned here are unchanged from the prior handoff.
+Status: **deployed and running live**. Written so a new session can resume without re-deriving
+context. Supersedes the previous version of this doc for everything covered below; sections not
+mentioned here are unchanged from prior sessions. Session 2's own header still applies for its own
+listed items.
+
+## Session 3 (2026-09-28) — three real bugs found and fixed, all deployed and verified live
+
+Triggered by two separate operator reports in the same session: (1) the CPU-lockup/Kafka-outage
+investigation from earlier the same day (see the `strategy_optimizer` config section below —
+unrelated code, same session), and (2) two direct complaints about this pipeline specifically:
+"the previous session's id-suffix 'fix' for duplicate names was a lazy hack, the real fix is
+making the generation number actually increment," and "the panel's live-trade numbers look wrong
+— only ~5 signals total across 118 active candidates, but paper trading is clearly opening
+hundreds of positions a day."
+
+### 1. CRITICAL BUG (root cause of the id-suffix hack): every candidate landed on the same
+generation number, forever
+
+`proposeCandidate` (`internal/optimizer/loop.go`) computed a new candidate's generation as
+`origin.Generation+1` — **always** the origin's own generation plus one, never the lineage's own
+history. Since the origin's generation never changes, every single candidate ever proposed for one
+lineage landed on the identical number (2), which is exactly what forced the previous session's
+`#<id>` suffix onto `DisplayName` to disambiguate two genuinely different candidates that otherwise
+rendered as the same string.
+
+**Fixed properly**: `Store.MaxGeneration(ctx, lineage)` (new, `internal/optimizer/store.go`) reads
+`MAX(generation)` across the lineage's ENTIRE history (a real aggregate, not "the most recent row",
+which would be fragile to insertion order); `proposeCandidate` now uses `MaxGeneration+1`. Verified
+live: freshly-proposed candidates for lineages that already had a generation-2 attempt now correctly
+land on generation 3 (`keltner_trend_scalp_v2_FIL_R10_G3_B0_P0`).
+
+**The `#<id>` suffix was then REMOVED from `DisplayName`** (explicit operator instruction, same
+session, after confirming the real fix works) — it was never a version number, just a workaround for
+a bug that no longer exists. `DisplayName` is now exactly
+`<kind>_<instId>_R<leverage>_G<generation>_B<backtestUpdates>_P<paperUpdates>`, no trailing id.
+Deployed and verified live via the real `/candidates/by-status` endpoint.
+
+5 new Go tests (`internal/optimizer/loop_test.go`), all mutation-checked (each fails with its own
+fix reverted, reproducing the exact original bug — e.g. `[2 2 2]` instead of a strictly increasing
+sequence): `TestLoop_ProposeIncrementsGenerationAcrossRejectedAttempts`,
+`TestStore_MaxGeneration_NoCandidatesYetReturnsOne`,
+`TestStore_MaxGeneration_ReflectsTheHighestCandidateEverCreated`. Verified against a real
+Postgres instance (a throwaway `timescale/timescaledb:latest-pg16` container via Colima, migrated
+with the project's own embedded migrations, NOT the production database) since this package's
+tests need a real database and have no rollback/isolation between runs — a real gotcha hit while
+writing these: hardcoded trial IDs (101/102/103) collided across repeated runs against a persistent
+test DB, producing a false failure (`[5 2 6 3 7 4]`) that had nothing to do with the fix itself;
+fixed by keying the test lineage's `InstID` off `time.Now().UnixNano()`.
+
+### 2. CRITICAL DESIGN GAP (explicit operator decision): auto-promotion never waited for real
+live-trading data before replacing an active candidate
+
+Root cause: `runAndRecord`'s auto-promote call (`internal/optimizer/loop.go`) called `Promote()` the
+instant a new candidate passed its backtest, with **zero** regard for whether the currently-active
+candidate had accumulated any real closed live trades of its own. A backtest pass says nothing
+about whether the running strategy is actually worse — only real trading data can answer that, and
+under the old behavior a strategy could be promoted and replaced again within the same hour with no
+live track record ever collected.
+
+**Fixed**: new `ValidationConfig.MinLiveTradesBeforeReplace` (migration `000041`, panel-editable,
+default 30 — same default as `MinTrades`). `Loop.readyToReplaceActive` checks the active
+candidate's `StrategyStatsFor` (real `paper_orders`, `Wins+Losses`) before `Promote()` is ever
+called; if the active candidate hasn't cleared the threshold yet, the new candidate stays
+`backtest_passed` (visible, not discarded) and the active one keeps running untouched, no matter how
+good the new backtest looks. Once the threshold is cleared, replacement proceeds normally.
+
+2 new Go tests, mutation-checked: `TestLoop_DoesNotReplaceActiveCandidateWithTooFewLiveTrades`,
+`TestLoop_ReplacesActiveCandidateOnceItHasEnoughLiveTrades` (seeds real closed `paper_orders` rows
+via `OpenPaperOrder`/`ClosePaperOrder` to prove the gate lifts once enough live trades exist).
+
+**Side fix found while wiring this**: `ValidationConfig` (`internal/optimizer/store.go`) had NO
+JSON tags at all, so `json.Encode` wrote capital-first Go field names (`MinTrades`, `RiskProfile`,
+...) while the panel's `OptimizerValidationConfig` TypeScript type expects camelCase
+(`minTrades`, `riskProfile`, ...) with no case translation anywhere in the proxy chain — the panel's
+entire "Validation config" edit form had been silently reading every field as `undefined` since it
+was built. Fixed by adding explicit `json:"..."` tags matching the panel's existing type.
+
+### 3. CRITICAL DATA-INTEGRITY BUG: 914 strategies were trading live completely outside the
+optimizer's own tracking — this is what made the panel's live-data numbers look wrong
+
+Investigating the operator's "only ~5 live signals shown, but clearly way more trades are
+happening" report found the panel was actually correct — the bug was on the trading side, not the
+display side. `paper_orders` showed **2,429 closed positions in 24h across 225 distinct
+strategy_ids**, but only **6** of the optimizer's own 118 `paper_active` candidates had any real
+trade at all. The other ~2,400 trades came from **6,220 `strategies` rows** all created in a tight
+~2-minute burst at 07:46–07:48 the same morning — a one-time bulk-clone event, NOT part of any code
+currently in this repo (no matching commit, no matching code path found) and NOT tracked anywhere
+in `strategy_candidates` at all. 914 of those 6,220 had live, enabled `strategy_assignments` and
+were opening/closing real paper positions completely outside the optimizer pipeline's promotion
+logic, generation numbering, or the live-trade gate from fix #2 above — invisible to the panel
+because the panel (correctly) only ever reads the real `strategy_candidates` table.
+
+**Fixed per explicit operator instruction** ("بله همه رو پاک کن و از استراتژی‌های جدید استفاده
+کن" — paper trading strategy/token control belongs to the optimizer, full stop): all 914 ghost
+assignments were disabled (`strategy_assignments.enabled = false`, `mode='paper'`), backed up first
+to `strategy_assignments_ghost_backup_20260928` (a full row dump, not deleted — this project's own
+"never delete, keep for audit" convention). `paper-trader` restarted. Verified: enabled paper
+assignments dropped from ~1034 to exactly 120, of which 118 are the real optimizer candidates (the
+remaining 2 are origin bootstrap rows for kinds with no tunable params — expected, not a leftover).
+
+**Not fully root-caused** — the exact script/process that created the 6,220 rows at 07:46-07:48 was
+never found in this repo's git history. Worth keeping an eye out for it if it recurs (check for
+`_G1_B0_P0`-named `strategies` rows created in a tight timestamp cluster, `cloned_from` pointing at
+a real `is_origin=true` row — that's the exact signature). If it does recur, the fix is the same
+query pattern used this session (filter `strategies.name LIKE '%_G1_B0_P0'` + a `created_at`
+cluster, disable the resulting `strategy_assignments`, never delete).
+
+## Open items for next session
+
+- Confirm the 118→~120 promoted-candidate paper trading volume actually ramps up over the next
+  24-48h now that the ghost strategies are gone and the real pipeline is the only thing trading —
+  this was NOT verified post-fix (deployed right at context limit) beyond confirming the assignment
+  counts and a clean `paper-trader` restart. Check `paper_orders` closed-trade volume and distinct
+  `strategy_id` count again in the next session; it should now show ~118-120 distinct ids, not 225.
+- The exact source of the 6,220-row 07:46-07:48 bulk-clone burst is still unknown — see above.
+- `strategy_assignments_ghost_backup_20260928` and `strategy_assignments_backup_20260928` (an
+  earlier session-2 backup table, different rows) are both sitting in the production database —
+  fine to leave (matches this project's audit-trail convention) but worth knowing they're there if
+  disk usage on the DB ever needs auditing.
 
 ## What this session found and fixed (in order)
 
