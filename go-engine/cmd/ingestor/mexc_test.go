@@ -29,7 +29,7 @@ func TestMexcCandleArray_BuildsTheExactLayoutDecodeCandleExpects(t *testing.T) {
 		Volume:    decimal.RequireFromString("12345.6789"),
 	}
 
-	got := mexcCandleArray(c)
+	got := mexcCandleArray(c, true)
 
 	if len(got) != 9 {
 		t.Fatalf("want a 9-element array (indices 0-8), got %d elements: %v", len(got), got)
@@ -54,7 +54,19 @@ func TestMexcCandleArray_BuildsTheExactLayoutDecodeCandleExpects(t *testing.T) {
 		t.Errorf("index 5 (volume): want 12345.6789, got %s", got[5])
 	}
 	if got[8] != "1" {
-		t.Errorf("index 8 (confirm): want \"1\" (always finalized), got %q", got[8])
+		t.Errorf("index 8 (confirm): want \"1\" for confirm=true, got %q", got[8])
+	}
+}
+
+// TestMexcCandleArray_ConfirmFalseWritesZero pins the other half of the 2026-09-23 fix: a forming
+// (not-yet-closed) push must carry confirm="0", matching OKX's own confirm=0 wire behavior — this is
+// what lets the panel's live-candle chart tell a still-forming bar from a closed one, and what makes
+// PaperTrader.handleCandle correctly skip strategy evaluation on it (CLAUDE.md §14).
+func TestMexcCandleArray_ConfirmFalseWritesZero(t *testing.T) {
+	c := domain.Candle{Timestamp: time.Now(), Open: decimal.Zero, High: decimal.Zero, Low: decimal.Zero, Close: decimal.Zero, Volume: decimal.Zero}
+	got := mexcCandleArray(c, false)
+	if got[8] != "0" {
+		t.Errorf("index 8 (confirm): want \"0\" for confirm=false, got %q", got[8])
 	}
 }
 
@@ -68,7 +80,7 @@ func TestMexcCandleArray_TimestampIsMilliseconds(t *testing.T) {
 	ts := time.Unix(1700000000, 0).UTC() // a round, recognizable Unix-seconds value
 	c := domain.Candle{Timestamp: ts, Open: decimal.Zero, High: decimal.Zero, Low: decimal.Zero, Close: decimal.Zero, Volume: decimal.Zero}
 
-	got := mexcCandleArray(c)
+	got := mexcCandleArray(c, true)
 	if got[0] != "1700000000000" {
 		t.Fatalf("index 0 must be milliseconds (1700000000000), got %s — a seconds/milliseconds mixup would produce 1700000000", got[0])
 	}
@@ -79,7 +91,7 @@ func TestMexcCandleArray_TimestampIsMilliseconds(t *testing.T) {
 // decodeCandle never reads them (only checks len(...) for the fields it does read), so this is
 // safe, but a future reader should not assume a non-empty value belongs there.
 func TestMexcCandleArray_IndicesSixAndSevenAreEmpty(t *testing.T) {
-	got := mexcCandleArray(domain.Candle{Timestamp: time.Now(), Open: decimal.Zero, High: decimal.Zero, Low: decimal.Zero, Close: decimal.Zero, Volume: decimal.Zero})
+	got := mexcCandleArray(domain.Candle{Timestamp: time.Now(), Open: decimal.Zero, High: decimal.Zero, Low: decimal.Zero, Close: decimal.Zero, Volume: decimal.Zero}, true)
 	if got[6] != "" || got[7] != "" {
 		t.Errorf("indices 6-7 (volCcy/volCcyQuote, no MEXC equivalent): want empty, got %q, %q", got[6], got[7])
 	}

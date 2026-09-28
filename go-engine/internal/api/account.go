@@ -51,7 +51,7 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// exchange ("okx", "MEXC_100x_1", ...) only means anything for mode="paper" today — bot/manual
+	// exchange ("okx", "mexc", ...) only means anything for mode="paper" today — bot/manual
 	// trading has no second-exchange instance (2026-09-22). Empty defaults to "okx" at the
 	// repository layer, unchanged for every existing panel request that never sends it.
 	account, err := s.Repo.GetAccountEquityEx(r.Context(), mode, r.URL.Query().Get("exchange"), s.AccountInitialUSD)
@@ -68,7 +68,7 @@ type setAccountCapRequest struct {
 	// file — a body field rather than a query param since this is a mutating POST, not a GET.
 	Mode      string          `json:"mode"`
 	NewCapUSD decimal.Decimal `json:"newCapUsd"`
-	// Exchange ("okx", "MEXC_100x_1", ...) only means anything for mode="paper" (2026-09-22) —
+	// Exchange ("okx", "mexc", ...) only means anything for mode="paper" (2026-09-22) —
 	// empty defaults to "okx" at the repository layer, unchanged for every existing panel request.
 	Exchange string `json:"exchange"`
 }

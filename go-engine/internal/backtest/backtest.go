@@ -71,8 +71,15 @@ type Sample struct {
 
 // Config parameterizes one run.
 type Config struct {
-	InstIDs []string
-	Bars    []string
+	// Exchange selects which exchange's candles this run replays ("okx", "mexc", ...). Empty
+	// defaults to "okx" (loadCandles' own default) — this package started OKX-only, and the
+	// default keeps every existing caller unaffected. Every instrument in InstIDs, and BTC's own
+	// reference series, are read from this one exchange; a run cannot mix exchanges (matching how
+	// every other per-exchange concern in this codebase — paper_trading_config, strategy_
+	// assignments, account_equity — is scoped one exchange at a time, migration 000037/000038).
+	Exchange string
+	InstIDs  []string
+	Bars     []string
 	// Kinds to evaluate. Empty means every registered strategy kind — appropriate for the dataset,
 	// where no capital is at risk, unlike the live roster which is deliberately small.
 	Kinds []string
@@ -160,11 +167,6 @@ type KindStats struct {
 // CandleSource reads stored history. Narrower than port.Repository on purpose: a dataset builder
 // must not be able to open an order, and the type system should enforce that rather than the
 // implementation being careful — the same reasoning as §17's HistoryCandleFetcher.
-//
-// The exchange parameter exists only to keep this interface structurally satisfied by
-// port.Repository's implementation (migration 000038, 2026-09-22) — the backtest/warm-start
-// package is OKX-only (docs/RL_V8_PLAN.md), so loadCandles below always passes "okx" and this
-// package has no multi-exchange concern of its own.
 type CandleSource interface {
 	ListCandlesRange(ctx context.Context, exchange, instID, bar string, from, to time.Time, limit int) ([]port.Candle, error)
 	CandleRange(ctx context.Context, exchange, instID, bar string) (oldest, newest time.Time, err error)
@@ -176,13 +178,20 @@ type Sink interface {
 	Write(Sample) error
 }
 
-// loadCandles reads a full range in pages, oldest first.
-func loadCandles(ctx context.Context, src CandleSource, instID, bar string, from, to time.Time) ([]domain.Candle, error) {
+// loadCandles reads a full range in pages, oldest first. exchange defaults to "okx" when empty —
+// this package started OKX-only (docs/RL_V8_PLAN.md's warm-start dataset), and the default keeps
+// every existing caller (cmd/backtest) byte-identical while a caller that DOES care about a
+// second exchange (the strategy optimizer, 2026-09-27 — "هرچی که میسازیم باید برای تمام صرافی ها
+// کار بکنه") can set Config.Exchange explicitly.
+func loadCandles(ctx context.Context, src CandleSource, exchange, instID, bar string, from, to time.Time) ([]domain.Candle, error) {
+	if exchange == "" {
+		exchange = "okx"
+	}
 	const page = 5000
 	var out []domain.Candle
 	cursor := from
 	for {
-		rows, err := src.ListCandlesRange(ctx, "okx", instID, bar, cursor, to, page)
+		rows, err := src.ListCandlesRange(ctx, exchange, instID, bar, cursor, to, page)
 		if err != nil {
 			return nil, err
 		}

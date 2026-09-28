@@ -52,7 +52,11 @@ export type PositionMode = 'paper' | 'bot' | 'manual'
 // trading). 'okx' is the original, always-on instance; new entries are just data, no schema
 // change needed to add one. Kept as a literal union (not a bare string) so the Paper page's
 // profile selector has a closed, typo-proof set to render tabs from.
-export const PAPER_PROFILES = ['okx', 'mexc_100x_1'] as const
+//
+// 'mexc_100x_1' was a mistake from the session that introduced this (it invented a fake third
+// "exchange" instead of just labeling this the mexc paper-trading profile it actually is) and was
+// corrected to plain 'mexc' the same day, with every already-written DB row migrated to match.
+export const PAPER_PROFILES = ['okx', 'mexc'] as const
 export type PaperProfile = (typeof PAPER_PROFILES)[number]
 
 // discoveryExchangeFor maps a paper-trading PROFILE label (paper_orders.exchange /
@@ -62,10 +66,13 @@ export type PaperProfile = (typeof PAPER_PROFILES)[number]
 // one place that translation lives, so Manage Strategies/Manage Tokens (and any future caller)
 // never hardcode a profile-label-to-exchange-name mapping of their own — a future profile just
 // adds one entry here, matching the operator's "same interface/port mechanism, easy for future
-// exchanges" instruction (2026-09-22).
+// exchanges" instruction (2026-09-22). Identity for both entries today since every profile
+// currently IS its own real exchange; a future config-variant profile on top of an existing
+// exchange (e.g. 'mexc_no_early_close') is exactly why this stays a lookup rather than the label
+// itself.
 export const PAPER_PROFILE_EXCHANGE: Record<string, string> = {
   okx: 'okx',
-  mexc_100x_1: 'mexc',
+  mexc: 'mexc',
 }
 export function discoveryExchangeFor(profile: string | undefined): string {
   return PAPER_PROFILE_EXCHANGE[profile ?? 'okx'] ?? 'okx'
@@ -76,7 +83,7 @@ export function discoveryExchangeFor(profile: string | undefined): string {
 // known (2026-09-08). A 'closing' order is still an OPEN position — the close is only recorded once
 // the exchange confirms the flatten filled, so a failed close leaves a row visibly stuck in
 // 'closing' rather than one that claims to be flat.
-export type OrderStatus = 'pending' | 'opening' | 'partial' | 'filled' | 'closing' | 'canceled'
+export type OrderStatus = 'pending' | 'opening' | 'partial' | 'filled' | 'closing' | 'canceled' | 'untracked'
 // 'rl_early' is the model choosing to close a position before either SL or TP was touched
 // (CLAUDE.md §15.12's early-close action, gated behind paper_trading.rl_early_close).
 export type CloseReason = 'sl' | 'tp' | 'manual' | 'timeout' | 'rl_early'
@@ -145,7 +152,7 @@ export interface Position {
   LastErrorAt: string | null
   // Which paper-trading profile this row belongs to (2026-09-22, multi-exchange paper trading) —
   // 'okx' for every pre-existing row and the default instance; a second profile like
-  // 'MEXC_100x_1' is its own fully isolated account/config/strategy-assignment set. Always 'okx'
+  // 'mexc' is its own fully isolated account/config/strategy-assignment set. Always 'okx'
   // for bot/manual rows (their tables have no exchange column at all).
   Exchange: PaperProfile | string
 }
@@ -209,50 +216,59 @@ export interface ParamChange {
   CreatedAt: string
 }
 
-// Independent strategy-tester service (2026-08-30 request) — proxied through cmd/api's
-// /api/tester/* routes. Its own JSON uses camelCase (unlike the rest of this file, which mirrors
-// Go's PascalCase field names directly) because cmd/strategy-tester's response is forwarded
-// byte-for-byte rather than re-decoded/re-encoded by cmd/api.
-export interface TesterVersionStats {
-  signalCount: number
-  wins: number
-  losses: number
-  tpCloses: number
-  slCloses: number
-  openCount: number
-  winRatePct: string
-  realizedPnl: string
-}
-
-export interface TesterVersion {
+// Strategy backtest/optimize pipeline (rebuilt 2026-09-27, replacing the removed
+// cmd/strategy-tester above) — proxied through cmd/api's /api/optimizer/* routes.
+export interface OptimizerCandidate {
   id: number
   kind: string
-  version: number
-  displayName: string
-  config: Record<string, number> | null
-  // Every tunable param's actual running value (overrides merged onto factory defaults) — use
-  // this for a compare/diff view, not `config`, which is empty whenever a version overrides
-  // nothing and would otherwise make every param look like it changed from nothing.
-  effectiveConfig: Record<string, number> | null
-  parentVersionId: number | null
-  enabled: boolean
-  // "origin" | "manual" | "optimizer" — distinguishes the seeded default, an operator's panel
-  // edit, and the automatic optimizer loop's own proposal (2026-08-31).
-  source: string
-  stats: TesterVersionStats
-}
-
-export interface TesterVersionDetail {
-  version: TesterVersion
-  parent?: TesterVersion
-}
-
-export interface TesterConfig {
+  instId: string
   bar: string
-  instIds: string[]
-  notionalUsd: string
-  leverage: string
-  maxOpenDuration: string // Go duration string, e.g. "6h"
+  exchange: string
+  riskProfile: string
+  leverage: number
+  displayName: string
+  status: 'proposed' | 'backtesting' | 'backtest_rejected' | 'backtest_passed' | 'paper_active' | 'paper_replaced'
+  source: 'origin' | 'manual' | 'optimizer'
+  generation: number
+  backtestUpdates: number
+  paperUpdates: number
+  backtestTradeCount?: number
+  backtestWinRatePct?: string
+  backtestRealizedPnl?: string
+  backtestResets?: number
+  backtestSignificanceT?: string
+  backtestRejectReason?: string
+  // The real span of historical candles replayed for this backtest — "over how many days was
+  // this PnL earned", not when the backtest itself ran.
+  backtestFrom?: string
+  backtestTo?: string
+  strategyId?: number
+}
+
+export interface OptimizerValidationConfig {
+  riskProfile: string
+  minTrades: number
+  minWinRatePct: string
+  minRealizedPnL: string
+  minSignificanceT: string
+  maxResets: number
+  backtestLookback: string
+}
+
+// What every backtest's PnL is actually measured against — GET /api/optimizer/backtest-capital.
+export interface OptimizerBacktestCapital {
+  initialUsd: string
+  maxPositionPct: string
+  positionCapitalUsd: string
+}
+
+export interface OptimizerLineageStatus {
+  Kind: string
+  InstID: string
+  Bar: string
+  Exchange: string
+  RiskProfile: string
+  inFlightCandidateId?: number
 }
 
 // Paper-trading control box + stats box (2026-09-01 request), proxied/read through cmd/api's

@@ -594,6 +594,25 @@ pre.logs {
   color: var(--text-dim);
 }
 
+/* Backtest vs. Live column groups on the Strategy Optimizer's Active tab (2026-09-28) — a
+   distinct accent color per group, carried faintly into every cell beneath it, so the eye can
+   tell "this number describes the backtest that got it promoted" from "this number is happening
+   right now" without re-reading the header row on every glance. */
+.col-group-backtest {
+  color: var(--accent);
+  text-shadow: 0 0 8px rgba(88, 166, 255, 0.45);
+}
+.col-group-live {
+  color: #d2a8ff;
+  text-shadow: 0 0 8px rgba(210, 168, 255, 0.45);
+}
+.col-cell-backtest {
+  background: rgba(88, 166, 255, 0.06);
+}
+.col-cell-live {
+  background: rgba(210, 168, 255, 0.06);
+}
+
 .sort-arrow {
   margin-left: 0.25rem;
   font-size: 0.7rem;

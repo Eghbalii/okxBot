@@ -38,10 +38,45 @@ type tickEvent struct {
 // unrealized PnL client-side from entry_px/size/leverage rather than polling REST for it. Same
 // "type" discriminator convention as usecase.PaperOrderEvent so the panel can tell the two kinds of
 // message on this one socket apart.
+//
+// Exchange was added 2026-09-23 alongside the MEXC price consumer below — this project's own short
+// symbols (SOL, AVAX, XRP, DOGE, ...) are traded on BOTH exchanges under the same short instId, so
+// broadcasting price ticks with no exchange tag would make the panel's live-price map ambiguous the
+// moment both an OKX and a MEXC position exist for the same token at once, silently showing one
+// exchange's price on the other's row. Omitted (empty string) means "okx", matching every other
+// exchange-scoped field's convention across this codebase (candles.exchange, paper_orders.exchange).
 type priceUpdate struct {
-	Type   string `json:"type"` // "price"
-	InstID string `json:"instId"`
-	Price  string `json:"price"`
+	Type     string `json:"type"` // "price"
+	InstID   string `json:"instId"`
+	Price    string `json:"price"`
+	Exchange string `json:"exchange,omitempty"`
+}
+
+// runPriceBridge consumes one exchange's tickers topic and broadcasts a reshaped priceUpdate to
+// every connected panel client, tagged with exchange (empty for OKX, matching every other
+// exchange-scoped field's "empty means okx" convention). Shared by the OKX and MEXC wiring below so
+// the reshape/tag logic can never drift between the two — before this existed as a shared function,
+// only the OKX topic was ever consumed at all, and a MEXC position's live price/PnL on the panel
+// simply never updated (found 2026-09-23, right after the same gap was fixed for the candle chart).
+// Runs until ctx is done; Consumer.Run already stops on cancellation (internal/kafkastream), so the
+// caller does not need to track or close the underlying consumer separately.
+func runPriceBridge(ctx context.Context, brokers []string, topic, consumerGroup, exchange string, srv *api.Server, logger *slog.Logger) {
+	consumer := kafkastream.NewConsumer(brokers, topic, consumerGroup)
+	err := consumer.Run(ctx, func(_ context.Context, data []byte) error {
+		var tick tickEvent
+		if err := json.Unmarshal(data, &tick); err != nil {
+			return nil // malformed tick: skip rather than fail the whole consumer loop
+		}
+		out, err := json.Marshal(priceUpdate{Type: "price", InstID: tick.InstID, Price: tick.Last, Exchange: exchange})
+		if err != nil {
+			return nil
+		}
+		srv.Broadcast(out)
+		return nil
+	})
+	if err != nil && ctx.Err() == nil {
+		logger.Error("prices consumer exited", "topic", topic, "error", err)
+	}
 }
 
 // candleEvent is the ingestor's own Kafka payload for one candle push (the OKX wire shape: a string
@@ -64,17 +99,60 @@ type candleEvent struct {
 // with the exchange's own numbers.
 //
 // Confirmed is passed through so the panel can tell a still-forming bar from a closed one.
+//
+// Exchange added 2026-09-23, same reasoning/pattern as priceUpdate's own Exchange field: this
+// bridge only ever consumed okx.candles.<bar>, so a MEXC chart's history loaded correctly (once the
+// REST endpoint was fixed to accept ?exchange=) but the live/forming candle never updated and never
+// rolled onto the next bar when one closed — runCandleBridge below is the same fix as
+// runPriceBridge, applied to the topic this struct backs.
 type candleUpdate struct {
 	Type      string `json:"type"` // "candle"
 	InstID    string `json:"instId"`
 	Bar       string `json:"bar"`
-	Timestamp string `json:"ts"` // epoch ms, as OKX sends it
+	Timestamp string `json:"ts"` // epoch ms — both OKX and MEXC publish this in ms
 	Open      string `json:"open"`
 	High      string `json:"high"`
 	Low       string `json:"low"`
 	Close     string `json:"close"`
 	Volume    string `json:"volume"`
 	Confirmed bool   `json:"confirmed"`
+	Exchange  string `json:"exchange,omitempty"`
+}
+
+// runCandleBridge is candleUpdate's counterpart to runPriceBridge above — same shared-function
+// reasoning: one consumer per (exchange, bar) topic, reshaped and broadcast identically regardless
+// of which exchange it came from, so the decode/tag logic cannot drift between OKX's and MEXC's
+// wiring.
+func runCandleBridge(ctx context.Context, brokers []string, topic, consumerGroup, exchange string, srv *api.Server, logger *slog.Logger, bar string) {
+	consumer := kafkastream.NewConsumer(brokers, topic, consumerGroup)
+	err := consumer.Run(ctx, func(_ context.Context, data []byte) error {
+		var ev candleEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil // malformed: skip rather than fail the consumer loop
+		}
+		// [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm] — cmd/ingestor/mexc.go's
+		// mexcCandleArray mirrors OKX's own wire shape exactly, so this decode needs no
+		// exchange-specific branch. Guard on length rather than assuming: a short array would panic
+		// on index, taking the goroutine (and with it this bar's whole stream) down silently.
+		if len(ev.Candle) < 6 {
+			return nil
+		}
+		out, err := json.Marshal(candleUpdate{
+			Type: "candle", InstID: ev.InstID, Bar: ev.Bar,
+			Timestamp: ev.Candle[0], Open: ev.Candle[1], High: ev.Candle[2],
+			Low: ev.Candle[3], Close: ev.Candle[4], Volume: ev.Candle[5],
+			Confirmed: ev.Candle[len(ev.Candle)-1] == "1",
+			Exchange:  exchange,
+		})
+		if err != nil {
+			return nil
+		}
+		srv.Broadcast(out)
+		return nil
+	})
+	if err != nil && ctx.Err() == nil {
+		logger.Error("candles consumer exited", "bar", bar, "topic", topic, "error", err)
+	}
 }
 
 // bookLevel mirrors one row of OKX's books5 payload: [price, size, deprecated, numOrders]. Decoded
@@ -152,7 +230,7 @@ func main() {
 		Repo:                   repo,
 		RLBaseURL:              cfg.RLService.URL,
 		GrafanaURL:             cfg.API.GrafanaURL,
-		TesterBaseURL:          cfg.Tester.URL,
+		OptimizerBaseURL:       cfg.StrategyOptimizer.ServiceURL,
 		PaperTraderBaseURL:     cfg.PaperTrading.URL,
 		PaperTraderProfileURLs: parsePaperTraderProfileURLs(os.Getenv("PAPER_TRADER_PROFILE_URLS")),
 		TraderBaseURL:          cfg.Trading.URL,
@@ -243,66 +321,29 @@ func main() {
 	// own "paper-trader" group on the same okx.tickers topic, so this never competes for offsets or
 	// skips messages paper-trader also needs. Reshaped to {type,instId,price} rather than forwarded
 	// as OKX's raw wire payload, so the panel doesn't need to know OKX's ticker JSON shape.
-	pricesConsumer := kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.tickers", "api-ws-bridge-tickers")
-	go func() {
-		err := pricesConsumer.Run(ctx, func(_ context.Context, data []byte) error {
-			var tick tickEvent
-			if err := json.Unmarshal(data, &tick); err != nil {
-				return nil // malformed tick: skip rather than fail the whole consumer loop
-			}
-			out, err := json.Marshal(priceUpdate{Type: "price", InstID: tick.InstID, Price: tick.Last})
-			if err != nil {
-				return nil
-			}
-			srv.Broadcast(out)
-			return nil
-		})
-		if err != nil && ctx.Err() == nil {
-			logger.Error("prices consumer exited", "error", err)
-		}
-	}()
+	//
+	// A SECOND price consumer for mexc.tickers was added 2026-09-23 — found live: the panel's chart
+	// was fixed to read MEXC candles correctly, but the positions table's live price/PnL still
+	// showed nothing for a MEXC position, because this bridge only ever consumed OKX's own topic.
+	// runPriceBridge is shared between the two so the reshape/broadcast logic (and the exchange tag
+	// on the outgoing message, priceUpdate's own doc comment) can never drift between them.
+	go runPriceBridge(ctx, cfg.Kafka.Brokers, "okx.tickers", "api-ws-bridge-tickers", "", srv, logger)
+	go runPriceBridge(ctx, cfg.Kafka.Brokers, "mexc.tickers", "api-ws-bridge-tickers-mexc", "mexc", srv, logger)
 
-	// Live candles per configured timeframe, so the chart renders the forming bar from OKX's own
-	// OHLC instead of reconstructing it from ticks (see candleUpdate above). One consumer per bar
-	// because each timeframe is its own topic (CLAUDE.md §12), each with its own group so none of
-	// them competes for offsets with paper-trader's.
+	// Live candles per configured timeframe, so the chart renders the forming bar from the
+	// exchange's own OHLC instead of reconstructing it from ticks (see candleUpdate above). One
+	// consumer per (exchange, bar) — each timeframe is its own topic per exchange (CLAUDE.md §12),
+	// each with its own group so none of them competes for offsets with paper-trader's.
+	//
+	// The MEXC loop was added 2026-09-23 — same gap and same fix as runPriceBridge just above: this
+	// bridge only ever consumed okx.candles.<bar>, so a MEXC chart's live/forming candle never
+	// updated even after the REST history endpoint was fixed. cmd/api only loads config.yaml (OKX's
+	// own), never config.mexc.yaml, so this reuses cfg.Ingestion.Bars for MEXC's topics too — both
+	// ingestors are deployed with the same bar list (5m/15m/1H/4H/1D); a bar MEXC doesn't actually
+	// publish is a silent no-op on that one topic, not an error.
 	for _, bar := range cfg.Ingestion.Bars {
-		bar := bar
-		c := kafkastream.NewConsumer(cfg.Kafka.Brokers, "okx.candles."+bar, "api-ws-bridge-candles-"+bar)
-		go func() {
-			err := c.Run(ctx, func(_ context.Context, data []byte) error {
-				var ev candleEvent
-				if err := json.Unmarshal(data, &ev); err != nil {
-					return nil // malformed: skip rather than fail the consumer loop
-				}
-				// OKX sends [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]. Guard on length
-				// rather than assuming: a short array would panic on index, taking the goroutine
-				// (and with it this bar's whole stream) down silently.
-				if len(ev.Candle) < 6 {
-					return nil
-				}
-				out, err := json.Marshal(candleUpdate{
-					Type:      "candle",
-					InstID:    ev.InstID,
-					Bar:       ev.Bar,
-					Timestamp: ev.Candle[0],
-					Open:      ev.Candle[1],
-					High:      ev.Candle[2],
-					Low:       ev.Candle[3],
-					Close:     ev.Candle[4],
-					Volume:    ev.Candle[5],
-					Confirmed: ev.Candle[len(ev.Candle)-1] == "1",
-				})
-				if err != nil {
-					return nil
-				}
-				srv.Broadcast(out)
-				return nil
-			})
-			if err != nil && ctx.Err() == nil {
-				logger.Error("candles consumer exited", "bar", bar, "error", err)
-			}
-		}()
+		go runCandleBridge(ctx, cfg.Kafka.Brokers, "okx.candles."+bar, "api-ws-bridge-candles-"+bar, "", srv, logger, bar)
+		go runCandleBridge(ctx, cfg.Kafka.Brokers, "mexc.candles."+bar, "api-ws-bridge-candles-mexc-"+bar, "mexc", srv, logger, bar)
 	}
 
 	// Live order book (docs/MANUAL_TRADE_PLAN.md §7) — books5 snapshots for every configured
@@ -345,7 +386,10 @@ func main() {
 		<-ctx.Done()
 		srv.CloseWS()
 		_ = orderEventsConsumer.Close()
-		_ = pricesConsumer.Close()
+		// The price bridges (runPriceBridge, one per exchange) own and close their own Consumer
+		// internally on ctx.Done() — same as the per-bar candle consumers just below, which were
+		// never threaded through this explicit-close list either; Consumer.Run already stops on
+		// context cancellation (internal/kafkastream), so an explicit Close here would be redundant.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
@@ -360,7 +404,7 @@ func main() {
 
 // parsePaperTraderProfileURLs parses PAPER_TRADER_PROFILE_URLS, a comma-separated list of
 // "<exchange-label>=<base-url>" pairs (2026-09-22, multi-exchange paper trading) — e.g.
-// "MEXC_100x_1=http://paper-trader-mexc:8098". Deliberately a single generic env var rather than
+// "mexc=http://paper-trader-mexc:8098". Deliberately a single generic env var rather than
 // one new env var per profile: any future config-variant paper-trading experiment (a different
 // exchange, or the same exchange with a different flag set) is just another entry here, with no
 // code change needed to support it. A malformed entry (no "=", empty key) is skipped rather than

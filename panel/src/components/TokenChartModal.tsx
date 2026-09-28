@@ -53,6 +53,7 @@ function availableChartHeight(): number {
 export default function TokenChartModal({
   instId: initialInstId,
   mode,
+  exchange,
   positions,
   livePrices,
   onClose,
@@ -60,6 +61,11 @@ export default function TokenChartModal({
   /** Token the chart opens on; the strip can switch to another without closing the modal. */
   instId: string
   mode: PositionMode
+  /** Which paper-trading profile's candles to read (CLAUDE.md, multi-exchange paper trading) —
+   *  "okx"/undefined for the default instance, "mexc" for the second one. Without this the chart
+   *  always queried the OKX-only default and showed "no candle data" for every non-OKX token, even
+   *  though the candles table held real history for it under a different `exchange` value. */
+  exchange?: string
   positions: Position[]
   /** instId -> last traded price, from the page's existing socket (CLAUDE.md §11.4). */
   livePrices: Record<string, string>
@@ -87,12 +93,12 @@ export default function TokenChartModal({
   // refetchMs keeps the original behaviour of picking up a bar that closes while the modal is open.
   // maxAgeMs is deliberately shorter than that interval so a revisit after a while still
   // revalidates promptly, while a rapid back-and-forth between two positions serves from cache.
-  const seriesKey = `candles:${instId}:${bar}`
+  const seriesKey = `candles:${exchange ?? 'okx'}:${instId}:${bar}`
   const {
     data: candles,
     error,
     loading: candlesLoading,
-  } = useCachedResource(seriesKey, () => api.candles({ instId, bar, limit: 500 }), {
+  } = useCachedResource(seriesKey, () => api.candles({ instId, bar, limit: 500, exchange }), {
     maxAgeMs: 30_000,
     refetchMs: CANDLE_REFETCH_MS,
   })
@@ -100,7 +106,7 @@ export default function TokenChartModal({
   // Folds OKX's own live candle pushes into the series (over the same WebSocket the price comes
   // from), so the forming bar carries the exchange's real OHLC instead of extremes reconstructed
   // from whichever ticks this browser happened to receive.
-  const liveCandles = useLiveCandles(candles, instId, bar)
+  const liveCandles = useLiveCandles(candles, instId, bar, exchange || 'okx')
 
   // Closed orders are filtered to the chart's own timeframe: a 1H order's entry sits at a
   // timestamp the 5m candles never had, so its marker would land on the wrong candle.

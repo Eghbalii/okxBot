@@ -697,6 +697,13 @@ type Repository interface {
 	ListAssignments(ctx context.Context, instID string, enabledOnly bool, mode, exchange string) ([]StrategyAssignment, error)
 	SetAssignmentEnabled(ctx context.Context, id int64, enabled bool) error
 	DeleteAssignment(ctx context.Context, id int64) error
+	// DisableOriginAssignments disables every currently-enabled assignment for mode whose strategy
+	// is an ORIGIN row (strategies.is_origin), across every exchange — the backtest/optimize
+	// pipeline (CLAUDE.md 2026-09-28) never assigns an origin directly, only a promoted clone, so
+	// this is how "stop trading on the old, untuned strategies, only run pipeline-promoted ones"
+	// is enforced without deleting anything (origins and their history stay in the database,
+	// matching this project's own never-delete convention — they just stop opening new positions).
+	DisableOriginAssignments(ctx context.Context, mode string) (int, error)
 
 	// StrategyStatsFor computes strategyID's track record for mode ("paper" or "bot") and, for
 	// mode="paper", exchange (2026-09-22, multi-exchange paper trading) — CLAUDE.md §11.3,
@@ -1006,7 +1013,7 @@ type Repository interface {
 	ListEquityHistoryEx(ctx context.Context, mode, exchange string, since time.Time, limit int) ([]EquityPoint, error)
 	// SetAccountCapEx is the exchange-scoped sibling of SetAccountCap above (2026-09-22), used by
 	// cmd/api's panel-triggered "Set Trading Cap" control (handleSetAccountCap) so an operator can
-	// seed/re-baseline a second paper-trading profile's balance (e.g. "MEXC_100x_1") the same way
+	// seed/re-baseline a second paper-trading profile's balance (e.g. "mexc") the same way
 	// they already can for the OKX one — same semantics, same reason="reset" history point, just
 	// scoped to a second, isolated account_equity row. exchange="" behaves exactly like
 	// SetAccountCap (defaults to "okx"), so every existing panel call is unaffected.

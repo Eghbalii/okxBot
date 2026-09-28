@@ -159,19 +159,34 @@ func runMEXCIngestor(ctx context.Context, stop context.CancelFunc, cfg *config.C
 					logger.Warn("failed to decode mexc kline payload", "bar", bar, "error", err)
 					return
 				}
-				// MEXC has no "this bar is closed" flag (unlike OKX's confirm=1) — the finalizer
-				// infers closure by observing a push for a newer bar's open time and returns the
-				// PREVIOUS, now-complete bar exactly once (mexcws.KlineFinalizer's own doc
-				// comment). Every push before that is the bar still forming and is correctly
-				// dropped here — publishing it would re-evaluate strategies on an unfinished
-				// candle (CLAUDE.md §14).
-				finalized, ok := finalizer.Observe(sym, interval, c)
-				if !ok {
-					return
+				// Publish EVERY push, exactly like the OKX branch above does (its Handler calls
+				// pub.Publish unconditionally on every WS message, forming bars included) — found
+				// 2026-09-23: the previous version of this handler only published once a bar had
+				// closed, which made the panel's live-candle WebSocket chart (cmd/api's
+				// runCandleBridge) receive nothing for MEXC between bar closes, unlike OKX's chart
+				// which updates continuously from confirm=0 pushes. The strategy-evaluation concern
+				// that motivated the original design (CLAUDE.md §14: publishing a forming bar must
+				// not re-evaluate strategies on it) is handled downstream by
+				// PaperTrader.handleCandle's own Confirmed check, not by withholding the publish —
+				// same division of responsibility OKX's ingestor already uses.
+				//
+				// MEXC has no "this bar is closed" flag on the wire (unlike OKX's confirm=1), so
+				// Observe still does the one thing only it can: infer closure by noticing a push for
+				// a NEWER bar's open time, in which case it hands back the PREVIOUS (now-complete)
+				// bar. That previous bar is published here as confirm=1 BEFORE this push's own
+				// still-forming candle is published as confirm=0 — the strict order a chart/consumer
+				// needs to see "bar N finalized" ahead of "bar N+1 started forming".
+				if prev, closed := finalizer.Observe(sym, interval, c); closed {
+					finalEvent := candleEvent{InstID: sym, Bar: bar, Candle: mexcCandleArray(prev, true)}
+					if err := pub.Publish(ctx, sym, finalEvent); err != nil {
+						logger.Warn("failed to publish finalized candle to kafka", "bar", bar, "error", err)
+					} else {
+						metrics.IngestorEventsTotal.WithLabelValues("candle", sym).Inc()
+					}
 				}
-				event := candleEvent{InstID: sym, Bar: bar, Candle: mexcCandleArray(finalized)}
-				if err := pub.Publish(ctx, sym, event); err != nil {
-					logger.Warn("failed to publish candle to kafka", "bar", bar, "error", err)
+				formingEvent := candleEvent{InstID: sym, Bar: bar, Candle: mexcCandleArray(c, false)}
+				if err := pub.Publish(ctx, sym, formingEvent); err != nil {
+					logger.Warn("failed to publish forming candle to kafka", "bar", bar, "error", err)
 					return
 				}
 				metrics.IngestorEventsTotal.WithLabelValues("candle", sym).Inc()
@@ -201,21 +216,26 @@ func runMEXCIngestor(ctx context.Context, stop context.CancelFunc, cfg *config.C
 
 // mexcCandleArray builds usecase.decodeCandle's exact expected raw array layout
 // (internal/usecase/tickfeed.go: index 0=ts_ms, 1=open, 2=high, 3=low, 4=close, 5=volume, index 8
-// (if present)="1" means confirmed/finalized) from a finalized domain.Candle. Indices 6-7 (OKX's
-// own volCcy/volCcyQuote fields) have no MEXC equivalent and are left empty — decodeCandle never
-// reads them, only checks len(...) >= 6 for the fields this function fills and len(...) >= 9 for
-// the optional confirm flag at index 8.
+// (if present)="1" means confirmed/finalized) from a domain.Candle. Indices 6-7 (OKX's own
+// volCcy/volCcyQuote fields) have no MEXC equivalent and are left empty — decodeCandle never reads
+// them, only checks len(...) >= 6 for the fields this function fills and len(...) >= 9 for the
+// optional confirm flag at index 8.
 //
-// confirm is always "1" here because this is only ever called with a candle the finalizer has
-// already confirmed closed (mexcws.KlineFinalizer.Observe's ok=true case) — MEXC's own wire
-// protocol has no partial/forming-bar equivalent to publish in the first place, unlike OKX which
-// pushes confirm=0 for the still-forming bar on the same event shape.
-func mexcCandleArray(c domain.Candle) []string {
+// confirm is now the caller's own decision (2026-09-23, was always hardcoded "1"): the ingestor
+// publishes every forming push too (confirm=false), matching OKX's own confirm=0 wire behavior, so
+// the panel's live-candle chart updates continuously instead of only once per bar close — see the
+// call sites' own comments for why withholding the publish was the wrong place to prevent
+// re-evaluating strategies on an unfinished candle.
+func mexcCandleArray(c domain.Candle, confirm bool) []string {
+	confirmStr := "0"
+	if confirm {
+		confirmStr = "1"
+	}
 	return []string{
 		strconv.FormatInt(c.Timestamp.UnixMilli(), 10),
 		c.Open.String(), c.High.String(), c.Low.String(), c.Close.String(), c.Volume.String(),
 		"", "", // indices 6-7: OKX's volCcy/volCcyQuote, no MEXC equivalent, unread by decodeCandle
-		"1", // index 8: confirm flag — always finalized by the time this is built
+		confirmStr, // index 8: confirm flag
 	}
 }
 

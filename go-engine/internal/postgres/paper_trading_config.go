@@ -131,12 +131,32 @@ func (r *Repository) SetAssignmentsEnabledForKinds(ctx context.Context, mode, ex
 	if exchange == "" {
 		exchange = "okx"
 	}
-	_, err := r.pool.Exec(ctx, `
+
+	// In paper mode, origin-strategy rows are excluded entirely (2026-09-28) — the backtest/
+	// optimize pipeline now owns which strategy trades each (token, bar) in paper mode, disabling
+	// every origin assignment once a real tuned candidate exists to replace it (optimizer.Promote/
+	// DisableOriginAssignments). Before this exclusion, this function's own UPDATE re-enabled every
+	// origin row whose kind appeared in activeKinds on EVERY cmd/paper-trader restart (activeKinds
+	// is a coarse per-kind allowlist that has nothing to do with origin-vs-promoted, so it matched
+	// origins indiscriminately), and its INSERT could even create a brand-new origin assignment
+	// for a (kind, inst, bar) that already had a real promoted clone — because the ON CONFLICT
+	// target is keyed by strategy_id, and a clone always has a DIFFERENT strategy_id than its
+	// origin, so the conflict never fired. Together these silently reverted the pipeline's cleanup
+	// on every single restart, which is why paper positions kept opening under old strategy names
+	// no matter how many times the origin assignments were disabled by hand or by the pipeline.
+	// mode="bot" (real trading) has no such pipeline yet and still needs this function's original
+	// bootstrap behavior, so only paper mode gets the exclusion.
+	originClause := ""
+	if mode == "paper" {
+		originClause = "AND NOT s.is_origin"
+	}
+
+	_, err := r.pool.Exec(ctx, fmt.Sprintf(`
 		UPDATE strategy_assignments
 		SET enabled = (s.kind = ANY($1)), updated_at = now()
 		FROM strategies s
-		WHERE strategy_assignments.strategy_id = s.id AND strategy_assignments.mode = $2 AND strategy_assignments.exchange = $3
-	`, activeKinds, mode, exchange)
+		WHERE strategy_assignments.strategy_id = s.id AND strategy_assignments.mode = $2 AND strategy_assignments.exchange = $3 %s
+	`, originClause), activeKinds, mode, exchange)
 	if err != nil {
 		return fmt.Errorf("set assignments enabled for kinds %v (mode %s, exchange %s): %w", activeKinds, mode, exchange, err)
 	}
@@ -153,7 +173,10 @@ func (r *Repository) SetAssignmentsEnabledForKinds(ctx context.Context, mode, ex
 	// ON CONFLICT would otherwise re-enable a per-token assignment an operator had deliberately
 	// turned off from the Strategies page, which is a different setting from this global per-kind
 	// switch and must not be overwritten by it.
-	if len(instIDs) == 0 || len(bars) == 0 {
+	//
+	// Skipped entirely in paper mode (2026-09-28, same reasoning as above): creating a fresh origin
+	// assignment here is exactly what let a fully-cleaned-up lineage silently regrow one.
+	if mode == "paper" || len(instIDs) == 0 || len(bars) == 0 {
 		return nil
 	}
 	_, err = r.pool.Exec(ctx, `

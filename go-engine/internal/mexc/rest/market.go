@@ -131,6 +131,49 @@ func (c *Client) GetCandles(instID, bar string, limit int) ([]domain.Candle, err
 	return candles, nil
 }
 
+// GetCandlesRange fetches every candle in [start, end) for one instrument/timeframe, oldest-first.
+//
+// This is the ranged counterpart to GetCandles (which only ever asks for "the most recent N" via a
+// derived start time). It exists for historical backfill/backtest data collection
+// (go-engine/tools/candlefetch) — a genuine, ongoing capability, not a one-off script, so it lives
+// here beside GetCandles rather than being built ad hoc by a caller reaching into doPublic.
+//
+// Deliberately MEXC-only: this project explicitly removed its OKX equivalent (the
+// GET /market/history-candles endpoint) and the operator instruction backing that removal was that
+// it must never be called again (CLAUDE.md §33.5/§17's own history) — nothing in this codebase
+// should grow a new OKX call to that endpoint under a different name. MEXC's plain
+// /api/v1/contract/kline/{symbol} endpoint takes a start/end window directly and has no such
+// history attached to it.
+//
+// A single call may not return the whole window — MEXC's kline endpoint has an undocumented
+// practical cap on how many bars one response carries (observed empirically, not stated in any
+// doc). Paging is the caller's job (see tools/candlefetch), not this method's: GetCandlesRange
+// always returns exactly what MEXC sent for [start, end), and a caller wanting a wider span than one
+// response covers must page by advancing start past the last returned candle's timestamp.
+func (c *Client) GetCandlesRange(instID, bar string, start, end time.Time) ([]domain.Candle, error) {
+	interval, ok := IntervalFor(bar)
+	if !ok {
+		return nil, fmt.Errorf("mexc: unsupported bar %q", bar)
+	}
+	params := map[string]string{"interval": interval}
+	if !start.IsZero() {
+		params["start"] = strconv.FormatInt(start.Unix(), 10)
+	}
+	if !end.IsZero() {
+		params["end"] = strconv.FormatInt(end.Unix(), 10)
+	}
+
+	var resp klineResponse
+	if err := c.doPublic("/api/v1/contract/kline/"+instID, params, &resp); err != nil {
+		return nil, fmt.Errorf("mexc get candles range %s %s: %w", instID, bar, err)
+	}
+	candles, err := resp.toCandles()
+	if err != nil {
+		return nil, fmt.Errorf("mexc get candles range %s %s: %w", instID, bar, err)
+	}
+	return candles, nil
+}
+
 // contractDetail is /api/v1/contract/detail's data object — the contract-shape metadata required to
 // convert a notional size into a valid contract count before placing an order.
 //

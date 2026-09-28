@@ -357,7 +357,7 @@ func (r *Repository) AdjustAccountCap(ctx context.Context, mode string, deltaUSD
 
 // AdjustAccountCapEx is the exchange-scoped sibling of AdjustAccountCap above (2026-09-22,
 // multi-exchange paper trading) — used by MarketScanner's per-token top-up so a second
-// paper-trading profile's (e.g. "mexc_100x_1") own account row grows with ITS OWN newly-admitted
+// paper-trading profile's (e.g. "mexc") own account row grows with ITS OWN newly-admitted
 // tokens, not OKX's. Same precondition as AdjustAccountCap: requires an existing (mode, exchange)
 // row (GetAccountEquityEx must have seeded it first). exchange="" behaves exactly like
 // AdjustAccountCap (defaults to "okx").

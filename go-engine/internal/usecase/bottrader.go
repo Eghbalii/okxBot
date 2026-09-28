@@ -925,7 +925,11 @@ func (e *BotTrader) openBot(
 		return nil, nil
 	}
 
-	paperShaped := buildPaperOrder(e.InstID, price, signal, notional, a.StrategyID, bar)
+	// buildPaperOrder's own Leverage field is discarded below (real trading always uses the model's
+	// own sized leverage, order.Leverage = leverage) — e.MaxLeverage is passed only so the two
+	// buildPaperOrder call sites (this one and PaperTrader's) stay symmetric, not because this path
+	// depends on the value.
+	paperShaped := buildPaperOrder(e.InstID, price, signal, notional, a.StrategyID, bar, e.MaxLeverage)
 	order := port.BotOrder{
 		InstID:     paperShaped.InstID,
 		StrategyID: paperShaped.StrategyID,
@@ -2098,6 +2102,36 @@ func (e *BotTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, log
 		}
 		logger.Error("reconcile: exchange reports an open position this system has no record of",
 			"instId", e.InstID, "remoteSize", remote.Pos, "remoteSide", remote.PosSide)
+		// Halting is not enough on its own — it stops new trading but does nothing to make the
+		// existing position visible to the person who has to decide what to do about it (2026-09-28
+		// request, after a real PUMP position sat invisible on the panel while only a log line and a
+		// halted risk manager recorded it existed at all). Write it as a real bot_orders row so it
+		// shows up on the Positions page exactly like any other open position, status='untracked' so
+		// the panel/operator can tell it apart from one this system actually opened — its entry time,
+		// true open reason, and SL/TP (if any) are unknown, so those fields are left unset rather than
+		// guessed. Best-effort: a write failure must not block the halt above, which is the one action
+		// here that is actually safety-critical.
+		if _, err := e.Repo.OpenBotOrder(ctx, port.BotOrder{
+			InstID:  e.InstID,
+			Side:    untrackedPositionSide(remote),
+			EntryPx: remote.AvgPx,
+			// remote.NotionalUsd is OKX's own LEVERAGED notional (position value at the current
+			// mark, i.e. size * leverage) — the exact field BotOrder.Size must NOT hold, since
+			// every other write path treats Size as margin (the capital actually committed before
+			// leverage, e.g. bottrader.go:1024's order.Size = approved.PositionNotionalUSD.Abs()).
+			// The first version of this fix put the leveraged figure straight into Size, which
+			// read as roughly 5x the real committed capital on the PUMP incident this exists to
+			// fix (reported $10.01 against a real ~$2 margin) — caught only because the operator
+			// checked the exchange directly and it didn't match the account's own sizing rule
+			// (equity / active slots, CLAUDE.md §32.4), which a leveraged figure could never satisfy.
+			Size:     untrackedMargin(remote),
+			Leverage: remote.Lever,
+			OpenedAt: time.Now().UTC(),
+			Status:   "untracked",
+		}); err != nil {
+			logger.Error("reconcile: failed to record untracked position for panel visibility",
+				"instId", e.InstID, "error", err)
+		}
 		e.RiskManager.Halt(fmt.Sprintf("reconcile: untracked open position on %s (exchange reports %s %s)",
 			e.InstID, remote.Pos.String(), remote.PosSide))
 	case remote != nil && len(local) > 0:
@@ -2107,10 +2141,7 @@ func (e *BotTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, log
 		// per trade.go's own long-standing note) — a sign/side mismatch is the concrete, checkable
 		// case worth alerting on now.
 		localSide := local[0].Side
-		remoteSide := "buy"
-		if remote.PosSide == "short" || remote.Pos.IsNegative() {
-			remoteSide = "sell"
-		}
+		remoteSide := untrackedPositionSide(remote)
 		if localSide != remoteSide {
 			logger.Error("reconcile: side mismatch between local record and exchange",
 				"instId", e.InstID, "localSide", localSide, "remoteSide", remoteSide, "remotePosSide", remote.PosSide)
@@ -2203,6 +2234,28 @@ func (e *BotTrader) isOpenInFlight() bool {
 // exchange — the surrounding ReconcileWith needs both. That matters here because this exact
 // decision, made wrongly, halted all real trading for two hours (CLAUDE.md §48), and a regression
 // test should be able to reproduce it directly rather than approximate it.
+// untrackedPositionSide derives "buy"/"sell" from OKX's own position fields — the single
+// definition both reconcile branches (side-mismatch detection and the untracked-position record)
+// read from, so the two can never disagree about which side a given remote position is on.
+func untrackedPositionSide(remote *domain.Position) string {
+	if remote.PosSide == "short" || remote.Pos.IsNegative() {
+		return "sell"
+	}
+	return "buy"
+}
+
+// untrackedMargin converts OKX's own leveraged NotionalUsd back into margin (the capital actually
+// committed, before leverage) — the units port.BotOrder.Size is defined in everywhere else. A
+// zero/non-positive leverage falls back to the notional unconverted rather than dividing by zero;
+// OKX's own position response should never report that for a genuinely open position, but a
+// silent divide-by-zero panic would be a strictly worse failure than one wrong number here.
+func untrackedMargin(remote *domain.Position) decimal.Decimal {
+	if !remote.Lever.IsPositive() {
+		return remote.NotionalUsd
+	}
+	return remote.NotionalUsd.Div(remote.Lever)
+}
+
 func (e *BotTrader) shouldDeferUntrackedHalt(logger *slog.Logger, remote *domain.Position) bool {
 	if !e.isOpenInFlight() {
 		return false

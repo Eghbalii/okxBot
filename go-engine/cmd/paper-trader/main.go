@@ -210,11 +210,11 @@ func main() {
 	// same value cmd/ingestor uses to decide which exchange's market data it publishes — NOT from
 	// this process's own `exchange` (PAPER_EXCHANGE) variable above. The two answer different
 	// questions and must not be conflated: `exchange` is this PROCESS's isolation/comparison label
-	// (e.g. "MEXC_100x_1", scoping account_equity/paper_orders/config rows so two experiments never
-	// share state), while the topic prefix is which REAL exchange's ingestor populated the Kafka
-	// topics this process reads ticks/candles from. Using `exchange` here would have been wrong in
-	// the specific case that motivated this fix: PAPER_EXCHANGE="MEXC_100x_1" is not a valid topic
-	// prefix at all ("MEXC_100x_1.tickers" was never published by anything).
+	// (e.g. "mexc", scoping account_equity/paper_orders/config rows so two experiments never share
+	// state), while the topic prefix is which REAL exchange's ingestor populated the Kafka topics
+	// this process reads ticks/candles from. For a future config-variant experiment on the SAME
+	// exchange (e.g. PAPER_EXCHANGE="mexc_no_early_close") the two would genuinely differ — this is
+	// the specific case that motivated keeping them as two separate values rather than one.
 	//
 	// cmd/ingestor publishes MEXC's own ticks/candles to "mexc.tickers"/"mexc.candles.<bar>" (a
 	// second, independent ingestor instance, INGEST_EXCHANGE=mexc); a paper-trader instance whose

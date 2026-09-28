@@ -409,6 +409,86 @@ func TestReconcile_UntrackedExchangePositionHalts(t *testing.T) {
 	}
 }
 
+// TestReconcile_UntrackedExchangePositionIsRecordedForThePanel is the fix for a real incident
+// (2026-09-28): halting alone stopped new trading but left the untracked position itself
+// completely invisible — nothing wrote a row, so it never reached the Positions page where an
+// operator could actually see and act on it. This asserts the position now gets its own
+// status='untracked' bot_orders row with the exchange's own side/entry/size/leverage, alongside
+// (not instead of) the halt.
+func TestReconcile_UntrackedExchangePositionIsRecordedForThePanel(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		positions: []domain.Position{{
+			InstID: "BTC-USDT-SWAP", Pos: dec("-2"), PosSide: "short",
+			AvgPx: dec("50000"), Lever: dec("10"), NotionalUsd: dec("100"),
+		}},
+		balances: []domain.Balance{{Ccy: "USDT", Eq: dec("1000")}},
+	}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+
+	rt.reconcile(context.Background(), testLogger())
+
+	var found *port.BotOrder
+	for _, o := range repo.realOrders {
+		if o.Status == "untracked" {
+			cp := o
+			found = &cp
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected an untracked bot_orders row to be written, got %d rows: %+v", len(repo.realOrders), repo.realOrders)
+	}
+	if found.Side != "sell" {
+		t.Errorf("Side = %q, want sell (remote reports short/-2)", found.Side)
+	}
+	if !found.EntryPx.Equal(dec("50000")) {
+		t.Errorf("EntryPx = %s, want 50000 (exchange's own avgPx)", found.EntryPx)
+	}
+	if !found.Leverage.Equal(dec("10")) {
+		t.Errorf("Leverage = %s, want 10", found.Leverage)
+	}
+	// Size must be MARGIN (notional / leverage), never the exchange's own leveraged notional
+	// directly — the exact bug a real incident found (2026-09-28): the first version of this fix
+	// wrote NotionalUsd straight into Size, reporting ~5x the real committed capital.
+	if !found.Size.Equal(dec("10")) {
+		t.Errorf("Size = %s, want 10 (notional 100 / leverage 10 = margin, not the raw leveraged notional)", found.Size)
+	}
+	if found.ClosedAt != nil {
+		t.Error("an untracked position must be recorded OPEN, not closed")
+	}
+}
+
+// TestUntrackedMargin_DividesNotionalByLeverage pins the exact fix for the real PUMP incident
+// (2026-09-28): OKX reported NotionalUsd=10.01, Lever=4.88 for a position whose real committed
+// margin was ~$2.05 — the first version of this fix stored the $10.01 figure directly, which read
+// as roughly 5x the real capital and could never have come from this account's own sizing rule
+// (equity / active slots). Uses the exact real-world numbers rather than a round ratio so a
+// regression back to "store NotionalUsd as-is" cannot coincidentally pass.
+func TestUntrackedMargin_DividesNotionalByLeverage(t *testing.T) {
+	remote := &domain.Position{NotionalUsd: dec("10.01"), Lever: dec("4.88")}
+	got := untrackedMargin(remote)
+	want := dec("10.01").Div(dec("4.88"))
+	if !got.Equal(want) {
+		t.Errorf("untrackedMargin() = %s, want %s (10.01 / 4.88)", got, want)
+	}
+	// Sanity: the wrong (pre-fix) answer would have been 10.01 outright — assert we are not that.
+	if got.Equal(dec("10.01")) {
+		t.Error("untrackedMargin() returned the raw leveraged notional unchanged — leverage was not applied")
+	}
+}
+
+// TestUntrackedMargin_NonPositiveLeverageFallsBackToNotional guards the divide-by-zero case: OKX
+// should never report zero/negative leverage for a genuinely open position, but a panic here would
+// be a strictly worse failure than reporting an inflated size for one malformed reading.
+func TestUntrackedMargin_NonPositiveLeverageFallsBackToNotional(t *testing.T) {
+	remote := &domain.Position{NotionalUsd: dec("50"), Lever: dec("0")}
+	got := untrackedMargin(remote)
+	if !got.Equal(dec("50")) {
+		t.Errorf("untrackedMargin() with zero leverage = %s, want 50 (fallback to notional, no panic)", got)
+	}
+}
+
 // TestReconcile_MatchingStateIsANoOp confirms local state agreeing with the exchange produces no
 // close, no halt, and no spurious order.
 func TestReconcile_MatchingStateIsANoOp(t *testing.T) {

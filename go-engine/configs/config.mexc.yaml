@@ -10,8 +10,14 @@
 # this section) — left out entirely rather than duplicated with placeholder values.
 
 trading:
-  # A small starter set, plain MEXC symbols (BTC_USDT, stable, no expiry — internal/mexc/adapter.go
-  # returns an identity SymbolResolver, so every entry below maps to itself in symbol_map).
+  # This list only matters as a ONE-TIME fallback seed for symbols with no roster row at all
+  # (usecase.RosterFor) — once the discovery scan (cmd/api's MarketScanner) has admitted rows under
+  # exchange="mexc" to the `instruments` table, every service reads FROM THERE, not from here.
+  # As of 2026-09-22 the roster already holds all ~148 USDT-quoted MEXC perpetuals clearing the
+  # scan's volume floor, so this list is effectively vestigial — kept at a small set (not the full
+  # 148) specifically so it can never re-seed/override an operator's disabled-token choice on a
+  # fresh database (RosterFor only seeds symbols with NO row; see migration 000030's own "resurrect
+  # a disabled token" bug for why that matters).
   inst_ids:
     - "BTC"
     - "ETH"
@@ -57,11 +63,22 @@ paper_trading:
     - "1H"
   candle_limit: 100
   rl_decision_bar: "5m"
-  rl_sltp_adjust: false
-  rl_sizing: false
+  # Corrected 2026-09-23 (explicit operator instruction): this instance must match OKX's own
+  # paper_trading section EXACTLY — the only intentional MEXC-specific difference anywhere in this
+  # file is risk.max_leverage (100 here vs 10 for OKX, the real account's own ceiling), which caps
+  # what the model's LeverageFrac output can map onto ([1x, MaxLeverage], CLAUDE.md §15.4). It is
+  # NOT a fixed leverage value — with rl_sizing on, size/leverage are the MODEL's own decision per
+  # position (target_exposure/leverage_frac), same as OKX. An earlier version of this file had
+  # rl_sizing/rl_early_close hardcoded false, which silently forced every MEXC position onto a
+  # FIXED leverage (usecase.PaperTrader.fixedLeverage(), itself only just fixed the same session to
+  # stop ignoring risk.max_leverage) instead of letting the model decide — the operator's own words:
+  # "لورج و مقدار حجم رو مدل باید تعیین کنه نه ثابت از رو کانفیگ خونده بشه." Fixed by matching OKX's
+  # three RL flags one-for-one; see config.yaml's own comment for why each was enabled there.
+  rl_sltp_adjust: true
+  rl_sizing: true
   rl_update_pnl_threshold_pct: 0.01
   rl_update_max_interval: 15m
-  rl_early_close: false
+  rl_early_close: true
   rl_clamps:
     min_sl_dist_pct: 0.005
     max_sl_dist_pct: 0.05
@@ -71,10 +88,15 @@ paper_trading:
   rl_max_open_duration: 6h
 
 # One shared paper-trading pool for THIS instance only — completely separate from the OKX
-# instance's account_equity row (both are mode="paper", isolated by the new exchange column,
-# 2026-09-22). $4 per active token (the operator's own instruction) x 2 starter tokens (BTC, ETH)
-# = $8 starting balance. Raise this by $4 for every token added to trading.inst_ids below, same
-# per-token-budget reasoning as the OKX account's own history (CLAUDE.md §26).
+# instance's account_equity row (both are mode="paper", isolated by the exchange column,
+# 2026-09-22). $4 per active token (the operator's own instruction, CLAUDE.md §26's precedent) is
+# applied automatically by cmd/api's MarketScanner.topUpForNewTokens every time the scan admits a
+# NEW token to the roster — this initial_usd value only matters as the starting point before any
+# top-up has happened (or after a drain-to-zero reset, §15.7), not as the current live balance.
+# With the roster now at ~148 MEXC tokens (2026-09-22, all admitted for paper trading) the live
+# account_equity row has already grown via that per-token top-up; this constant is left at a small
+# value deliberately so a fresh/reset account starts conservative and grows with the roster rather
+# than assuming the full token count up front.
 account:
   initial_usd: 8
   max_position_pct: 0.25

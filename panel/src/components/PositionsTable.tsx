@@ -41,7 +41,13 @@ function closeReasonBadge(reason: CloseReason | null) {
 // still be live on the exchange (2026-09-08).
 function statusBadge(status: OrderStatus | null) {
   if (!status || status === 'filled') return <span className="badge badge-dim">filled</span>
-  const cls = status === 'canceled' ? 'badge-red' : 'badge-yellow'
+  // 'untracked' (2026-09-28): a position reconcile found already open on the exchange with NO
+  // local record of how or when it was opened — this system did not decide to open it, or has
+  // lost all memory of having done so. Red, not yellow, and its own distinct label rather than
+  // falling into the generic in-flight styling: an in-flight order resolves on its own within
+  // seconds, this does not, and it needs the operator's own attention (close it directly on the
+  // exchange if that's the right call) rather than reading as "just still settling".
+  const cls = status === 'canceled' ? 'badge-red' : status === 'untracked' ? 'badge-red' : 'badge-yellow'
   return <span className={'badge ' + cls} title={statusHelp[status] ?? status}>{status}</span>
 }
 
@@ -51,6 +57,7 @@ const statusHelp: Record<string, string> = {
   partial: 'Partially filled — a real, smaller-than-intended position exists.',
   closing: 'Flattening order sent, waiting on the exchange to confirm. The position is still open until it does.',
   canceled: 'Never filled before the fill timeout — no position was opened.',
+  untracked: 'Found open on the exchange with no local record of how it was opened. Review and close directly on the exchange if needed.',
 }
 
 // Date on one line, time on the other — a single "03/09/2026, 05:40:11" line was too wide for the
@@ -206,7 +213,7 @@ export default function PositionsTable({ mode }: { mode: PositionMode }) {
   // Also enabled while a chart is open: the chart's header strip shows live PnL for every open
   // position regardless of how the table itself is filtered, so a chart opened from the closed-only
   // view would otherwise show "—" for all of them.
-  const livePrices = usePriceStream(showLiveColumns || chartInstId !== null)
+  const livePrices = usePriceStream(showLiveColumns || chartInstId !== null, exchange || 'okx')
 
   // Resolved from the current poll's data rather than held in state, so an open modal keeps showing
   // fresh values (live PnL, a close that just landed) instead of a snapshot frozen at click time.
@@ -296,7 +303,7 @@ export default function PositionsTable({ mode }: { mode: PositionMode }) {
           trading-state pause/stop control) that have no equivalent for hand-placed orders — manual
           mode only ever needed the positions table itself (2026-09-19 request). */}
       {/* Profile selector (2026-09-22 request): a second, fully independent paper-trading instance
-          (e.g. "MEXC_100x_1", 100x leverage) runs in parallel with the always-on OKX one, isolated
+          (e.g. "mexc", 100x leverage) runs in parallel with the always-on OKX one, isolated
           by the `exchange` column added the same day. Only meaningful on the Paper tab — bot/manual
           trading has no second instance to switch between. */}
       {mode === 'paper' && PAPER_PROFILES.length > 1 && (
@@ -591,6 +598,7 @@ export default function PositionsTable({ mode }: { mode: PositionMode }) {
         <TokenChartModal
           instId={chartInstId}
           mode={mode}
+          exchange={exchange}
           positions={rows ?? []}
           livePrices={livePrices}
           onClose={() => setChartInstId(null)}

@@ -227,11 +227,21 @@ type PaperTrader struct {
 // tradeoff for bounding rl_service's inference load; it is not meant to track every tick.
 const RLAdjustInterval = 2 * time.Second
 
-// defaultPaperLeverage is what a paper order records when the RL sizing pass isn't active.
-// Lowered 20x -> 10x (2026-09-01, explicit operator request): OKX's real account this service will
-// eventually trade against caps leverage at 10x, so paper trading needs to train/validate against
-// the leverage ceiling the real account can actually use, not a higher one it never could. Was 20x
-// (2026-08-31) before OKX's real-account limit was confirmed.
+// defaultPaperLeverage is the FALLBACK fixed-sizing leverage when a PaperTrader instance has no
+// MaxLeverage configured at all (leftover config, a test construction, etc.) — never the value any
+// currently-deployed instance actually uses. 10x happens to equal OKX's own real-account leverage
+// cap (2026-09-01, explicit operator request: paper trading should train/validate against the
+// leverage ceiling the real account can actually use), which is why this constant looked like "the"
+// fixed leverage for a long time even though it was always meant to track each instance's own
+// configured ceiling.
+//
+// That coupling was wrong for a SECOND paper-trading instance targeting a different exchange with a
+// different real leverage ceiling: this variable is process-wide, so paper-trader-mexc's fixed-sizing
+// path (RLSizing off) recorded every position at this same 10x despite config.mexc.yaml's own
+// risk.max_leverage: 100 (2026-09-23 operator request: "100x max leverage" for the MEXC test) —
+// found by the operator noticing every MEXC position showed leverage=10 regardless of the config.
+// Fixed by PaperTrader.fixedLeverage(), which now reads MaxLeverage per instance and falls back to
+// this constant only when that field was left unset (decimal.Decimal's zero value).
 var defaultPaperLeverage = decimal.NewFromInt(10)
 
 // decisionBar picks which timeframe's strategy signals and price context feed a TICK-driven RL
@@ -322,6 +332,20 @@ func (e *PaperTrader) exchange() string {
 		return "okx"
 	}
 	return e.Exchange
+}
+
+// fixedLeverage is what a paper order records when RLSizing is off — this instance's own
+// MaxLeverage ceiling (cfg.Risk.MaxLeverage, e.g. 10 for OKX, 100 for the MEXC test instance,
+// 2026-09-23), falling back to defaultPaperLeverage only when MaxLeverage was left entirely unset
+// (a test construction, or a struct literal that predates this field). Every currently-deployed
+// instance sets MaxLeverage, so the fallback exists purely as a safety net, never as the intended
+// value — see defaultPaperLeverage's own doc comment for the bug this replaces (every MEXC
+// position silently recording the OKX-tuned 10x regardless of config.mexc.yaml's risk.max_leverage).
+func (e *PaperTrader) fixedLeverage() decimal.Decimal {
+	if e.MaxLeverage.IsPositive() {
+		return e.MaxLeverage
+	}
+	return defaultPaperLeverage
 }
 
 // dynamicNotional is what a new position opens at when RLSizing is off: CurrentEquity /
@@ -583,7 +607,7 @@ func (e *PaperTrader) evaluateStrategies(ctx context.Context, bar string, price 
 			continue
 		}
 
-		order := buildPaperOrder(e.InstID, price, signal, e.dynamicNotional(ctx, logger), a.StrategyID, bar)
+		order := buildPaperOrder(e.InstID, price, signal, e.dynamicNotional(ctx, logger), a.StrategyID, bar, e.fixedLeverage())
 		order.Exchange = e.exchange()
 
 		// Retain this signal for carry-forward onto later price-driven update calls (CLAUDE.md
@@ -863,10 +887,11 @@ func closeReason(o port.PaperOrder, price decimal.Decimal) (string, bool) {
 	return SLTPTouchReason(o.Side, o.SLPx, o.TPPx, price)
 }
 
-// SLTPTouchReason is the shared SL/TP-touch comparison — genuine domain logic (CLAUDE.md §16.3's
-// trial mechanics require the exact same touch semantics PaperTrader uses for real paper orders,
-// so cmd/strategy-optimizer's trial checker calls this directly rather than duplicating it).
-// side is "buy" or "sell"; slPx/tpPx may be nil (no touch check on that side). Returns ("sl" or
+// SLTPTouchReason is the shared SL/TP-touch comparison — genuine domain logic that every caller
+// judging a position/trial's outcome (PaperTrader, BotTrader, and the backtest engine, §21/§45
+// rebuild) reuses rather than reimplementing, so a candle's SL/TP touch is judged identically
+// everywhere it's checked. side is "buy" or "sell"; slPx/tpPx may be nil (no touch check on that
+// side). Returns ("sl" or
 // "tp", true) on a touch, or ("", false) if neither has been hit yet at price.
 func SLTPTouchReason(side string, slPx, tpPx *decimal.Decimal, price decimal.Decimal) (string, bool) {
 	switch side {
@@ -1005,7 +1030,7 @@ func hasOpenBaselineFor(orders []port.PaperOrder, strategyID int64) bool {
 	return false
 }
 
-func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signal, notionalUSD decimal.Decimal, strategyID int64, bar string) port.PaperOrder {
+func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signal, notionalUSD decimal.Decimal, strategyID int64, bar string, leverage decimal.Decimal) port.PaperOrder {
 	var slPx, tpPx *decimal.Decimal
 	direction := decimal.NewFromInt(1)
 	if signal.Side == strategy.Sell {
@@ -1045,9 +1070,10 @@ func buildPaperOrder(instID string, price decimal.Decimal, signal strategy.Signa
 		TPPx:       tpPx,
 		Size:       notionalUSD,
 		Bar:        bar,
-		// 1x is the un-sized default: the strategy layer has no view on leverage, so an order
-		// opened without the RL sizing pass (PaperTrader.RLSizing) records the unlevered position
-		// the signal itself implies. The caller overwrites Size/Leverage when RL sizing is on.
-		Leverage: defaultPaperLeverage,
+		// leverage is the caller's own fixed-sizing leverage (PaperTrader.fixedLeverage) — the
+		// strategy layer has no view on leverage at all, so this is always an instance-level
+		// default, never something the signal itself implies. The caller overwrites Size/Leverage
+		// separately when RL sizing is on.
+		Leverage: leverage,
 	}
 }

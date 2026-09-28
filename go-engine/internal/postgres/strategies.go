@@ -183,6 +183,21 @@ func (r *Repository) DeleteAssignment(ctx context.Context, id int64) error {
 	return nil
 }
 
+// DisableOriginAssignments disables (never deletes) every currently-enabled assignment for mode
+// whose strategy is an origin row — see the port.Repository doc comment for why this exists.
+func (r *Repository) DisableOriginAssignments(ctx context.Context, mode string) (int, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE strategy_assignments sa
+		SET enabled = false, updated_at = now()
+		FROM strategies s
+		WHERE sa.strategy_id = s.id AND s.is_origin AND sa.mode = $1 AND sa.enabled = true
+	`, mode)
+	if err != nil {
+		return 0, fmt.Errorf("disable origin assignments for mode %q: %w", mode, err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // StrategyStatsFor computes a strategy's paper-trading track record from paper_orders
 // (CLAUDE.md §11.3) — no separately maintained counters.
 //

@@ -97,7 +97,7 @@ function TradingHealthBanner({ mode }: { mode: PositionMode }) {
 function TradingControls({ mode, exchange }: { mode: PositionMode; exchange?: PaperProfile | string }) {
   // Manage Strategies/Manage Tokens both work for any profile (2026-09-22): they read the
   // discovery-scan `instruments`/per-profile stats using discoveryExchangeFor to translate this
-  // profile's isolation LABEL (e.g. "MEXC_100x_1") to the real exchange name
+  // profile's isolation LABEL (e.g. "mexc") to the real exchange name
   // (instruments/market_tokens' own key, "mexc") the roster and scan actually use.
   const discoveryExchange = discoveryExchangeFor(exchange)
   const [cfg, setCfg] = useState<PaperTradingConfig | null>(null)

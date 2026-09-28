@@ -59,11 +59,13 @@ func buildExchangeSources(cfg *config.Config, logger *slog.Logger) []usecase.Exc
 			// paper-trader-mexc is a real, running execution instance now (2026-09-22
 			// multi-exchange paper trading) — a MEXC discovery admission DOES spend a share of a
 			// real account's sizing budget, so this must top up like OKX's own. AccountExchange is
-			// the paper-trading profile label PAPER_EXCHANGE=MEXC_100x_1 resolves to
-			// (strings.ToLower in cmd/paper-trader/main.go), not the bare exchange name "mexc" —
-			// account_equity is keyed by that label, never the discovery roster's exchange name.
+			// the paper-trading profile label PAPER_EXCHANGE resolves to — "mexc" (corrected
+			// 2026-09-22: an earlier session used "mexc_100x_1" here, inventing a fake third
+			// "exchange" instead of just naming this the mexc profile it is; every row already
+			// tagged mexc_100x_1 was migrated to mexc in the same deploy) — account_equity is keyed
+			// by that label, which for MEXC is now identical to the discovery roster's exchange name.
 			src.TradesLive = true
-			src.AccountExchange = "mexc_100x_1"
+			src.AccountExchange = "mexc"
 		default:
 			// config.validateScanExchanges already refused an unknown name at startup, so reaching
 			// here means a new exchange was added to that allowlist without being wired up. Log

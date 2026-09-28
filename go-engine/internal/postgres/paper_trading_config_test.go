@@ -2,10 +2,13 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/eghbalii/okxBot/go-engine/internal/port"
 )
@@ -28,7 +31,15 @@ func testDSN() string {
 }
 
 func postgresAvailable(dsn string) bool {
-	host := "localhost:5432"
+	// Parse the DSN's own host:port rather than hardcoding localhost:5432 — this let a test file
+	// pointed at a throwaway Postgres on a different port (2026-09-28's SetAssignmentsEnabledForKinds
+	// regression test, POSTGRES_DSN=...:15433/...) silently skip every time, reporting "no local
+	// Postgres reachable" while a real one was listening exactly where the DSN said to look.
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return false
+	}
+	host := net.JoinHostPort(cfg.ConnConfig.Host, fmt.Sprintf("%d", cfg.ConnConfig.Port))
 	conn, err := net.DialTimeout("tcp", host, 300*time.Millisecond)
 	if err != nil {
 		return false

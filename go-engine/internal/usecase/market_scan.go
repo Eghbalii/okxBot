@@ -55,7 +55,7 @@ type ExchangeSource struct {
 	TradesLive bool
 	// AccountExchange is which paper-trading PROFILE's account_equity row this exchange's top-ups
 	// land on (2026-09-22, multi-exchange paper trading) — the free-string isolation label
-	// PaperTrader.Exchange uses (e.g. "mexc_100x_1"), NOT necessarily equal to Name (the real
+	// PaperTrader.Exchange uses (e.g. "mexc"), NOT necessarily equal to Name (the real
 	// exchange name the discovery/instruments roster is keyed by). Required whenever TradesLive is
 	// true; topUpForNewTokens fails loudly rather than guessing if it is left empty on a
 	// TradesLive source, since a wrong guess would silently top up the wrong account.

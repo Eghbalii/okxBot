@@ -14,12 +14,23 @@ import "time"
 // Verified live 2026-09-13: a bogus interval returns {"success":false,"code":600,"message":
 // "Parameter error"} — which is a clear failure, but only if the request is made at all. The point
 // of this table is to fail before that, with a message naming the bar.
+//
+// "1H" is "Min60", NOT "Hour1" (corrected 2026-09-22, found by tools/candlefetch's first real run
+// against the live REST kline endpoint) — "Hour1" returns the exact code=600 "Parameter error"
+// above on EVERY request, with or without start/end, confirmed by curling
+// contract.mexc.com/api/v1/contract/kline/BTC_USDT directly. This table's original "1H":"Hour1"
+// entry was apparently never actually exercised against the live REST endpoint (only against the
+// separate WS subscription path, cmd/ingestor/mexc.go's own wsIntervalFor, which already uses the
+// correct "Min60" — that override now exists ONLY for historical/documentation reasons, since REST
+// and WS agree on "Min60" for this one bar after this fix; wsIntervalFor is left in place rather
+// than removed, since deleting it would silently reintroduce a REST/WS naming assumption if this
+// table's own "1H" entry is ever changed again without re-verifying WS separately).
 var intervals = map[string]string{
 	"1m":  "Min1",
 	"5m":  "Min5",
 	"15m": "Min15",
 	"30m": "Min30",
-	"1H":  "Hour1",
+	"1H":  "Min60",
 	"4H":  "Hour4",
 	"8H":  "Hour8",
 	"1D":  "Day1",

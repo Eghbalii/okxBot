@@ -23,17 +23,16 @@ type Server struct {
 	Repo       port.Repository
 	RLBaseURL  string
 	GrafanaURL string
-	// TesterBaseURL is cmd/strategy-tester's base URL — proxied through so the panel never talks
-	// to it directly (matching every other backend, all reachable only via cmd/api, CLAUDE.md §11).
-	// Empty disables the tester routes with a clear error rather than a confusing connection-reset.
-	TesterBaseURL string
+	// OptimizerBaseURL is cmd/strategy-optimizer's HTTP surface — proxied through so the panel
+	// never talks to it directly (CLAUDE.md §11), same posture as every other internal service.
+	OptimizerBaseURL string
 	// PaperTraderBaseURL is cmd/paper-trader's control-box HTTP surface — used only to proxy the
 	// restart button (CLAUDE.md): GET/PUT /api/paper-trading/config talk to Postgres directly via
 	// Repo instead, same as every other cmd/api handler, since that data must stay readable/
 	// writable even when cmd/paper-trader itself happens to be down or mid-restart.
 	PaperTraderBaseURL string
 	// PaperTraderProfileURLs maps a second (or later, third, fourth, ...) independent
-	// cmd/paper-trader instance's Exchange label (e.g. "MEXC_100x_1") to ITS OWN control-box
+	// cmd/paper-trader instance's Exchange label (e.g. "mexc") to ITS OWN control-box
 	// base URL, for handleRestartTrading (2026-09-22, multi-exchange paper trading) — the OKX
 	// instance stays reachable via PaperTraderBaseURL above regardless of this map's contents.
 	// Nil/missing entries are not an error: a restart request for an unconfigured profile fails
@@ -188,6 +187,17 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/strategies/{id}/reset", s.handleResetStrategy)
 	mux.HandleFunc("GET /api/strategies/{id}/stats", s.handleStrategyStats)
 
+	// Strategy backtest/optimize pipeline (rebuilt 2026-09-27) — proxied through to
+	// cmd/strategy-optimizer, same access-control posture as every other panel data source.
+	mux.HandleFunc("POST /api/optimizer/run", s.proxyOptimizer("/run"))
+	mux.HandleFunc("GET /api/optimizer/status", s.proxyOptimizer("/status"))
+	mux.HandleFunc("GET /api/optimizer/config", s.proxyOptimizer("/config"))
+	mux.HandleFunc("PUT /api/optimizer/config", s.proxyOptimizer("/config"))
+	mux.HandleFunc("GET /api/optimizer/candidates", s.proxyOptimizer("/candidates"))
+	mux.HandleFunc("GET /api/optimizer/candidates/by-status", s.proxyOptimizer("/candidates/by-status"))
+	mux.HandleFunc("GET /api/optimizer/backtest-capital", s.proxyOptimizer("/backtest-capital"))
+	mux.HandleFunc("POST /api/optimizer/candidates/{id}/promote", s.proxyOptimizerWithID("/candidates/%s/promote"))
+
 	mux.HandleFunc("GET /api/assignments", s.handleListAssignments)
 	mux.HandleFunc("POST /api/assignments", s.handleCreateAssignment)
 	mux.HandleFunc("PATCH /api/assignments/{id}", s.handleSetAssignmentEnabled)
@@ -220,18 +230,6 @@ func (s *Server) Routes() http.Handler {
 	// chart — candles for the price line, param-changes for the vertical markers.
 	mux.HandleFunc("GET /api/candles", s.handleListCandles)
 	mux.HandleFunc("GET /api/strategies/{id}/param-changes", s.handleListParamChanges)
-
-	// Independent strategy-tester tab (2026-08-30 request): proxied through, same access-control
-	// posture as every other panel data source (CLAUDE.md §11) — the panel never talks to
-	// cmd/strategy-tester directly.
-	mux.HandleFunc("GET /api/tester/stats", s.proxyTester("/stats"))
-	mux.HandleFunc("GET /api/tester/versions/{id}", s.proxyTesterWithID("/versions/%s"))
-	mux.HandleFunc("POST /api/tester/versions", s.proxyTesterBody("/versions"))
-	mux.HandleFunc("POST /api/tester/versions/{id}/enable", s.proxyTesterWithIDBody("/versions/%s/enable"))
-	mux.HandleFunc("DELETE /api/tester/versions/{id}", s.proxyTesterWithID("/versions/%s"))
-	mux.HandleFunc("GET /api/tester/config", s.proxyTester("/config"))
-	mux.HandleFunc("PUT /api/tester/config", s.proxyTesterBody("/config"))
-	mux.HandleFunc("POST /api/tester/restart", s.proxyTesterBody("/restart"))
 
 	// Panel control-box for paper trading (CLAUDE.md): pause/stop, long/short toggle, active
 	// strategies/tokens/timeframes. Config reads/writes hit Postgres directly (Repo) rather than

@@ -23,11 +23,17 @@ import type { Candle } from '../api/types'
  * `fetched` stays the authority for history: anything at or before its newest row is dropped here,
  * so a streamed bar can never contradict a stored one, and that same filter bounds this map rather
  * than letting it grow for as long as the chart stays open.
+ *
+ * exchange (added 2026-09-23, same reasoning as usePriceStream's own parameter): several tokens
+ * (SOL, XRP, DOGE, ...) trade on both OKX and MEXC under the same short instId, so the live candle
+ * stream is ambiguous without this filter. Defaults to "okx" so every pre-existing caller keeps its
+ * exact prior behavior.
  */
 export function useLiveCandles(
   fetched: Candle[] | null,
   instId: string,
   bar: string,
+  exchange: string = 'okx',
 ): Candle[] | null {
   // Streamed bars for this (instId, bar), keyed by timestamp so a repeated push for the same bar
   // REPLACES it rather than appending a duplicate — OKX pushes the forming bar continuously.
@@ -40,6 +46,7 @@ export function useLiveCandles(
     return openEventsSocket((event) => {
       if (event.type !== 'candle') return
       if (event.instId !== instId || event.bar !== bar) return
+      if ((event.exchange || 'okx') !== exchange) return
       const ts = Number(event.ts)
       if (!Number.isFinite(ts)) return
       setLive((prev) => {
@@ -71,7 +78,7 @@ export function useLiveCandles(
         return next
       })
     })
-  }, [instId, bar])
+  }, [instId, bar, exchange])
 
   return useMemo(() => {
     if (fetched === null) return null

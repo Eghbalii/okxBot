@@ -19,9 +19,10 @@ import type {
   ExchangeOrderRaw,
   TokenAffordability,
   TokenStats,
-  TesterConfig,
-  TesterVersion,
-  TesterVersionDetail,
+  OptimizerCandidate,
+  OptimizerValidationConfig,
+  OptimizerLineageStatus,
+  OptimizerBacktestCapital,
   ExchangeBalance,
   MarketToken,
   Instrument,
@@ -172,7 +173,7 @@ export const api = {
   resetStrategy: (id: number) => request<void>(`/strategies/${id}/reset`, { method: 'POST' }),
   // mode ("paper" or "bot") scopes the track record — paper and bot trading each have a fully
   // independent one, sourced from paper_orders vs. real_orders respectively. exchange (2026-09-22)
-  // further scopes a paper track record to one profile (e.g. "MEXC_100x_1") — omitted/'okx' means
+  // further scopes a paper track record to one profile (e.g. "mexc") — omitted/'okx' means
   // exactly what it always has.
   strategyStats: (id: number, mode: PositionMode, exchange?: PaperProfile | string) =>
     request<StrategyStats>(`/strategies/${id}/stats?mode=${mode}${exchangeParam(exchange)}`),
@@ -252,9 +253,13 @@ export const api = {
   // Candles + param-changes back the Strategies page's price-chart marker overlay (CLAUDE.md
   // §16): candles draw the price line, param-changes draw the vertical "params changed here"
   // marker lines on top of it.
-  candles: (opts: { instId: string; bar: string; limit?: number }) => {
+  candles: (opts: { instId: string; bar: string; limit?: number; exchange?: string }) => {
     const params = new URLSearchParams({ instId: opts.instId, bar: opts.bar })
     if (opts.limit) params.set('limit', String(opts.limit))
+    // exchange picks which paper-trading profile's candles to read (backend defaults to "okx"
+    // when omitted, internal/api/server.go's handleListCandles) — omitted for the default OKX
+    // instance so existing callers/URLs are unchanged.
+    if (opts.exchange && opts.exchange !== 'okx') params.set('exchange', opts.exchange)
     return requestList<Candle>(`/candles?${params}`)
   },
   paramChanges: (strategyId: number, opts: { instId: string; since?: string }) => {
@@ -263,27 +268,28 @@ export const api = {
     return requestList<ParamChange>(`/strategies/${strategyId}/param-changes?${params}`)
   },
 
-  // Independent strategy-tester service (2026-08-30 request), proxied through cmd/api.
-  testerStats: () => requestList<TesterVersion>('/tester/stats'),
-  testerVersion: (id: number) => request<TesterVersionDetail>(`/tester/versions/${id}`),
-  createTesterVersion: (kind: string, config: Record<string, number>) =>
-    request<TesterVersion>('/tester/versions', {
-      method: 'POST',
-      body: JSON.stringify({ kind, config }),
-    }),
-  enableTesterVersion: (id: number) =>
-    request<{ ok: boolean }>(`/tester/versions/${id}/enable`, { method: 'POST' }),
-  // 2026-08-31: lets the operator permanently remove a version they no longer want kept — the
-  // automatic optimizer loop otherwise never deletes anything on its own.
-  deleteTesterVersion: (id: number) =>
-    request<{ ok: boolean }>(`/tester/versions/${id}`, { method: 'DELETE' }),
-  testerConfig: () => request<TesterConfig>('/tester/config'),
-  saveTesterConfig: (patch: { bar?: string; notionalUsd?: string; leverage?: string; maxOpenDuration?: string }) =>
-    request<{ ok: boolean; restartRequired: boolean }>('/tester/config', {
-      method: 'PUT',
-      body: JSON.stringify(patch),
-    }),
-  restartTester: () => request<{ status: string }>('/tester/restart', { method: 'POST' }),
+  // Strategy backtest/optimize pipeline (rebuilt 2026-09-27), proxied through cmd/api to
+  // cmd/strategy-optimizer. lineage identifies one (kind, inst_id, bar, exchange, riskProfile)
+  // tuning target — all five are required query params, since a partial lineage could span
+  // multiple risk profiles with different leverage/naming.
+  optimizerCandidates: (lineage: { kind: string; instId: string; bar: string; exchange: string; riskProfile: string }) => {
+    const params = new URLSearchParams(lineage)
+    return requestList<OptimizerCandidate>(`/optimizer/candidates?${params}`)
+  },
+  // Across EVERY lineage sharing one status — what the Strategies page's Active/Backtested/
+  // Rejected browser actually needs (unlike optimizerCandidates above, which answers for one
+  // exact lineage only). Newest first, capped at `limit`.
+  optimizerCandidatesByStatus: (status: string, limit = 500) =>
+    requestList<OptimizerCandidate>(`/optimizer/candidates/by-status?status=${status}&limit=${limit}`),
+  optimizerBacktestCapital: () => request<OptimizerBacktestCapital>('/optimizer/backtest-capital'),
+  promoteOptimizerCandidate: (id: number) =>
+    request<{ strategyId: number }>(`/optimizer/candidates/${id}/promote`, { method: 'POST' }),
+  optimizerStatus: () => requestList<OptimizerLineageStatus>('/optimizer/status'),
+  optimizerConfig: (riskProfile: string) =>
+    request<OptimizerValidationConfig>(`/optimizer/config?riskProfile=${riskProfile}`),
+  saveOptimizerConfig: (patch: OptimizerValidationConfig) =>
+    request<void>('/optimizer/config', { method: 'PUT', body: JSON.stringify(patch) }),
+  runOptimizerNow: () => request<void>('/optimizer/run', { method: 'POST' }),
 
   // Paper-trading control box + stats box (2026-09-01 request, extended to real trading
   // 2026-09-04), above the Positions table — mode selects which tab's data this serves.
@@ -429,10 +435,16 @@ export interface PaperOrderEvent {
 
 // PriceUpdate mirrors cmd/api's priceUpdate — the live last-traded price pushed over the same
 // socket on every tick (CLAUDE.md §11.4's positions panel), for moment-to-moment PnL client-side.
+//
+// exchange (added 2026-09-23) distinguishes which exchange's tick this is — several tokens (SOL,
+// AVAX, XRP, DOGE, ...) trade on both OKX and MEXC under the same short instId, so a price stream
+// with no exchange tag would be ambiguous the moment both an OKX and a MEXC position exist for the
+// same token. Omitted/absent means "okx", matching the backend's own convention.
 export interface PriceUpdate {
   type: 'price'
   instId: string
   price: string
+  exchange?: string
 }
 
 // CandleUpdate mirrors cmd/api's candleUpdate — one candle as OKX reports it, forming bars
@@ -449,6 +461,10 @@ export interface CandleUpdate {
   close: string
   volume: string
   confirmed: boolean
+  // exchange (added 2026-09-23, same reasoning as PriceUpdate's own field): several tokens trade on
+  // both OKX and MEXC under the same short instId, so the live candle stream is ambiguous without
+  // this. Omitted/absent means "okx".
+  exchange?: string
 }
 
 // OrderbookUpdate mirrors cmd/api's orderbookUpdate — a full books5 snapshot (5 levels/side) for

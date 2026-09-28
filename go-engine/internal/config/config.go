@@ -52,11 +52,6 @@ type Config struct {
 		PrivateWSURL string `yaml:"private_ws_url"`
 	} `yaml:"mexc"`
 
-	// Redis is still used by internal/optimizer.TrialStore for disposable trial state (CLAUDE.md
-	// §16.3) — unrelated to the event bus, which now runs on Kafka (below).
-	Redis struct {
-		Addr string `yaml:"-"`
-	} `yaml:"redis"`
 
 	// Kafka configures the internal event bus (CLAUDE.md §12): ticks/candles/paper-order events
 	// flow through Kafka topics (internal/kafkastream), replacing the earlier Redis Streams bus.
@@ -284,134 +279,41 @@ type Config struct {
 		Units      []string `yaml:"units"`           // systemd unit names or docker container names to report on
 	} `yaml:"api"`
 
-	// Optimizer configures cmd/strategy-optimizer (CLAUDE.md §16): the standing service that
-	// time-boxes real-market-data trial runs of candidate strategy.Strategy parameter sets per
-	// (inst_id, kind) and, on a scheduled interval, persists the best-performing candidate as a
-	// new durable sub-strategy row. Deliberately not folded into PaperTrading — this is a
-	// separate optimization concern with its own trial-lifecycle bookkeeping (§16.1/§16.2).
-	Optimizer struct {
-		// URL is the Python/Optuna sidecar's base URL (optimizer-service/, §16's "Optuna sidecar
-		// is a brand-new service" decision) — set from env only, matching RLService.URL's pattern.
+	// StrategyOptimizer configures cmd/strategy-optimizer (rebuilt 2026-09-27, replacing the
+	// abandoned live-trial-based Optimizer/Tester sections above — CLAUDE.md §21/§33.5 document
+	// why the old design never worked and was fully removed rather than patched): a real
+	// backtest-first pipeline that replays candidate strategy.Strategy parameter sets against
+	// historical `candles` rows (not live ticks/Kafka), validates the result against
+	// per-risk-profile thresholds (Postgres-backed, panel-editable — strategy_optimizer_config),
+	// and only then promotes a passing candidate into production's strategies/strategy_assignments
+	// so it actually starts paper trading. Per (kind, inst_id, bar, exchange, risk_profile)
+	// lineage, not per-kind-only — the operator's explicit "a strategy that only works well on one
+	// token is a real win, we are not chasing one universal strategy."
+	StrategyOptimizer struct {
+		// URL is the Python/Optuna sidecar's base URL (optimizer-service/, kept and reused as-is —
+		// its ask/tell protocol was never the problem, only how the two old Go services drove it).
+		// Read by cmd/strategy-optimizer itself, from OPTIMIZER_SERVICE_URL.
 		URL string `yaml:"-"`
-		// Addr is cmd/strategy-optimizer's own HTTP API bind address (POST /optimize, GET
-		// /status) — analogous to API.Addr.
+		// ServiceURL is where OTHER processes (cmd/api) reach cmd/strategy-optimizer's own HTTP
+		// surface, from STRATEGY_OPTIMIZER_SERVICE_URL — deliberately a separate field from URL
+		// above, which is this SAME service's outbound link to the Python sidecar; conflating the
+		// two would have cmd/api proxying panel requests at the sidecar instead of this service.
+		ServiceURL string `yaml:"-"`
+		// Addr is this service's own HTTP API bind address (POST /run, GET /status, GET/PUT
+		// /config — the panel-editable validation thresholds, per risk profile).
 		Addr string `yaml:"addr"`
-		// ScheduleInterval is a Go duration string (e.g. "24h") on which the built-in scheduler
-		// automatically fires one optimization pass per configured Target. This REVISES CLAUDE.md
-		// §16.4's original "manually-triggered only" framing — see §16.7.
+		// ScheduleInterval is a Go duration string (e.g. "1h") on which the built-in loop checks
+		// every configured (kind, inst_id, bar, exchange) lineage for a judgeable in-flight
+		// backtest candidate or a free slot to propose a new one.
 		ScheduleInterval string `yaml:"schedule_interval"`
-		// RunDuration is each optimization run's wall-clock time box (e.g. "4h") — the primary
-		// stopping rule (revises §16.3 step 5's "minimum trial count" framing to "time-boxed,
-		// with a minimum-trades-per-candidate eligibility floor" — see MinTradesPerCandidate).
-		RunDuration string `yaml:"run_duration"`
-		// MinTradesPerCandidate is the per-candidate minimum completed trades before it's even
-		// eligible to be scored/win at run end (§16.3 step 5's noise-rejection reasoning).
-		MinTradesPerCandidate int `yaml:"min_trades_per_candidate"`
-		// MinImprovementPct is how many percentage points a winning candidate's win rate must
-		// beat the current baseline's win rate by before it's persisted (e.g. 5.0 = must beat
-		// baseline by >=5pp). If no baseline exists for a target, MinWinRatePctFloor is used
-		// instead (see below) — an explicit, documented implementation choice for one of §16.6's
-		// "resolve at implementation time" items.
-		MinImprovementPct decimal.Decimal `yaml:"min_improvement_pct"`
-		// MinWinRatePctFloor is the win-rate floor a winning candidate must clear when no clean
-		// baseline exists to compare against (e.g. a fresh inst_id+kind with no assignment yet).
-		MinWinRatePctFloor decimal.Decimal `yaml:"min_win_rate_pct_floor"`
-		// Bar is the single candle timeframe each run evaluates candidates against (§16.3: "pick
-		// one bar to optimize against per run target ... make it explicit, not hidden").
-		Bar string `yaml:"bar"`
-		// CandleWindow mirrors PaperTrading.CandleLimit for the optimizer's own candle windows.
-		CandleWindow int `yaml:"candle_window"`
-		// BatchSize is how many candidate parameter sets are requested from the sidecar at once,
-		// refilled as trials complete (§16.3 step 1).
+		// BatchSize is how many candidate parameter sets are requested from the sidecar at once
+		// per lineage.
 		BatchSize int `yaml:"batch_size"`
-		// TrialTTLBufferSec pads a trial's Redis TTL beyond the run's remaining time box, so a
-		// stale trial key self-cleans even if the process crashes mid-run (§16.3 step 2's "TTL
-		// should exceed the run's remaining time box comfortably").
-		TrialTTLBufferSec int `yaml:"trial_ttl_buffer_sec"`
-		// Targets is the explicit list of (inst_id, kind) pairs the scheduler optimizes on its
-		// interval. Empty means "derive from Trading.InstIDs x DefaultKinds" (see Load below) —
-		// kept simple per the "your call" instruction rather than a separate DB-backed table,
-		// since this is operator-level config, not per-token runtime state like strategy
-		// assignments (§11.3).
-		Targets []OptimizerTarget `yaml:"targets"`
-		// DefaultKinds is the strategy kinds considered for every Trading.InstIDs entry when
-		// Targets is empty.
-		DefaultKinds []string `yaml:"default_kinds"`
-		// MaxLossPct caps the loss a trial's own SL can realize, as a fraction of entry price
-		// (2026-08-31 request: "SL should never allow more than 15% loss, at any leverage" — the
-		// optimizer's trials are unleveraged, §16.3, so this is a direct price-distance cap here
-		// rather than needing maxSLDistPctFor's leverage division). Applied in signalPrices before
-		// a trial is ever opened, mirroring PaperTrading.RLClamps.MaxLossPct/Tester.RLClamps.
-		// MaxLossPct's same 15% cap on the two other SL-placing paths — this was the one path that
-		// had no cap at all. Zero disables the cap; defaulted to 0.15 below (not opt-in), same
-		// reasoning as the other two.
-		MaxLossPct decimal.Decimal `yaml:"max_loss_pct"`
-	} `yaml:"optimizer"`
-
-	// Tester configures cmd/strategy-tester: a standalone paper-trading copy that opens real
-	// positions against live prices to validate strategy signal quality entirely independent of
-	// the RL agent and the production paper-trading path (2026-08-30 request) — separate storage
-	// (tester_orders/tester_strategy_versions, migration 000010), separate config, separate
-	// process, so it can never affect or be affected by cmd/paper-trader.
-	Tester struct {
-		// URL is cmd/strategy-tester's base URL as reached from cmd/api (env only, same pattern
-		// as Optimizer.URL/RLService.URL) — used to proxy the panel's tester tab through cmd/api
-		// rather than exposing this service directly (CLAUDE.md §11).
-		URL string `yaml:"-"`
-		// Addr is cmd/strategy-tester's own HTTP API bind address, analogous to Optimizer.Addr.
-		Addr string `yaml:"addr"`
-		// Bar is the single decision timeframe this service trades on. Set to "5m" per the
-		// operator's own observation (2026-08-30) that signals/fills concentrate there — see
-		// CLAUDE.md for the measured evidence (10/10 tokens' single open-position slot filled by
-		// 5m, 15m/1H essentially starved).
-		Bar string `yaml:"bar"`
-		// InstIDs defaults to Trading.InstIDs when empty (Load below) — deliberately the same
-		// roster the production system trades, per the operator's explicit "don't limit to one or
-		// two tokens, use exactly the same tokens" instruction.
-		InstIDs []string `yaml:"inst_ids"`
-		// NotionalUSD/Leverage are fixed for every position this service opens — there is no RL
-		// sizing here, so "how much" is a flat config value, not a decision (operator's own
-		// "size/leverage doesn't matter, start with $10 and 10x" instruction).
-		NotionalUSD  decimal.Decimal `yaml:"notional_usd"`
-		Leverage     decimal.Decimal `yaml:"leverage"`
-		CandleWindow int             `yaml:"candle_window"`
-		// MaxOpenDuration force-closes a tester position open longer than this, close_reason=
-		// 'timeout' (2026-08-30 request, mirroring paper_trading.rl_max_open_duration/§15.14 for
-		// the SAME reason on a SEPARATE config path — this service has no in-trade update
-		// mechanic at all, so a position with neither level touched would otherwise sit open
-		// forever). Zero falls back to a 6h default at construction time, same starting value as
-		// production's.
-		MaxOpenDuration time.Duration `yaml:"max_open_duration"`
-
-		// Optimize configures cmd/strategy-tester's own automatic per-kind optimization loop
-		// (2026-08-31 request): the service proposes new parameter candidates for each strategy
-		// kind, judges them by win rate + PnL once enough trades accumulate, and always builds the
-		// next candidate from whichever version (including the origin) currently scores best —
-		// entirely independent of Optimizer above (separate storage, separate Optuna study
-		// namespace via tester.StudyID). Reuses Optimizer.URL's sidecar deployment (the operator's
-		// own call: the sidecar is generic and safely shared, studies are isolated per study_id).
-		Optimize struct {
-			// CheckInterval is how often the loop checks every kind for a judgeable candidate or a
-			// free slot to propose a new one (operator's explicit "لوپ رو هر ۱ ساعت اجرا کنیم").
-			CheckInterval time.Duration `yaml:"check_interval"`
-		} `yaml:"optimize"`
-
-		// RLClamps bounds this service's own opened SL levels the same way PaperTrading.RLClamps
-		// does production's (2026-08-31 request) — this service previously had NO clamp/EnsureStop
-		// pass at all (deliberately, since it measures raw strategy signal quality), which also
-		// meant a strategy's own SL had no leverage-aware loss ceiling. Only MaxLossPct is actually
-		// used here (tester.BuildOrder has no "missing stop" fallback to fill — a signal with no
-		// stop is still skipped outright, CLAUDE.md §16.9's rule) — the other fields exist so this
-		// struct's shape matches PaperTrading.RLClamps and a future EnsureStop-style fallback could
-		// reuse it without a config change.
-		RLClamps struct {
-			MinSLDistPct decimal.Decimal `yaml:"min_sl_dist_pct"`
-			MaxSLDistPct decimal.Decimal `yaml:"max_sl_dist_pct"`
-			MaxLossPct   decimal.Decimal `yaml:"max_loss_pct"`
-			MinTPSLRatio decimal.Decimal `yaml:"min_tp_sl_ratio"`
-			MaxTPSLRatio decimal.Decimal `yaml:"max_tp_sl_ratio"`
-		} `yaml:"rl_clamps"`
-	} `yaml:"tester"`
+		// RiskProfiles maps each risk profile ("low"/"high") to the exchange and leverage ceiling
+		// it backtests/paper-trades under (operator's explicit two-track split: OKX tokens at a
+		// conservative ~10x, MEXC tokens scalp-oriented up to ~100x).
+		RiskProfiles map[string]RiskProfileConfig `yaml:"risk_profiles"`
+	} `yaml:"strategy_optimizer"`
 
 	// Gateway configures cmd/okx-gateway, the single process that holds real OKX credentials and
 	// rate-limits/prioritizes REST calls across every other service (CLAUDE.md §27.1). Every
@@ -519,13 +421,17 @@ type GatewayClassLimit struct {
 	IntervalMs int `yaml:"interval_ms"`
 }
 
-// OptimizerTarget is one (instrument, strategy-kind) pair cmd/strategy-optimizer's scheduler
-// optimizes on its configured interval (CLAUDE.md §16.6: "whether cmd/strategy-optimizer runs
-// against every configured token/base-strategy pair by default or requires an explicit
-// operator-triggered list" — resolved here as an explicit, config-driven list).
-type OptimizerTarget struct {
-	InstID string `yaml:"inst_id"`
-	Kind   string `yaml:"kind"`
+// RiskProfileConfig is one risk profile's process-wiring config (which exchange it backtests/
+// paper-trades under, and the leverage ceiling that exchange's own account allows) — the
+// per-lineage VALIDATION thresholds (min trades/win-rate/PnL/drawdown, backtest lookback) are
+// deliberately NOT here: they live in Postgres (strategy_optimizer_config), panel-editable per
+// the operator's explicit request, not a YAML value needing a redeploy to change.
+type RiskProfileConfig struct {
+	Exchange      string          `yaml:"exchange"`
+	InstIDs       []string        `yaml:"inst_ids"`
+	MaxLeverage   decimal.Decimal `yaml:"max_leverage"`
+	Bars          []string        `yaml:"bars"`
+	StrategyKinds []string        `yaml:"strategy_kinds"`
 }
 
 // Load reads the YAML config at path (if provided) and overlays secrets/endpoints from
@@ -589,7 +495,6 @@ func Load(path string) (*Config, error) {
 		cfg.MEXC.PrivateWSURL = "wss://contract.mexc.com/edge"
 	}
 
-	cfg.Redis.Addr = envOr("REDIS_ADDR", "localhost:6379")
 	cfg.Kafka.Brokers = strings.Split(envOr("KAFKA_BROKERS", "localhost:9092"), ",")
 	cfg.Postgres.DSN = envOr("POSTGRES_DSN", "postgres://okxbot:okxbot@localhost:5432/okxbot")
 	cfg.RLService.URL = envOr("RL_SERVICE_URL", "http://localhost:8000")
@@ -680,49 +585,41 @@ func Load(path string) (*Config, error) {
 		cfg.API.Units = []string{"okxbot-rl-service-1"}
 	}
 
-	cfg.Optimizer.URL = envOr("OPTIMIZER_SERVICE_URL", "http://localhost:8001")
-	if cfg.Optimizer.Addr == "" {
-		cfg.Optimizer.Addr = envOr("OPTIMIZER_ADDR", "0.0.0.0:8091")
+	cfg.StrategyOptimizer.URL = envOr("OPTIMIZER_SERVICE_URL", "http://localhost:8001")
+	cfg.StrategyOptimizer.ServiceURL = envOr("STRATEGY_OPTIMIZER_SERVICE_URL", "http://localhost:8091")
+	if cfg.StrategyOptimizer.Addr == "" {
+		cfg.StrategyOptimizer.Addr = envOr("STRATEGY_OPTIMIZER_ADDR", "0.0.0.0:8091")
 	}
-	if cfg.Optimizer.ScheduleInterval == "" {
-		cfg.Optimizer.ScheduleInterval = "24h"
+	if cfg.StrategyOptimizer.ScheduleInterval == "" {
+		cfg.StrategyOptimizer.ScheduleInterval = "1h"
 	}
-	if cfg.Optimizer.RunDuration == "" {
-		cfg.Optimizer.RunDuration = "4h"
+	if cfg.StrategyOptimizer.BatchSize == 0 {
+		cfg.StrategyOptimizer.BatchSize = 5
 	}
-	if cfg.Optimizer.MinTradesPerCandidate == 0 {
-		cfg.Optimizer.MinTradesPerCandidate = 15
-	}
-	if cfg.Optimizer.MinImprovementPct.IsZero() {
-		cfg.Optimizer.MinImprovementPct = decimal.NewFromInt(5)
-	}
-	if cfg.Optimizer.MinWinRatePctFloor.IsZero() {
-		cfg.Optimizer.MinWinRatePctFloor = decimal.NewFromInt(50)
-	}
-	if cfg.Optimizer.Bar == "" {
-		cfg.Optimizer.Bar = "15m"
-	}
-	if cfg.Optimizer.CandleWindow == 0 {
-		cfg.Optimizer.CandleWindow = 100
-	}
-	if cfg.Optimizer.BatchSize == 0 {
-		cfg.Optimizer.BatchSize = 5
-	}
-	if cfg.Optimizer.TrialTTLBufferSec == 0 {
-		cfg.Optimizer.TrialTTLBufferSec = 3600
-	}
-	if len(cfg.Optimizer.DefaultKinds) == 0 {
-		cfg.Optimizer.DefaultKinds = []string{"rsi_sma"}
-	}
-	if len(cfg.Optimizer.Targets) == 0 {
-		for _, instID := range cfg.Trading.InstIDs {
-			for _, kind := range cfg.Optimizer.DefaultKinds {
-				cfg.Optimizer.Targets = append(cfg.Optimizer.Targets, OptimizerTarget{InstID: instID, Kind: kind})
-			}
+	if cfg.StrategyOptimizer.RiskProfiles == nil {
+		// Default two-track split (operator's explicit 2026-09-27 request): OKX tokens run
+		// conservatively at up to 10x, MEXC tokens run scalp-oriented up to 100x. Bars/strategy
+		// kinds default to what's already configured elsewhere so a fresh deploy needs no extra
+		// config to get a sane first backtest pass.
+		cfg.StrategyOptimizer.RiskProfiles = map[string]RiskProfileConfig{
+			"low": {
+				Exchange:    "okx",
+				InstIDs:     cfg.Trading.InstIDs,
+				MaxLeverage: decimal.NewFromInt(10),
+				Bars:        []string{"5m", "15m", "1H"},
+			},
+			"high": {
+				// InstIDs left empty deliberately — the "high" profile's token roster is MEXC's
+				// discovered roster (usecase.RosterFor, §53.1's DB-backed roster, not a static
+				// config list), resolved by the optimizer service at run time rather than
+				// duplicated here as a second, driftable source of truth.
+				Exchange:    "mexc",
+				MaxLeverage: decimal.NewFromInt(100),
+				Bars:        []string{"5m"},
+			},
 		}
 	}
 
-	cfg.Tester.URL = envOr("TESTER_SERVICE_URL", "http://localhost:8092")
 	cfg.PaperTrading.URL = envOr("PAPER_TRADER_SERVICE_URL", "http://localhost:8093")
 	cfg.Trading.URL = envOr("TRADER_SERVICE_URL", "http://localhost:8095")
 	cfg.Gateway.URL = envOr("OKX_GATEWAY_URL", "http://localhost:8094")
@@ -745,30 +642,6 @@ func Load(path string) (*Config, error) {
 	if cfg.FundingRate.PollInterval == 0 {
 		cfg.FundingRate.PollInterval = time.Hour
 	}
-	if cfg.Tester.Addr == "" {
-		cfg.Tester.Addr = envOr("TESTER_ADDR", "0.0.0.0:8092")
-	}
-	if cfg.Tester.Bar == "" {
-		cfg.Tester.Bar = "5m"
-	}
-	if len(cfg.Tester.InstIDs) == 0 {
-		cfg.Tester.InstIDs = cfg.Trading.InstIDs
-	}
-	if cfg.Tester.NotionalUSD.IsZero() {
-		cfg.Tester.NotionalUSD = decimal.NewFromInt(10)
-	}
-	if cfg.Tester.Leverage.IsZero() {
-		cfg.Tester.Leverage = decimal.NewFromInt(10)
-	}
-	if cfg.Tester.CandleWindow == 0 {
-		cfg.Tester.CandleWindow = 300
-	}
-	if cfg.Tester.MaxOpenDuration == 0 {
-		cfg.Tester.MaxOpenDuration = 6 * time.Hour
-	}
-	if cfg.Tester.Optimize.CheckInterval == 0 {
-		cfg.Tester.Optimize.CheckInterval = time.Hour
-	}
 	// MaxLossPct defaults to a hard 15% cap (2026-08-31 request: "no limit with any leverage
 	// should go down more than 15%") — unlike PaperTrading.RLClamps' other fields, this one is
 	// not opt-in-only-if-configured, since an unbounded loss at high leverage is exactly the
@@ -782,15 +655,6 @@ func Load(path string) (*Config, error) {
 	// untouched and only bites on the pathological ratios (40:1-80:1 measured in production).
 	if cfg.PaperTrading.RLClamps.MaxTPSLRatio.IsZero() {
 		cfg.PaperTrading.RLClamps.MaxTPSLRatio = decimal.NewFromFloat(3)
-	}
-	if cfg.Tester.RLClamps.MaxTPSLRatio.IsZero() {
-		cfg.Tester.RLClamps.MaxTPSLRatio = decimal.NewFromFloat(3)
-	}
-	if cfg.Tester.RLClamps.MaxLossPct.IsZero() {
-		cfg.Tester.RLClamps.MaxLossPct = decimal.NewFromFloat(0.15)
-	}
-	if cfg.Optimizer.MaxLossPct.IsZero() {
-		cfg.Optimizer.MaxLossPct = decimal.NewFromFloat(0.15)
 	}
 
 	// Token discovery (2026-09-13). Interval 8h is "a few times a day", the operator's own figure —

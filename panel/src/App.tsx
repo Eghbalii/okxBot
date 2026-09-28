@@ -8,7 +8,6 @@ import ModelStatusPage from './pages/ModelStatusPage'
 import StrategiesPage from './pages/StrategiesPage'
 import PositionsPage from './pages/PositionsPage'
 import HomePage from './pages/HomePage'
-import StrategyTesterPage from './pages/StrategyTesterPage'
 import TradePage from './pages/TradePage'
 import AccountPage from './pages/AccountPage'
 
@@ -18,7 +17,6 @@ const tabs = [
   { to: '/positions/paper', label: 'Positions' },
   { to: '/account', label: 'Account' },
   { to: '/strategies', label: 'Strategies' },
-  { to: '/strategy-tester', label: 'Strategy Tester' },
   { to: '/model', label: 'RL Model' },
   { to: '/resources', label: 'Resources' },
 ]
@@ -82,7 +80,6 @@ export default function App() {
           <Route path="/trade/:symbol" element={<TradePage />} />
           <Route path="/account" element={<AccountPage />} />
           <Route path="/strategies" element={<StrategiesPage />} />
-          <Route path="/strategy-tester" element={<StrategyTesterPage />} />
           <Route path="/model" element={<ModelStatusPage />} />
           <Route path="/resources" element={<ResourcesPage />} />
         </Routes>

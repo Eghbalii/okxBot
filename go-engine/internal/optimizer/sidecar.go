@@ -9,17 +9,19 @@ import (
 	"time"
 
 	"github.com/shopspring/decimal"
+
+	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 )
 
-// SidecarClient calls the Python/Optuna candidate-proposal sidecar (optimizer-service/,
-// CLAUDE.md §16.2) — mirrors internal/rlclient.Client's shape (BaseURL + plain net/http, JSON
-// body, no retries in v1).
+// SidecarClient calls the Python/Optuna candidate-proposal sidecar (optimizer-service/, kept
+// as-is from the original design — its ask/tell protocol was never the problem, only how the two
+// removed Go services drove it, CLAUDE.md §21/§33.5). Mirrors internal/rlclient.Client's shape
+// (BaseURL + plain net/http, JSON body, no retries in v1).
 type SidecarClient struct {
 	BaseURL    string
 	httpClient *http.Client
 }
 
-// NewSidecarClient creates a SidecarClient pointed at the sidecar's base URL.
 func NewSidecarClient(baseURL string) *SidecarClient {
 	return &SidecarClient{
 		BaseURL:    baseURL,
@@ -34,10 +36,10 @@ type SidecarParamSpec struct {
 	Max  float64 `json:"max"`
 }
 
-// Candidate is one proposed parameter set from the sidecar, keyed by its opaque TrialID (the
-// sidecar's Optuna trial number) so a later Report call can attribute the outcome to the right
+// SuggestedCandidate is one proposed parameter set from the sidecar, keyed by its opaque TrialID
+// (the sidecar's Optuna trial number) so a later Report call attributes the outcome to the right
 // underlying optuna.Trial.
-type Candidate struct {
+type SuggestedCandidate struct {
 	TrialID int
 	Params  map[string]decimal.Decimal
 }
@@ -59,8 +61,10 @@ type suggestResponse struct {
 }
 
 // Suggest asks the sidecar for n candidate parameter sets for studyID, given specs' [min,max]
-// ranges (CLAUDE.md §16.3 step 1).
-func (c *SidecarClient) Suggest(ctx context.Context, studyID string, specs []SidecarParamSpec, n int) ([]Candidate, error) {
+// ranges. Each returned candidate's params are clamped to specs' own ranges before being handed
+// back, so a sidecar rounding quirk can never propose a value outside what the strategy itself
+// declared as valid.
+func (c *SidecarClient) Suggest(ctx context.Context, studyID string, specs []SidecarParamSpec, n int) ([]SuggestedCandidate, error) {
 	body, err := json.Marshal(suggestRequest{StudyID: studyID, ParamSpecs: specs, NCandidates: n})
 	if err != nil {
 		return nil, fmt.Errorf("marshal suggest request: %w", err)
@@ -85,13 +89,22 @@ func (c *SidecarClient) Suggest(ctx context.Context, studyID string, specs []Sid
 		return nil, fmt.Errorf("decode /suggest response: %w", err)
 	}
 
-	candidates := make([]Candidate, 0, len(out.Candidates))
+	specByName := make(map[string]strategy.ParamSpec, len(specs))
+	for _, s := range specs {
+		specByName[s.Name] = strategy.ParamSpec{Name: s.Name, Min: decimal.NewFromFloat(s.Min), Max: decimal.NewFromFloat(s.Max)}
+	}
+
+	candidates := make([]SuggestedCandidate, 0, len(out.Candidates))
 	for _, rc := range out.Candidates {
 		params := make(map[string]decimal.Decimal, len(rc.Params))
 		for k, v := range rc.Params {
-			params[k] = decimal.NewFromFloat(v)
+			d := decimal.NewFromFloat(v)
+			if spec, ok := specByName[k]; ok {
+				d = strategy.ClampParam(spec, d)
+			}
+			params[k] = d
 		}
-		candidates = append(candidates, Candidate{TrialID: rc.TrialID, Params: params})
+		candidates = append(candidates, SuggestedCandidate{TrialID: rc.TrialID, Params: params})
 	}
 	return candidates, nil
 }
@@ -102,8 +115,7 @@ type reportRequest struct {
 	Score   float64 `json:"score"`
 }
 
-// Report tells the sidecar how one candidate's accumulated trades scored (CLAUDE.md §16.3 step
-// 4), closing the loop for its next suggestion.
+// Report tells the sidecar how one candidate scored, closing the loop for its next suggestion.
 func (c *SidecarClient) Report(ctx context.Context, studyID string, trialID int, score float64) error {
 	body, err := json.Marshal(reportRequest{StudyID: studyID, TrialID: trialID, Score: score})
 	if err != nil {
@@ -126,7 +138,11 @@ func (c *SidecarClient) Report(ctx context.Context, studyID string, trialID int,
 	return nil
 }
 
-// StudyID builds the sidecar study id convention (CLAUDE.md §16.2: `"{inst_id}:{kind}"`).
-func StudyID(instID, kind string) string {
-	return instID + ":" + kind
+// StudyID builds this pipeline's Optuna study id — scoped to the FULL lineage (kind, inst_id,
+// bar, exchange, risk_profile), not just "{inst_id}:{kind}" like the removed
+// cmd/strategy-optimizer's convention, since the same kind+token pair can now be tuned
+// independently under two different risk profiles/exchanges (the operator's explicit two-track
+// OKX-10x/MEXC-100x split) and each needs its own, non-colliding Optuna study.
+func StudyID(l Lineage) string {
+	return fmt.Sprintf("%s:%s:%s:%s:%s", l.Exchange, l.RiskProfile, l.InstID, l.Bar, l.Kind)
 }

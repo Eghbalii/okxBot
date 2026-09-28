@@ -193,6 +193,9 @@ func (r *fakeRepository) SetAssignmentEnabled(ctx context.Context, id int64, ena
 	return nil
 }
 func (r *fakeRepository) DeleteAssignment(ctx context.Context, id int64) error { return nil }
+func (r *fakeRepository) DisableOriginAssignments(ctx context.Context, mode string) (int, error) {
+	return 0, nil
+}
 func (r *fakeRepository) StrategyStatsFor(ctx context.Context, strategyID int64, mode, exchange string) (port.StrategyStats, error) {
 	return port.StrategyStats{}, nil
 }
@@ -1267,7 +1270,7 @@ func TestRealizedPnLWithFunding_OutsideWindowNotCounted(t *testing.T) {
 
 func TestBuildPaperOrder_SLTPForBuyAndSell(t *testing.T) {
 	buySignal := strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}
-	buyOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), buySignal, dec("100"), 0, "5m")
+	buyOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), buySignal, dec("100"), 0, "5m", defaultPaperLeverage)
 	if buyOrder.SLPx == nil || !buyOrder.SLPx.Equal(dec("99")) {
 		t.Errorf("expected buy SL=99, got %v", buyOrder.SLPx)
 	}
@@ -1276,12 +1279,48 @@ func TestBuildPaperOrder_SLTPForBuyAndSell(t *testing.T) {
 	}
 
 	sellSignal := strategy.Signal{Side: strategy.Sell, SLPct: dec("0.01"), TPPct: dec("0.02")}
-	sellOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), sellSignal, dec("100"), 0, "5m")
+	sellOrder := buildPaperOrder("BTC-USDT-SWAP", dec("100"), sellSignal, dec("100"), 0, "5m", defaultPaperLeverage)
 	if sellOrder.SLPx == nil || !sellOrder.SLPx.Equal(dec("101")) {
 		t.Errorf("expected sell SL=101, got %v", sellOrder.SLPx)
 	}
 	if sellOrder.TPPx == nil || !sellOrder.TPPx.Equal(dec("98")) {
 		t.Errorf("expected sell TP=98, got %v", sellOrder.TPPx)
+	}
+}
+
+// TestBuildPaperOrder_UsesTheLeverageItIsGiven is the exact regression for the 2026-09-23 bug: every
+// paper-trader instance (OKX at 10x, the MEXC test instance at 100x, CLAUDE.md's own "100x max
+// leverage" request) shared ONE package-level defaultPaperLeverage constant, so a fixed-sizing MEXC
+// order was silently recorded at 10x regardless of its own config.mexc.yaml's risk.max_leverage:
+// 100. buildPaperOrder now takes leverage as an explicit parameter instead of reading the global, so
+// this asserts the parameter is what actually lands on the order — not the shared constant.
+func TestBuildPaperOrder_UsesTheLeverageItIsGiven(t *testing.T) {
+	signal := strategy.Signal{Side: strategy.Buy, SLPct: dec("0.01"), TPPct: dec("0.02")}
+	order := buildPaperOrder("STORJ", dec("0.03"), signal, dec("4"), 0, "5m", dec("100"))
+	if !order.Leverage.Equal(dec("100")) {
+		t.Errorf("expected the order to carry the 100x it was given, got %sx (defaultPaperLeverage=%sx)", order.Leverage, defaultPaperLeverage)
+	}
+}
+
+// TestFixedLeverage_UsesInstanceOwnMaxLeverage is the same regression one layer up: PaperTrader's
+// own fixedLeverage() method must read ITS OWN MaxLeverage (populated per-instance from
+// cfg.Risk.MaxLeverage), never the shared defaultPaperLeverage fallback, whenever MaxLeverage is
+// actually set — which every currently-deployed instance does.
+func TestFixedLeverage_UsesInstanceOwnMaxLeverage(t *testing.T) {
+	pt := newTestPaperTrader(newFakeRepository(), nil)
+	pt.MaxLeverage = dec("100") // the MEXC test instance's own configured ceiling
+	if got := pt.fixedLeverage(); !got.Equal(dec("100")) {
+		t.Errorf("fixedLeverage() = %sx, want 100x (this instance's own MaxLeverage, not defaultPaperLeverage=%sx)", got, defaultPaperLeverage)
+	}
+}
+
+// TestFixedLeverage_FallsBackWhenMaxLeverageUnset covers the safety-net case: a PaperTrader
+// constructed without ever setting MaxLeverage (a stale test/struct literal) must still produce A
+// leverage, not zero — decimal.Decimal's zero value is not a usable leverage.
+func TestFixedLeverage_FallsBackWhenMaxLeverageUnset(t *testing.T) {
+	pt := &PaperTrader{}
+	if got := pt.fixedLeverage(); !got.Equal(defaultPaperLeverage) {
+		t.Errorf("fixedLeverage() with MaxLeverage unset = %sx, want the defaultPaperLeverage fallback (%sx)", got, defaultPaperLeverage)
 	}
 }
 
@@ -2368,8 +2407,13 @@ func TestEvaluateStrategies_RLSizingDisabledKeepsFixedSizing(t *testing.T) {
 	}
 
 	o := openedOrder(t, repo)
-	if !o.Size.Equal(dec("100")) || !o.Leverage.Equal(defaultPaperLeverage) {
-		t.Errorf("expected the fixed 100 @ %sx while rl_sizing is off, got %s @ %sx", defaultPaperLeverage, o.Size, o.Leverage)
+	// Asserted against pt.MaxLeverage, not the package-level defaultPaperLeverage: this is exactly
+	// the distinction the 2026-09-23 fix introduced (every MEXC paper order was silently recording
+	// the OKX-tuned 10x regardless of its own instance's configured MaxLeverage=100) —
+	// newSizingTestPaperTrader sets MaxLeverage=100, so this test would (correctly) fail against
+	// the old hardcoded-10x assertion if fixedLeverage() ever regressed back to ignoring it.
+	if !o.Size.Equal(dec("100")) || !o.Leverage.Equal(pt.MaxLeverage) {
+		t.Errorf("expected the fixed 100 @ %sx (this instance's own MaxLeverage) while rl_sizing is off, got %s @ %sx", pt.MaxLeverage, o.Size, o.Leverage)
 	}
 	if model.calls != 0 {
 		t.Errorf("expected the model never consulted while rl_sizing is off, got %d calls", model.calls)
@@ -2388,8 +2432,8 @@ func TestEvaluateStrategies_RLSizingFallsBackWhenModelErrors(t *testing.T) {
 	}
 
 	o := openedOrder(t, repo)
-	if !o.Size.Equal(dec("100")) || !o.Leverage.Equal(defaultPaperLeverage) {
-		t.Errorf("expected fallback to the fixed 100 @ %sx, got %s @ %sx", defaultPaperLeverage, o.Size, o.Leverage)
+	if !o.Size.Equal(dec("100")) || !o.Leverage.Equal(pt.MaxLeverage) {
+		t.Errorf("expected fallback to the fixed 100 @ %sx (this instance's own MaxLeverage), got %s @ %sx", pt.MaxLeverage, o.Size, o.Leverage)
 	}
 	if model.calls != 1 {
 		t.Errorf("expected one Predict attempt before falling back, got %d", model.calls)

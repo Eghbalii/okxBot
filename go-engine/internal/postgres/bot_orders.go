@@ -371,9 +371,13 @@ func (r *Repository) UpdateBotOrderPnLExtremes(ctx context.Context, id int64, ma
 // paged per f — mirrors ListPositions. f.Mode is ignored (every row is real by construction).
 // f.Open filters against ClosedAt, same as ListPositions; a "canceled" order (never filled) has
 // ClosedAt NULL forever, so it reads as "open" under a naive filter — excluded here by requiring
-// status IN ('filled','partial') whenever f.Open is true, so a canceled attempt never occupies a
-// slot in the "open positions" view. An f.Open == false or nil query is unaffected and still
-// returns canceled rows (visible under "closed"/"all", per the panel's Status badge design).
+// status IN ('filled','partial','closing','untracked') whenever f.Open is true, so a canceled
+// attempt never occupies a slot in the "open positions" view. 'untracked' (2026-09-28) is a
+// position reconcile found open on the exchange with no local record of how it was opened — it
+// MUST still count as open here, or the whole point of writing that row (making it visible to the
+// operator on the Positions page) is silently defeated one query away from where the row is
+// created. An f.Open == false or nil query is unaffected and still returns canceled rows (visible
+// under "closed"/"all", per the panel's Status badge design).
 func (r *Repository) ListBotPositions(ctx context.Context, f port.PositionFilter) ([]port.BotOrder, error) {
 	col, ok := positionSortColumns[f.SortBy]
 	if !ok {
@@ -399,7 +403,7 @@ func (r *Repository) ListBotPositions(ctx context.Context, f port.PositionFilter
 		FROM bot_orders ro
 		LEFT JOIN strategies s ON s.id = ro.strategy_id
 		WHERE ($1 = '' OR ro.inst_id = $1)
-			AND ($2::boolean IS NULL OR (ro.closed_at IS NULL AND (NOT $2 OR ro.status IN ('filled','partial','closing'))) = $2)
+			AND ($2::boolean IS NULL OR (ro.closed_at IS NULL AND (NOT $2 OR ro.status IN ('filled','partial','closing','untracked'))) = $2)
 		ORDER BY ` + orderClause
 
 	args := []any{f.InstID, f.Open}

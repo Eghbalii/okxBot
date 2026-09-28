@@ -77,7 +77,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	// read the same rows N times.
 	btc := map[string][]domain.Candle{}
 	for _, bar := range r.Cfg.Bars {
-		w, err := loadCandles(ctx, r.Src, btcSymbol, bar, r.Cfg.From, r.Cfg.To)
+		w, err := loadCandles(ctx, r.Src, r.Cfg.Exchange, btcSymbol, bar, r.Cfg.From, r.Cfg.To)
 		if err != nil {
 			return r.result, fmt.Errorf("load btc %s: %w", bar, err)
 		}
@@ -135,7 +135,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 const btcSymbol = "BTC"
 
 func (r *Runner) runOne(ctx context.Context, instID, bar string, kinds []string, btcAll []domain.Candle) error {
-	candles, err := loadCandles(ctx, r.Src, instID, bar, r.Cfg.From, r.Cfg.To)
+	candles, err := loadCandles(ctx, r.Src, r.Cfg.Exchange, instID, bar, r.Cfg.From, r.Cfg.To)
 	if err != nil {
 		return err
 	}
@@ -328,7 +328,7 @@ func volumeRanks(ctx context.Context, src CandleSource, cfg Config) map[string]d
 	bar := cfg.Bars[0]
 	var vs []vol
 	for _, instID := range cfg.InstIDs {
-		w, err := loadCandles(ctx, src, instID, bar, cfg.From, cfg.To)
+		w, err := loadCandles(ctx, src, cfg.Exchange, instID, bar, cfg.From, cfg.To)
 		if err != nil || len(w) == 0 {
 			continue
 		}

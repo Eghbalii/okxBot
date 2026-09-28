@@ -17,8 +17,10 @@ x-logging: &default-logging
 x-restart: &default-restart unless-stopped
 
 services:
-  # redis is now only used by cmd/strategy-optimizer's disposable trial state (CLAUDE.md §16.3) —
-  # the tick/candle/paper-order event bus moved to Kafka (below), CLAUDE.md §12.
+  # redis has no consumer left as of the 2026-09-27 strategy-optimizer rebuild (its only user,
+  # the old internal/optimizer.TrialStore, was removed) — kept running for now rather than
+  # removed outright, since deleting infrastructure is a separate decision from this pipeline
+  # rebuild. The tick/candle/paper-order event bus itself is on Kafka (below), CLAUDE.md §12.
   redis:
     logging: *default-logging
     restart: *default-restart
@@ -267,10 +269,13 @@ services:
   # comparison label PaperTrader.Exchange is threaded through every exchange-scoped repository call
   # with (open orders, account balance/history, control-box config, strategy assignments) — it is
   # NOT the same thing as mexc-gateway's GATEWAY_EXCHANGE (which selects which exchange's REST
-  # adapter to build). Set to "MEXC_100x_1" (the operator's own chosen profile name/column value,
-  # 2026-09-22) rather than a bare "mexc", since this mechanism generalizes beyond one exchange to
-  # any future config-variant experiment (e.g. "no_early_close") — the label is what the panel's
-  # profile switcher shows and what a direct DB query filters on. Points at mexc-gateway, never OKX.
+  # adapter to build), but the two must still agree on the underlying exchange identity. Set to
+  # "mexc" (corrected 2026-09-22 — was "MEXC_100x_1", a mistake from an earlier session that invented
+  # a fake third "exchange" instead of just labeling this the mexc paper-trading profile it actually
+  # is; every existing "mexc_100x_1"-tagged row was migrated to "mexc" in the same deploy). The label
+  # mechanism itself still generalizes to a future config-variant experiment (e.g. "no_early_close")
+  # if one is ever needed — it's what the panel's profile switcher shows and what a direct DB query
+  # filters on. Points at mexc-gateway, never OKX.
   paper-trader-mexc:
     logging: *default-logging
     restart: *default-restart
@@ -279,7 +284,7 @@ services:
       dockerfile: Dockerfile.paper-trader
     environment:
       CONFIG_PATH: /app/configs/config.mexc.yaml
-      PAPER_EXCHANGE: MEXC_100x_1
+      PAPER_EXCHANGE: mexc
       # Which exchange's Kafka topics to CONSUME ticks/candles from ("mexc.tickers"/
       # "mexc.candles.<bar>", published by the mexc-ingestor service below) — NOT the same thing
       # as PAPER_EXCHANGE above, which only scopes this process's own account/orders/config rows
@@ -413,12 +418,15 @@ services:
     ports:
       - "8001:8001"
 
-  # DELIBERATELY DISABLED (2026-09-04, explicit operator instruction) — profiles: [disabled] means
-  # a plain "docker compose up -d" (with no service name and no --profile flag) never starts this,
-  # even after a host reboot or a broad compose up. Do not remove the profiles line without asking
-  # first. See CLAUDE.md for the reasoning (paired with strategy-tester, §21's own known-bug note).
+  # Strategy backtest/optimize pipeline (rebuilt 2026-09-27, replacing the old cmd/strategy-optimizer
+  # + cmd/strategy-tester, both removed entirely — CLAUDE.md §21/§33.5 record why the live-trial
+  # design never worked). Backtests candidate strategy.Strategy parameter sets against historical
+  # `candles` rows (Postgres), validates the result against panel-editable per-risk-profile
+  # thresholds, and only promotes a passing candidate into production's strategies/
+  # strategy_assignments — no live Kafka/Redis trial mechanic at all. Enabled by default (not
+  # profiles:[disabled]) since, unlike its predecessors, this pipeline never places a live order
+  # itself; it only proposes and validates before anything reaches paper trading.
   strategy-optimizer:
-    profiles: ["disabled"]
     logging: *default-logging
     restart: *default-restart
     build:
@@ -426,74 +434,24 @@ services:
       dockerfile: Dockerfile.strategy-optimizer
     environment:
       CONFIG_PATH: /app/configs/config.yaml
-      KAFKA_BROKERS: kafka:9092
-      REDIS_ADDR: redis:6379 # internal/optimizer.TrialStore only — disposable trial state, CLAUDE.md §16.3
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       OPTIMIZER_SERVICE_URL: http://optimizer-service:8001
-      OPTIMIZER_ADDR: "0.0.0.0:8091"
+      STRATEGY_OPTIMIZER_ADDR: "0.0.0.0:8091"
       METRICS_ADDR: ":9103"
-      # CLAUDE.md §27.1: talks to OKX only through cmd/okx-gateway now (its only OKX call is
-      # trial candle-window seeding via GetCandles) — no OKX credentials held here directly.
-      OKX_GATEWAY_URL: http://okx-gateway:8094
+      # Same convention as api's own PAPER_TRADER_SERVICE_URL/PAPER_TRADER_PROFILE_URLS — used
+      # once at startup to restart every paper-trader instance after disabling origin-strategy
+      # assignments, so the cleanup actually takes effect (2026-09-28).
+      PAPER_TRADER_SERVICE_URL: http://paper-trader:8093
+      PAPER_TRADER_PROFILE_URLS: "mexc=http://paper-trader-mexc:8098"
     ports:
       - "8091:8091"
       - "9103:9103"
     volumes:
       - ./go-engine/configs:/app/configs
     depends_on:
-      kafka:
-        condition: service_healthy
-      redis:
-        condition: service_started
       timescaledb:
         condition: service_started
       optimizer-service:
-        condition: service_started
-      okx-gateway:
-        condition: service_started
-
-  # Independent strategy-validation service (2026-08-30 request): a standalone paper-trading
-  # copy that opens real virtual positions against live prices to judge strategy signal quality,
-  # entirely apart from the RL agent and cmd/paper-trader (CLAUDE.md's tester package doc comment
-  # has the full design). Separate storage (tester_orders/tester_strategy_versions, migration
-  # 000010) so it can never collide with production paper-trading data.
-  # DELIBERATELY DISABLED (2026-09-04, explicit operator instruction, reaffirming §21's own
-  # known-bug note) — profiles: [disabled] means a plain "docker compose up -d" never starts this.
-  # Do not remove the profiles line without asking first.
-  strategy-tester:
-    profiles: ["disabled"]
-    logging: *default-logging
-    restart: *default-restart
-    build:
-      context: ./go-engine
-      dockerfile: Dockerfile.strategy-tester
-    environment:
-      CONFIG_PATH: /app/configs/config.yaml
-      KAFKA_BROKERS: kafka:9092
-      POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
-      TESTER_ADDR: "0.0.0.0:8092"
-      METRICS_ADDR: ":9104"
-      # Reuses the SAME optimizer-service sidecar deployment as strategy-optimizer for the
-      # automatic per-kind optimization loop (2026-08-31, internal/tester/optimizer_loop.go) — safe
-      # because Optuna studies are isolated per opaque study_id string (tester.StudyID's "tester:"
-      # prefix can never collide with strategy-optimizer's own "{inst_id}:{kind}" convention).
-      OPTIMIZER_SERVICE_URL: http://optimizer-service:8001
-      # CLAUDE.md §27.1: talks to OKX only through cmd/okx-gateway now (its only OKX call is
-      # seedWindow's read-only GetCandles) — no OKX credentials held here directly.
-      OKX_GATEWAY_URL: http://okx-gateway:8094
-    ports:
-      - "8092:8092"
-      - "9104:9104"
-    volumes:
-      - ./go-engine/configs:/app/configs
-    depends_on:
-      kafka:
-        condition: service_healthy
-      timescaledb:
-        condition: service_started
-      optimizer-service:
-        condition: service_started
-      okx-gateway:
         condition: service_started
 
   api:
@@ -507,14 +465,14 @@ services:
       KAFKA_BROKERS: kafka:9092 # consumes okx.paper-order-events for the panel's WebSocket bridge, CLAUDE.md §11.4/§12
       POSTGRES_DSN: postgres://okxbot:okxbot@timescaledb:5432/okxbot
       RL_SERVICE_URL: http://rl-service:8000
-      TESTER_SERVICE_URL: http://strategy-tester:8092
+      STRATEGY_OPTIMIZER_SERVICE_URL: http://strategy-optimizer:8091
       PAPER_TRADER_SERVICE_URL: http://paper-trader:8093
       # Second/third/... independent cmd/paper-trader profile control-box URLs, keyed by their own
       # Exchange label (2026-09-22, multi-exchange paper trading) — parsed by
       # parsePaperTraderProfileURLs (cmd/api/main.go) into Server.PaperTraderProfileURLs, so
       # handleRestartTrading's ?exchange= routes to the right process. The OKX/default profile
       # keeps using PAPER_TRADER_SERVICE_URL above unconditionally; this is additive.
-      PAPER_TRADER_PROFILE_URLS: "MEXC_100x_1=http://paper-trader-mexc:8098"
+      PAPER_TRADER_PROFILE_URLS: "mexc=http://paper-trader-mexc:8098"
       TRADER_SERVICE_URL: http://trader:8095
       # cmd/api calls the gateway for two things: amending a real position's resting SL/TP when an
       # operator edits it from the panel (CLAUDE.md §35), and the Manage Tokens modal's
@@ -544,6 +502,8 @@ services:
       rl-service:
         condition: service_started
       okx-gateway:
+        condition: service_started
+      strategy-optimizer:
         condition: service_started
 
   panel:

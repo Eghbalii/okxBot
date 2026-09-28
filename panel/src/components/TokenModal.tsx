@@ -41,7 +41,7 @@ function sortRows(rows: Instrument[], stats: Record<string, TokenStats>, sortBy:
 //
 // 2026-09-22 (multi-exchange paper trading): takes an explicit `exchange` prop (the REAL exchange
 // name instruments/market_tokens are keyed by, e.g. "okx"/"mexc" — distinct from a paper-trading
-// PROFILE label like "MEXC_100x_1", see PositionsTable/PaperTradingConfigBox) so the same modal
+// PROFILE label like "mexc", see PositionsTable/PaperTradingConfigBox) so the same modal
 // serves any exchange's roster, following the same interface/port pattern the rest of this
 // project's multi-exchange support already uses — no exchange-specific branch lives in this file.
 //
@@ -94,7 +94,7 @@ export default function TokenModal({
   // config-variant profile label that has no real exchange behind it (this modal only makes sense
   // for a profile that IS a real, scanned exchange).
   // The REAL exchange name (instruments/market_tokens' own key, e.g. "okx"/"mexc") — distinct
-  // from the paper-trading profile label above it in PositionsTable (e.g. "MEXC_100x_1"), which
+  // from the paper-trading profile label above it in PositionsTable (e.g. "mexc"), which
   // is a free-string isolation/comparison label that need not equal a real exchange's name at
   // all (see PAPER_PROFILES in api/types.ts, which carries both and is the single place that
   // maps one to the other).
