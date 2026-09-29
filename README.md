@@ -11,6 +11,7 @@ The exchange layer is a pluggable adapter behind a single interface, not a hardc
 adding a new exchange means writing one adapter, not touching the trading engine, the risk manager,
 or any business logic. Two exchanges (OKX and MEXC) are supported today.
 
+[![CI](https://github.com/eghbalii/okxBot/actions/workflows/ci.yml/badge.svg)](https://github.com/eghbalii/okxBot/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-React_19-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
@@ -213,6 +214,13 @@ a hard requirement.
 - **Python 3.11+**; see `rl-service/requirements.txt` for the pinned library set (Gymnasium-style
   environment shapes, Stable-Baselines3, PyTorch CPU build, FastAPI).
 - Docker + Docker Compose to run the full stack locally instead of each service natively.
+
+## CI
+
+GitHub Actions builds and tests all three parts of the stack on every push/PR: `go build`/`go vet`/
+`gofmt`/`go test -race` for go-engine, `pytest` for rl-service, and a type-checked build + lint for
+the panel. Tests that need a real Postgres/Redis skip cleanly when neither is reachable, rather than
+failing — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ## Monitoring & logs
 
