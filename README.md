@@ -1,313 +1,323 @@
+<div align="center">
+
 # okxBot
 
-RL-driven OKX futures/perpetual-swap trading bot. Go handles realtime market data, order
-execution and hard risk limits; Python trains and serves the RL agent that decides position
-sizing and leverage.
+**A reinforcement-learning futures trading bot, built on a hybrid Go + Python architecture.**
 
-See [CLAUDE.md](CLAUDE.md) for full architecture, API notes, and roadmap — read it before making
-changes.
+Go handles realtime market data, order execution, and hard risk limits.
+Python trains and serves the reinforcement-learning agent that decides position sizing, leverage, and in-trade risk management.
 
-## Layout
+The exchange layer is a pluggable adapter behind a single interface, not a hardcoded integration —
+adding a new exchange means writing one adapter, not touching the trading engine, the risk manager,
+or any business logic. Two exchanges (OKX and MEXC) are supported today.
 
-- `go-engine/` — Go module: WebSocket ingestor, OKX REST client, paper-trading engine, strategy
-  engine, trading engine, strategy parameter optimizer (`cmd/strategy-optimizer`, CLAUDE.md §16),
-  risk manager, Postgres persistence, Prometheus metrics.
-- `rl-service/` — Python: Gymnasium environment (dev sanity-check only), PPO training
-  (Stable-Baselines3), FastAPI inference server.
-- `optimizer-service/` — Python: minimal FastAPI + Optuna sidecar that proposes candidate strategy
-  parameter sets for `cmd/strategy-optimizer` (CLAUDE.md §16.2) — no ML model, no torch.
-- `docker-compose.yml` — Kafka + Redis + TimescaleDB + Prometheus + Grafana + Loki/Promtail + all
-  Go/Python services.
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-React_19-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![PyTorch](https://img.shields.io/badge/PyTorch-SAC-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org)
+[![Kafka](https://img.shields.io/badge/Kafka-event_bus-231F20?logo=apachekafka&logoColor=white)](https://kafka.apache.org)
+[![PostgreSQL](https://img.shields.io/badge/TimescaleDB-Postgres-4169E1?logo=postgresql&logoColor=white)](https://www.timescale.com)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com)
+[![Exchanges](https://img.shields.io/badge/Exchanges-OKX_%7C_MEXC-6E56CF)](#pluggable-exchange-adapters)
 
-## Monitoring & logs
+</div>
 
-Prometheus scrapes `/metrics` from the ingestor (`:9101`), paper trader (`:9102`), and the
-strategy optimizer (`:9103`) — see
-`prometheus.yml`. Metrics include strategy signals, paper orders opened/closed (by SL/TP/manual
-reason), open-order count, and cumulative realized PnL (CLAUDE.md §11 has the full list). Grafana
-is at `http://10.8.0.1:3000` over the OpenVPN tunnel (admin password from
-`GRAFANA_ADMIN_PASSWORD` in `.env`) with **both
-Prometheus and Loki auto-provisioned as data sources** (`grafana/provisioning/datasources/`) — no
-manual setup needed. Dashboards aren't pre-built yet, add them once there's real paper-trading
-data to look at.
+---
 
-**Logs** are aggregated into Loki (`loki-config.yml`) by Promtail (`promtail-config.yml`), which
-tails every container's Docker `json-file` log off disk directly — not live container discovery,
-which was tried first and found (via a real crash while building this) to silently miss any
-container that exits before Promtail's next discovery cycle. Query in Grafana's **Explore** tab
-against the Loki data source, e.g.:
-- `{level="ERROR"}` — every error, across every service, in one query
-- `{container_id="<id>"}` — one container's full log (get the id from `docker ps -a`)
-- `|= "failed"` — full-text filter across every container's logs, no label needed
-Retention is 14 days by default (`loki-config.yml`); logs from non-Go containers (Python services,
-Postgres, Redis, Kafka) are captured too, just without a parsed `level` label since they don't
-emit `logfmt`. See CLAUDE.md §11.7 for the full design/rationale, including why the discovery-based
-approach was replaced.
+## What this is
 
-## Quickstart (development, OKX demo trading only)
+okxBot is a futures/perpetual-swap trading system where a **Soft Actor-Critic (SAC) reinforcement-learning
+agent** decides *how* to trade — position sizing, leverage, and when to adjust or close a position —
+while classic technical/price-action **strategies** decide *when* there's a setup worth acting on
+in the first place. The RL agent never overrides a strategy's chosen direction; it decides how much
+risk to take on it, and can learn to trust some strategies more than others from their live,
+running track record.
+
+It's a real, end-to-end system rather than a backtesting toy:
+
+- 🔌 **Live market data** streamed from the exchange over WebSocket, fanned out through Kafka
+- 📊 **60+ built-in strategies** — moving averages, RSI/MACD/Bollinger/Keltner, ICT/smart-money
+  concepts (order blocks, fair value gaps, liquidity sweeps), classic price-action patterns, and a
+  few structural additions (a confluence combiner, a BTC-divergence strategy, a regime filter)
+- 🧠 **One shared RL policy** trained on pooled experience across every traded instrument, served
+  over a small FastAPI inference service and (optionally) kept learning continuously from live
+  outcomes
+- 🧪 **A paper-trading engine** that is the actual training-data source — not a toy backtest, a
+  forward-test loop that opens virtual positions against the live price feed and closes them on
+  real stop-loss/take-profit touches
+- 🕰️ **A full backtesting engine** (`cmd/backtest`) that replays historical candles through the
+  exact same strategy implementations and the exact same observation-building code the live system
+  uses — no reimplementation, no train/serve skew by construction. It's used two ways: to score
+  every strategy's statistical edge against a null baseline before trusting it with real capital,
+  and to build a warm-start training dataset that pretrains the RL model before deployment, so a
+  fresh install doesn't need weeks of live data before the policy produces anything better than
+  random noise
+- 🛡️ **Hard, RL-independent risk limits** in Go — max leverage, max exposure, a loss cap enforced
+  at multiple redundant layers, liquidation-distance floors — so nothing the model outputs can
+  exceed them
+- 🔀 **A clean ports-and-adapters architecture** — the trading engine, risk manager, and every
+  use-case depend only on interfaces, never on a specific exchange's SDK. Adding an exchange means
+  writing one adapter that satisfies `port.ExchangeClient`; nothing else changes. Proven by
+  supporting two independent exchanges (OKX and MEXC) today, verified by a static test that fails
+  the build if application logic ever imports an exchange package directly
+- 📈 **A full operator dashboard** — live positions, strategy performance, RL model health,
+  account balances, and a manual discretionary trading page — built with React, TypeScript, and Vite
+
+See [CLAUDE.md](CLAUDE.md) for the full architecture reference.
+
+## Pluggable exchange adapters
+
+Nothing in the trading engine, the risk manager, or the RL pipeline knows which exchange it's
+talking to. Every exchange-specific detail — authentication scheme, response envelope shape,
+symbol format, which errors are safe to retry — lives entirely inside that exchange's own adapter
+package, behind a small set of interfaces (`port.ExchangeClient`, `port.SymbolResolver`).
+
+The gateway logic itself (`internal/gateway`: rate limiting, retry/backoff, metrics) carries **no
+exchange name in its package or its code** — it's generic by construction, not generic by
+coincidence. Each exchange runs its **own gateway instance** (a real credential and rate-limit
+boundary should never be shared across exchanges), built from the same underlying gateway binary
+and parameterized by which adapter it loads at startup — so running a new exchange in production is
+"start another instance of the same service, pointed at a new adapter," not "write a new service."
+
+Two exchanges are implemented today — **OKX** (the primary, real-money exchange) and **MEXC** (used
+for a parallel paper-trading comparison) — each handling its own quirks (differing auth schemes,
+kline payload shapes, timestamp granularities, how stop-loss/take-profit attach to a position)
+invisibly to everything else in the system. Adding a third exchange is a new adapter package, not a
+rewrite.
+
+> **Note on naming**: a few identifiers predating the multi-exchange design still carry an
+> OKX-specific name at the file/env-var level (the gateway binary's directory, its Dockerfile, and
+> its config env var) even though the code they name is fully exchange-agnostic today. This is a
+> known cleanup item, not a design constraint — see [CLAUDE.md](CLAUDE.md) for details.
+
+## Architecture
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │              Exchange adapter                 │
+                    │   (pluggable — OKX, MEXC, or a new one)       │
+                    └──────────────┬─────────────────┬─────────────┘
+                                   │ WebSocket        │ REST (orders,
+                                   │ (ticks/candles)  │  positions, algo SL/TP)
+                                   ▼                  ▼
+                   ┌───────────────────────┐  ┌──────────────────────┐
+                   │      Ingestor         │  │   exchange gateway     │
+                   │  (Go, per exchange)   │  │  credential-isolated,  │
+                   └───────────┬───────────┘  │  rate-limited, retries │
+                               │ publishes    └──────────┬─────────────┘
+                               ▼                          │ every trading
+                        ┌─────────────┐                   │ service calls
+                        │    Kafka     │                   │ through this
+                        │ (event bus)  │                   │
+                        └──────┬───────┘                   │
+                               │ consumes                  │
+              ┌────────────────┼────────────────┐          │
+              ▼                ▼                ▼          │
+      ┌───────────────┐ ┌────────────┐ ┌────────────────┐ │
+      │  Paper Trader   │ │ Strategy   │ │   Bot Trader    │◄┘
+      │ (forward-test,  │ │ Optimizer  │ │ (live/real-money │
+      │  training data) │ │ (Optuna)   │ │  trading loop)   │
+      └────────┬────────┘ └────────────┘ └────────┬─────────┘
+               │                                   │
+               │         POST /predict             │
+               └───────────────┬───────────────────┘
+                               ▼
+                    ┌─────────────────────┐
+                    │     rl-service       │
+                    │  (Python, SAC/SB3)   │
+                    │  FastAPI inference    │
+                    │  + continuous learning│
+                    └───────────────────────┘
+
+              ┌──────────────────────────────────────┐
+              │              TimescaleDB               │
+              │   candles · orders · account equity ·  │
+              │   strategy assignments · optimizer runs │
+              └──────────────────────────────────────────┘
+                               ▲
+                               │ reads/writes
+              ┌────────────────┴────────────────┐
+              │             cmd/api               │
+              │  dashboard REST API + WebSocket   │
+              └────────────────┬───────────────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │        panel          │
+                    │ React + TypeScript     │
+                    │    + Vite dashboard    │
+                    └────────────────────────┘
+```
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Trading engine, ingestion, risk, API | **Go** — `net/http`, `pgx`, `kafka-go`, `decimal` |
+| RL training & inference | **Python** — Stable-Baselines3 (SAC), PyTorch, FastAPI |
+| Strategy parameter search | **Python** — Optuna (Bayesian optimization sidecar) |
+| Event bus | **Apache Kafka** (single-broker Kraft mode) |
+| Durable storage | **TimescaleDB** (PostgreSQL + time-series extension) |
+| Disposable trial state | **Redis** |
+| Dashboard | **React 19 + TypeScript + Vite**, hand-rolled CSS |
+| Metrics & logs | **Prometheus + Grafana**, **Loki + Promtail** |
+| Deployment | **Docker Compose** |
+
+## Repository layout
+
+```
+go-engine/          Go module — ingestion, trading engine, risk, dashboard API
+  cmd/
+    ingestor/        exchange WebSocket -> Kafka
+    paper-trader/    forward-test engine (RL training-data source)
+    trader/          live trading loop (strategy signal -> RL model -> real orders)
+    backtest/        offline replay engine (RL warm-start dataset)
+    strategy-optimizer/  tunes strategy parameters against live data
+    okx-gateway/     exchange gateway binary — credential-isolated, rate-limited, pluggable
+                       across exchanges despite the (legacy) directory name
+    api/             dashboard REST API + WebSocket
+  internal/
+    domain/          core entities, no framework dependencies
+    usecase/         application logic (PaperTrader, BotTrader, ManualTrader, SignalConductor)
+    port/            interfaces use-cases depend on (ExchangeClient, Repository, ModelClient, ...)
+    okx/, mexc/      exchange adapters, each implementing the same port.ExchangeClient interface
+    postgres/        TimescaleDB adapter
+    kafkastream/     Kafka producer/consumer
+    strategy/        60+ built-in strategies + indicator library
+    optimizer/       strategy-parameter-optimizer trial lifecycle
+    risk/            hard, RL-independent risk limits
+
+rl-service/         Python — RL environment, training, FastAPI inference server
+optimizer-service/  Python — minimal FastAPI + Optuna sidecar (no ML model)
+panel/              React + TypeScript + Vite dashboard
+docker-compose.yml  full stack: Kafka, Redis, TimescaleDB, Prometheus, Grafana, Loki, all services
+```
+
+## Quickstart (development, exchange demo/simulated trading only)
 
 ```bash
 cp go-engine/configs/config.example.yaml go-engine/configs/config.yaml
 cp rl-service/configs/config.example.yaml rl-service/configs/config.yaml
-cp .env.example .env   # fill in OKX demo API key/secret/passphrase
+cp .env.example .env   # fill in exchange demo API credentials
 
 docker compose up -d kafka redis timescaledb prometheus grafana loki promtail
 
-# Go: start the market data ingestor (WS -> Kafka: ticks + candles)
+# Go: market-data ingestor (WebSocket -> Kafka: ticks + candles)
 cd go-engine && go run ./cmd/ingestor
 
-# Go: start the Paper Trading Engine (virtual orders, the RL training data source, see CLAUDE.md §8)
+# Go: the paper trading engine (virtual orders, the RL training-data source)
 cd go-engine && go run ./cmd/paper-trader
 
-# Python: serve inference (training is driven by the paper-trading trade log, see CLAUDE.md §8)
+# Python: RL inference service
 cd rl-service && pip install -r requirements.txt
 uvicorn rl_service.serve.api:app --port 8000
-python -m rl_service.train   # optional: run once a paper-trading trade log exists
 
-# Go: start the trading engine (talks to the RL service + OKX)
+# Go: backtest every strategy against historical candles to see which have a real edge
+# (measured against a null "coin flip" baseline, not just raw PnL) before trusting any of
+# them with capital, then build a warm-start dataset and pretrain the model on it
+cd go-engine && go run ./cmd/backtest -out ../rl-service/data/warmstart.jsonl
+cd rl-service && python -m rl_service.warmstart --dataset data/warmstart.jsonl
+
+# Go: the live trading engine (talks to rl-service + the exchange)
 cd go-engine && go run ./cmd/trader
 
-# Optional: strategy parameter optimizer (CLAUDE.md §16) — tunes existing strategies' own
-# parameters against real market data, independent of the RL agent. Requires optimizer-service.
+# Optional: strategy parameter optimizer — tunes existing strategies against real
+# market data, independent of the RL agent
 cd optimizer-service && pip install -r requirements.txt
 uvicorn optimizer_service.api:app --port 8001
-cd go-engine && go run ./cmd/strategy-optimizer   # POST /optimize, GET /status on :8091
+cd go-engine && go run ./cmd/strategy-optimizer
 ```
 
-**Always run against OKX demo trading (`x-simulated-trading: 1`) until the strategy has been
-backtested and evaluated.** Live trading with real funds is a config change, not a code change —
-treat it with matching caution.
+**Always run against the exchange's demo/simulated trading mode until a strategy has been
+backtested and evaluated with real paper-trading data.** Enabling real-money trading is a
+configuration change, not a code change — treat it with matching caution.
 
 ## Infrastructure & resource requirements
 
-**No GPU is required.** The RL policy (Stable-Baselines3 PPO, `MlpPolicy`) trains on engineered
-feature vectors, not images/sequences — small MLPs train faster on CPU than GPU at this scale,
-since GPU transfer overhead dominates for networks this size. Revisit only if the model later
-moves to CNN/image inputs (e.g. candlestick chart images) or large transformer feature extractors.
+**No GPU is required.** The RL policy (Stable-Baselines3 SAC, a small MLP over engineered feature
+vectors) trains comfortably on CPU — GPU transfer overhead would dominate at this network size.
 
-Minimum viable single-node setup for development / early paper-trading (no live capital yet):
+Minimum viable single-node setup for development / early paper-trading:
 
-| Component                              | CPU        | RAM     | Disk           | GPU |
-|-----------------------------------------|-----------|---------|----------------|-----|
-| RL training (`rl_service/train.py`)     | 4 vCPU    | 8 GB    | —              | no  |
-| RL inference (`rl_service/serve/api.py`)| 1–2 vCPU  | 1–2 GB  | —              | no  |
-| go-engine (ingestor + trader + api)     | 1–2 vCPU  | 1 GB    | —              | no  |
-| Kafka (event bus, single Kraft-mode broker) | 1 vCPU | 1 GB   | 10 GB+ SSD     | no  |
-| Redis (strategy-optimizer trial state)  | 1 vCPU    | 512 MB–1 GB | —          | no  |
-| TimescaleDB/Postgres                    | 2 vCPU    | 4 GB    | 50 GB+ SSD     | no  |
-| Loki + Promtail (log aggregation)       | 1 vCPU    | 512 MB–1 GB | 10 GB+ SSD | no  |
-| **Total minimum, all-in-one box**       | **8 vCPU**| **16 GB** | **100 GB SSD** | **no** |
+| Component | CPU | RAM | Disk | GPU |
+|---|---|---|---|---|
+| RL training / warm-start | 2–4 vCPU | 2–4 GB | — | no |
+| RL inference + continuous learning | 1 vCPU | 1 GB | — | no |
+| go-engine services (ingestor, trader, paper-trader, api) | 1–2 vCPU | 1 GB | — | no |
+| Kafka (single Kraft-mode broker) | 1 vCPU | 1 GB | 10 GB+ SSD | no |
+| Redis (optimizer trial state) | 1 vCPU | 512 MB | — | no |
+| TimescaleDB | 1–2 vCPU | 2–4 GB | 20 GB+ SSD | no |
+| Loki + Promtail (log aggregation) | 1 vCPU | 512 MB | 10 GB+ SSD | no |
+| **Total, comfortable single box** | **4–8 vCPU** | **8 GB** | **50 GB+ SSD** | **no** |
 
-Notes:
-- 8 vCPU / 16 GB / 100 GB SSD is achievable on a mid-tier cloud VM (e.g. a DigitalOcean/Linode
-  8 vCPU–16 GB droplet, or an equivalent AWS/GCP instance) — no specialized hardware needed to get
-  started.
-- Scale RAM/CPU up if running parallel training environments (`SubprocVecEnv` with `n_envs > 1`)
-  for faster wall-clock training, or if storing raw tick-level data for many instruments (prefer
-  aggregating to 1s/1m bars for long-term storage; keep raw tick retention short via a Timescale
-  retention policy).
-- **Kafka is the internal event bus** (ticks, candles, paper-order open/close events) — a
-  single-broker Kraft-mode deployment (no separate Zookeeper), which is enough at this project's
-  scale; a multi-broker cluster would only make sense at real production traffic volumes this
-  project doesn't have. Consumed by `cmd/paper-trader`, `cmd/strategy-optimizer`, and `cmd/api`'s
-  WebSocket bridge (which pushes real-time position-open/SL/TP-hit events to the panel — see
-  CLAUDE.md §11.4/§12). Worth noting directly: this project started on Redis Streams, which worked
-  fine at this scale — Kafka was adopted specifically for the architecture/ops experience it
-  demonstrates in a public repository, not because Redis Streams hit a real limit. Redis itself
-  stays in the stack for `cmd/strategy-optimizer`'s disposable trial-parameter state (CLAUDE.md
-  §16.3), unrelated to the event bus.
+The full stack (every service, all monitoring, a live instrument roster) has run in production on
+a 2 vCPU / 4 GB RAM VPS — idle resource usage sits well under half of that. Kafka was chosen for
+the event bus for the architecture/operations experience it demonstrates in a public repository —
+a simpler in-memory or Redis-Streams-based bus would be a perfectly reasonable choice at this
+project's actual scale, and this trade-off is worth stating plainly rather than implying Kafka was
+a hard requirement.
 
-### Dependencies to run the services
+### Dependencies
 
-- **Go 1.23+** (see `go-engine/go.mod`), Kafka (Kraft-mode, `apache/kafka` image), Redis 7+,
-  Postgres 16 + TimescaleDB extension (via `docker-compose.yml`).
-- **Python 3.11+** recommended (repo is also tested against 3.9); see
-  `rl-service/requirements.txt` for the pinned library set (Gymnasium, Stable-Baselines3, PyTorch
-  CPU build, FastAPI, pandas/numpy).
-- Docker + Docker Compose if running the full stack locally instead of each service natively.
+- **Go 1.26+** (see `go-engine/go.mod`), Kafka (Kraft mode), Redis 7+, PostgreSQL 16 + the
+  TimescaleDB extension.
+- **Python 3.11+**; see `rl-service/requirements.txt` for the pinned library set (Gymnasium-style
+  environment shapes, Stable-Baselines3, PyTorch CPU build, FastAPI).
+- Docker + Docker Compose to run the full stack locally instead of each service natively.
 
-## VPS deployment
+## Monitoring & logs
 
-The stack is deployed on a small (2 vCPU / 3.8 GB RAM / 25 GB disk) Ubuntu 24.04 VPS — comfortably
-enough per the resource measurements in CLAUDE.md §15.1 (idle full stack + monitoring is ~585 MB
-RAM, ~30% of one core). This section is the reproducible procedure for redoing that deployment
-(a fresh VPS, a second environment, disaster recovery) — **no credentials are stored here or in
-the repo**; treat the steps below as a runbook, not stored secrets.
+Prometheus scrapes `/metrics` from every Go service — strategy signals, paper orders opened/closed
+(by close reason), open-position gauges, cumulative realized PnL, and exchange-gateway request
+volume by consumer/outcome. Grafana ships with both Prometheus and Loki auto-provisioned as data
+sources — no manual setup needed.
 
-### 1. SSH access
+Logs are aggregated into Loki by Promtail, which tails each container's Docker `json-file` log
+directly off disk (not live container discovery, which was tried first and found to silently miss
+a container that exits before the next discovery cycle — worth knowing if you ever consider
+switching back). Query in Grafana's Explore tab, e.g. `{level="ERROR"}` for every error across
+every service, or `|= "failed"` as a full-text filter with no label needed.
 
-Add an entry to `~/.ssh/config` (local machine, not committed) pointing at the server, e.g.:
+## Deployment
 
-```
-Host okx
-  HostName <server-ip>
-  Port <ssh-port>
-  User root
-  ServerAliveInterval 30
-  ServerAliveCountMax 5
-  TCPKeepAlive yes
-```
+The full stack is designed to run via Docker Compose on a single small VPS. See
+[CLAUDE.md](CLAUDE.md) for the detailed architecture and design rationale behind each service. A
+production deployment needs, at minimum:
 
-Copy your public key over (one-time, needs the initial root password) so all further access is
-key-based, then confirm passwordless login works and disable password auth if desired:
+1. Real exchange API credentials, held **only** by the exchange gateway service — never by any
+   other service.
+2. A private network boundary in front of the dashboard and every service port (see **Access
+   control** below) — there is no authentication layer in the panel today, so network isolation is
+   the only access control. Do not expose these ports on the open internet.
+3. A staged rollout: demo/simulated trading first, then paper trading with real market data (no
+   capital at risk), then real trading gated behind an explicit configuration flag, one exchange
+   and a small instrument roster at a time.
 
-```bash
-ssh-copy-id -p <ssh-port> root@<server-ip>
-ssh okx 'echo ok'   # should connect with no password prompt
-```
+### Access control: OpenVPN today, app-level auth planned
 
-### 2. Install Docker
+The panel and every backend service port are reachable **only over an OpenVPN tunnel** — nothing
+is published on the open internet, and the panel itself has no login of its own. OpenVPN was
+chosen for this deployment for a few concrete reasons:
 
-```bash
-ssh okx 'curl -fsSL https://get.docker.com | sh'
-ssh okx 'docker compose version'   # Compose plugin ships with the convenience script
-```
+- It's mature, self-hosted, and needs no third-party account or external dependency to operate —
+  the whole access boundary lives on infrastructure this project already controls.
+- Split-tunneling keeps it scoped: a connected client's own general traffic is unaffected, only
+  requests to the server cross the tunnel.
+- It's a genuine network-layer boundary rather than an application-layer one, so it protects every
+  service uniformly (the dashboard, Grafana, the exchange gateway) without each one needing its own
+  auth implementation.
 
-### 3. Ship the code
+This is a deliberate, revisitable trade-off, not a permanent design decision: **application-level
+authentication is planned** — OAuth2, Google sign-in, and 2FA are the leading candidates — to sit
+in front of the panel itself, so access no longer depends solely on network reachability. Until
+then, treat network isolation as the *only* gate and never publish these ports directly.
 
-From the repo root, package only what's tracked in git (this naturally excludes `.env`,
-`configs/config.yaml`, model artifacts, and anything else gitignored — see CLAUDE.md §6):
+## License
 
-```bash
-git archive --format=zip -o /tmp/okxBot.zip HEAD
-ssh okx 'mkdir -p /opt/okxBot'
-scp /tmp/okxBot.zip okx:/opt/okxBot/okxBot.zip
-ssh okx 'cd /opt/okxBot && unzip -oq okxBot.zip && rm okxBot.zip'
-```
+Not yet decided — see `LICENSE` once it's added to the repository root.
 
-To push a code change after editing locally, re-run the same three commands — `unzip -o`
-overwrites in place. There's no rsync/git-pull wiring on the server; this project intentionally
-keeps deploys as an explicit, reviewable step rather than auto-syncing.
+## Disclaimer
 
-### 4. Configuration
-
-Not committed to git (CLAUDE.md §6) — create these on the server from the `.example` templates,
-same shape as local dev:
-
-```bash
-ssh okx 'cd /opt/okxBot && cp go-engine/configs/config.example.yaml go-engine/configs/config.yaml'
-ssh okx 'cd /opt/okxBot && cp rl-service/configs/config.example.yaml rl-service/configs/config.yaml'
-ssh okx 'cd /opt/okxBot && cp .env.example .env'
-```
-
-Then edit `go-engine/configs/config.yaml` for the instrument roster you actually want live
-(`trading.inst_ids`, `ingestion.bars`/`paper_trading.bars`), and `.env` for OKX API credentials
-**once you have them** — paper-trading and the RL/optimizer services run with no exchange
-credentials at all (`.env`'s `OKX_API_KEY`/`SECRET`/`PASSPHRASE` stay blank); only `cmd/trader`
-(OKX demo or real order placement) needs them. Always use OKX **demo trading** keys
-(`OKX_SIMULATED_TRADING=1`) until there's a paper-trading track record worth trusting — see
-CLAUDE.md §15.6's paper → demo → real progression.
-
-**Keep your local copies of these files in sync by hand** — the server's `config.yaml`/`.env` are
-real (gitignored) config, not tracked, so a change made directly on the server (e.g. via `ssh okx`
-+ an editor) won't appear back in your local checkout automatically, and vice versa. There's no
-sync tooling for this on purpose (CLAUDE.md §6: secrets/local config are deliberately kept out of
-git) — if you edit config on the server, mirror the change into your local
-`go-engine/configs/config.yaml`/`rl-service/configs/config.yaml` (or vice versa) so the two
-environments don't quietly drift apart.
-
-### 5. Bring the stack up
-
-Infra first (so Postgres/Kafka/Redis are ready before anything tries to migrate against them),
-then the app services, then monitoring:
-
-```bash
-ssh okx 'cd /opt/okxBot && docker compose up -d redis kafka timescaledb'
-ssh okx 'cd /opt/okxBot && docker compose up -d --build ingestor paper-trader rl-service optimizer-service strategy-optimizer api'
-ssh okx 'cd /opt/okxBot && docker compose up -d prometheus grafana loki promtail'
-```
-
-**Known one-time quirks, both harmless and already documented in CLAUDE.md — don't "fix" them:**
-- The very first Kafka publish after topics are auto-created can log `Unknown Topic Or Partition`
-  a few times before succeeding (CLAUDE.md §12) — self-resolving, not fatal (every publisher logs
-  a warning and continues).
-- If `paper-trader`, `api`, and `strategy-optimizer` are started in the same `docker compose up`
-  invocation, whichever's `Repository.Migrate` call runs first can win a race against the others,
-  which then exit 1 on a duplicate-migration-row conflict. Just re-run
-  `docker compose up -d api strategy-optimizer` — migrations are already applied, so the retry
-  starts clean. (This is a real gap worth fixing in code — a migration lock or `depends_on` +
-  healthcheck ordering across app services — not yet done.)
-- Building `paper-trader`/`api`/`ingestor`/`strategy-optimizer` in parallel on a 2 vCPU box briefly
-  saturates the CPU (load average ~18 during the build) and can knock Kafka's healthcheck to
-  `unhealthy` for a few minutes — it recovers on its own once the builds finish; this is a resource
-  contention artifact of the build, not a Kafka problem.
-
-`panel` (the React dashboard) and `trader` (live/demo order placement) are **not** started by the
-commands above — `trader` needs real OKX demo credentials in `.env` first, and `panel` is optional
-until there's a reason to browse the dashboard over the OpenVPN tunnel (CLAUDE.md §11: it's never
-meant to be reachable outside that network, so don't publish its port to the open internet). Start
-them once ready with `docker compose up -d --build trader panel`.
-
-### 6. Seed candle history (once, before the first warm-start)
-
-A fresh database has no candle history, and warm-start training needs some (CLAUDE.md §17). OKX
-serves it directly — no need to wait days for the live ingestor to accumulate it:
-
-```bash
-ssh okx 'cd /opt/okxBot && docker compose run --rm paper-trader -backfill'
-```
-
-Note the argument goes directly after `paper-trader`, **not** repeated as
-`paper-trader /app/paper-trader -backfill` — `docker compose run` appends whatever you pass after
-the service name to the image's existing `ENTRYPOINT`, so repeating the binary path there makes
-`os.Args[1]` a literal path string instead of a flag and silently falls through to the normal
-trading loop instead of backfilling. Takes about 90 seconds per CLAUDE.md §17's own measurement
-(1,500 candles per instrument+timeframe pair, paced to stay well inside OKX's rate limit).
-
-### 7. Verify
-
-```bash
-ssh okx 'cd /opt/okxBot && docker compose ps'                       # every service Up (kafka: healthy)
-ssh okx 'curl -s http://localhost:8000/health'                       # rl-service: model_loaded should be false until trained
-ssh okx 'docker exec okxbot-api-1 wget -qO- http://127.0.0.1:8090/api/account'   # api works, but only reachable from inside its own container/network — see below
-```
-
-`cmd/api` and `cmd/strategy-optimizer` bind to `127.0.0.1` **inside their containers**
-(`api.addr`/`optimizer.addr` in config), which is correct and deliberate (CLAUDE.md §11: no auth
-in v1, reachability is meant to be gated by network access, not by the app) — it means
-`curl localhost:8090` from the **host** will get a connection reset, which is expected, not a
-misconfiguration. Reach them either via `docker exec <container> wget -qO- http://127.0.0.1:<port>/...`
-for a quick check, or by putting the host behind an OpenVPN tunnel (CLAUDE.md §11's intended
-long-term access model) and rebinding to the VPN-facing interface.
-
-Grafana, and every other service port, is reachable **only over the OpenVPN tunnel** — connect
-with the client profile, then use the VPN gateway address: Grafana at `http://10.8.0.1:3000`,
-the panel at `:8080`, `cmd/api` at `:8090`, Prometheus at `:9090`, Loki at `:3100`. Both
-Prometheus and Loki are auto-provisioned as Grafana data sources, no manual setup. The admin
-password comes from `GRAFANA_ADMIN_PASSWORD` in `.env` (compose refuses to start without it).
-
-Direct `http://<server-ip>:<port>` access is firewalled off. The ports still bind `0.0.0.0`
-deliberately — VPN clients arrive on `tun0`, so a `127.0.0.1` bind would make them unreachable
-over the tunnel, and binding `tun0`'s address directly would break Docker startup whenever it
-precedes OpenVPN. The gate is iptables (`OKXBOT_LOCK` on INPUT, plus a DROP in `DOCKER-USER`,
-which is the only chain Docker's own rules will not bypass), persisted via `iptables-persistent`.
-
-### 8. Next steps (per CLAUDE.md §14's "NEXT UP" roadmap item 4)
-
-The infrastructure is running, but the RL model is still untrained/no-op (`rl-service`'s
-`/health` reports `model_loaded: false`) and every RL-driven behavior
-(`rl_sizing`/`rl_sltp_adjust`/`learning_enabled`) is off in `config.yaml` — this is the correct,
-safe starting state, not something left unfinished. In order:
-
-1. **Warm-start training** against the backfilled candle history:
-   `docker compose run --rm rl-service python -m rl_service.train --warm-start` — produces
-   `models/sac_global.zip`, which `rl-service`'s existing volume mount
-   (`./rl-service/models:/app/models`) makes visible to the running `rl-service` container
-   immediately (restart it, or it'll pick up the file on its next load path — check
-   `rl_service/serve/api.py` for whether a restart is required).
-2. Enable `serve.learning_enabled: true` in `rl-service/configs/config.yaml` (paper mode only —
-   CLAUDE.md §15.11 is explicit this must stay off for real money) and restart `rl-service`.
-3. Enable `paper_trading.rl_sizing: true` in `go-engine/configs/config.yaml` and restart
-   `paper-trader`.
-4. Enable `paper_trading.rl_sltp_adjust: true`, same file, same restart.
-5. Leave `paper_trading.rl_early_close` off — it's the one lifecycle action that destroys the
-   counterfactual (CLAUDE.md §15.12).
-
-Doing these one at a time, in this order, is deliberate: if the reward curve looks wrong after step
-2, it's attributable to `learning_enabled` alone, not tangled up with sizing or SL/TP-adjust
-changes happening at the same time.
-
-Separately, whenever OKX demo API credentials are available: fill in `.env`'s `OKX_API_KEY`/
-`OKX_API_SECRET`/`OKX_API_PASSPHRASE`, leave `OKX_SIMULATED_TRADING=1`, and bring up `cmd/trader`
-(`docker compose up -d --build trader`) for the OKX demo-trading dry run that's still the one open
-Phase 2 item in CLAUDE.md §14 requiring a real server to run on.
+This project places real financial orders when configured to do so. Trading futures/perpetual
+swaps with leverage carries substantial risk of loss. Nothing here is financial advice. Use at
+your own risk, and never run real-money trading without first validating extensively against
+demo/simulated trading and paper-trading data.
