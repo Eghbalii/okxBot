@@ -38,8 +38,19 @@ jobs:
       # database skip themselves cleanly when one isn't reachable (see CLAUDE.md §16), rather than
       # failing. -race is on: WebSocket clients, Kafka consumers, and the trading use-cases all
       # rely on goroutines communicating safely.
+      #
+      # internal/strategy and internal/backtest are excluded from -race and run separately below:
+      # both replay real candle data through every strategy kind (tens of thousands of Evaluate()
+      # calls — coherence/anti-vacuity checks across real market data, CLAUDE.md §16.8/§16.9/§45.3,
+      # plus backtest's own full historical replay). That's ~3-4 minutes without instrumentation but
+      # multiplies badly under the race detector's per-access bookkeeping (measured: 15+ minutes and
+      # still not finished). Neither package has concurrency of its own — pure functions over a
+      # candle slice — so -race has nothing to catch there anyway.
       - name: Test (-race)
-        run: go test -race ./...
+        run: go test -race $(go list ./... | grep -vE '/internal/(strategy|backtest)$')
+
+      - name: Test internal/strategy, internal/backtest (no -race, CPU-heavy over real candle data)
+        run: go test ./internal/strategy/... ./internal/backtest/...
 
   python:
     name: Python (rl-service) test
