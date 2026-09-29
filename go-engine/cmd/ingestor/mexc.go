@@ -11,9 +11,9 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/domain"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
+	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	mexcrest "github.com/eghbalii/okxBot/go-engine/internal/mexc/rest"
 	mexcws "github.com/eghbalii/okxBot/go-engine/internal/mexc/ws"
-	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
 )

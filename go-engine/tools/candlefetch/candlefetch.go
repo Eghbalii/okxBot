@@ -115,11 +115,11 @@ type Target struct {
 // this package depending on any particular UI (CLAUDE.md's own repeated "no UI framework" pattern
 // extends naturally here — a plain channel of snapshots, render however the caller likes).
 type Progress struct {
-	Completed   int
-	Total       int
+	Completed    int
+	Total        int
 	CandlesSaved int64
-	Errors      int
-	Elapsed     time.Duration
+	Errors       int
+	Elapsed      time.Duration
 	// ETA is Elapsed scaled by remaining/completed work — zero until at least one job has finished,
 	// since there is nothing to extrapolate from before that.
 	ETA time.Time

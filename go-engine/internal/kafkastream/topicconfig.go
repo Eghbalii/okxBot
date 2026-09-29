@@ -75,7 +75,9 @@ func EnsureTopicRetentionInBackground(ctx context.Context, logger *slog.Logger, 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	apply := func(ctx context.Context) error { return EnsureTopicRetention(ctx, brokers, topic, retentionMs, segmentBytes) }
+	apply := func(ctx context.Context) error {
+		return EnsureTopicRetention(ctx, brokers, topic, retentionMs, segmentBytes)
+	}
 	go retryUntilSuccess(ctx, logger, 10*time.Second, apply, func() {
 		logger.Info("kafka topic retention override applied", "topic", topic, "retentionMs", retentionMs, "segmentBytes", segmentBytes)
 	}, func(err error) {

@@ -117,9 +117,9 @@ type OrderRequest struct {
 	TdMode     string          `json:"tdMode"`               // "cross" or "isolated"
 	Side       string          `json:"side"`                 // "buy" or "sell"
 	PosSide    string          `json:"posSide,omitempty"`    // "long" or "short" (hedge mode)
-	OrdType    string          `json:"ordType"`               // "market", "limit", ...
-	Sz         decimal.Decimal `json:"sz"`                    // size in contracts
-	Px         decimal.Decimal `json:"px,omitempty"`          // required for limit orders
+	OrdType    string          `json:"ordType"`              // "market", "limit", ...
+	Sz         decimal.Decimal `json:"sz"`                   // size in contracts
+	Px         decimal.Decimal `json:"px,omitempty"`         // required for limit orders
 	ReduceOnly bool            `json:"reduceOnly,omitempty"` // OKX only honors this in net mode; see domain.OrderRequest
 }
 

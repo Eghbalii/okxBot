@@ -31,17 +31,17 @@ import "github.com/shopspring/decimal"
 // (CLAUDE.md §27.3). SL uses the source's own wide ATR(14)x8 backstop — genuinely a disaster-only
 // level per the source's own documentation, not the primary exit mechanism.
 type AnchoredVWAPTrend struct {
-	SwingLen     int
-	EMALen       int
-	AllowShort   bool
-	ChopATRLen   int
-	ChopRangeMult decimal.Decimal
+	SwingLen        int
+	EMALen          int
+	AllowShort      bool
+	ChopATRLen      int
+	ChopRangeMult   decimal.Decimal
 	BackstopATRLen  int
 	BackstopATRMult decimal.Decimal
 
-	dir            int // 1 = up, -1 = down, 0 = undetermined
-	wasLongCond    bool
-	wasShortCond   bool
+	dir          int // 1 = up, -1 = down, 0 = undetermined
+	wasLongCond  bool
+	wasShortCond bool
 }
 
 func NewAnchoredVWAPTrend() *AnchoredVWAPTrend {

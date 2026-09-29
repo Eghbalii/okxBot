@@ -40,12 +40,12 @@ import "github.com/shopspring/decimal"
 //     since in-trade stop management belongs to the SL/TP-adjust layer (CLAUDE.md §15.4), not to a
 //     fresh Evaluate() call with no memory of "how long has this position been open."
 type ADXDMIQuality struct {
-	Period       int
-	ADXThreshold decimal.Decimal
-	DISpreadMin  decimal.Decimal
-	TrendEMALen  int
-	FastEMALen   int
-	ATRPeriod    int
+	Period             int
+	ADXThreshold       decimal.Decimal
+	DISpreadMin        decimal.Decimal
+	TrendEMALen        int
+	FastEMALen         int
+	ATRPeriod          int
 	InitialStopATRMult decimal.Decimal
 	ChandelierLen      int
 	ChandelierATRMult  decimal.Decimal

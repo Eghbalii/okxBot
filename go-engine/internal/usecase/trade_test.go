@@ -211,6 +211,7 @@ func (f *fakeExchangeClient) PlaceOrder(req domain.OrderRequest) (*domain.OrderR
 	f.ordSeq++
 	return &domain.OrderResult{SCode: "0", OrdID: fmt.Sprintf("fake-ord-id-%d", f.ordSeq)}, nil
 }
+
 // closePositionErr, when set, makes ClosePosition return an error without removing anything from
 // f.positions — mirroring OKX's own real rejection when there is nothing to close.
 //

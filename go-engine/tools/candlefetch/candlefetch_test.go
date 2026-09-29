@@ -195,11 +195,11 @@ func TestResolveJobs_UnsupportedBarErrors(t *testing.T) {
 // actually exercised rather than assumed — a fetcher that always returns everything in one call
 // would never prove fetchAndSaveOne's cursor-advance logic does anything.
 type fakeFetcher struct {
-	mu         sync.Mutex
-	calls      int
-	pageSize   int
-	err        error
-	errAfter   int // fail on call number errAfter (1-indexed); 0 = never fail
+	mu          sync.Mutex
+	calls       int
+	pageSize    int
+	err         error
+	errAfter    int // fail on call number errAfter (1-indexed); 0 = never fail
 	granularity time.Duration
 }
 

@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    name: Go build, vet, test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-engine
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-engine/go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt'd:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      # No Postgres/Redis service is provisioned here — the handful of tests that need a real
+      # database skip themselves cleanly when one isn't reachable (see CLAUDE.md §16), rather than
+      # failing. -race is on: WebSocket clients, Kafka consumers, and the trading use-cases all
+      # rely on goroutines communicating safely.
+      - name: Test (-race)
+        run: go test -race ./...
+
+  python:
+    name: Python (rl-service) test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rl-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Test
+        run: python -m pytest tests/ -q
+
+  panel:
+    name: Panel build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: panel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: panel/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build

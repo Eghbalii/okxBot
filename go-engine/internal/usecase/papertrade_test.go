@@ -301,6 +301,7 @@ func (r *fakeRepository) RequestManualCloseAll(ctx context.Context, exchange str
 	}
 	return n, nil
 }
+
 // paperTradingConfigKey mirrors the real repository's (mode, exchange) composite key
 // (2026-09-22, multi-exchange paper trading) — exchange="" defaults to "okx".
 func paperTradingConfigKey(mode, exchange string) string {

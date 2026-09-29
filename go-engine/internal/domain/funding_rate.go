@@ -14,7 +14,7 @@ import (
 // either the sign or the magnitude correctly, which is why this is polled and stored rather than
 // assumed.
 type FundingRate struct {
-	InstID       string
-	FundingTime  time.Time
-	FundingRate  decimal.Decimal // signed fraction, e.g. -0.0002 = -0.02%
+	InstID      string
+	FundingTime time.Time
+	FundingRate decimal.Decimal // signed fraction, e.g. -0.0002 = -0.02%
 }

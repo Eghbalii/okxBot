@@ -9,7 +9,7 @@ import "github.com/shopspring/decimal"
 //
 // Real parameters/behavior, read directly from the source:
 //   - MA type "SMMA" (Smoothed Moving Average, a recursive RMA-style average — `v7 := (v7[1]*(len-1)
-//     + src) / len`), not a plain SMA. Default period (`basisLen`) 8, not 14.
+//   - src) / len`), not a plain SMA. Default period (`basisLen`) 8, not 14.
 //   - The source smooths OPEN and CLOSE as two SEPARATE series and crosses THEM against each other:
 //     `xlong = crossover(closeSeriesAlt, openSeriesAlt)`, `xshort = crossunder(...)` — i.e. the
 //     smoothed CLOSE crossing above the smoothed OPEN signals long, the mirror signals short. The

@@ -466,13 +466,13 @@ func runBotTrader(
 	// unlike BotTrader which is one-per-configured-instrument — a manual order can be placed on
 	// ANY token the operator picks from a live search, not just the pre-configured roster.
 	manualTrader := &usecase.ManualTrader{
-		Repo:              repo,
-		Exchange:          exchangeClient,
-		Logger:            logger,
-		ExecInstType:      cfg.Trading.ExecInstType,
-		SettleCcy:         cfg.Trading.ExecSettleCcy,
-		TdMode:            cfg.Trading.TdMode,
-		PosMode:           cfg.Trading.PosMode,
+		Repo:         repo,
+		Exchange:     exchangeClient,
+		Logger:       logger,
+		ExecInstType: cfg.Trading.ExecInstType,
+		SettleCcy:    cfg.Trading.ExecSettleCcy,
+		TdMode:       cfg.Trading.TdMode,
+		PosMode:      cfg.Trading.PosMode,
 		// 2026-09-29: resolves against trading.symbol_map FIRST, then the instruments table's own
 		// exec_inst_id (the same X-Perp id the ingestor's public scan already populates) — mirrors
 		// resolveBotExecInstIDs's fallback order, but resolved live per call rather than once at

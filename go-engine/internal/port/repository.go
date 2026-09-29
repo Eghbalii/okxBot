@@ -355,12 +355,12 @@ type ManualOrder struct {
 	// other states' meaning, which this mirrors.
 	Status string
 
-	EntryPx     *decimal.Decimal // nil while resting/unfilled; set once the entry actually fills
-	SLPx        *decimal.Decimal
-	TPPx        *decimal.Decimal
-	Size        decimal.Decimal // USD notional requested (§8.2)
-	Leverage    decimal.Decimal
-	Contracts   *decimal.Decimal
+	EntryPx   *decimal.Decimal // nil while resting/unfilled; set once the entry actually fills
+	SLPx      *decimal.Decimal
+	TPPx      *decimal.Decimal
+	Size      decimal.Decimal // USD notional requested (§8.2)
+	Leverage  decimal.Decimal
+	Contracts *decimal.Decimal
 	// TdMode is the margin mode this order actually used ("cross" or "isolated") — recorded on the
 	// order itself, not just the intent, so the panel/audit trail shows what was really sent rather
 	// than assuming every order used whatever the current default happens to be now.

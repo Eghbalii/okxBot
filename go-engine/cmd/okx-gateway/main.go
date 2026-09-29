@@ -33,8 +33,8 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/gateway"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
-	mexcrest "github.com/eghbalii/okxBot/go-engine/internal/mexc/rest"
 	"github.com/eghbalii/okxBot/go-engine/internal/metrics"
+	mexcrest "github.com/eghbalii/okxBot/go-engine/internal/mexc/rest"
 	"github.com/eghbalii/okxBot/go-engine/internal/okx/rest"
 	"github.com/eghbalii/okxBot/go-engine/internal/okx/ws"
 )

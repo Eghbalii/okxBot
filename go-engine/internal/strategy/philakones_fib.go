@@ -39,18 +39,18 @@ type PhilakonesFib struct {
 func NewPhilakonesFib() *PhilakonesFib {
 	return &PhilakonesFib{
 		EMA1: 8, EMA2: 13, EMA3: 21, EMA4: 34, EMA5: 55,
-		RSIPeriod:    14,
-		RSILongMin:   decimal.NewFromInt(40),
-		RSILongMax:   decimal.NewFromInt(70),
-		RSIShortMin:  decimal.NewFromInt(30),
-		RSIShortMax:  decimal.NewFromInt(60),
-		StochKPeriod: 14,
-		StochKSmooth: 3,
-		StochDPeriod: 3,
-		StochLongMax: decimal.NewFromInt(80),
+		RSIPeriod:     14,
+		RSILongMin:    decimal.NewFromInt(40),
+		RSILongMax:    decimal.NewFromInt(70),
+		RSIShortMin:   decimal.NewFromInt(30),
+		RSIShortMax:   decimal.NewFromInt(60),
+		StochKPeriod:  14,
+		StochKSmooth:  3,
+		StochDPeriod:  3,
+		StochLongMax:  decimal.NewFromInt(80),
 		StochShortMin: decimal.NewFromInt(20),
-		SLPct:        decimal.NewFromFloat(0.01),
-		TPPct:        decimal.NewFromFloat(0.02),
+		SLPct:         decimal.NewFromFloat(0.01),
+		TPPct:         decimal.NewFromFloat(0.02),
 	}
 }
 

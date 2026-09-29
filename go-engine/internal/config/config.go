@@ -52,7 +52,6 @@ type Config struct {
 		PrivateWSURL string `yaml:"private_ws_url"`
 	} `yaml:"mexc"`
 
-
 	// Kafka configures the internal event bus (CLAUDE.md §12): ticks/candles/paper-order events
 	// flow through Kafka topics (internal/kafkastream), replacing the earlier Redis Streams bus.
 	Kafka struct {

@@ -22,10 +22,10 @@ type HullSuite struct {
 	HMALen       int
 	SLPct, TPPct decimal.Decimal
 
-	prevHull    decimal.Decimal // HULL[1] from the last call, for the [0]-vs-[2] comparison
+	prevHull     decimal.Decimal // HULL[1] from the last call, for the [0]-vs-[2] comparison
 	prevPrevHull decimal.Decimal // HULL[2] from the last call
-	prevWasUp   bool
-	hasPrev     int // 0, 1, or 2+ prior evaluations seeded
+	prevWasUp    bool
+	hasPrev      int // 0, 1, or 2+ prior evaluations seeded
 }
 
 func NewHullSuite() *HullSuite {

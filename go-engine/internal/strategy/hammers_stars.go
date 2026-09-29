@@ -29,10 +29,10 @@ import "github.com/shopspring/decimal"
 // (default-disabled) EMA filter — a bare hammer/star pattern is tradeable on its own, unlike the
 // first pass's invented "must follow an opposite trend" gate.
 type HammersStars struct {
-	ATRPeriod    int
-	FibLevel     decimal.Decimal
-	StopMult     decimal.Decimal
-	RiskReward   decimal.Decimal
+	ATRPeriod  int
+	FibLevel   decimal.Decimal
+	StopMult   decimal.Decimal
+	RiskReward decimal.Decimal
 }
 
 func NewHammersStars() *HammersStars {

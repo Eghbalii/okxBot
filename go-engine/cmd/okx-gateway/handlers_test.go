@@ -22,13 +22,13 @@ import (
 // fakeExchange is a hand-rolled exchangeClient recording calls, matching this repo's existing
 // fake-over-mock-library convention (e.g. internal/usecase/trade_test.go).
 type fakeExchange struct {
-	ticker       domain.Ticker
-	positions    []domain.Position
-	balances     []domain.Balance
-	candles      []domain.Candle
-	orderResult  *domain.OrderResult
-	orderStatus  domain.OrderStatus
-	instrument   domain.Instrument
+	ticker        domain.Ticker
+	positions     []domain.Position
+	balances      []domain.Balance
+	candles       []domain.Candle
+	orderResult   *domain.OrderResult
+	orderStatus   domain.OrderStatus
+	instrument    domain.Instrument
 	fundingRates  []domain.FundingRate
 	allTickers    []domain.MarketTicker
 	accountConfig domain.AccountConfig
