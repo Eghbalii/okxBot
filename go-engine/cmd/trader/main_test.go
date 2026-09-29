@@ -80,34 +80,6 @@ func TestUseConductorLifecycle_DefaultsOff(t *testing.T) {
 	}
 }
 
-// Real trading's early-close switch must be its OWN, never paper_trading's: enabling early close
-// for paper research must not silently enable it against real capital (2026-09-08 request). This
-// asserts the two are genuinely independent in BOTH directions, since a mapping that reads the
-// wrong field would still look right whenever the two flags happen to agree.
-func TestBotEarlyCloseAllowed_IsIndependentOfPaperFlag(t *testing.T) {
-	var cfg config.Config
-
-	cfg.Trading.AllowRLEarlyClose = false
-	cfg.PaperTrading.RLEarlyClose = true
-	if realEarlyCloseAllowed(&cfg) {
-		t.Error("paper's early-close flag must NOT enable early close against real capital")
-	}
-
-	cfg.Trading.AllowRLEarlyClose = true
-	cfg.PaperTrading.RLEarlyClose = false
-	if !realEarlyCloseAllowed(&cfg) {
-		t.Error("real's own flag must enable early close regardless of paper's")
-	}
-}
-
-// Off by default (Go's zero value), so a config that never mentions the key ignores the model's
-// early-close action rather than acting on it against real money.
-func TestBotEarlyCloseAllowed_DefaultsOff(t *testing.T) {
-	if realEarlyCloseAllowed(&config.Config{}) {
-		t.Error("allow_rl_early_close must default to false")
-	}
-}
-
 // The restart handler's exit code and the compose restart policy have to agree, and getting that
 // pair wrong has now broken real trading twice in different directions:
 //

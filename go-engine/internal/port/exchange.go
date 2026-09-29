@@ -13,6 +13,12 @@ type ExchangeClient interface {
 	GetBalance(ccy string) ([]domain.Balance, error)
 	GetCandles(instID, bar string, limit int) ([]domain.Candle, error)
 	PlaceOrder(req domain.OrderRequest) (*domain.OrderResult, error)
+	// ClosePosition flattens whatever this instrument's position currently is on the exchange
+	// itself — OKX's own POST /api/v5/trade/close-position, which takes no size at all and reads
+	// the position's live size from the exchange side. Used instead of PlaceOrder+ReduceOnly for
+	// every real-money close (2026-09-29): it structurally cannot open a new position, since there
+	// is nothing to compute a wrong size/side from if the position is already gone.
+	ClosePosition(req domain.ClosePositionRequest) (*domain.ClosePositionResult, error)
 	SetLeverage(req domain.LeverageChange) error
 	// CancelOrder cancels a still-open order (CLAUDE.md §27.5's fill-timeout mechanism: an order
 	// unfilled after the configured timeout is canceled, never re-priced/retried automatically).

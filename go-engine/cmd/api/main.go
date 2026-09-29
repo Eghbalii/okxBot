@@ -7,10 +7,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -19,7 +21,7 @@ import (
 	"github.com/eghbalii/okxBot/go-engine/internal/config"
 	"github.com/eghbalii/okxBot/go-engine/internal/gatewayclient"
 	"github.com/eghbalii/okxBot/go-engine/internal/kafkastream"
-	"github.com/eghbalii/okxBot/go-engine/internal/okx"
+	"github.com/eghbalii/okxBot/go-engine/internal/port"
 	"github.com/eghbalii/okxBot/go-engine/internal/postgres"
 	"github.com/eghbalii/okxBot/go-engine/internal/strategy"
 	"github.com/eghbalii/okxBot/go-engine/internal/usecase"
@@ -237,12 +239,16 @@ func main() {
 		// Read-only: Report never changes the roster, so opening the Manage Tokens modal cannot
 		// enable or disable anything. cmd/trader owns the acting half (AffordabilityService.Run).
 		Affordability: &usecase.AffordabilityService{
-			Repo:           repo,
-			Exchange:       gatewayclient.New(cfg.Gateway.URL, "api"),
-			Logger:         logger,
-			Mode:           "bot",
-			AllTokens:      cfg.Trading.InstIDs,
-			Symbols:        okx.SymbolMap(cfg.Trading.SymbolMap),
+			Repo:     repo,
+			Exchange: gatewayclient.New(cfg.Gateway.URL, "api"),
+			Logger:   logger,
+			Mode:     "bot",
+			// 2026-09-29: was cfg.Trading.InstIDs (the fixed 10-token config list) — BotTrader's own
+			// roster is now every token with an enabled mode="bot" strategy_assignments row
+			// (cmd/trader/main.go's botAssignedInstIDs), so this reporting-only mirror must use the
+			// same dynamic source or it silently omits every token the optimizer has since added.
+			AllTokens:      botAssignedInstIDsOrEmpty(ctx, repo, logger),
+			Symbols:        dbBackedSymbolResolver{repo: repo, ctx: ctx, symbolMap: cfg.Trading.SymbolMap},
 			ExecInstType:   cfg.Trading.ExecInstType,
 			MaxPositionPct: cfg.Account.MaxPositionPct,
 			MaxLeverage:    cfg.Risk.MaxLeverage,
@@ -262,7 +268,13 @@ func main() {
 		// TdMode/PosMode for the manual leverage-setting endpoint (docs/MANUAL_TRADE_PLAN.md §3) —
 		// the same values cmd/trader's ManualTrader uses for every order it actually places.
 		ManualTrading: api.ManualTradingConfig{TdMode: cfg.Trading.TdMode, PosMode: cfg.Trading.PosMode},
-		ExecInstIDFor: okx.SymbolMap(cfg.Trading.SymbolMap).Resolve,
+		// 2026-09-29: was okx.SymbolMap(cfg.Trading.SymbolMap).Resolve — fixed 10-token map only.
+		// BotTrader trades any token the optimizer has promoted (cmd/trader/main.go's
+		// botAssignedInstIDs/resolveBotExecInstIDs), so the panel's manual SL/TP-amend path needs
+		// the SAME symbol_map-then-instruments-table fallback or every token outside the original
+		// 10 fails with "no OKX instId configured for symbol" the moment an operator edits its
+		// SL/TP from the panel (exactly the bug this fixes).
+		ExecInstIDFor: dbBackedSymbolResolver{repo: repo, ctx: ctx, symbolMap: cfg.Trading.SymbolMap}.Resolve,
 		ExecInstType:  cfg.Trading.ExecInstType,
 		ProcessMgr:    cfg.API.ProcessMgr,
 		Units:         cfg.API.Units,
@@ -410,6 +422,77 @@ func main() {
 // code change needed to support it. A malformed entry (no "=", empty key) is skipped rather than
 // failing startup — a typo in this optional, comparison-only mapping should not take the whole
 // API service down.
+// dbBackedSymbolResolver implements port.SymbolResolver by checking trading.symbol_map first (so
+// a hand-corrected entry always wins, e.g. ahead of a contract roll the ingestor's scan hasn't
+// caught up to yet), then falling back to the instruments table's own exec_inst_id — the same
+// X-Perp id the ingestor's public OKX scan populates for every discovered token
+// (internal/usecase/market_scan.go), confirmed live to be this account's tradeable product family
+// (CLAUDE.md §4). A duplicate of cmd/trader's own copy rather than a shared import — same
+// reasoning as buildBotTraderClamps's own duplication note: a separate copy per binary means a
+// future change to one binary's resolution rule can't silently also change the other's.
+//
+// Added 2026-09-29 (same day as cmd/trader's own roster change) to fix a real production bug: an
+// operator editing a promoted-but-not-originally-configured token's SL/TP from the panel got
+// "no OKX instId configured for symbol X" from this exact code path, still pointed at the old
+// fixed 10-token okx.SymbolMap after cmd/trader itself had already moved off it.
+type dbBackedSymbolResolver struct {
+	repo      *postgres.Repository
+	ctx       context.Context
+	symbolMap map[string]string
+}
+
+func (r dbBackedSymbolResolver) Resolve(symbol string) (string, error) {
+	if v, ok := r.symbolMap[symbol]; ok && v != "" {
+		return v, nil
+	}
+	instruments, err := r.repo.ListInstruments(r.ctx, port.InstrumentFilter{Exchange: "okx"})
+	if err != nil {
+		return "", fmt.Errorf("resolve %q: list instruments: %w", symbol, err)
+	}
+	for _, in := range instruments {
+		if in.Symbol == symbol && in.ExecInstID != "" {
+			return in.ExecInstID, nil
+		}
+	}
+	return "", fmt.Errorf("no OKX instrument id known for symbol %q", symbol)
+}
+
+func (r dbBackedSymbolResolver) ResolveAll(symbols []string) ([]string, error) {
+	out := make([]string, len(symbols))
+	for i, s := range symbols {
+		v, err := r.Resolve(s)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
+}
+
+// botAssignedInstIDsOrEmpty mirrors cmd/trader's own botAssignedInstIDs (every DISTINCT inst_id
+// with at least one enabled mode="bot" strategy_assignments row) for the Affordability reporter's
+// AllTokens field. Returns an empty slice rather than failing startup on error — this is a
+// read-only reporting feature (cmd/api's own Affordability never enables/disables anything, see
+// the comment at its call site), so a transient DB hiccup here must not take down the whole panel
+// API.
+func botAssignedInstIDsOrEmpty(ctx context.Context, repo *postgres.Repository, logger *slog.Logger) []string {
+	rows, err := repo.ListAssignments(ctx, "", true, "bot", "")
+	if err != nil {
+		logger.Warn("failed to load bot-mode instrument roster for affordability reporting", "error", err)
+		return nil
+	}
+	seen := make(map[string]bool, len(rows))
+	var out []string
+	for _, a := range rows {
+		if !seen[a.InstID] {
+			seen[a.InstID] = true
+			out = append(out, a.InstID)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func parsePaperTraderProfileURLs(raw string) map[string]string {
 	out := map[string]string{}
 	for _, pair := range strings.Split(raw, ",") {

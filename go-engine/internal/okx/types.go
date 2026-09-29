@@ -113,20 +113,21 @@ func (b Balance) ToDomain() domain.Balance {
 // OrderRequest is the payload for POST /api/v5/trade/order. No attachAlgoOrds field — tried and
 // removed 2026-09-22, see domain.OrderRequest's own doc comment for why.
 type OrderRequest struct {
-	InstID  string          `json:"instId"`
-	TdMode  string          `json:"tdMode"`            // "cross" or "isolated"
-	Side    string          `json:"side"`              // "buy" or "sell"
-	PosSide string          `json:"posSide,omitempty"` // "long" or "short" (hedge mode)
-	OrdType string          `json:"ordType"`           // "market", "limit", ...
-	Sz      decimal.Decimal `json:"sz"`                // size in contracts
-	Px      decimal.Decimal `json:"px,omitempty"`      // required for limit orders
+	InstID     string          `json:"instId"`
+	TdMode     string          `json:"tdMode"`               // "cross" or "isolated"
+	Side       string          `json:"side"`                 // "buy" or "sell"
+	PosSide    string          `json:"posSide,omitempty"`    // "long" or "short" (hedge mode)
+	OrdType    string          `json:"ordType"`               // "market", "limit", ...
+	Sz         decimal.Decimal `json:"sz"`                    // size in contracts
+	Px         decimal.Decimal `json:"px,omitempty"`          // required for limit orders
+	ReduceOnly bool            `json:"reduceOnly,omitempty"` // OKX only honors this in net mode; see domain.OrderRequest
 }
 
 // OrderRequestFromDomain converts a domain.OrderRequest to the OKX wire payload.
 func OrderRequestFromDomain(req domain.OrderRequest) OrderRequest {
 	return OrderRequest{
 		InstID: req.InstID, TdMode: req.TdMode, Side: req.Side, PosSide: req.PosSide,
-		OrdType: req.OrdType, Sz: req.Sz, Px: req.Px,
+		OrdType: req.OrdType, Sz: req.Sz, Px: req.Px, ReduceOnly: req.ReduceOnly,
 	}
 }
 
@@ -141,6 +142,29 @@ type OrderResult struct {
 // ToDomain converts an OrderResult to its domain representation.
 func (r OrderResult) ToDomain() domain.OrderResult {
 	return domain.OrderResult{OrdID: r.OrdID, ClOrdID: r.ClOrdID, SCode: r.SCode, SMsg: r.SMsg}
+}
+
+// ClosePositionRequest mirrors OKX's POST /api/v5/trade/close-position body — deliberately no
+// size field at all, since the exchange reads its own live position size (domain.ClosePositionRequest's
+// own doc explains why this shape closes the class of race a manually-sized flatten order cannot).
+type ClosePositionRequest struct {
+	InstID  string `json:"instId"`
+	MgnMode string `json:"mgnMode"`
+	PosSide string `json:"posSide,omitempty"`
+}
+
+// ClosePositionResultWire mirrors a single entry of the close-position response data array.
+type ClosePositionResultWire struct {
+	InstID  string `json:"instId"`
+	PosSide string `json:"posSide"`
+}
+
+func (r ClosePositionResultWire) ToDomain() domain.ClosePositionResult {
+	return domain.ClosePositionResult{InstID: r.InstID, PosSide: r.PosSide}
+}
+
+func ClosePositionRequestFromDomain(req domain.ClosePositionRequest) ClosePositionRequest {
+	return ClosePositionRequest{InstID: req.InstID, MgnMode: req.MgnMode, PosSide: req.PosSide}
 }
 
 // OrderStatus mirrors a single entry of the GET /api/v5/trade/order response data array.

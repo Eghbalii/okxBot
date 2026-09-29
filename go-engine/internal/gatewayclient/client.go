@@ -159,6 +159,14 @@ func (c *Client) PlaceOrder(req domain.OrderRequest) (*domain.OrderResult, error
 	return &out, nil
 }
 
+func (c *Client) ClosePosition(req domain.ClosePositionRequest) (*domain.ClosePositionResult, error) {
+	var out domain.ClosePositionResult
+	if err := c.do(context.Background(), http.MethodPost, "/position/close", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (c *Client) CancelOrder(instID, ordID string) error {
 	body := map[string]string{"instId": instID, "ordId": ordID}
 	return c.do(context.Background(), http.MethodPost, "/order/cancel", body, nil)

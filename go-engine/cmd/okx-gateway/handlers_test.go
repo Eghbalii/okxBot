@@ -34,6 +34,7 @@ type fakeExchange struct {
 	accountConfig domain.AccountConfig
 
 	placeOrderCalls    int
+	closePositionCalls int
 	cancelOrderCalls   int
 	getOrderCalls      int
 	getInstrumentCalls int
@@ -88,6 +89,14 @@ func (f *fakeExchange) PlaceOrder(req domain.OrderRequest) (*domain.OrderResult,
 		return nil, err
 	}
 	return f.orderResult, nil
+}
+
+func (f *fakeExchange) ClosePosition(req domain.ClosePositionRequest) (*domain.ClosePositionResult, error) {
+	f.closePositionCalls++
+	if err := f.maybeFail(); err != nil {
+		return nil, err
+	}
+	return &domain.ClosePositionResult{InstID: req.InstID, PosSide: req.PosSide}, nil
 }
 func (f *fakeExchange) SetLeverage(req domain.LeverageChange) error {
 	f.setLeverageCalls++

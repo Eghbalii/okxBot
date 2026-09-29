@@ -145,6 +145,40 @@ func (c *Client) PlaceOrder(req domain.OrderRequest) (*domain.OrderResult, error
 	}, nil
 }
 
+// ClosePosition flattens req.InstID's current position at market. MEXC has no size-free
+// close-position primitive the way OKX does (domain.ClosePositionRequest's own doc explains why
+// OKX's version matters for real trading), so this composes the same guarantee from what MEXC
+// does offer: read the position's OWN live size and side from GetPositions, then place a market
+// order for exactly that — never a caller-supplied or locally-derived size. This method is not
+// reachable from real trading today (MEXC backs only a paper-trading comparison instance, never
+// BotTrader's real-money path), but implements the port faithfully rather than stubbing it.
+func (c *Client) ClosePosition(req domain.ClosePositionRequest) (*domain.ClosePositionResult, error) {
+	positions, err := c.GetPositions("")
+	if err != nil {
+		return nil, fmt.Errorf("mexc close position %s: %w", req.InstID, err)
+	}
+	for _, p := range positions {
+		if p.InstID != req.InstID || p.Pos.IsZero() {
+			continue
+		}
+		side, posSide := "sell", "long"
+		if p.Pos.IsNegative() {
+			side, posSide = "buy", "short"
+		}
+		closeReq := domain.OrderRequest{
+			InstID: req.InstID, TdMode: req.MgnMode, Side: side, PosSide: posSide,
+			OrdType: "market", Sz: p.Pos.Abs(),
+		}
+		if _, err := c.PlaceOrder(closeReq); err != nil {
+			return nil, fmt.Errorf("mexc close position %s: %w", req.InstID, err)
+		}
+		return &domain.ClosePositionResult{InstID: req.InstID, PosSide: posSide}, nil
+	}
+	// No open position found — the same benign "nothing to close" outcome OKX's own close-position
+	// reports, per domain.ClosePositionRequest's doc.
+	return &domain.ClosePositionResult{InstID: req.InstID}, nil
+}
+
 // CancelOrder cancels one still-open order.
 //
 // MEXC's cancel takes an ARRAY of order ids and reports per-item results, so a single-order cancel

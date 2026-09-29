@@ -113,12 +113,14 @@ func TestOpenBot_ClosesThePositionWhenProtectionCannotBePlaced(t *testing.T) {
 	if len(open) != 0 {
 		t.Fatalf("an unprotectable position must not be left open, got %d open", len(open))
 	}
-	// Two orders reached the exchange: the entry, then the flatten that undid it.
-	if len(exchange.placedOrders) != 2 {
-		t.Fatalf("expected the entry to be flattened immediately (2 orders), got %d", len(exchange.placedOrders))
+	// The entry reached the exchange as an ordinary PlaceOrder; the flatten that undid it is now a
+	// ClosePosition call instead (2026-09-29, no client-supplied size — see
+	// domain.ClosePositionRequest's doc).
+	if len(exchange.placedOrders) != 1 {
+		t.Fatalf("expected exactly the entry order placed, got %d", len(exchange.placedOrders))
 	}
-	if exchange.placedOrders[1].Side != "sell" {
-		t.Errorf("the second order must flatten the long, got side %q", exchange.placedOrders[1].Side)
+	if len(exchange.closePositionCalls) != 1 {
+		t.Fatalf("expected the entry to be flattened immediately via close-position, got %d calls", len(exchange.closePositionCalls))
 	}
 }
 

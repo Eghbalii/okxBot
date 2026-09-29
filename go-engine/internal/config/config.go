@@ -115,18 +115,11 @@ type Config struct {
 		// (RLSizing/RLSLTPAdjust/etc.) — this is the riskiest commit in that plan to get wrong
 		// silently, so an explicit off-by-default flag is the safety valve.
 		UseConductorLifecycle bool `yaml:"use_conductor_lifecycle"`
-		// AllowRLEarlyClose is real trading's OWN switch for the model's early-close action
-		// (close_reason='rl_early'), independent of paper_trading.rl_early_close (2026-09-08
-		// request). Real trading otherwise borrows every RL setting from the paper_trading
-		// section — deliberately, since the clamp bounds and update cadence are the same question
-		// for both engines — but early close is not: it is the one lifecycle action that destroys
-		// the counterfactual (a position closed early can never show what it would have done),
-		// and on a real account it also spends a real fee to do so.
-		//
-		// Sharing the paper flag would mean enabling early close for paper-trading RESEARCH
-		// silently enabled it against real capital, which is exactly the coupling to avoid. This
-		// defaults false (Go's zero value, no override logic touches it), so real trading ignores
-		// the model's close action unless it is turned on explicitly here.
+		// AllowRLEarlyClose is no longer read by cmd/trader (2026-09-29 request): BotTrader now
+		// hardcodes RLEarlyClose=false unconditionally, so this config key has no effect on real
+		// trading. Left in the schema rather than removed since dropping a yaml field is a schema
+		// change this fix doesn't need to make; paper_trading.rl_early_close remains fully live for
+		// paper-trading research, unaffected by this.
 		AllowRLEarlyClose bool `yaml:"allow_rl_early_close"`
 		// SafeMoneyUSD is a reserve subtracted from the exchange's reported real balance before
 		// BotTrader ever sizes a position or records equity for the panel (CLAUDE.md real-trading

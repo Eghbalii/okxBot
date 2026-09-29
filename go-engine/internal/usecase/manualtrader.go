@@ -743,6 +743,13 @@ func (m *ManualTrader) closeManual(ctx context.Context, o port.ManualOrder, reas
 	req := domain.OrderRequest{InstID: o.ExecInstID, TdMode: m.orderTdMode(o.TdMode), Side: side, OrdType: "market", Sz: *o.Contracts}
 	if m.posMode() == "long_short" {
 		req.PosSide = posSideFor(signedNotionalForSide(o.Side))
+	} else {
+		// ReduceOnly (2026-09-29, same fix as BotTrader.closeBotWith): a manual position can carry
+		// its own resting exchange-side SL/TP algo order (placeProtection above), which can fire and
+		// close the position moments before an operator's own manual close request lands here. On a
+		// flat account, a plain market flatten would silently open a brand-new, unintended position
+		// instead of failing — reduceOnly makes OKX reject it when there is nothing left to reduce.
+		req.ReduceOnly = true
 	}
 	result, err := m.Exchange.PlaceOrder(req)
 	if err != nil {

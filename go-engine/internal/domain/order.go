@@ -18,6 +18,16 @@ type OrderRequest struct {
 	OrdType string // "market", "limit", ...
 	Sz      decimal.Decimal
 	Px      decimal.Decimal // required for limit orders
+	// ReduceOnly tells the exchange this order may only reduce or close an existing position, never
+	// open one or increase it. Set true on every flatten/close order this system places (2026-09-29
+	// request): without it, a close order that races the exchange's OWN protective algo order —
+	// which can fire and close the position moments before this system's tick monitor notices and
+	// sends its own flatten — has nothing left to reduce, so on a flat account a plain market order
+	// simply OPENS A NEW, unintended position instead of erroring out. reduceOnly makes OKX reject
+	// such an order outright when there is nothing to reduce, which is the correct outcome: the
+	// close already happened via the exchange's own order, and this system should learn that from
+	// reconciliation rather than accidentally trading again.
+	ReduceOnly bool
 }
 
 // OrderResult is the exchange's response to a placed order.
@@ -26,6 +36,31 @@ type OrderResult struct {
 	ClOrdID string
 	SCode   string
 	SMsg    string
+}
+
+// ClosePositionRequest is OKX's own POST /api/v5/trade/close-position: unlike OrderRequest, it
+// carries NO size at all — the exchange reads its own live position size and flattens exactly
+// that, at market. This is the structural fix for the whole class of race this system has hit
+// live more than once (2026-09-29): a flatten built from THIS system's own locally-stored size
+// can land a moment after the exchange's own protective order already closed the position, and
+// once nothing is left to reduce, a plain market order (even with ReduceOnly) still depends on
+// the exchange correctly rejecting it in that exact instant. close-position sidesteps the whole
+// question of "how much is still open" by never asking this system to answer it: if the position
+// is already gone, there is nothing for OKX to read a size from, so nothing is opened.
+type ClosePositionRequest struct {
+	InstID  string
+	MgnMode string // "cross" or "isolated"
+	PosSide string // "long" or "short" (hedge mode); empty/omitted in net mode
+}
+
+// ClosePositionResult is OKX's response to a close-position request. An empty/zero value with no
+// error is a valid "there was nothing to close" answer from OKX itself (verified: the endpoint is
+// documented to require an existing position and is the exchange's own purpose-built "flatten
+// whatever this instrument's position currently is" primitive) — never a reason to try again with
+// a manually-computed size.
+type ClosePositionResult struct {
+	InstID  string
+	PosSide string
 }
 
 // LeverageChange is a request to set leverage for an instrument.

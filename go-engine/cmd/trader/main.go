@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"sort"
 	"syscall"
 	"time"
 
@@ -156,7 +157,7 @@ func main() {
 	riskManager := risk.NewManager(riskLimits, startEquity)
 
 	if cfg.Trading.UseConductorLifecycle {
-		runBotTrader(ctx, logger, cfg, exchangeClient, rlClient, riskManager, pgRepo, mode, execInstIDFor)
+		runBotTrader(ctx, logger, cfg, exchangeClient, rlClient, riskManager, pgRepo, mode)
 		return
 	}
 
@@ -205,7 +206,6 @@ func runBotTrader(
 	riskManager *risk.Manager,
 	repo *postgres.Repository,
 	mode string,
-	execInstIDFor map[string]string,
 ) {
 	if err := strategy.SeedOrigins(ctx, repo); err != nil {
 		logger.Error("failed to seed origin strategies", "error", err)
@@ -225,10 +225,7 @@ func runBotTrader(
 	if tradingPaused {
 		logger.Info("real trading is not in the running state", "tradingState", ptCfg.TradingState)
 	}
-	// Global per-kind "active strategies" toggle, scoped to mode=bot — bulk-applied BEFORE
-	// loadBotTraderStrategyAssignments reads them below, mirroring cmd/paper-trader's own
-	// sequencing exactly. A no-op when ActiveKinds is empty (no restriction configured).
-	// Reuses PaperTrading.Bars/CandleLimit/RLClamps/RLUpdate*/RLEarlyClose/RLMaxOpenDuration —
+	// Reuses PaperTrading.Bars/CandleLimit/RLClamps/RLUpdate*/RLMaxOpenDuration —
 	// real trading does not need its own separate bar-list or clamp config section (CLAUDE.md §27's
 	// plan §2's own note): the decision-vs-context bar split and the clamp bounds are the same
 	// question for both engines, and duplicating the config key would just risk the two drifting.
@@ -241,29 +238,62 @@ func runBotTrader(
 		logger.Error("paper_trading.bars is empty; BotTrader needs at least one decision bar")
 		os.Exit(1)
 	}
-	// The instrument roster is trading.inst_ids from config.yaml — the SAME configured list
-	// paper-trader trades — filtered ONLY by paper_trading_config.disabled_inst_ids (the Manage
-	// Tokens checkbox), exactly mirroring cmd/paper-trader's own roster (CLAUDE.md, corrected
-	// 2026-09-22 per explicit operator instruction).
+	// The instrument roster is no longer trading.inst_ids from config.yaml (2026-09-29, second
+	// request the same day): the first cut of this change still built the roster from the fixed
+	// 10-symbol config list, which meant a token the optimizer promoted for a NEW instrument (one
+	// outside that hand-maintained list) got a mode="bot" strategy_assignments row that was never
+	// actually loaded — silently unreachable. The roster is now every DISTINCT inst_id with at
+	// least one enabled mode="bot" assignment, discovered fresh from the database at startup —
+	// mirroring cmd/paper-trader's own DB-backed roster (RosterFor) instead of a config-file list.
 	//
-	// REVISES the 2026-09-13 design (migration 000031's separate instruments.enabled_real column):
-	// that column was meant to be a second, explicit real-money gate a person would flip per token
-	// from the panel — but no panel control for it was ever built, so in practice it just sat at
-	// its default (false, admitted-but-off) for every token. The operator's own instruction is
-	// direct: there is exactly ONE save action for tokens/strategies (Manage Tokens) and exactly
-	// ONE run action (the Real tab's Run button) — whatever is checked when Run is pressed is what
-	// trades, with no second flag anywhere else to also remember to flip. enabled_real is no longer
-	// read by this process; the column itself is left in place (still read by the Home page's
-	// display badge, §53.6) rather than dropped, since removing it is a schema change this fix does
-	// not need to make.
-	instIDs := append([]string(nil), cfg.Trading.InstIDs...)
-	if len(instIDs) == 0 {
-		logger.Error("trading.inst_ids is empty — configure at least one instrument for real trading")
+	// BotTrader no longer consults its own per-kind ("active strategies") or per-token ("Manage
+	// Tokens" disabled_inst_ids) enable toggles at all, and now not even trading.inst_ids itself —
+	// it trades EXACTLY what the strategy-optimizer has promoted, mirrored into a mode="bot"
+	// strategy_assignments row at promotion time (internal/optimizer/promote.go). Both panel
+	// controls (ptCfg.ActiveKinds, ptCfg.DisabledInstIDs) are still read/saved for the paper-mode
+	// UI's own use but are deliberately NOT applied here — loadBotTraderStrategyAssignments below
+	// is the sole source of truth for which (strategy, inst, bar) combinations BotTrader runs, and
+	// botAssignedInstIDs below is the sole source of truth for WHICH TOKENS get an engine at all.
+	instIDs, err := botAssignedInstIDs(ctx, repo)
+	if err != nil {
+		logger.Error("failed to determine bot-mode instrument roster from strategy_assignments", "error", err)
 		os.Exit(1)
 	}
-
-	if err := repo.SetAssignmentsEnabledForKinds(ctx, "bot", "", ptCfg.ActiveKinds, instIDs, decisionBars); err != nil {
-		logger.Error("failed to apply real-mode active-strategy-kinds restriction", "error", err)
+	if len(instIDs) == 0 {
+		logger.Error("no enabled mode=bot strategy_assignments — nothing for real trading to run; " +
+			"has the strategy-optimizer promoted anything yet?")
+		os.Exit(1)
+	}
+	// Each new token needs OKX's own wire-format instId to actually place a real order — resolved
+	// from the SAME instruments.exec_inst_id column the ingestor/paper-trader roster already
+	// populates from OKX's public GetAllTickers scan (internal/usecase/market_scan.go), which is
+	// already the X-Perp FUTURES product this account can trade (confirmed live, CLAUDE.md §4: this
+	// account's classic SWAP instruments report maxBuy=maxSell=0). This replaces
+	// trading.symbol_map's hand-maintained 10-entry map as the source for any token beyond those
+	// original 10 — the map itself is left in cfg for backward compatibility/override but is no
+	// longer required to cover every real-trading token.
+	execInstIDFor, missingExecID, err := resolveBotExecInstIDs(ctx, repo, instIDs, cfg.Trading.SymbolMap)
+	if err != nil {
+		logger.Error("failed to resolve real-trading instrument ids", "error", err)
+		os.Exit(1)
+	}
+	if len(missingExecID) > 0 {
+		// Not fatal: every OTHER token still trades. A token with no known exec_inst_id has never
+		// been seen by the ingestor's public scan yet (or the scan hasn't run since it was assigned)
+		// — it is dropped from THIS run's roster and logged loudly rather than reaching an order
+		// placement call with an empty instId.
+		logger.Error("dropping bot-mode tokens with no resolvable OKX instrument id (not on the ingestor's roster yet)",
+			"tokens", missingExecID)
+		filtered := instIDs[:0]
+		for _, id := range instIDs {
+			if _, ok := execInstIDFor[id]; ok {
+				filtered = append(filtered, id)
+			}
+		}
+		instIDs = filtered
+	}
+	if len(instIDs) == 0 {
+		logger.Error("every bot-mode token was dropped for a missing exec_inst_id — nothing to trade")
 		os.Exit(1)
 	}
 	// trading_state="stopped" force-closes every currently-open real position, once, at startup —
@@ -382,8 +412,11 @@ func runBotTrader(
 
 			// Panel control-box gates for real mode (CLAUDE.md real-trading readiness plan,
 			// 2026-09-04) — mirrors cmd/paper-trader's own PaperTrader construction exactly.
+			// NOT ptCfg.DisabledInstIDs (2026-09-29): the "Manage Tokens" per-token disable checkbox
+			// is one of the enable/disable flags BotTrader now deliberately ignores — see the note
+			// above loadBotTraderStrategyAssignments. Which tokens actually trade is entirely decided
+			// by which mode="bot" strategy_assignments rows the optimizer has promoted.
 			TradingPaused: tradingPaused,
-			OpensDisabled: slices.Contains(ptCfg.DisabledInstIDs, instID),
 			DisableLong:   ptCfg.DisableLong,
 			DisableShort:  ptCfg.DisableShort,
 
@@ -403,11 +436,10 @@ func runBotTrader(
 
 			RLUpdatePnLThresholdPct: cfg.PaperTrading.RLUpdatePnLThresholdPct,
 			RLUpdateMaxInterval:     cfg.PaperTrading.RLUpdateMaxInterval,
-			// NOT cfg.PaperTrading.RLEarlyClose: real trading has its own switch for this one action
-			// (2026-09-08 request), so turning early close on for paper research cannot silently turn
-			// it on against real capital. Every OTHER RL setting is still shared with paper_trading —
-			// see the note above on why that sharing is deliberate.
-			RLEarlyClose:    realEarlyCloseAllowed(cfg),
+			// Hardcoded false, not cfg-driven (2026-09-29 request): BotTrader never allows the model
+			// to close a position early — paper trading's own RLEarlyClose flag is untouched and
+			// still config-driven for research.
+			RLEarlyClose:    false,
 			RLClamps:        clamps,
 			MaxOpenDuration: cfg.PaperTrading.RLMaxOpenDuration,
 
@@ -441,7 +473,26 @@ func runBotTrader(
 		SettleCcy:         cfg.Trading.ExecSettleCcy,
 		TdMode:            cfg.Trading.TdMode,
 		PosMode:           cfg.Trading.PosMode,
-		ExecInstIDFor:     okx.SymbolMap(cfg.Trading.SymbolMap).Resolve,
+		// 2026-09-29: resolves against trading.symbol_map FIRST, then the instruments table's own
+		// exec_inst_id (the same X-Perp id the ingestor's public scan already populates) — mirrors
+		// resolveBotExecInstIDs's fallback order, but resolved live per call rather than once at
+		// startup, since a manual order can target ANY token the operator picks from a live search,
+		// not just BotTrader's own pre-resolved roster.
+		ExecInstIDFor: func(symbol string) (string, error) {
+			if v, ok := cfg.Trading.SymbolMap[symbol]; ok && v != "" {
+				return v, nil
+			}
+			in, err := repo.ListInstruments(ctx, port.InstrumentFilter{Exchange: "okx"})
+			if err != nil {
+				return "", fmt.Errorf("resolve %q: list instruments: %w", symbol, err)
+			}
+			for _, i := range in {
+				if i.Symbol == symbol && i.ExecInstID != "" {
+					return i.ExecInstID, nil
+				}
+			}
+			return "", fmt.Errorf("no OKX instrument id known for symbol %q", symbol)
+		},
 		FillTimeout:       time.Duration(cfg.FillTimeout.OrderFillTimeoutSec) * time.Second,
 		OrderEvents:       orderEventsPub,
 		AccountInitialUSD: cfg.Account.InitialUSD,
@@ -509,11 +560,13 @@ func runBotTrader(
 		Exchange: exchangeClient,
 		Logger:   logger,
 		Mode:     "bot",
-		// The full CONFIGURED set, not the real-enabled roster: this service decides which tokens
-		// are affordable and re-enables one that has become affordable again, so handing it only the
-		// already-enabled subset would leave it unable to ever restore a token it disabled itself.
-		AllTokens:      cfg.Trading.InstIDs,
-		Symbols:        okx.SymbolMap(cfg.Trading.SymbolMap),
+		// The full bot-mode ASSIGNED set (2026-09-29: was cfg.Trading.InstIDs, the fixed 10-token
+		// config list; now instIDs, the dynamic roster botAssignedInstIDs just resolved from
+		// strategy_assignments) — this service decides which tokens are affordable and re-enables
+		// one that has become affordable again, so handing it only the already-enabled subset would
+		// leave it unable to ever restore a token it disabled itself.
+		AllTokens:      instIDs,
+		Symbols:        dbBackedSymbolResolver{repo: repo, ctx: ctx, symbolMap: cfg.Trading.SymbolMap},
 		ExecInstType:   cfg.Trading.ExecInstType,
 		MaxPositionPct: cfg.Account.MaxPositionPct,
 		MaxLeverage:    cfg.Risk.MaxLeverage,
@@ -602,16 +655,6 @@ func runBotTrader(
 // §23) — a separate copy rather than an import specifically so a future field added to one config
 // section doesn't silently also need to change the other's caller; both map their own
 // cfg.*.RLClamps into conductor.Clamps field-by-field.
-// realEarlyCloseAllowed reads real trading's OWN early-close switch, deliberately NOT
-// paper_trading.rl_early_close (2026-09-08 request). Extracted as a named function rather than
-// left as a field read inside main()'s struct literal for the same reason buildBotTraderClamps
-// was: a value buried in a large literal is exactly what got silently dropped in the incident that
-// left every real position uncapped, so the mapping gets a test that fails if it ever points back
-// at the paper flag.
-func realEarlyCloseAllowed(cfg *config.Config) bool {
-	return cfg.Trading.AllowRLEarlyClose
-}
-
 func buildBotTraderClamps(cfg *config.Config) conductor.Clamps {
 	return conductor.Clamps{
 		MinSLDistPct: cfg.PaperTrading.RLClamps.MinSLDistPct,
@@ -657,4 +700,111 @@ func loadBotTraderStrategyAssignments(ctx context.Context, repo *postgres.Reposi
 			"instId", instID, "skipped", skipped, "loaded", len(out))
 	}
 	return out, nil
+}
+
+// dbBackedSymbolResolver implements port.SymbolResolver by checking trading.symbol_map first (so
+// a hand-corrected entry always wins, e.g. ahead of a contract roll the ingestor's scan hasn't
+// caught up to yet), then falling back to the instruments table's own exec_inst_id — the same
+// X-Perp id the ingestor's public OKX scan populates for every discovered token
+// (internal/usecase/market_scan.go), confirmed live to be this account's tradeable product family
+// (CLAUDE.md §4). Used by AffordabilityService so afford-ability checks aren't limited to the
+// original hand-maintained 10-token symbol_map (2026-09-29, same request as botAssignedInstIDs).
+type dbBackedSymbolResolver struct {
+	repo      *postgres.Repository
+	ctx       context.Context
+	symbolMap map[string]string
+}
+
+func (r dbBackedSymbolResolver) Resolve(symbol string) (string, error) {
+	if v, ok := r.symbolMap[symbol]; ok && v != "" {
+		return v, nil
+	}
+	instruments, err := r.repo.ListInstruments(r.ctx, port.InstrumentFilter{Exchange: "okx"})
+	if err != nil {
+		return "", fmt.Errorf("resolve %q: list instruments: %w", symbol, err)
+	}
+	for _, in := range instruments {
+		if in.Symbol == symbol && in.ExecInstID != "" {
+			return in.ExecInstID, nil
+		}
+	}
+	return "", fmt.Errorf("no OKX instrument id known for symbol %q", symbol)
+}
+
+func (r dbBackedSymbolResolver) ResolveAll(symbols []string) ([]string, error) {
+	out := make([]string, len(symbols))
+	for i, s := range symbols {
+		v, err := r.Resolve(s)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
+}
+
+// botAssignedInstIDs returns every DISTINCT inst_id with at least one enabled mode="bot"
+// strategy_assignments row, sorted for a stable startup log/engine-start order (2026-09-29,
+// mirroring cmd/paper-trader's own RosterFor which reads from the instruments table rather than
+// config — BotTrader's roster comes from strategy_assignments instead, since a bot-mode row is
+// itself what "the optimizer activated this token for real trading" means; see
+// internal/optimizer/promote.go). instID="" in ListAssignments returns every instrument's rows.
+func botAssignedInstIDs(ctx context.Context, repo *postgres.Repository) ([]string, error) {
+	rows, err := repo.ListAssignments(ctx, "", true, "bot", "")
+	if err != nil {
+		return nil, fmt.Errorf("list bot-mode assignments: %w", err)
+	}
+	seen := make(map[string]bool, len(rows))
+	var out []string
+	for _, a := range rows {
+		if !seen[a.InstID] {
+			seen[a.InstID] = true
+			out = append(out, a.InstID)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// resolveBotExecInstIDs resolves each of instIDs to OKX's own wire-format instrument id, needed to
+// actually place a real order. Checks trading.symbol_map FIRST (2026-09-29: the original 10-entry
+// hand-maintained map stays authoritative where it exists, e.g. if it's ever hand-corrected ahead
+// of the ingestor's own scan picking up a contract roll), falling back to the instruments table's
+// own exec_inst_id — the SAME X-Perp FUTURES id the ingestor's public OKX scan already populates
+// for every token it discovers (internal/usecase/market_scan.go), confirmed live to be this
+// account's tradeable product family (CLAUDE.md §4: classic SWAP instruments report
+// maxBuy=maxSell=0 on this account). A token resolvable by NEITHER is reported in missing rather
+// than failing the whole roster — one token with no known instrument id must not stop every other
+// already-tradeable token from starting.
+func resolveBotExecInstIDs(ctx context.Context, repo *postgres.Repository, instIDs []string, symbolMap map[string]string) (execInstIDFor map[string]string, missing []string, err error) {
+	execInstIDFor = make(map[string]string, len(instIDs))
+	var unresolvedBySymbolMap []string
+	for _, id := range instIDs {
+		if v, ok := symbolMap[id]; ok && v != "" {
+			execInstIDFor[id] = v
+			continue
+		}
+		unresolvedBySymbolMap = append(unresolvedBySymbolMap, id)
+	}
+	if len(unresolvedBySymbolMap) == 0 {
+		return execInstIDFor, nil, nil
+	}
+	instruments, err := repo.ListInstruments(ctx, port.InstrumentFilter{Exchange: "okx"})
+	if err != nil {
+		return nil, nil, fmt.Errorf("list instruments to resolve real-trading exec ids: %w", err)
+	}
+	bySymbol := make(map[string]string, len(instruments))
+	for _, in := range instruments {
+		if in.ExecInstID != "" {
+			bySymbol[in.Symbol] = in.ExecInstID
+		}
+	}
+	for _, id := range unresolvedBySymbolMap {
+		if v, ok := bySymbol[id]; ok {
+			execInstIDFor[id] = v
+		} else {
+			missing = append(missing, id)
+		}
+	}
+	return execInstIDFor, missing, nil
 }

@@ -283,17 +283,27 @@ func TestApplyBotAdjustment_ExchangeAmendFailureLeavesLevelsUnchanged(t *testing
 // TestCloseBot_ExchangeFailureDoesNotCloseInDB confirms exchange-first ordering: if PlaceOrder
 // (the flattening order) fails, CloseBotOrder must never be called — a DB failure-to-flatten
 // must never leave the system believing a still-open real position is closed.
+// 2026-09-29: closeBot's exchange-flatten path now uses ClosePosition (no client-supplied size)
+// followed by a GetPositions poll for confirmation, replacing the old PlaceOrder+waitForFill.
+// A ClosePosition error alone is not fatal (it may just mean "already closed" — see
+// domain.ClosePositionRequest's doc), but if the position is STILL reported open afterward, that
+// is a genuine stuck close and must not be recorded as done.
 func TestCloseBot_ExchangeFailureDoesNotCloseInDB(t *testing.T) {
 	repo := newFakeRepository()
-	exchange := &fakeExchangeClient{placeOrderErr: context.DeadlineExceeded}
+	exchange := &fakeExchangeClient{
+		closePositionErr:     context.DeadlineExceeded,
+		noAutoFlattenOnClose: true, // ClosePosition fails AND the position stays open on the exchange
+		positions:            []domain.Position{{InstID: "BTC-USDT-SWAP", Pos: dec("10")}},
+	}
 	rt := newTestBotTrader(repo, exchange, nil, nil)
+	rt.closeSettlePollTimeoutOverride = 50 * time.Millisecond
 
 	order := port.BotOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
 	repo.realOrders[1] = order
 
 	err := rt.closeBot(context.Background(), order, dec("110"), "sl", testLogger())
 	if err == nil {
-		t.Fatal("expected closeBot to return an error when the flattening order fails")
+		t.Fatal("expected closeBot to return an error when the position is still open after the poll timeout")
 	}
 	if repo.realOrders[1].ClosedAt != nil {
 		t.Error("expected the order to remain open in the DB when the exchange close failed")
@@ -319,11 +329,13 @@ func TestCloseBot_SucceedsAndReportsTerminal(t *testing.T) {
 	if err := rt.closeBot(context.Background(), order, dec("110"), "tp", testLogger()); err != nil {
 		t.Fatalf("closeBot returned error: %v", err)
 	}
-	if len(exchange.placedOrders) != 1 {
-		t.Fatalf("expected exactly 1 flattening order, got %d", len(exchange.placedOrders))
+	// 2026-09-29: the flatten is now a ClosePosition call (no client-supplied side/size — see
+	// domain.ClosePositionRequest's doc), not a PlaceOrder.
+	if len(exchange.closePositionCalls) != 1 {
+		t.Fatalf("expected exactly 1 close-position call, got %d", len(exchange.closePositionCalls))
 	}
-	if exchange.placedOrders[0].Side != "sell" {
-		t.Errorf("expected a sell order to flatten a long, got %q", exchange.placedOrders[0].Side)
+	if exchange.closePositionCalls[0].InstID != rt.execInstID() {
+		t.Errorf("expected close-position for %q, got %q", rt.execInstID(), exchange.closePositionCalls[0].InstID)
 	}
 	if repo.realOrders[1].ClosedAt == nil {
 		t.Error("expected the order to be closed in the DB")
@@ -728,14 +740,16 @@ func TestOpenBot_PartialFillRecordsActualSize(t *testing.T) {
 	}
 	// Size is MARGIN throughout this codebase, not notional — realizedPnLWithFunding derives the
 	// notional as Size x Leverage, so the two cannot both be Size. Since 2026-09-09 it is derived
-	// from what the exchange actually filled rather than by scaling the request:
+	// from what the exchange actually filled rather than by scaling the request. Real trading's
+	// leverage is now fixed at BotFixedLeverage (2026-09-29, rl-sizing bypassed for BotTrader),
+	// not the model's LeverageFrac:
 	//
 	//   AccFillSz(2.5) x CtVal(1, unset in this fixture) x AvgPx(100) = $250 notional
-	//   margin = 250 / leverage(5.5, from LeverageFrac 0.5 against MaxLeverage 10) = $45.45
+	//   margin = 250 / BotFixedLeverage(10) = $25
 	//
 	// Computed independently here rather than read back from open[0].Size, which would make the
 	// check tautological.
-	lev := dec("1").Add(dec("0.5").Mul(dec("10").Sub(dec("1")))) // 5.5
+	lev := dec(fmt.Sprint(BotFixedLeverage))
 	wantSize := dec("2.5").Mul(dec("100")).Div(lev)
 	if !open[0].Size.Sub(wantSize).Abs().LessThan(dec("0.01")) {
 		t.Errorf("expected recorded size ~%s (margin backing the filled 2.5 contracts at 100), got %s", wantSize, open[0].Size)
@@ -748,26 +762,27 @@ func TestOpenBot_PartialFillRecordsActualSize(t *testing.T) {
 // TestCloseBot_UnfilledFlattenDoesNotMarkClosed confirms the flatten leg's own fill-timeout path:
 // if the closing order doesn't fully fill, the DB row must NOT be marked closed — a partially- or
 // un-flattened position is still real exposure on the exchange (CLAUDE.md §27.5).
+// 2026-09-29: "unfilled flatten" is now represented by the position remaining reported OPEN on
+// GetPositions past the poll timeout (close-position has no order id to poll/cancel via the old
+// GetOrder/CancelOrder mechanism — see pollUntilFlat).
 func TestCloseBot_UnfilledFlattenDoesNotMarkClosed(t *testing.T) {
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{
-		orderStatus: &domain.OrderStatus{State: "live", AccFillSz: dec("0"), Sz: dec("1")},
+		noAutoFlattenOnClose: true,
+		positions:            []domain.Position{{InstID: "BTC-USDT-SWAP", Pos: dec("10")}},
 	}
 	rt := newTestBotTrader(repo, exchange, nil, nil)
-	rt.FillTimeout = 50 * time.Millisecond
+	rt.closeSettlePollTimeoutOverride = 50 * time.Millisecond
 
 	order := port.BotOrder{ID: 1, InstID: rt.InstID, Side: "buy", EntryPx: dec("100"), Size: dec("10"), Leverage: dec("1")}
 	repo.realOrders[1] = order
 
 	err := rt.closeBot(context.Background(), order, dec("110"), "sl", testLogger())
 	if err == nil {
-		t.Fatal("expected closeBot to return an error when the flatten order doesn't fill")
+		t.Fatal("expected closeBot to return an error when the position never settles flat")
 	}
 	if repo.realOrders[1].ClosedAt != nil {
 		t.Error("expected the order to remain open in the DB when the flatten didn't confirm fill")
-	}
-	if len(exchange.cancelOrderCalls) != 1 {
-		t.Errorf("expected the unfilled flatten order to be canceled, got %d cancel calls", len(exchange.cancelOrderCalls))
 	}
 }
 
@@ -1108,8 +1123,12 @@ func TestCloseBot_DoesNotApplyRealizedPnLToTheAccount(t *testing.T) {
 func TestCloseBot_FailedFlattenLeavesPositionOpenAndRecordsError(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
-	exchange := &fakeExchangeClient{placeOrderErr: fmt.Errorf("okx: insufficient margin")}
+	exchange := &fakeExchangeClient{
+		noAutoFlattenOnClose: true,
+		positions:            []domain.Position{{InstID: "BTC-USDT-SWAP", Pos: dec("10")}},
+	}
 	rt := newTestBotTrader(repo, exchange, nil, nil)
+	rt.closeSettlePollTimeoutOverride = 50 * time.Millisecond
 
 	sl, tp := dec("90"), dec("110")
 	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
@@ -1143,14 +1162,21 @@ func TestCloseBot_FailedFlattenLeavesPositionOpenAndRecordsError(t *testing.T) {
 // The exchange's own fill price, realized PnL and fee are what get stored — not the tick price that
 // merely triggered the close, and not a locally computed PnL. Order 3 recorded close_px=102 from a
 // stale trigger tick while the market was at 103.9.
+// 2026-09-29: the exchange's own close numbers now come from closeFactsFromExchange (reading
+// whichever protective algo order leg fired), not from polling the flatten order's own GetOrder
+// status — close-position has no order id to poll that way. This test sets up the TP leg as
+// having fired and naming a resulting order, which is what closeBotWith now reads after
+// ClosePosition + a successful GetPositions poll confirm the position is flat.
 func TestCloseBot_PrefersExchangeReportedNumbers(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
-	exchange := &fakeExchangeClient{}
-	exchange.orderStatusQueue = []domain.OrderStatus{{
-		State: "filled", AvgPx: dec("103.9"), AccFillSz: dec("1"), Sz: dec("1"),
-		Pnl: dec("0.25"), Fee: dec("-0.02"),
-	}}
+	exchange := &fakeExchangeClient{
+		algoStatus: &domain.AlgoOrderStatus{State: "effective", ActualSide: "tp", OrdID: "flatten-ord-1"},
+		orderStatus: &domain.OrderStatus{
+			State: "filled", AvgPx: dec("103.9"), AccFillSz: dec("1"), Sz: dec("1"),
+			Pnl: dec("0.25"), Fee: dec("-0.02"),
+		},
+	}
 	rt := newTestBotTrader(repo, exchange, nil, nil)
 
 	sl, tp := dec("90"), dec("110")
@@ -1161,6 +1187,10 @@ func TestCloseBot_PrefersExchangeReportedNumbers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	realOrder := repo.realOrders[id]
+	realOrder.ExchangeAlgoOrderID = algoOrderID("SL-1")
+	realOrder.ExchangeTPAlgoOrderID = algoOrderID("TP-1")
+	repo.realOrders[id] = realOrder
 	o, err := repo.GetBotOrder(ctx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -1455,10 +1485,18 @@ func TestCloseBot_ConfirmedCloseSettlesEvenAPartialFill(t *testing.T) {
 // and its record is final (2026-09-09 request: "don't call it each time — when the system reads
 // it, save the JSON there"). Every later view is then a row read rather than a live API call
 // against a rate-limit budget shared with real trading.
+// 2026-09-29: close-position (the new exchange-flatten mechanism, replacing PlaceOrder) returns no
+// order id of its own — domain.ClosePositionResult carries only instId/posSide, by design, since
+// it never places an ordinary order this system could look up via GetOrderRaw. The close leg's raw
+// record is now captured only when the EXCHANGE's own protective algo order is what actually fired
+// (its resulting order does have an id) — this test exercises exactly that case, rather than a
+// close-position-driven close, which legitimately has no raw record to capture any more.
 func TestCloseBot_CapturesExchangeRecordsForBothLegs(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
-	exchange := &fakeExchangeClient{}
+	exchange := &fakeExchangeClient{
+		algoStatus: &domain.AlgoOrderStatus{State: "effective", ActualSide: "sl", OrdID: "flatten-ord-1"},
+	}
 	model := &fakeModelClient{action: domain.Action{
 		Action: domain.ActionOpen, SizePct: dec("0.5"), LeverageFrac: dec("0.5"),
 	}}
@@ -1478,7 +1516,7 @@ func TestCloseBot_CapturesExchangeRecordsForBothLegs(t *testing.T) {
 		t.Fatal("the open leg's exchange record must be captured once the fill is confirmed")
 	}
 
-	if err := rt.closeBot(ctx, open[0], dec("110"), "manual", testLogger()); err != nil {
+	if err := rt.closeBot(ctx, open[0], dec("110"), "sl", testLogger()); err != nil {
 		t.Fatalf("closeBot: %v", err)
 	}
 	after, err := repo.GetBotOrder(ctx, open[0].ID)
@@ -1486,7 +1524,7 @@ func TestCloseBot_CapturesExchangeRecordsForBothLegs(t *testing.T) {
 		t.Fatalf("get after: %v", err)
 	}
 	if len(after.ExchangeCloseRaw) == 0 {
-		t.Fatal("the close leg's exchange record must be captured once the flatten is confirmed")
+		t.Fatal("the close leg's exchange record must be captured once the fired algo leg's own order is read")
 	}
 	// Both legs must be stored, and stored separately — a capture that overwrote the other leg
 	// would leave the order with only half its history.
@@ -1540,73 +1578,12 @@ func TestCloseBot_ExchangeRecordFailureDoesNotAffectTheClose(t *testing.T) {
 // 1, left 1 live on OKX behind a row recording a complete close, and the untracked position that
 // produced halted real trading for three hours. ETH (5 of 6) and DOGE (20 of 21) failed the same
 // way: whenever price moves in a position's favour, the same margin buys fewer contracts.
-func TestCloseBot_ClosesTheContractsActuallyOpened(t *testing.T) {
-	ctx := context.Background()
-	repo := newFakeRepository()
-	inst := domain.Instrument{CtVal: dec("0.0001"), LotSz: dec("1"), MinSz: dec("1")}
-	exchange := &fakeExchangeClient{instrument: &inst}
-	rt := newTestBotTrader(repo, exchange, nil, nil)
-
-	contracts := dec("2")
-	sl, tp := dec("70000"), dec("90000")
-	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
-		InstID: rt.InstID, Side: "buy", EntryPx: dec("78863.3"), SLPx: &sl, TPPx: &tp,
-		Size: dec("1.6124186773046364"), Leverage: dec("9.7819879055023189"),
-		Contracts: &contracts, Status: "filled", OpenedAt: time.Now(),
-	})
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	o, err := repo.GetBotOrder(ctx, id)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-
-	// Closing at a price ABOVE entry — the favourable move that triggered the under-close.
-	if err := rt.closeBot(ctx, o, dec("79258.5"), "tp", testLogger()); err != nil {
-		t.Fatalf("closeBot: %v", err)
-	}
-
-	if len(exchange.placedOrders) != 1 {
-		t.Fatalf("expected exactly one flattening order, got %d", len(exchange.placedOrders))
-	}
-	if got := exchange.placedOrders[0].Sz; !got.Equal(dec("2")) {
-		t.Fatalf("flatten size: want 2 contracts (what was opened), got %s — a short flatten leaves "+
-			"a live remainder on the exchange behind a row that claims to be flat", got)
-	}
-}
-
-// Rows opened before the contract count was recorded have nothing better to fall back on, but the
-// fallback must at least size at the ENTRY price — the price the position was actually opened at —
-// rather than the current one.
-func TestCloseBot_LegacyRowFallsBackToEntryPriceSizing(t *testing.T) {
-	ctx := context.Background()
-	repo := newFakeRepository()
-	inst := domain.Instrument{CtVal: dec("0.0001"), LotSz: dec("1"), MinSz: dec("1")}
-	exchange := &fakeExchangeClient{instrument: &inst}
-	rt := newTestBotTrader(repo, exchange, nil, nil)
-
-	sl, tp := dec("70000"), dec("90000")
-	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
-		InstID: rt.InstID, Side: "buy", EntryPx: dec("78863.3"), SLPx: &sl, TPPx: &tp,
-		Size: dec("1.6124186773046364"), Leverage: dec("9.7819879055023189"),
-		Status: "filled", OpenedAt: time.Now(), // no Contracts — a pre-migration row
-	})
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	o, err := repo.GetBotOrder(ctx, id)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-
-	if err := rt.closeBot(ctx, o, dec("79258.5"), "tp", testLogger()); err != nil {
-		t.Fatalf("closeBot: %v", err)
-	}
-	if got := exchange.placedOrders[0].Sz; !got.Equal(dec("2")) {
-		t.Fatalf("legacy fallback must size at the entry price: want 2, got %s", got)
-	}
-}
+// 2026-09-29: TestCloseBot_ClosesTheContractsActuallyOpened and
+// TestCloseBot_LegacyRowFallsBackToEntryPriceSizing (both here previously) guarded against an
+// under-close from a locally re-derived flatten size — a bug class that closeBotWith's switch to
+// close-position (domain.ClosePositionRequest) has made structurally impossible: close-position
+// carries no client-supplied size at all, so there is no derivation left to get wrong. Removed
+// rather than reworked onto a mechanism the bug no longer applies to.
 
 // A position whose stop was breached while the engine was not watching must close on the very next
 // reconciliation poll, not wait for a tick (2026-09-09 request: closing must be verified against
@@ -1865,7 +1842,8 @@ func TestMonitorOpenPositions_StillFlattensWhenTheProtectiveOrderIsStillResting(
 		t.Fatalf("monitorOpenPositions: %v", err)
 	}
 
-	if len(exchange.placedOrders) == 0 {
+	// 2026-09-29: the flatten is now a ClosePosition call, not a PlaceOrder.
+	if len(exchange.closePositionCalls) == 0 {
 		t.Error("a still-resting protective order has not fired, so this system must send the flatten")
 	}
 }
@@ -1873,9 +1851,15 @@ func TestMonitorOpenPositions_StillFlattensWhenTheProtectiveOrderIsStillResting(
 // TestMonitorOpenPositions_FlattensWhenTheProtectiveOrderCannotBeRead is the safety property. An
 // unreadable status is "don't know", never "already handled" — declining to flatten on a failed
 // API call would leave real exposure open on nothing more than a network blip.
-func TestMonitorOpenPositions_FlattensWhenTheProtectiveOrderCannotBeRead(t *testing.T) {
+// 2026-09-29: when the protective order's own state can't be read, the fallback is no longer a
+// blind flatten — a fresh GetPositions check decides. This is the "genuinely still open" half of
+// that fix: the exchange confirms the position is still live, so flattening is correct.
+func TestMonitorOpenPositions_FlattensWhenTheProtectiveOrderCannotBeReadButPositionStillOpen(t *testing.T) {
 	repo := newFakeRepository()
-	exchange := &fakeExchangeClient{getAlgoErr: errors.New("gateway timeout")}
+	exchange := &fakeExchangeClient{
+		getAlgoErr: errors.New("gateway timeout"),
+		positions:  []domain.Position{{InstID: "BTC-USDT-SWAP", Pos: dec("10")}},
+	}
 	rt := newTestBotTrader(repo, exchange, nil, nil)
 	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
 	repo.realOrders[1] = port.BotOrder{
@@ -1888,8 +1872,44 @@ func TestMonitorOpenPositions_FlattensWhenTheProtectiveOrderCannotBeRead(t *test
 		t.Fatalf("monitorOpenPositions: %v", err)
 	}
 
-	if len(exchange.placedOrders) == 0 {
-		t.Error("an unreadable protective order must fall back to a normal flatten, not be assumed fired")
+	// 2026-09-29: the flatten is now a ClosePosition call, not a PlaceOrder.
+	if len(exchange.closePositionCalls) == 0 {
+		t.Error("an unreadable protective order, with the exchange confirming the position is still open, must fall back to a normal flatten")
+	}
+}
+
+// 2026-09-29: the other half of the same fix — when the protective order's state can't be read
+// AND the exchange reports the position is already gone (the real incident this closes: OKX's own
+// stop fired first, then this process raced it), the fallback must NOT blindly flatten, since a
+// plain market order against a flat account would open a brand-new, unintended position. It must
+// instead record the position as exchange-closed.
+func TestMonitorOpenPositions_RecordsExchangeCloseWhenProtectiveOrderCannotBeReadAndPositionIsGone(t *testing.T) {
+	repo := newFakeRepository()
+	exchange := &fakeExchangeClient{
+		getAlgoErr: errors.New("gateway timeout"),
+		positions:  nil, // exchange reports no open position at all
+	}
+	rt := newTestBotTrader(repo, exchange, nil, nil)
+	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
+	repo.realOrders[1] = port.BotOrder{
+		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
+		EntryPx: dec("100"), SLPx: decPtr("96"), Size: dec("10"), Leverage: dec("1"),
+		ExchangeAlgoOrderID: algoOrderID("ALGO-1"),
+	}
+
+	start := time.Now()
+	if err := rt.monitorOpenPositions(context.Background(), dec("95"), testLogger()); err != nil {
+		t.Fatalf("monitorOpenPositions: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < exchangeCloseSettleDelay {
+		t.Errorf("expected the ambiguous-state grace delay (%s) to be taken before the GetPositions check, only waited %s", exchangeCloseSettleDelay, elapsed)
+	}
+
+	if len(exchange.placedOrders) != 0 {
+		t.Error("must NOT place a flatten order when the exchange confirms no position is open — that would open a brand-new one")
+	}
+	if repo.realOrders[1].ClosedAt == nil {
+		t.Error("expected the position to be recorded as closed (via the exchange-confirmed path), not left open")
 	}
 }
 
@@ -1915,7 +1935,8 @@ func TestMonitorOpenPositions_ManualCloseIsNotDeferredToTheExchange(t *testing.T
 		t.Fatalf("monitorOpenPositions: %v", err)
 	}
 
-	if len(exchange.placedOrders) == 0 {
+	// 2026-09-29: the flatten is now a ClosePosition call, not a PlaceOrder.
+	if len(exchange.closePositionCalls) == 0 {
 		t.Error("a manual close must always send its own flatten")
 	}
 }
@@ -1961,10 +1982,12 @@ func TestOpenBot_CrossMarginGuardTightensAnOverWideStop(t *testing.T) {
 	if open[0].SLPx == nil {
 		t.Fatal("expected a non-nil stop-loss")
 	}
-	// Margin=$500, Leverage=10 (measured directly): cap-safe distance = 1/(500*10) = 0.02% of
-	// entry, i.e. 99.98 for a long — strictly tighter than the pre-existing clamp's own 95.
-	if !open[0].SLPx.Equal(dec("99.98")) {
-		t.Fatalf("SLPx = %s, want 99.98 (the $1-cap-safe distance, tighter than the pre-existing clamp's own 95)", open[0].SLPx)
+	// Margin=$100 (equity/BotFixedLeverage split, 2026-09-29 fixed sizing — SizePct is no longer
+	// consulted), Leverage=10 (BotFixedLeverage, fixed rather than model-chosen): cap-safe distance
+	// = 1/(100*10) = 0.1% of entry, i.e. 99.9 for a long — strictly tighter than the pre-existing
+	// clamp's own 95.
+	if !open[0].SLPx.Equal(dec("99.9")) {
+		t.Fatalf("SLPx = %s, want 99.9 (the $1-cap-safe distance, tighter than the pre-existing clamp's own 95)", open[0].SLPx)
 	}
 }
 

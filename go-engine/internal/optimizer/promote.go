@@ -71,6 +71,24 @@ func Promote(ctx context.Context, store *Store, repo port.Repository, candidateI
 		return 0, fmt.Errorf("create assignment for candidate %d's strategy %d: %w", candidateID, strategyID, err)
 	}
 
+	// Mirror the same assignment under mode="bot" (2026-09-29 request): BotTrader now trades
+	// exactly whatever the optimizer has promoted for paper, ignoring its own separate per-kind/
+	// per-token enable toggles entirely — this is the one and only place that produces a bot-mode
+	// row, so a candidate promoted here goes live for both engines atomically. Only for OKX
+	// lineages: real trading is OKX-only today (§4), and a MEXC-only comparison lineage (e.g.
+	// exchange="mexc") has no corresponding real-money instrument for BotTrader to trade at all.
+	if c.Lineage.Exchange == "" || c.Lineage.Exchange == "okx" {
+		if _, err := repo.CreateAssignment(ctx, port.StrategyAssignment{
+			StrategyID: strategyID,
+			InstID:     c.Lineage.InstID,
+			Bar:        c.Lineage.Bar,
+			Enabled:    true,
+			Mode:       "bot",
+		}); err != nil {
+			return 0, fmt.Errorf("create bot-mode assignment for candidate %d's strategy %d: %w", candidateID, strategyID, err)
+		}
+	}
+
 	if err := store.PromoteCandidate(ctx, candidateID, strategyID); err != nil {
 		return 0, fmt.Errorf("promote candidate %d: %w", candidateID, err)
 	}
@@ -101,8 +119,16 @@ func Promote(ctx context.Context, store *Store, repo port.Repository, candidateI
 	// pipeline's own "backtest_rejected rows are kept for audit" posture), it just stops being
 	// evaluated going forward.
 	if hadPrevious && previous.StrategyID != nil {
-		if err := disableAssignmentFor(ctx, repo, *previous.StrategyID, c.Lineage.InstID, c.Lineage.Bar, c.Lineage.Exchange); err != nil {
+		if err := disableAssignmentFor(ctx, repo, "paper", *previous.StrategyID, c.Lineage.InstID, c.Lineage.Bar, c.Lineage.Exchange); err != nil {
 			return 0, fmt.Errorf("disable previous candidate %d's assignment: %w", previous.ID, err)
+		}
+		// Same demotion mirrored into mode="bot" (see the mirrored CreateAssignment above) — without
+		// this, a lineage's second-and-later promotion would leave the PREVIOUS candidate's bot-mode
+		// assignment enabled alongside the new one, doubling real trades on that (inst, bar).
+		if c.Lineage.Exchange == "" || c.Lineage.Exchange == "okx" {
+			if err := disableAssignmentFor(ctx, repo, "bot", *previous.StrategyID, c.Lineage.InstID, c.Lineage.Bar, ""); err != nil {
+				return 0, fmt.Errorf("disable previous candidate %d's bot-mode assignment: %w", previous.ID, err)
+			}
 		}
 	}
 
@@ -116,8 +142,13 @@ func Promote(ctx context.Context, store *Store, repo port.Repository, candidateI
 	// (kind, inst, bar), producing duplicate trades from the same setup and corrupting the
 	// per-strategy stats this whole pipeline exists to produce. Unconditional and idempotent: if
 	// the origin's assignment is already disabled (or never existed), this is a no-op.
-	if err := disableAssignmentFor(ctx, repo, originID, c.Lineage.InstID, c.Lineage.Bar, c.Lineage.Exchange); err != nil {
+	if err := disableAssignmentFor(ctx, repo, "paper", originID, c.Lineage.InstID, c.Lineage.Bar, c.Lineage.Exchange); err != nil {
 		return 0, fmt.Errorf("disable origin assignment for candidate %d's lineage: %w", candidateID, err)
+	}
+	if c.Lineage.Exchange == "" || c.Lineage.Exchange == "okx" {
+		if err := disableAssignmentFor(ctx, repo, "bot", originID, c.Lineage.InstID, c.Lineage.Bar, ""); err != nil {
+			return 0, fmt.Errorf("disable origin bot-mode assignment for candidate %d's lineage: %w", candidateID, err)
+		}
 	}
 
 	return strategyID, nil
@@ -136,8 +167,8 @@ func findOriginStrategyID(ctx context.Context, repo port.Repository, kind string
 	return 0, fmt.Errorf("no origin strategy row for kind %q — has strategy.SeedOrigins run?", kind)
 }
 
-func disableAssignmentFor(ctx context.Context, repo port.Repository, strategyID int64, instID, bar, exchange string) error {
-	assignments, err := repo.ListAssignments(ctx, instID, false, "paper", exchange)
+func disableAssignmentFor(ctx context.Context, repo port.Repository, mode string, strategyID int64, instID, bar, exchange string) error {
+	assignments, err := repo.ListAssignments(ctx, instID, false, mode, exchange)
 	if err != nil {
 		return err
 	}

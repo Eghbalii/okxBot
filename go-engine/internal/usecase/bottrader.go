@@ -130,6 +130,11 @@ type BotTrader struct {
 	// comment on why this is deliberately not a tight loop. Zero falls back to the constant below.
 	ReconcileInterval time.Duration
 
+	// closeSettlePollTimeoutOverride lets tests shrink pollUntilFlat's wait from the production
+	// closeSettlePollTimeout (2 minutes) so a test exercising the "never settles" path doesn't
+	// actually block for 2 real minutes. Zero (every production caller) falls back to the constant.
+	closeSettlePollTimeoutOverride time.Duration
+
 	// ReconciledExternally tells Run not to start this engine's own reconciliation loop because a
 	// ReconcileDriver is polling the account once on the whole roster's behalf. See AccountSnapshot
 	// for why per-engine polling was the wrong shape.
@@ -427,6 +432,61 @@ func (e *BotTrader) instrumentOrZero() domain.Instrument {
 //
 // The private WebSocket (positions/orders/account push) is the better primary for this and is
 // wired separately; this poll remains as the backup that does not depend on a socket staying up.
+// BotMaxOpenPositions and BotFixedLeverage implement the 2026-09-29 request to connect BotTrader
+// to the strategy-optimizer's promoted candidates: leverage is fixed rather than model-chosen, and
+// the account is split into exactly this many equal slots, with any signal arriving once all slots
+// are full simply dropped (not queued) until a position closes and frees one — the model's own
+// SizePct/LeverageFrac output is never consulted for real trading (rl-sizing is bypassed), only its
+// open/skip and SL/TP decisions still are.
+const (
+	BotMaxOpenPositions = 10
+	BotFixedLeverage    = 10
+)
+
+// closeSettlePollTimeout bounds how long closeBotWith's exchange-close path waits for
+// GetPositions to confirm flat after a close-position call (2026-09-29 request, replacing the
+// previous PlaceOrder+waitForFill's few-second timeout, which live incidents showed was too
+// short in some cases even for that mechanism, let alone the new position-existence poll). A
+// position genuinely still open after 2 minutes is a stuck close needing a human, not something
+// to wait out further or assume succeeded.
+const closeSettlePollTimeout = 2 * time.Minute
+
+// closeSettlePollInterval is how often pollUntilFlat re-checks GetPositions while waiting.
+const closeSettlePollInterval = 3 * time.Second
+
+// pollUntilFlat blocks until GetPositions reports this instrument flat, or the poll timeout
+// elapses — the wait-for-fill equivalent for closeBotWith's close-position path, which has no
+// ordId to poll via GetOrder the way a PlaceOrder-based flatten did. Returns false on timeout.
+func (e *BotTrader) pollUntilFlat(o port.BotOrder, logger *slog.Logger) bool {
+	timeout := closeSettlePollTimeout
+	interval := closeSettlePollInterval
+	if e.closeSettlePollTimeoutOverride > 0 {
+		timeout = e.closeSettlePollTimeoutOverride
+		interval = timeout / 10
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if !e.positionStillOpenOnExchange(o, logger) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(interval)
+	}
+}
+
+// exchangeCloseSettleDelay is a short grace pause taken ONLY on the rare "protection state
+// unreadable" path in monitorOpenPositions, immediately before its own fresh GetPositions
+// verification — giving OKX's own protective order, if it already fired, a moment to actually
+// settle into GetPositions' reported state before this system asks. 2026-09-29 request (real
+// incident: the exchange's own SL/TP close and this process's tick-driven close raced, and the
+// loser's flatten order landed after the position was already gone, opening a brand-new one). Not
+// applied to the common, fast case where protectionAlreadyFired's GetAlgoOrder reads already
+// answered cleanly — only this already-rare ambiguous branch pays it, so ordinary closes are not
+// slowed down.
+const exchangeCloseSettleDelay = 2 * time.Second
+
 const DefaultReconcileInterval = 20 * time.Second
 
 func (e *BotTrader) reconcileInterval() time.Duration {
@@ -762,6 +822,42 @@ func hasOpenPosition(open []port.BotOrder) bool {
 	return len(open) > 0
 }
 
+// positionStillOpenOnExchange asks OKX directly (GET /api/v5/account/positions) whether this
+// position still has non-zero size — the one authoritative answer for the case
+// protectionAlreadyFired cannot resolve itself: both its algo-order-leg reads came back
+// inconclusive (no algo id recorded, or both GetAlgoOrder calls failed).
+//
+// Added 2026-09-29 after a live incident: falling straight through to closeBot in that "don't
+// know" case used to blindly flatten from stale local state. When the exchange's own protective
+// order had ALREADY closed the position in that gap, a plain flatten order opened a brand-new,
+// unintended position on an account that was actually flat, rather than erroring out — exactly
+// the race the operator reported, worsened here because the "don't know" fallback had no fresh
+// check of its own at all (unlike the "ok=true" path, which already trusts GetAlgoOrder's answer).
+//
+// A read failure here is treated as "assume still open" (returns true) — the conservative
+// direction: the alternative (assuming closed) would let a mere network hiccup write a
+// closed-on-the-exchange record for a position that is, in fact, still live and unprotected while
+// nothing is watching it. Falling through to the ordinary flatten path is safe either way now that
+// it also carries ReduceOnly (closeBotWith): if the exchange really had already closed the
+// position, OKX itself rejects the flatten instead of silently opening a new one.
+func (e *BotTrader) positionStillOpenOnExchange(o port.BotOrder, logger *slog.Logger) bool {
+	if e.Exchange == nil {
+		return true
+	}
+	positions, err := e.Exchange.GetPositions(e.execInstType())
+	if err != nil {
+		logger.Warn("could not verify open position against the exchange before closing; assuming still open",
+			"id", o.ID, "instId", e.InstID, "error", err)
+		return true
+	}
+	for _, p := range positions {
+		if p.InstID == e.execInstID() && !p.Pos.IsZero() {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *BotTrader) evaluateStrategies(ctx context.Context, bar string, price decimal.Decimal, logger *slog.Logger) error {
 	if halted, reason := e.RiskManager.Halted(); halted {
 		logger.Warn("real trading halted, skipping new opens", "instId", e.InstID, "reason", reason)
@@ -897,31 +993,26 @@ func (e *BotTrader) openBot(
 		return nil, nil
 	}
 
-	// The per-position ceiling is the even share of the account across the active roster
-	// (equity/tokenCount), NOT account.max_position_pct alone (2026-09-08 request): splitting the
-	// budget evenly is what keeps one token from consuming several tokens' worth of risk, which a
-	// flat 25% ceiling on a 10-token roster does not — it would let four positions commit the
-	// entire account.
-	//
-	// Whichever is TIGHTER wins, so account.max_position_pct keeps working as the hard backstop it
-	// was written to be (§15.6) and can only ever make the budget smaller, never larger. On a
-	// roster of 1-3 tokens the even share is the looser of the two and the config cap binds; from
-	// 4 tokens up the even share binds. This also makes the ceiling the model is TOLD about
-	// (buildObservation's MaxPositionPct, already the even share) the same number it is actually
-	// held to — before this they disagreed, advising 1/10 while permitting 1/4.
-	cfg := sizingConfig{
-		InstID:              e.InstID,
-		MaxLeverage:         e.MaxLeverage,
-		MaxPositionPct:      tighterPct(e.evenShareOfAccount(), e.MaxPositionPct),
-		MaxTotalExposurePct: e.MaxTotalExposurePct,
+	// Hard cap on simultaneous real positions (2026-09-29 request): once BotMaxOpenPositions are
+	// open account-wide, any further signal is dropped outright, not queued — it only gets another
+	// chance once a position closes and a later signal fires. obs.OpenPositionCount is already an
+	// account-wide count computed fresh for this decision by buildObservation/exposureSnapshotBot,
+	// so no extra query is needed here.
+	if obs.OpenPositionCount >= BotMaxOpenPositions {
+		logger.Info("real open: max open positions reached, dropping signal", "instId", e.InstID,
+			"openPositionCount", obs.OpenPositionCount, "maxOpenPositions", BotMaxOpenPositions)
+		return nil, nil
 	}
-	openOrdersView := make([]port.PaperOrder, len(openOrders))
-	for i, o := range openOrders {
-		openOrdersView[i] = asPaperOrderView(o)
-	}
-	notional, leverage, sized := sizeFromModelAction(cfg, action, obs, openOrdersView, logger)
-	if !sized {
-		logger.Info("real open: model action not sizable, declining", "instId", e.InstID)
+
+	// Sizing and leverage are fixed, not model-chosen (2026-09-29 request, bypassing rl-sizing for
+	// real trading): leverage is always BotFixedLeverage, and each of the BotMaxOpenPositions slots
+	// gets an equal share of tradable equity (equity/10) rather than the model's own SizePct. The
+	// model is still consulted above for the open/skip decision and below for SL/TP, only sizing
+	// itself is no longer its call.
+	notional := obs.AccountEquityUSD.Div(decimal.NewFromInt(BotMaxOpenPositions))
+	leverage := decimal.NewFromInt(BotFixedLeverage)
+	if !notional.IsPositive() {
+		logger.Info("real open: zero tradable equity, declining", "instId", e.InstID)
 		return nil, nil
 	}
 
@@ -1462,50 +1553,27 @@ func (e *BotTrader) monitorOpenPositions(ctx context.Context, price decimal.Deci
 
 		// A manual close request from the panel wins over everything else, same priority order as
 		// PaperTrader.monitorOpenOrders (CLAUDE.md real-trading readiness plan, 2026-09-04 — Close
-		// button wiring): the operator explicitly asked to exit right now, checked before a
-		// coincidental SL/TP touch on the same tick decides the reason instead.
+		// button wiring).
+		//
+		// 2026-09-29 (explicit operator instruction): this monitor no longer watches for a SL/TP
+		// touch at all, in either direction — not to flatten, not even to verify/record. The
+		// exchange's own resting protective order (placeProtection) is now the ONLY mechanism that
+		// ever closes a position for reaching its stop or target; this process never races it, never
+		// asks "did it already fire", never sends its own flatten for that reason. The prior
+		// generation of this fix (protectionAlreadyFired / positionStillOpenOnExchange / ReduceOnly /
+		// close-position) still reduced the race window on every iteration, but a live incident
+		// (2026-09-29, a spurious SL trigger notification with no corresponding local action) made
+		// the operator's own instruction explicit: stop touching SL/TP outcomes from this process
+		// entirely, in every form, and trust the exchange's own fill/close event (reconcile's
+		// "remote==nil, local still open" branch, unchanged) to tell this system after the fact.
+		// Opening a position and adjusting an in-trade SL/TP are UNCHANGED — only the "act on price
+		// reaching the level" behavior is removed here.
 		reason, hit := conductor.CloseReasonManual, o.ManualCloseRequested
-		if !hit {
-			reason, hit = closeReason(asPaperOrderView(o), price)
-		}
 		if !hit && e.conductor().IsTimedOut(o.OpenedAt, now) {
 			reason, hit = conductor.CloseReasonTimeout, true
 		}
 		if !hit {
 			continue
-		}
-		// The exchange holds the real stop (CLAUDE.md §35), and its own order fires the moment the
-		// trigger is reached — usually before this monitor sees the same tick. Flattening anyway
-		// asks OKX to close a position it already closed, which it rejects with
-		// sCode=51169 "you don't have any positions in this direction ... to reduce or close".
-		//
-		// That is what every genuine exchange error on this deployment has been: 9 of 9, all
-		// close_reason sl/tp, all on orders that had a protective order resting. The close itself
-		// was never in danger — the exchange had already done it — but each one recorded a scary
-		// last_error on a trade that completed exactly as intended, which is noise in the one
-		// channel that must stay trustworthy.
-		//
-		// So on a LOCAL SL/TP touch, ask the exchange first. Only the SL/TP reasons are checked:
-		// a manual close or a timeout is this system deciding to exit, and no resting order is
-		// going to have done that for us.
-		if reason == conductor.CloseReasonSL || reason == conductor.CloseReasonTP {
-			if fired, ok := e.protectionAlreadyFired(o, logger); ok && fired {
-				logger.Info("exchange's own protective order already closed this position; recording it rather than sending a duplicate flatten",
-					"id", o.ID, "instId", e.InstID, "reason", reason)
-				exReason, closePx, exPnL, exFee := e.closeFactsFromExchange(o, logger)
-				if exReason != "" {
-					reason = exReason
-				}
-				if !closePx.IsPositive() {
-					closePx = price
-				}
-				facts := &exchangeCloseFacts{PnL: exPnL, Fee: exFee}
-				// skipExchange: there is nothing left to flatten.
-				if err := e.closeBotWith(ctx, o, closePx, reason, true, facts, logger); err != nil {
-					logger.Error("failed to record an exchange-closed position", "id", o.ID, "instId", e.InstID, "error", err)
-				}
-				continue
-			}
 		}
 		if err := e.closeBot(ctx, o, price, reason, logger); err != nil {
 			logger.Error("failed to close real order", "id", o.ID, "instId", e.InstID, "error", err)
@@ -1621,87 +1689,89 @@ func (e *BotTrader) closeBotWith(ctx context.Context, o port.BotOrder, price dec
 	}
 
 	if !skipExchange {
-		side := "sell"
-		if o.Side == "sell" {
-			side = "buy"
+		// close-position (2026-09-29 request, replacing a manually-sized PlaceOrder+ReduceOnly):
+		// OKX's own POST /api/v5/trade/close-position takes NO size — it reads the position's live
+		// size on the exchange and flattens exactly that. This is the structural fix for the race
+		// this system has hit live more than once (bot orders 178/182 on WIF, 180/184 on RENDER):
+		// a flatten built from THIS system's own locally-stored size/side can land a moment after
+		// the exchange's own protective algo order already closed the position, and once nothing is
+		// left to reduce, a manually-sized order — even with ReduceOnly — still depends on the
+		// exchange correctly rejecting it in that exact instant, which was found live to not always
+		// hold (see domain.ClosePositionRequest's own doc). close-position sidesteps the question
+		// of "how much is still open" entirely: if the position is already gone, there is nothing
+		// for OKX to read a size from, so nothing is opened.
+		mgnMode := e.TdMode
+		if mgnMode == "" {
+			mgnMode = "isolated"
 		}
-		// No close-price selection here any more: the flatten closes a contract COUNT, which no
-		// price enters into. Choosing a price was only ever input to the size derivation that
-		// caused the under-close.
-		inst, err := e.instrumentMeta()
-		if err != nil {
-			return e.recordCloseError(ctx, o.ID, fmt.Errorf("fetch instrument metadata: %w", err), logger)
-		}
-		// Close exactly the contracts the exchange filled on the open. Re-deriving a count from the
-		// stored margin is what broke here (2026-09-09): the open is sized at the ENTRY price and
-		// the flatten was sizing at the CURRENT one, so a position whose price had moved favourably
-		// bought fewer contracts for the same margin and the flatten under-closed by one — BTC
-		// closed 1 of 2, ETH 5 of 6, DOGE 20 of 21. Each left a live remainder on the exchange
-		// behind a row that recorded a complete close, and the untracked positions that produced
-		// halted real trading for three hours.
-		//
-		// Falls back to the derivation only for rows opened before the count was recorded, since
-		// those genuinely have nothing better — and at the ENTRY price, which is at least the price
-		// the position was actually sized at.
-		sz := o.Contracts
-		if sz == nil || !sz.IsPositive() {
-			derived := sizeToContracts(o.Size, o.Leverage, o.EntryPx, inst)
-			sz = &derived
-		}
-		req := domain.OrderRequest{InstID: e.execInstID(), TdMode: e.TdMode, Side: side, OrdType: "market", Sz: *sz}
+		req := domain.ClosePositionRequest{InstID: e.execInstID(), MgnMode: mgnMode}
 		if e.PosMode == "long_short" {
 			req.PosSide = posSideFor(signedNotionalForSide(o.Side))
 		}
-		result, err := e.Exchange.PlaceOrder(req)
-		if err != nil {
-			return e.recordCloseError(ctx, o.ID, fmt.Errorf("flatten position: %w", err), logger)
-		}
-		if result != nil && result.SCode != "0" {
-			return e.recordCloseError(ctx, o.ID,
-				fmt.Errorf("flatten order rejected: sCode=%s sMsg=%s", result.SCode, result.SMsg), logger)
-		}
-
-		// Mark the close IN FLIGHT before waiting on it. This is what makes an in-progress or a
-		// stuck close visible to a trader watching the panel rather than a row that looks idle —
-		// and it records the flattening order's id, without which a close cannot be audited
-		// against OKX afterwards at all (bot order 3 had no such record).
-		if result != nil {
-			closeOrdID = result.OrdID
-			if err := e.Repo.SetBotOrderClosing(ctx, o.ID, result.OrdID); err != nil {
-				logger.Warn("failed to mark bot order closing", "id", o.ID, "error", err)
-			}
+		if _, err := e.Exchange.ClosePosition(req); err != nil {
+			// Not fatal by itself: OKX rejects close-position when there is genuinely no position to
+			// close, which is exactly the "already closed by the exchange's own protective order"
+			// case this whole change exists to handle safely. The poll below is the real judge —
+			// it asks the exchange directly rather than inferring anything from this error's text.
+			logger.Warn("close-position request did not succeed; verifying against the exchange directly",
+				"id", o.ID, "instId", e.InstID, "error", err)
 		}
 
-		// CLAUDE.md §27.5: confirm the flatten actually filled before marking the DB row closed —
-		// an unfilled or partially-filled flatten leaves real exposure still open on the exchange,
-		// and closing the DB row in that case would make the system believe a position is flat when
-		// it isn't. A partial fill here is deliberately NOT split into a smaller closed row (unlike
-		// a partial OPEN fill, which records the smaller size actually acquired): a partially-
-		// flattened position is still one open position with a reduced size, which the next tick's
-		// ordinary SL/TP/timeout check and the reconciliation poll both already handle correctly
-		// without new bookkeeping — this only needs to not lie about it being closed.
-		if result != nil && result.OrdID != "" {
-			status, err := e.waitForFill(ctx, result.OrdID, logger)
-			if err != nil {
-				return e.recordCloseError(ctx, o.ID, fmt.Errorf("wait for flatten fill: %w", err), logger)
+		// Mark the close IN FLIGHT before waiting on it, exactly as the old PlaceOrder path did —
+		// this is what makes an in-progress or a stuck close visible to a trader watching the panel
+		// rather than a row that looks idle. No order id to record here (close-position's response
+		// carries clOrdId/instId/posSide, not an ordId GetOrder can look up), so this only flips the
+		// status; closeOrdID stays empty and captureExchangeRecord below is skipped for this close.
+		if err := e.Repo.SetBotOrderClosing(ctx, o.ID, ""); err != nil {
+			logger.Warn("failed to mark bot order closing", "id", o.ID, "error", err)
+		}
+
+		// CLAUDE.md §27.5's confirm-before-recording rule, adapted: with no ordId to poll via
+		// GetOrder, confirmation is a GetPositions poll for this instrument going flat — the same
+		// authoritative check positionStillOpenOnExchange already performs elsewhere, reused here
+		// as the wait-for-fill equivalent. Up to 2 minutes (2026-09-29 request, replacing the
+		// previous few-second wait after live incidents showed a shorter window wasn't enough): a
+		// position that is STILL reported open after that long is a genuine stuck-close, not a
+		// normal settlement delay, and must be recorded as a failure rather than assumed closed.
+		if !e.pollUntilFlat(o, logger) {
+			return e.recordCloseError(ctx, o.ID, fmt.Errorf(
+				"close-position for %d did not settle within %s; position may still be open on the exchange, not marking closed",
+				o.ID, closeSettlePollTimeout), logger)
+		}
+		// The exchange's own close reason/price/pnl/fee, ONLY if a protective algo leg actually
+		// fired — NOT closeFactsFromExchange, which always returns a reason (falling back to
+		// "manual") on the assumption its caller already knows the exchange did the closing. Here
+		// THIS call's own ClosePosition may be what actually closed the position (e.g. a genuine
+		// "sl"/"tp"/"manual"/"timeout"/"rl_early" reason this function's own caller already
+		// determined), so overwriting reason unconditionally would relabel a correct close as
+		// "manual" every time neither leg happens to have fired — exactly the regression a live
+		// test caught (an rl_early close recorded as manual). Only trust the leg's own answer when
+		// it explicitly reports ok=true (i.e., it actually fired).
+		exReason, exClosePx, exPnL, exFee, exOK := e.closeFactsFromLeg(o, o.ExchangeAlgoOrderID, "sl", logger)
+		firedAlgoID := o.ExchangeAlgoOrderID
+		if !exOK {
+			exReason, exClosePx, exPnL, exFee, exOK = e.closeFactsFromLeg(o, o.ExchangeTPAlgoOrderID, "tp", logger)
+			firedAlgoID = o.ExchangeTPAlgoOrderID
+		}
+		if exOK {
+			reason = exReason
+			if exClosePx.IsPositive() {
+				price = exClosePx
+				exchangeClosePx = &exClosePx
 			}
-			if !status.IsFilled() {
-				return e.recordCloseError(ctx, o.ID, fmt.Errorf(
-					"flatten order for %d not fully filled (state=%s, filled=%s/%s); "+
-						"position may still be open on the exchange, not marking closed",
-					o.ID, status.State, status.AccFillSz, status.Sz), logger)
+			exchangePnL, exchangeFee = exPnL, exFee
+			// The fired leg's own resulting order carries the audit-trail record this close's
+			// captureExchangeRecord call below would otherwise have nothing to fetch — close-position
+			// itself returns no order id (domain.ClosePositionResult has none, by design: it never
+			// placed an ordinary order this system could ask GetOrderRaw about). Re-reading the algo
+			// status a second time here is cheap (one more GetAlgoOrder call, only on this already-
+			// rare "the exchange's own order closed it" path) and is what lets the close leg's raw
+			// record still get captured the way it always has.
+			if firedAlgoID != nil && *firedAlgoID != "" {
+				if algo, err := e.Exchange.GetAlgoOrder(e.execInstID(), *firedAlgoID); err == nil {
+					closeOrdID = algo.OrdID
+				}
 			}
-			// The exchange's own fill price is what the position actually closed at — preferred
-			// over the tick price that merely TRIGGERED the close, which is what produced order
-			// 3's nonsense close_px of 102 against a market trading at 103.9.
-			if status.AvgPx.IsPositive() {
-				avg := status.AvgPx
-				exchangeClosePx = &avg
-				price = avg
-			}
-			// OKX's own realized PnL and fee for this flatten, preferred over a local calculation
-			// that cannot see fees, funding, or the true fill price (2026-09-08 request).
-			exchangePnL, exchangeFee = exchangeCloseNumbers(status)
 		}
 	}
 
@@ -2100,6 +2170,20 @@ func (e *BotTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, log
 		if e.shouldDeferUntrackedHalt(logger, remote) {
 			break
 		}
+		// Second, independent check (2026-09-29, after a live incident: bot orders 202/203 on ETH,
+		// opened 1.7s apart with the same side/entry/size) — a direct re-query for ANY row matching
+		// this remote position, not filtered by openPositions()'s Open=true status list. The primary
+		// fix for that incident was openPositions() itself missing status='opening' from its "is this
+		// open" list (a just-accepted, not-yet-fill-confirmed order fell through as "no local
+		// record"); this is defense-in-depth for the same class of gap under any OTHER status this
+		// list doesn't yet cover, or a read-consistency lag this process cannot otherwise see. Only a
+		// recent match counts — an old closed row on the same side/price is a coincidence, not this
+		// position.
+		if e.recentlyOpenedMatch(ctx, remote, logger) {
+			logger.Info("reconcile: a locally-tracked row already matches this remote position; not writing a duplicate untracked row",
+				"instId", e.InstID, "remoteSize", remote.Pos, "remoteSide", remote.PosSide)
+			break
+		}
 		logger.Error("reconcile: exchange reports an open position this system has no record of",
 			"instId", e.InstID, "remoteSize", remote.Pos, "remoteSide", remote.PosSide)
 		// Halting is not enough on its own — it stops new trading but does nothing to make the
@@ -2150,30 +2234,15 @@ func (e *BotTrader) ReconcileWith(ctx context.Context, snap AccountSnapshot, log
 			break
 		}
 
-		// A position that agrees with the exchange can still be one this engine has stopped
-		// watching. SL/TP execution is tick-driven and in-process (§27.3), so it stops entirely
-		// whenever the process does — and the position keeps running on the exchange with real
-		// money behind it and nothing enforcing its stop.
-		//
-		// Real order 33 (PEPE, 2026-09-09): its stop sat at -14.7% of margin, price breached it and
-		// reached -19.6% while the trader was down for 15 minutes, and nothing closed it. It only
-		// exited because the operator had already requested a manual close — by then back at -8.7%,
-		// so the loss happened to be smaller, but that was luck, not the system working.
-		//
-		// This is the check that makes "verify against the exchange" mean something for a position
-		// that already exists: the poll re-runs the same SL/TP touch test against the exchange's
-		// own mark price, so a stop breached during any gap is acted on at the next poll instead of
-		// waiting for a tick that may never be evaluated. Uses MarkPx, which reconcile already
-		// fetches and previously ignored.
-		if remote.MarkPx.IsPositive() {
-			if reason, hit := closeReason(asPaperOrderView(local[0]), remote.MarkPx); hit {
-				logger.Warn("reconcile: position is past its own SL/TP but was never closed; closing now",
-					"instId", e.InstID, "id", local[0].ID, "reason", reason, "markPx", remote.MarkPx)
-				if err := e.closeBot(ctx, local[0], remote.MarkPx, reason, logger); err != nil {
-					logger.Error("reconcile: failed to close a position past its level", "id", local[0].ID, "error", err)
-				}
-			}
-		}
+		// 2026-09-29 (explicit operator instruction, same change as monitorOpenPositions): this no
+		// longer checks whether the position is past its own SL/TP and no longer closes it itself in
+		// that case. The exchange's own resting protective order is the ONLY mechanism that closes a
+		// position for reaching its stop or target — this reconcile pass no longer verifies that
+		// against remote.MarkPx or races it in any way. If the exchange's own order has already
+		// closed the position, that surfaces through the OTHER branch of this switch
+		// (remote == nil && len(local) > 0, below in source order but evaluated first since it's a
+		// separate pass once remote goes nil) — reconcile still records that as it always has; it
+		// simply never decides FOR ITSELF that a still-open position should close because of price.
 	}
 
 }
@@ -2237,6 +2306,48 @@ func (e *BotTrader) isOpenInFlight() bool {
 // untrackedPositionSide derives "buy"/"sell" from OKX's own position fields — the single
 // definition both reconcile branches (side-mismatch detection and the untracked-position record)
 // read from, so the two can never disagree about which side a given remote position is on.
+// recentlyOpenedMatchWindow bounds how far back recentlyOpenedMatch looks for a locally-tracked
+// row that already accounts for a remote position reconcile is about to call "untracked". Wide
+// enough to cover any realistic open-path stall (a slow exchange fill, a Postgres hiccup) but
+// short enough that an old, unrelated position on the same side/price by coincidence never
+// suppresses a genuine untracked-position alert days or weeks later.
+const recentlyOpenedMatchWindow = 5 * time.Minute
+
+// recentlyOpenedMatch reports whether ANY bot_orders row for this instrument — open or closed,
+// unfiltered by status — already accounts for remote, opened within recentlyOpenedMatchWindow.
+// Matches on side and approximate entry price (within 0.5%, since remote.AvgPx and the locally
+// recorded EntryPx can differ slightly — funding, slippage between the fill this system observed
+// and OKX's own average). This is deliberately a wider, unfiltered re-query rather than reusing
+// openPositions()'s Open=true list: that list's own status filter is exactly what a live incident
+// (bot orders 202/203 on ETH) found to have a gap, so the safety net here must not share that
+// list's blind spot.
+func (e *BotTrader) recentlyOpenedMatch(ctx context.Context, remote *domain.Position, logger *slog.Logger) bool {
+	rows, err := e.Repo.ListBotPositions(ctx, port.PositionFilter{InstID: e.InstID, Limit: 20, SortBy: "opened_at", SortDesc: true})
+	if err != nil {
+		logger.Warn("reconcile: could not re-check for a locally-tracked match before recording untracked",
+			"instId", e.InstID, "error", err)
+		return false
+	}
+	wantSide := untrackedPositionSide(remote)
+	cutoff := time.Now().Add(-recentlyOpenedMatchWindow)
+	for _, o := range rows {
+		if o.OpenedAt.Before(cutoff) {
+			continue
+		}
+		if o.Side != wantSide {
+			continue
+		}
+		if !remote.AvgPx.IsPositive() || o.EntryPx.IsZero() {
+			continue
+		}
+		diff := o.EntryPx.Sub(remote.AvgPx).Abs().Div(remote.AvgPx)
+		if diff.LessThanOrEqual(decimal.NewFromFloat(0.005)) {
+			return true
+		}
+	}
+	return false
+}
+
 func untrackedPositionSide(remote *domain.Position) string {
 	if remote.PosSide == "short" || remote.Pos.IsNegative() {
 		return "sell"

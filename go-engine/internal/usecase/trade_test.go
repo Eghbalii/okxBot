@@ -28,6 +28,11 @@ type fakeExchangeClient struct {
 	ordSeq int
 
 	placedOrders []domain.OrderRequest
+	// closePositionCalls/closePositionErr/noAutoFlattenOnClose back the fake's ClosePosition
+	// implementation, defined near PlaceOrder below.
+	closePositionCalls   []domain.ClosePositionRequest
+	closePositionErr     error
+	noAutoFlattenOnClose bool
 	// noDefaultBalance opts out of the funded-account default below, for the tests that
 	// specifically assert how an EMPTY balance response is handled — an exchange that reports
 	// nothing must never be read as a drained account.
@@ -206,6 +211,38 @@ func (f *fakeExchangeClient) PlaceOrder(req domain.OrderRequest) (*domain.OrderR
 	f.ordSeq++
 	return &domain.OrderResult{SCode: "0", OrdID: fmt.Sprintf("fake-ord-id-%d", f.ordSeq)}, nil
 }
+// closePositionErr, when set, makes ClosePosition return an error without removing anything from
+// f.positions — mirroring OKX's own real rejection when there is nothing to close.
+//
+// closePositionCalls records every ClosePosition request, so a test can assert whether/how many
+// times it was called without depending on the old PlaceOrder-based flatten's shape.
+//
+// noAutoFlattenOnClose, when true, makes ClosePosition a no-op that neither errors nor removes the
+// position from f.positions — for tests that want to control positionStillOpenOnExchange's answer
+// independently of whether ClosePosition itself "succeeded".
+func (f *fakeExchangeClient) ClosePosition(req domain.ClosePositionRequest) (*domain.ClosePositionResult, error) {
+	f.callMu.Lock()
+	f.closePositionCalls = append(f.closePositionCalls, req)
+	f.callMu.Unlock()
+	if f.closePositionErr != nil {
+		return nil, f.closePositionErr
+	}
+	if f.noAutoFlattenOnClose {
+		return &domain.ClosePositionResult{InstID: req.InstID}, nil
+	}
+	// Mirrors OKX's real close-position: removes exactly this instrument's position, as if the
+	// flatten filled immediately — so a subsequent positionStillOpenOnExchange/pollUntilFlat check
+	// (via GetPositions) correctly reports flat without a test needing to also manage f.positions.
+	filtered := f.positions[:0]
+	for _, p := range f.positions {
+		if p.InstID != req.InstID {
+			filtered = append(filtered, p)
+		}
+	}
+	f.positions = filtered
+	return &domain.ClosePositionResult{InstID: req.InstID, PosSide: req.PosSide}, nil
+}
+
 func (f *fakeExchangeClient) SetLeverage(req domain.LeverageChange) error {
 	f.leverageCalls = append(f.leverageCalls, req)
 	return f.setLeverageErr

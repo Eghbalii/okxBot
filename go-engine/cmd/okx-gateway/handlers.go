@@ -27,6 +27,10 @@ type exchangeClient interface {
 	GetBalance(ccy string) ([]domain.Balance, error)
 	GetCandles(instID, bar string, limit int) ([]domain.Candle, error)
 	PlaceOrder(req domain.OrderRequest) (*domain.OrderResult, error)
+	// ClosePosition flattens an instrument's live exchange-side position with no client-supplied
+	// size (2026-09-29) — see domain.ClosePositionRequest's own doc for why every real-money close
+	// uses this instead of a manually-sized PlaceOrder.
+	ClosePosition(req domain.ClosePositionRequest) (*domain.ClosePositionResult, error)
 	SetLeverage(req domain.LeverageChange) error
 	CancelOrder(instID, ordID string) error
 	GetOrder(instID, ordID string) (domain.OrderStatus, error)
@@ -86,6 +90,7 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("GET /balance", s.handleGetBalance)
 	mux.HandleFunc("GET /candles", s.handleGetCandles)
 	mux.HandleFunc("POST /order", s.handlePlaceOrder)
+	mux.HandleFunc("POST /position/close", s.handleClosePosition)
 	mux.HandleFunc("POST /order/cancel", s.handleCancelOrder)
 	mux.HandleFunc("GET /order", s.handleGetOrder)
 	mux.HandleFunc("GET /order/raw", s.handleGetOrderRaw)
@@ -278,6 +283,25 @@ func (s *service) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 	err := s.call(r.Context(), gateway.ClassTrade, r, func() error {
 		var innerErr error
 		result, innerErr = s.client.PlaceOrder(req)
+		return innerErr
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *service) handleClosePosition(w http.ResponseWriter, r *http.Request) {
+	var req domain.ClosePositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	var result *domain.ClosePositionResult
+	err := s.call(r.Context(), gateway.ClassTrade, r, func() error {
+		var innerErr error
+		result, innerErr = s.client.ClosePosition(req)
 		return innerErr
 	})
 	if err != nil {

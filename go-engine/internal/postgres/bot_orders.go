@@ -371,13 +371,21 @@ func (r *Repository) UpdateBotOrderPnLExtremes(ctx context.Context, id int64, ma
 // paged per f — mirrors ListPositions. f.Mode is ignored (every row is real by construction).
 // f.Open filters against ClosedAt, same as ListPositions; a "canceled" order (never filled) has
 // ClosedAt NULL forever, so it reads as "open" under a naive filter — excluded here by requiring
-// status IN ('filled','partial','closing','untracked') whenever f.Open is true, so a canceled
-// attempt never occupies a slot in the "open positions" view. 'untracked' (2026-09-28) is a
-// position reconcile found open on the exchange with no local record of how it was opened — it
+// status IN ('opening','filled','partial','closing','untracked') whenever f.Open is true, so a
+// canceled attempt never occupies a slot in the "open positions" view. 'untracked' (2026-09-28) is
+// a position reconcile found open on the exchange with no local record of how it was opened — it
 // MUST still count as open here, or the whole point of writing that row (making it visible to the
 // operator on the Positions page) is silently defeated one query away from where the row is
-// created. An f.Open == false or nil query is unaffected and still returns canceled rows (visible
-// under "closed"/"all", per the panel's Status badge design).
+// created. 'opening' (2026-09-29) was missing from this list entirely — openBot writes the row
+// with status='opening' the instant the exchange accepts the order, BEFORE the fill is confirmed
+// (CLAUDE.md real-trading readiness plan), and a reconcile pass landing in that exact window read
+// this query as "no local record of this position" even though the row already existed, and wrote
+// a second, duplicate 'untracked' row for the very position this system had just opened itself
+// (live incident: bot orders 202/203 on ETH, opened 1.7s apart, same side/entry/size). openInFlight
+// already exists to close a narrower version of this same gap (before ANY row exists) but does not
+// cover the gap between the row's insert and its fill confirmation, which this list fix closes at
+// the source instead. An f.Open == false or nil query is unaffected and still returns canceled rows
+// (visible under "closed"/"all", per the panel's Status badge design).
 func (r *Repository) ListBotPositions(ctx context.Context, f port.PositionFilter) ([]port.BotOrder, error) {
 	col, ok := positionSortColumns[f.SortBy]
 	if !ok {
@@ -403,7 +411,7 @@ func (r *Repository) ListBotPositions(ctx context.Context, f port.PositionFilter
 		FROM bot_orders ro
 		LEFT JOIN strategies s ON s.id = ro.strategy_id
 		WHERE ($1 = '' OR ro.inst_id = $1)
-			AND ($2::boolean IS NULL OR (ro.closed_at IS NULL AND (NOT $2 OR ro.status IN ('filled','partial','closing','untracked'))) = $2)
+			AND ($2::boolean IS NULL OR (ro.closed_at IS NULL AND (NOT $2 OR ro.status IN ('opening','filled','partial','closing','untracked'))) = $2)
 		ORDER BY ` + orderClause
 
 	args := []any{f.InstID, f.Open}

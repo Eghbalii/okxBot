@@ -29,6 +29,22 @@ func (c *Client) CancelOrder(instID, ordID string) error {
 	return c.do("POST", "/api/v5/trade/cancel-order", body, nil)
 }
 
+// ClosePosition flattens whatever this instrument's position currently is via POST
+// /api/v5/trade/close-position — see domain.ClosePositionRequest's doc for why this, not a
+// manually-sized PlaceOrder, is used for every real-money close (2026-09-29).
+func (c *Client) ClosePosition(req domain.ClosePositionRequest) (*domain.ClosePositionResult, error) {
+	wireReq := okx.ClosePositionRequestFromDomain(req)
+	var results []okx.ClosePositionResultWire
+	if err := c.do("POST", "/api/v5/trade/close-position", wireReq, &results); err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	result := results[0].ToDomain()
+	return &result, nil
+}
+
 // GetOrder fetches one order's current lifecycle state via GET /api/v5/trade/order — the
 // authoritative fill-status check CLAUDE.md §27.5/§27.6 requires: PlaceOrder's own response is
 // only OKX's acceptance of the request, not confirmation of what happened to it afterward.
