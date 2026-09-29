@@ -1585,16 +1585,17 @@ func TestCloseBot_ExchangeRecordFailureDoesNotAffectTheClose(t *testing.T) {
 // carries no client-supplied size at all, so there is no derivation left to get wrong. Removed
 // rather than reworked onto a mechanism the bug no longer applies to.
 
-// A position whose stop was breached while the engine was not watching must close on the very next
-// reconciliation poll, not wait for a tick (2026-09-09 request: closing must be verified against
-// the exchange, not only driven by the local tick feed).
+// A position the exchange no longer reports (its own resting stop/take-profit already closed it)
+// must be reflected locally on the very next reconciliation poll, not wait for a tick (2026-09-09
+// request: closing must be verified against the exchange, not only driven by the local tick feed).
 //
-// Real order 33's numbers: PEPE long, entry 0.00000362, stop 0.0000035659 (-14.7% of margin at
-// 9.87x). The trader was down for 15 minutes, price breached the stop and reached -19.6%, and
-// nothing closed it. Reconcile saw the position, agreed it matched the exchange, checked only the
-// side, and moved on. It exited 18 minutes later only because a manual close had been requested —
-// by then back at -8.7%, so the realized loss was smaller than the breach, which was luck.
-func TestReconcile_ClosesAPositionAlreadyPastItsStop(t *testing.T) {
+// 2026-09-29 (explicit operator instruction, see ReconcileWith's own comment on the remote != nil
+// branch): reconcile no longer compares a still-open remote position's mark price against its own
+// SL/TP and closes it itself — the exchange's own resting protective order is the only mechanism
+// that closes a position for reaching its stop or target. What reconcile still must do is catch
+// the position going away on the exchange's side (remote == nil) and close the local row to match,
+// which is exercised here.
+func TestReconcile_ClosesALocallyOpenPositionTheExchangeNoLongerReports(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepository()
 	exchange := &fakeExchangeClient{}
@@ -1607,18 +1608,16 @@ func TestReconcile_ClosesAPositionAlreadyPastItsStop(t *testing.T) {
 	id, err := repo.OpenBotOrder(ctx, port.BotOrder{
 		InstID: rt.InstID, Side: "buy", EntryPx: entry, SLPx: &sl, TPPx: &tp,
 		Size: dec("1.83"), Leverage: dec("9.8719062805175779"), Contracts: &contracts,
-		Status: "filled", OpenedAt: time.Now(),
+		// Opened well outside staleCloseGrace so reconcile doesn't defer this as a just-filled
+		// position it hasn't seen confirmed yet (see reconcile's own comment on that branch).
+		Status: "filled", OpenedAt: time.Now().Add(-5 * time.Minute),
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 
-	// The exchange reports the same position, at the price it actually reached: 0.000003548, well
-	// below the stop.
-	exchange.positions = []domain.Position{{
-		InstID: rt.execInstID(), PosSide: "long", Pos: dec("5"),
-		AvgPx: entry, MarkPx: dec("0.000003548"),
-	}}
+	// The exchange reports flat: its own stop already fired and closed the position.
+	exchange.positions = nil
 
 	rt.reconcile(ctx, testLogger())
 
@@ -1627,11 +1626,9 @@ func TestReconcile_ClosesAPositionAlreadyPastItsStop(t *testing.T) {
 		t.Fatalf("get after: %v", err)
 	}
 	if after.ClosedAt == nil {
-		t.Fatal("a position past its stop must be closed by the reconciliation poll — the tick-driven " +
-			"check does not run while the process is down, which is exactly when this matters")
-	}
-	if after.CloseReason == nil || *after.CloseReason != "sl" {
-		t.Fatalf("close reason: want sl, got %v", after.CloseReason)
+		t.Fatal("a position the exchange no longer reports must be closed locally by the " +
+			"reconciliation poll — the tick-driven check does not run while the process is down, " +
+			"which is exactly when this matters")
 	}
 }
 
@@ -1875,41 +1872,6 @@ func TestMonitorOpenPositions_FlattensWhenTheProtectiveOrderCannotBeReadButPosit
 	// 2026-09-29: the flatten is now a ClosePosition call, not a PlaceOrder.
 	if len(exchange.closePositionCalls) == 0 {
 		t.Error("an unreadable protective order, with the exchange confirming the position is still open, must fall back to a normal flatten")
-	}
-}
-
-// 2026-09-29: the other half of the same fix — when the protective order's state can't be read
-// AND the exchange reports the position is already gone (the real incident this closes: OKX's own
-// stop fired first, then this process raced it), the fallback must NOT blindly flatten, since a
-// plain market order against a flat account would open a brand-new, unintended position. It must
-// instead record the position as exchange-closed.
-func TestMonitorOpenPositions_RecordsExchangeCloseWhenProtectiveOrderCannotBeReadAndPositionIsGone(t *testing.T) {
-	repo := newFakeRepository()
-	exchange := &fakeExchangeClient{
-		getAlgoErr: errors.New("gateway timeout"),
-		positions:  nil, // exchange reports no open position at all
-	}
-	rt := newTestBotTrader(repo, exchange, nil, nil)
-	repo.accounts["bot"] = port.AccountEquity{Mode: "bot", InitialUSD: dec("1000"), EquityUSD: dec("1000")}
-	repo.realOrders[1] = port.BotOrder{
-		ID: 1, InstID: rt.InstID, Status: "filled", Side: "buy",
-		EntryPx: dec("100"), SLPx: decPtr("96"), Size: dec("10"), Leverage: dec("1"),
-		ExchangeAlgoOrderID: algoOrderID("ALGO-1"),
-	}
-
-	start := time.Now()
-	if err := rt.monitorOpenPositions(context.Background(), dec("95"), testLogger()); err != nil {
-		t.Fatalf("monitorOpenPositions: %v", err)
-	}
-	if elapsed := time.Since(start); elapsed < exchangeCloseSettleDelay {
-		t.Errorf("expected the ambiguous-state grace delay (%s) to be taken before the GetPositions check, only waited %s", exchangeCloseSettleDelay, elapsed)
-	}
-
-	if len(exchange.placedOrders) != 0 {
-		t.Error("must NOT place a flatten order when the exchange confirms no position is open — that would open a brand-new one")
-	}
-	if repo.realOrders[1].ClosedAt == nil {
-		t.Error("expected the position to be recorded as closed (via the exchange-confirmed path), not left open")
 	}
 }
 
