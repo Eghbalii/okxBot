@@ -509,4 +509,9 @@ Two datastores, each used for a distinct role:
 
 ## 18. License
 
-Not yet set. See `LICENSE` in the repository root once added.
+**Business Source License 1.1** (source-available, not OSI open-source). Anyone may run, modify,
+and use the code for any non-commercial purpose, including running their own trading instance.
+Offering the code (or a modified version of it) as a commercial product or service to a third
+party requires a separate commercial license from the copyright holder. Each released version
+converts automatically to Apache 2.0 four years after its publication date. See `LICENSE` in the
+repository root for the full text and the exact Additional Use Grant.

@@ -92,61 +92,11 @@ rewrite.
 
 ## Architecture
 
-```
-                    ┌─────────────────────────────────────────────┐
-                    │              Exchange adapter                 │
-                    │   (pluggable — OKX, MEXC, or a new one)       │
-                    └──────────────┬─────────────────┬─────────────┘
-                                   │ WebSocket        │ REST (orders,
-                                   │ (ticks/candles)  │  positions, algo SL/TP)
-                                   ▼                  ▼
-                   ┌───────────────────────┐  ┌──────────────────────┐
-                   │      Ingestor         │  │   exchange gateway     │
-                   │  (Go, per exchange)   │  │  credential-isolated,  │
-                   └───────────┬───────────┘  │  rate-limited, retries │
-                               │ publishes    └──────────┬─────────────┘
-                               ▼                          │ every trading
-                        ┌─────────────┐                   │ service calls
-                        │    Kafka     │                   │ through this
-                        │ (event bus)  │                   │
-                        └──────┬───────┘                   │
-                               │ consumes                  │
-              ┌────────────────┼────────────────┐          │
-              ▼                ▼                ▼          │
-      ┌───────────────┐ ┌────────────┐ ┌────────────────┐ │
-      │  Paper Trader   │ │ Strategy   │ │   Bot Trader    │◄┘
-      │ (forward-test,  │ │ Optimizer  │ │ (live/real-money │
-      │  training data) │ │ (Optuna)   │ │  trading loop)   │
-      └────────┬────────┘ └────────────┘ └────────┬─────────┘
-               │                                   │
-               │         POST /predict             │
-               └───────────────┬───────────────────┘
-                               ▼
-                    ┌─────────────────────┐
-                    │     rl-service       │
-                    │  (Python, SAC/SB3)   │
-                    │  FastAPI inference    │
-                    │  + continuous learning│
-                    └───────────────────────┘
+<div align="center">
 
-              ┌──────────────────────────────────────┐
-              │              TimescaleDB               │
-              │   candles · orders · account equity ·  │
-              │   strategy assignments · optimizer runs │
-              └──────────────────────────────────────────┘
-                               ▲
-                               │ reads/writes
-              ┌────────────────┴────────────────┐
-              │             cmd/api               │
-              │  dashboard REST API + WebSocket   │
-              └────────────────┬───────────────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │        panel          │
-                    │ React + TypeScript     │
-                    │    + Vite dashboard    │
-                    └────────────────────────┘
-```
+![okxBot architecture](images/Architecture.png)
+
+</div>
 
 ## Tech stack
 
@@ -313,7 +263,11 @@ then, treat network isolation as the *only* gate and never publish these ports d
 
 ## License
 
-Not yet decided — see `LICENSE` once it's added to the repository root.
+Licensed under the [Business Source License 1.1](LICENSE). You may run, modify, and use this
+project for any non-commercial purpose, including your own trading. Offering it (or a modified
+version) as a commercial product or service to third parties requires a commercial license —
+contact mr.eghbalii@gmail.com. Each release automatically converts to Apache 2.0 four years after
+its publication date.
 
 ## Disclaimer
 
