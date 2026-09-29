@@ -56,6 +56,11 @@ It's a real, end-to-end system rather than a backtesting toy:
 - 🛡️ **Hard, RL-independent risk limits** in Go — max leverage, max exposure, a loss cap enforced
   at multiple redundant layers, liquidation-distance floors — so nothing the model outputs can
   exceed them
+- 🔒 **Idempotent order state transitions** — every close path (SL/TP touch, manual close, model
+  early-close) guards on the row's own `closed_at IS NULL`, so two racing callers can never double-close
+  or double-count the same position
+- 🔌 **Per-connection WebSocket concurrency** — each exchange WS client runs its own read/write/heartbeat
+  goroutines with reconnect handling, independently for OKX and MEXC
 - 🔀 **A clean ports-and-adapters architecture** — the trading engine, risk manager, and every
   use-case depend only on interfaces, never on a specific exchange's SDK. Adding an exchange means
   writing one adapter that satisfies `port.ExchangeClient`; nothing else changes. Proven by
@@ -65,6 +70,29 @@ It's a real, end-to-end system rather than a backtesting toy:
   account balances, and a manual discretionary trading page — built with React, TypeScript, and Vite
 
 See [CLAUDE.md](CLAUDE.md) for the full architecture reference.
+
+## A note on how this was built
+
+This project was built with **Claude Code** as an AI pair-programmer, over many focused sessions.
+Architecture, risk-management rules, the RL design (reward shaping, the signal lifecycle, why SAC
+over PPO), and every trade-off documented in [CLAUDE.md](CLAUDE.md) were human-directed decisions —
+Claude handled implementation, iteration, and a large share of the debugging.
+
+This is not a one-shot generation. It went through the same discipline a hand-written system would:
+
+- **103 Go test files** and a property-tested Python reward function, including regression tests
+  written against real bugs found in review or in paper trading (e.g. a sizing bug that opened
+  every position at `1/leverage` the intended size).
+- **A static architecture test** that fails the build if application logic imports an exchange
+  adapter directly — the layering boundary is enforced, not just documented.
+- **Weeks of live paper trading** against real OKX and MEXC market data, opening and closing
+  virtual positions on real price action, before any of this touched real capital.
+- Every design decision in this README and in CLAUDE.md, including ones later reversed (see the
+  commit history), reflects a real trade-off that was evaluated, not a default Claude picked on its
+  own.
+
+If you're evaluating this repository, the [commit history](../../commits) is real and unedited —
+it shows the actual sequence of features, bugs, and fixes rather than a single generated drop.
 
 ## Pluggable exchange adapters
 
@@ -143,44 +171,11 @@ panel/              React + TypeScript + Vite dashboard
 docker-compose.yml  full stack: Kafka, Redis, TimescaleDB, Prometheus, Grafana, Loki, all services
 ```
 
-## Quickstart (development, exchange demo/simulated trading only)
-
-```bash
-cp go-engine/configs/config.example.yaml go-engine/configs/config.yaml
-cp rl-service/configs/config.example.yaml rl-service/configs/config.yaml
-cp .env.example .env   # fill in exchange demo API credentials
-
-docker compose up -d kafka redis timescaledb prometheus grafana loki promtail
-
-# Go: market-data ingestor (WebSocket -> Kafka: ticks + candles)
-cd go-engine && go run ./cmd/ingestor
-
-# Go: the paper trading engine (virtual orders, the RL training-data source)
-cd go-engine && go run ./cmd/paper-trader
-
-# Python: RL inference service
-cd rl-service && pip install -r requirements.txt
-uvicorn rl_service.serve.api:app --port 8000
-
-# Go: backtest every strategy against historical candles to see which have a real edge
-# (measured against a null "coin flip" baseline, not just raw PnL) before trusting any of
-# them with capital, then build a warm-start dataset and pretrain the model on it
-cd go-engine && go run ./cmd/backtest -out ../rl-service/data/warmstart.jsonl
-cd rl-service && python -m rl_service.warmstart --dataset data/warmstart.jsonl
-
-# Go: the live trading engine (talks to rl-service + the exchange)
-cd go-engine && go run ./cmd/trader
-
-# Optional: strategy parameter optimizer — tunes existing strategies against real
-# market data, independent of the RL agent
-cd optimizer-service && pip install -r requirements.txt
-uvicorn optimizer_service.api:app --port 8001
-cd go-engine && go run ./cmd/strategy-optimizer
-```
-
-**Always run against the exchange's demo/simulated trading mode until a strategy has been
-backtested and evaluated with real paper-trading data.** Enabling real-money trading is a
-configuration change, not a code change — treat it with matching caution.
+This repository is shared as a portfolio/reference project rather than a turnkey deployable
+product — bringing up the full stack involves database migrations, a seeded instrument roster, and
+per-service configuration beyond what a short command list could responsibly cover. See
+`docker-compose.yml` for how the services are actually wired together, and [CLAUDE.md](CLAUDE.md)
+for the full design rationale behind each one.
 
 ## Infrastructure & resource requirements
 
